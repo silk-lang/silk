@@ -3741,18 +3741,40 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     process.env,
   )
   assert.equal(directRun.status, 42, directRun.stderr)
-  // The direct backend writes only wasm modules, and a host build with it says so.
-  const directHost = yield* invoke(
+  // The direct backend supports WebAssembly and Linux x86-64 only, and refuses other native targets.
+  const directUnsupported = yield* invoke(
     silk,
-    ['build', '--manifest-path', join('threads', 'silk.toml'), '--backend', 'direct', '--stdlib', standardLibrary],
+    [
+      'build',
+      '--manifest-path',
+      join('threads', 'silk.toml'),
+      '--target',
+      'aarch64-unknown-linux-gnu',
+      '--backend',
+      'direct',
+      '--stdlib',
+      standardLibrary,
+    ],
     directory,
     process.env,
   )
-  assert.equal(directHost.status, 1, directHost.stderr)
+  assert.equal(directUnsupported.status, 1, directUnsupported.stderr)
   assert.match(
-    directHost.stderr,
-    /^silk: invalid compilation settings: UnsupportedCombination: backend = "direct" builds WebAssembly targets only; choose a wasm target, such as wasm32-wasip1, or backend = "llvm"$/m,
+    directUnsupported.stderr,
+    /^silk: invalid compilation settings: UnsupportedCombination: backend = "direct" builds WebAssembly and x86_64-unknown-linux-gnu targets only; choose one of those targets or backend = "llvm"$/m,
   )
+  if (process.platform === 'linux' && process.arch === 'x64') {
+    const directHost = yield* invoke(
+      silk,
+      ['build', '--manifest-path', join('threads', 'silk.toml'), '--backend', 'direct', '--stdlib', standardLibrary],
+      directory,
+      { ...process.env, SILK_CLANG: '/nonexistent' },
+    )
+    assert.equal(directHost.status, 0, directHost.stderr)
+    const directHostBin = join(threads, 'build', 'x86_64-unknown-linux-gnu', 'dev', 'threads')
+    const directHostRun = yield* invoke(directHostBin, [], directory, process.env)
+    assert.equal(directHostRun.status, 42, directHostRun.stderr)
+  }
   // Freed memory is reused: 100 threads with 1 MiB stacks and repeated list growth fit in 64 MiB.
   const churn = join(directory, 'churn')
   yield* fs.makeDirectory(churn, { recursive: true })

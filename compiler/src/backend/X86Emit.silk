@@ -52,6 +52,7 @@ import backend.X86Object {Function, Relocation, RelocationKind, RodataJumpEntry,
 import backend.X86Unwind {UnwindInfo}
 import silk.collections.bytes {Bytes}
 import silk.collections.list {List}
+import silk.collections.slice {Slice}
 import silk.core.effect {Effect}
 import silk.core.ownership {Copy}
 import silk.core.result {Result}
@@ -62,12 +63,23 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 
-struct BlockPatch {
-  patchAt: usize,
+struct LocalBranch {
+  opcodeAt: usize,
+  isJcc: bool,
+  cc: u8,
   targetBlock: usize,
+  targetOffset: usize,
+  shortened: bool,
 }
 
-impl Copy for BlockPatch {}
+impl Copy for LocalBranch {}
+
+struct Imm32 {
+  ok: bool,
+  value: i32,
+}
+
+impl Copy for Imm32 {}
 
 struct JumpEntryRef {
   rodataOffset: usize,
@@ -86,7 +98,7 @@ struct Emitter {
   jumpRefs: List<JumpEntryRef>,
   locations: List<u64>,
   blockOffsets: List<usize>,
-  blockPatches: List<BlockPatch>,
+  localBranches: List<LocalBranch>,
   frame: FramePlan,
   fixedGpCount: usize,
   fixedFpCount: usize,
@@ -116,7 +128,7 @@ pub effect fn emit(function: &SsaFunction, symbol: &[u8], exported: &[u8]) -> Fu
     jumpRefs: List<JumpEntryRef>.make(),
     locations: List<u64>.make(),
     blockOffsets: move blockOffsets,
-    blockPatches: List<BlockPatch>.make(),
+    localBranches: List<LocalBranch>.make(),
     frame: move frame,
     fixedGpCount: usize.ZERO,
     fixedFpCount: usize.ZERO,
@@ -142,35 +154,34 @@ pub effect fn emit(function: &SsaFunction, symbol: &[u8], exported: &[u8]) -> Fu
     if blk.startPlace != 0 {
       run recordLocation(&mut em, blk.startPlace)
     }
+    let fusedCmp = findFusedCompareInst(&em, function, b)
     let insts = List<usize>.asSlice(&blk.instructions)
     let mut i = usize.ZERO
     while i < insts.length {
-      let inst = function.instruction(insts[i])
-      if !inst.removed {
+      let instIdx = insts[i]
+      let inst = function.instruction(instIdx)
+      if !inst.removed && instIdx != fusedCmp {
         if inst.place != 0 {
           run recordLocation(&mut em, inst.place)
         }
-        run emitInstruction(&mut em, function, insts[i])
+        run emitInstruction(&mut em, function, instIdx)
       }
       i = i + usize.ONE
     }
     if blk.place != 0 {
       run recordLocation(&mut em, blk.place)
     }
-    run emitExit(&mut em, function, b, naked)
+    run emitExit(&mut em, function, b, naked, fusedCmp)
     b = b + usize.ONE
   }
 
-  // Patch all local block jumps and record jump-table entries.
+  // Relax short local branches from rel32 to 2-byte rel8 and patch all branch displacements.
+  run relaxBranches(&mut em)
+
+  // Record jump-table entries using post-relaxation block offsets.
   let bOffs = List<usize>.asSlice(&em.blockOffsets)
-  let patches = List<BlockPatch>.asSlice(&em.blockPatches)
-  let mut p = usize.ZERO
-  while p < patches.length {
-    X86Encode.patchRel32(&mut em.code, patches[p].patchAt, bOffs[patches[p].targetBlock])
-    p = p + usize.ONE
-  }
   let jRefs = List<JumpEntryRef>.asSlice(&em.jumpRefs)
-  p = usize.ZERO
+  let mut p = usize.ZERO
   while p < jRefs.length {
     run List<RodataJumpEntry>.append(&mut em.rodataJumps, RodataJumpEntry {
       rodataOffset: jRefs[p].rodataOffset,
@@ -191,6 +202,35 @@ pub effect fn emit(function: &SsaFunction, symbol: &[u8], exported: &[u8]) -> Fu
     unwind: em.unwind,
     locations: move em.locations,
   }
+}
+
+fn findFusedCompareInst(em: &Emitter, function: &SsaFunction, blockIdx: usize) -> usize {
+  let blk = function.block(blockIdx)
+  if blk.exit != Exit.Branch || blk.value == none() { return usize.MAX }
+  let uses = List<usize>.asSlice(&em.frame.valueUses)
+  let condIdx = u64.toUsize(blk.value)
+  if condIdx >= uses.length || uses[condIdx] != usize.ONE { return usize.MAX }
+  let insts = List<usize>.asSlice(&blk.instructions)
+  let mut k = insts.length
+  while k > usize.ZERO {
+    k = k - usize.ONE
+    let instIdx = insts[k]
+    let inst = function.instruction(instIdx)
+    if !inst.removed {
+      if inst.result != blk.value { return usize.MAX }
+      if let Operation.Compare {..} = inst.operation {
+        let ops = function.operandsOf(instIdx)
+        if ops.length >= 2 {
+          let opKind = function.value(ops[0]).kind
+          if !opKind.isVector() && !opKind.isFloat() && opKind.bits <= 64 {
+            return instIdx
+          }
+        }
+      }
+      return usize.MAX
+    }
+  }
+  return usize.MAX
 }
 
 fn isNakedFunction(function: &SsaFunction) -> bool {
@@ -260,9 +300,223 @@ effect fn addRodataReloc(em: &mut Emitter, codeOffset: usize, rodataOffset: usiz
   })
 }
 
-fn patchHere(em: &mut Emitter, patchAt: usize) -> () {
+effect fn emitJmp(em: &mut Emitter) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let opAt = Bytes.length(&em.code)
+  drop run X86Encode.jmpRel32(&mut em.code)
+  let idx = List<LocalBranch>.length(&em.localBranches)
+  run List<LocalBranch>.append(&mut em.localBranches, LocalBranch {
+    opcodeAt: opAt, isJcc: false, cc: 0, targetBlock: usize.MAX, targetOffset: usize.ZERO, shortened: false,
+  })
+  return idx
+}
+
+effect fn emitJcc(em: &mut Emitter, cc: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let opAt = Bytes.length(&em.code)
+  drop run X86Encode.jccRel32(&mut em.code, cc)
+  let idx = List<LocalBranch>.length(&em.localBranches)
+  run List<LocalBranch>.append(&mut em.localBranches, LocalBranch {
+    opcodeAt: opAt, isJcc: true, cc: cc, targetBlock: usize.MAX, targetOffset: usize.ZERO, shortened: false,
+  })
+  return idx
+}
+
+effect fn emitJmpBlock(em: &mut Emitter, targetBlock: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let opAt = Bytes.length(&em.code)
+  drop run X86Encode.jmpRel32(&mut em.code)
+  return run List<LocalBranch>.append(&mut em.localBranches, LocalBranch {
+    opcodeAt: opAt, isJcc: false, cc: 0, targetBlock: targetBlock, targetOffset: usize.ZERO, shortened: false,
+  })
+}
+
+effect fn emitJccBlock(em: &mut Emitter, cc: u8, targetBlock: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let opAt = Bytes.length(&em.code)
+  drop run X86Encode.jccRel32(&mut em.code, cc)
+  return run List<LocalBranch>.append(&mut em.localBranches, LocalBranch {
+    opcodeAt: opAt, isJcc: true, cc: cc, targetBlock: targetBlock, targetOffset: usize.ZERO, shortened: false,
+  })
+}
+
+fn patchHere(em: &mut Emitter, brIdx: usize) -> () {
   let here = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, patchAt, here)
+  let brs = List<LocalBranch>.asMutSlice(&mut em.localBranches)
+  brs[brIdx].targetOffset = here
+}
+
+fn patchTo(em: &mut Emitter, brIdx: usize, targetOffset: usize) -> () {
+  let brs = List<LocalBranch>.asMutSlice(&mut em.localBranches)
+  brs[brIdx].targetOffset = targetOffset
+}
+
+fn mapOldOffset(oldOff: usize, brs: &[LocalBranch], sb: &[usize]) -> usize {
+  let mut lo = usize.ZERO
+  let mut hi = brs.length
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if brs[mid].opcodeAt < oldOff {
+      lo = mid + usize.ONE
+    } else {
+      hi = mid
+    }
+  }
+  return oldOff - sb[lo]
+}
+
+fn resolveBranchTargets(bOffs: &[usize], brs: &mut [LocalBranch]) -> () {
+  let mut i = usize.ZERO
+  while i < brs.length {
+    if brs[i].targetBlock != usize.MAX {
+      brs[i].targetOffset = bOffs[brs[i].targetBlock]
+    }
+    i = i + usize.ONE
+  }
+}
+
+fn computeSavedPrefix(brs: &[LocalBranch], sb: &mut [usize]) -> () {
+  let mut acc = usize.ZERO
+  let mut i = usize.ZERO
+  while i < brs.length {
+    sb[i] = acc
+    if brs[i].shortened {
+      let delta: usize = if brs[i].isJcc { 4 } else { 3 }
+      acc = acc + delta
+    }
+    i = i + usize.ONE
+  }
+  sb[brs.length] = acc
+}
+
+fn markShortenedBranches(brs: &mut [LocalBranch], sb: &[usize]) -> bool {
+  let n = brs.length
+  let mut changed = false
+  let mut i = usize.ZERO
+  while i < n {
+    if !brs[i].shortened {
+      let oldLen: usize = if brs[i].isJcc { 6 } else { 5 }
+      let mappedStart = brs[i].opcodeAt - sb[i]
+      let target = brs[i].targetOffset
+      let mut lo = usize.ZERO
+      let mut hi = n
+      while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if brs[mid].opcodeAt < target {
+          lo = mid + usize.ONE
+        } else {
+          hi = mid
+        }
+      }
+      let mappedTarget = target - sb[lo]
+      let nextBase = if target > brs[i].opcodeAt { mappedStart + oldLen } else { mappedStart + 2 }
+      let rel = usize.toI64(mappedTarget) - usize.toI64(nextBase)
+      if rel >= -128 && rel <= 127 {
+        brs[i].shortened = true
+        changed = true
+      }
+    }
+    i = i + usize.ONE
+  }
+  return changed
+}
+
+effect fn buildCompactedCode(oldBytes: &[u8], brs: &[LocalBranch], sb: &[usize]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let n = brs.length
+  let mut newCode = run Bytes.makeWithCapacity(oldBytes.length - sb[n])
+  let mut cursor = usize.ZERO
+  let mut i = usize.ZERO
+  while i < n {
+    let br = brs[i]
+    if br.opcodeAt > cursor {
+      run Bytes.append(&mut newCode, Slice.view<u8>(oldBytes, cursor, br.opcodeAt - cursor))
+    }
+    let oldLen: usize = if br.isJcc { 6 } else { 5 }
+    let mappedTarget = mapOldOffset(br.targetOffset, brs, sb)
+    if br.shortened {
+      let nextIp = Bytes.length(&newCode) + 2
+      let rel = i64.wrappingToI32(usize.toI64(mappedTarget) - usize.toI64(nextIp))
+      if br.isJcc {
+        run X86Encode.jccRel8(&mut newCode, br.cc, rel)
+      } else {
+        run X86Encode.jmpRel8(&mut newCode, rel)
+      }
+    } else {
+      let dispAt = if br.isJcc {
+        run X86Encode.jccRel32(&mut newCode, br.cc)
+      } else {
+        run X86Encode.jmpRel32(&mut newCode)
+      }
+      X86Encode.patchRel32(&mut newCode, dispAt, mappedTarget)
+    }
+    cursor = br.opcodeAt + oldLen
+    i = i + usize.ONE
+  }
+  if cursor < oldBytes.length {
+    run Bytes.append(&mut newCode, Slice.view<u8>(oldBytes, cursor, oldBytes.length - cursor))
+  }
+  return move newCode
+}
+
+effect fn relaxBranches(em: &mut Emitter) -> () ! OutOfMemoryError ? &mut Allocator {
+  let n = List<LocalBranch>.length(&em.localBranches)
+  if n == usize.ZERO { return () }
+  resolveBranchTargets(List<usize>.asSlice(&em.blockOffsets), List<LocalBranch>.asMutSlice(&mut em.localBranches))
+  // Keep offsets untouched when raw inline assembly is present.
+  if em.frame.hasInlineAsm {
+    let brs = List<LocalBranch>.asSlice(&em.localBranches)
+    let mut i = usize.ZERO
+    while i < n {
+      let dispAt = brs[i].opcodeAt + (if brs[i].isJcc { 2 } else { usize.ONE })
+      X86Encode.patchRel32(&mut em.code, dispAt, brs[i].targetOffset)
+      i = i + usize.ONE
+    }
+    return ()
+  }
+
+  let mut savedBefore = run List<usize>.makeWithCapacity(n + usize.ONE)
+  let mut i = usize.ZERO
+  while i <= n {
+    run List<usize>.append(&mut savedBefore, usize.ZERO)
+    i = i + usize.ONE
+  }
+  let mut anyShortened = false
+  let mut changed = true
+  while changed {
+    computeSavedPrefix(List<LocalBranch>.asSlice(&em.localBranches), List<usize>.asMutSlice(&mut savedBefore))
+    changed = markShortenedBranches(List<LocalBranch>.asMutSlice(&mut em.localBranches), List<usize>.asSlice(&savedBefore))
+    if changed { anyShortened = true }
+  }
+  if !anyShortened {
+    let brs = List<LocalBranch>.asSlice(&em.localBranches)
+    i = usize.ZERO
+    while i < n {
+      let dispAt = brs[i].opcodeAt + (if brs[i].isJcc { 2 } else { usize.ONE })
+      X86Encode.patchRel32(&mut em.code, dispAt, brs[i].targetOffset)
+      i = i + usize.ONE
+    }
+    return ()
+  }
+  computeSavedPrefix(List<LocalBranch>.asSlice(&em.localBranches), List<usize>.asMutSlice(&mut savedBefore))
+  let sbSlice = List<usize>.asSlice(&savedBefore)
+  let brs = List<LocalBranch>.asSlice(&em.localBranches)
+  let mut newCode = run buildCompactedCode(Bytes.asSlice(&em.code), brs, sbSlice)
+  em.code = move newCode
+  let bOffMut = List<usize>.asMutSlice(&mut em.blockOffsets)
+  i = usize.ZERO
+  while i < bOffMut.length {
+    bOffMut[i] = mapOldOffset(bOffMut[i], brs, sbSlice)
+    i = i + usize.ONE
+  }
+  let relsMut = List<Relocation>.asMutSlice(&mut em.relocations)
+  i = usize.ZERO
+  while i < relsMut.length {
+    relsMut[i].offset = mapOldOffset(relsMut[i].offset, brs, sbSlice)
+    i = i + usize.ONE
+  }
+  let locsMut = List<u64>.asMutSlice(&mut em.locations)
+  i = usize.ZERO
+  while i < locsMut.length {
+    locsMut[i] = usize.toU64(mapOldOffset(u64.toUsize(locsMut[i]), brs, sbSlice))
+    i = i + 2
+  }
+  return ()
 }
 
 effect fn callExternal(em: &mut Emitter, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -289,7 +543,7 @@ effect fn emitPrologue(em: &mut Emitter, function: &SsaFunction) -> () ! OutOfMe
   run X86Encode.movRr64(&mut em.code, X86Encode.rbp(), X86Encode.rsp())
   let movEnd = u64.wrappingToU8(usize.toU64(Bytes.length(&em.code) - start))
 
-  // Push any callee-saved GPRs needed by inline asm or cmpxchg16b.
+  // Push any callee-saved GPRs allocated to SSA values or needed by inline asm / cmpxchg16b.
   let mask = em.frame.savedCalleeMask
   let mut r: u8 = 0
   while r < 16 {
@@ -327,7 +581,7 @@ effect fn emitPrologue(em: &mut Emitter, function: &SsaFunction) -> () ! OutOfMe
       g = g + usize.ONE
     }
     run X86Encode.testRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
-    let skipFp = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    let skipFp = run emitJcc(&mut em.*, X86Encode.ccE())
     let mut x: u8 = 0
     while x < 8 {
       drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), base + 48 + u8.toI32(x) * 16), x)
@@ -350,11 +604,14 @@ effect fn emitIncomingParams(em: &mut Emitter, function: &SsaFunction) -> () ! O
     let kind = function.value(val).kind
     let abi = function.argumentAbi(a)
     let home = valOff(&em.*, val)
+    let homeReg = valReg(&em.*, val)
     if abi.byvalSize > 0 {
       // `byval` aggregate lives on the caller's stack; the SSA argument is its address!
       let align: i32 = if abi.byvalAlignment > 8 { usize.toI32(abi.byvalAlignment) } else { 8 }
       stackOff = alignI32(stackOff, align)
-      if home != 0 {
+      if homeReg != X86Frame.regNone() {
+        drop run X86Encode.lea64(&mut em.code, homeReg, Mem.baseDisp(X86Encode.rbp(), stackOff))
+      } else if home != 0 {
         drop run X86Encode.lea64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff))
         drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), X86Encode.r11())
       }
@@ -416,12 +673,16 @@ effect fn emitIncomingParams(em: &mut Emitter, function: &SsaFunction) -> () ! O
     } else {
       // Ordinary <=64-bit integer or address.
       if gpIdx < 6 {
-        if home != 0 {
+        if homeReg != X86Frame.regNone() {
+          run X86Encode.movRr64(&mut em.code, homeReg, sysvGpArg(gpIdx))
+        } else if home != 0 {
           drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), sysvGpArg(gpIdx))
         }
         gpIdx = gpIdx + usize.ONE
       } else {
-        if home != 0 {
+        if homeReg != X86Frame.regNone() {
+          drop run X86Encode.movRm64(&mut em.code, homeReg, Mem.baseDisp(X86Encode.rbp(), stackOff))
+        } else if home != 0 {
           drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff))
           drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), X86Encode.r11())
         }
@@ -463,8 +724,52 @@ fn valOff(em: &Emitter, val: u64) -> i32 {
   return List<i32>.asSlice(&em.frame.valueOffsets)[u64.toUsize(val)]
 }
 
+fn valReg(em: &Emitter, val: u64) -> u8 {
+  if val == none() { return X86Frame.regNone() }
+  return List<u8>.asSlice(&em.frame.valueRegs)[u64.toUsize(val)]
+}
+
+fn valSlotBase(em: &Emitter, val: u64) -> i32 {
+  if val == none() { return 0 }
+  return List<i32>.asSlice(&em.frame.valueSlotBase)[u64.toUsize(val)]
+}
+
 fn slotOff(em: &Emitter, slot: usize) -> i32 {
   return List<i32>.asSlice(&em.frame.slotOffsets)[slot]
+}
+
+fn dstRegOrScratch(em: &Emitter, val: u64, scratch: u8) -> u8 {
+  let r = valReg(em, val)
+  if r != X86Frame.regNone() { return r }
+  return scratch
+}
+
+// Returns `val`'s assigned callee-saved GPR without emitting code, or loads `val` into `scratch`.
+effect fn regOrLoad(em: &mut Emitter, function: &SsaFunction, value: u64, scratch: u8) -> u8
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition != Definition.Constant {
+    let r = valReg(&em.*, value)
+    if r != X86Frame.regNone() { return r }
+  }
+  run loadGp(&mut em.*, function, value, scratch)
+  return scratch
+}
+
+fn constBitsImm32(function: &SsaFunction, value: u64, bits: usize) -> Imm32 {
+  let info = function.value(value)
+  if info.definition != Definition.Constant { return Imm32 {ok: false, value: 0} }
+  let c = function.constantOf(value)
+  if c.form != ConstantForm.Bits { return Imm32 {ok: false, value: 0} }
+  let masked = maskBits(c.low, bits)
+  if bits == 32 {
+    return Imm32 {ok: true, value: u64.wrappingToI32(masked)}
+  }
+  let signed = u64.wrappingToI64(masked)
+  if signed >= -2147483648 && signed <= 2147483647 {
+    return Imm32 {ok: true, value: i64.wrappingToI32(signed)}
+  }
+  return Imm32 {ok: false, value: 0}
 }
 
 // Loads any <=64-bit integer, flag, or address value into `dstReg` (clobbers only `dstReg` and
@@ -475,6 +780,18 @@ effect fn loadGp(em: &mut Emitter, function: &SsaFunction, value: u64, dstReg: u
   if info.definition == Definition.Constant {
     let c = function.constantOf(value)
     return run loadConstantGp(&mut em.*, function, c, info.kind, dstReg)
+  }
+  let sb = valSlotBase(&em.*, value)
+  if sb != 0 {
+    drop run X86Encode.lea64(&mut em.code, dstReg, Mem.baseDisp(X86Encode.rbp(), sb))
+    return ()
+  }
+  let reg = valReg(&em.*, value)
+  if reg != X86Frame.regNone() {
+    if reg != dstReg {
+      return run X86Encode.movRr64(&mut em.code, dstReg, reg)
+    }
+    return ()
   }
   let off = valOff(&em.*, value)
   if off == 0 {
@@ -532,6 +849,13 @@ effect fn loadConstantGp(em: &mut Emitter, function: &SsaFunction, c: Constant, 
 }
 
 effect fn storeGp(em: &mut Emitter, value: u64, srcReg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let reg = valReg(&em.*, value)
+  if reg != X86Frame.regNone() {
+    if reg != srcReg {
+      return run X86Encode.movRr64(&mut em.code, reg, srcReg)
+    }
+    return ()
+  }
   let off = valOff(&em.*, value)
   if off == 0 { return () }
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off), srcReg)
@@ -681,9 +1005,11 @@ effect fn emitInstruction(em: &mut Emitter, function: &SsaFunction, instIdx: usi
     Operation.VaEnd => { return () }
     Operation.VaStart => { return run emitVaStart(&mut em.*, function, ops[0]) }
     Operation.SlotAddress {slot} => {
+      if valSlotBase(&em.*, inst.result) != 0 { return () }
       let sOff = slotOff(&em.*, slot)
-      drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), sOff))
-      return run storeGp(&mut em.*, inst.result, X86Encode.rax())
+      let dst = dstRegOrScratch(&em.*, inst.result, X86Encode.rax())
+      drop run X86Encode.lea64(&mut em.code, dst, Mem.baseDisp(X86Encode.rbp(), sOff))
+      return run storeGp(&mut em.*, inst.result, dst)
     }
     Operation.FrameAddress => {
       return run storeGp(&mut em.*, inst.result, X86Encode.rbp())
@@ -692,22 +1018,34 @@ effect fn emitInstruction(em: &mut Emitter, function: &SsaFunction, instIdx: usi
       return run emitDynamicSlot(&mut em.*, function, ops[0], alignment, inst.result)
     }
     Operation.Offset {offset} => {
-      run loadGp(&mut em.*, function, ops[0], X86Encode.rax())
-      if offset != 0 {
-        let signed = u64.wrappingToI64(offset)
-        if signed >= -2147483648 && signed <= 2147483647 {
-          run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rax(), i64.wrappingToI32(signed))
-        } else {
-          run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), offset)
-          run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
-        }
+      if valSlotBase(&em.*, inst.result) != 0 { return () }
+      let dst = dstRegOrScratch(&em.*, inst.result, X86Encode.rax())
+      if offset == 0 {
+        run loadGp(&mut em.*, function, ops[0], dst)
+        return run storeGp(&mut em.*, inst.result, dst)
       }
+      let signed = u64.wrappingToI64(offset)
+      if signed >= -2147483648 && signed <= 2147483647 {
+        let base = run regOrLoad(&mut em.*, function, ops[0], X86Encode.rax())
+        drop run X86Encode.lea64(&mut em.code, dst, Mem.baseDisp(base, i64.wrappingToI32(signed)))
+        return run storeGp(&mut em.*, inst.result, dst)
+      }
+      run loadGp(&mut em.*, function, ops[0], X86Encode.rax())
+      run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), offset)
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
       return run storeGp(&mut em.*, inst.result, X86Encode.rax())
     }
     Operation.Index => {
+      let idxBits = function.value(ops[1]).kind.bits
+      if idxBits == 64 {
+        let dst = dstRegOrScratch(&em.*, inst.result, X86Encode.rax())
+        let base = run regOrLoad(&mut em.*, function, ops[0], X86Encode.rax())
+        let idx = run regOrLoad(&mut em.*, function, ops[1], X86Encode.rcx())
+        drop run X86Encode.lea64(&mut em.code, dst, Mem.baseIndex(base, idx, 1, 0))
+        return run storeGp(&mut em.*, inst.result, dst)
+      }
       run loadGp(&mut em.*, function, ops[0], X86Encode.rax())
       run loadGp(&mut em.*, function, ops[1], X86Encode.rcx())
-      let idxBits = function.value(ops[1]).kind.bits
       run normalizeInt(&mut em.*, X86Encode.rcx(), idxBits, false)
       run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
       return run storeGp(&mut em.*, inst.result, X86Encode.rax())
@@ -833,10 +1171,31 @@ effect fn emitAddrWithOffset(em: &mut Emitter, function: &SsaFunction, addrVal: 
   return ()
 }
 
+// Builds a `Mem.baseDisp(baseReg, disp)` addressing mode directly when `offset` fits in `i32`
+// (reusing `addrVal`'s callee-saved GPR with zero extra instructions), falling back to
+// `emitAddrWithOffset` into `scratchReg` otherwise.
+effect fn resolveAddrMem(em: &mut Emitter, function: &SsaFunction, addrVal: u64, offset: u64, scratchReg: u8) -> Mem
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let sb = valSlotBase(&em.*, addrVal)
+  if sb != 0 {
+    let total = i32.toI64(sb) + u64.wrappingToI64(offset)
+    if total >= -2147483648 && total <= 2147483647 {
+      return Mem.baseDisp(X86Encode.rbp(), i64.wrappingToI32(total))
+    }
+  }
+  let signed = u64.wrappingToI64(offset)
+  if signed >= -2147483648 && signed <= 2147483647 {
+    let base = run regOrLoad(&mut em.*, function, addrVal, scratchReg)
+    return Mem.baseDisp(base, i64.wrappingToI32(signed))
+  }
+  run emitAddrWithOffset(&mut em.*, function, addrVal, offset, scratchReg)
+  return Mem.baseDisp(scratchReg, 0)
+}
+
 effect fn emitLoad(em: &mut Emitter, function: &SsaFunction, addrVal: u64, offset: u64, kind: Kind, result: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rsi())
   if kind.isVector() {
+    run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rsi())
     let sz = kind.storeSize()
     let dstOff = valOff(&em.*, result)
     if dstOff == 0 { return () }
@@ -851,37 +1210,41 @@ effect fn emitLoad(em: &mut Emitter, function: &SsaFunction, addrVal: u64, offse
     return run X86Encode.repMovsb(&mut em.code)
   }
   if kind.isFloat() {
+    let mem = run resolveAddrMem(&mut em.*, function, addrVal, offset, X86Encode.rsi())
     if kind.bits == 64 {
-      drop run X86Encode.movsdRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+      drop run X86Encode.movsdRm(&mut em.code, 0, mem)
       return run storeFloat(&mut em.*, result, 0, true)
     }
-    drop run X86Encode.movssRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movssRm(&mut em.code, 0, mem)
     return run storeFloat(&mut em.*, result, 0, false)
   }
   if kind.bits > 64 {
+    run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rsi())
     drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
     drop run X86Encode.movRm64(&mut em.code, X86Encode.rdx(), Mem.baseDisp(X86Encode.rsi(), 8))
     return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
   }
+  let mem = run resolveAddrMem(&mut em.*, function, addrVal, offset, X86Encode.rsi())
+  let dst = dstRegOrScratch(&em.*, result, X86Encode.rax())
   let bytes = kind.elementBytes()
   if bytes == 1 {
-    drop run X86Encode.movzxRm8(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
-    if kind.bits == 1 { run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rax(), 1) }
+    drop run X86Encode.movzxRm8(&mut em.code, dst, mem)
+    if kind.bits == 1 { run X86Encode.aluRi64(&mut em.code, Alu.And, dst, 1) }
   } else if bytes == 2 {
-    drop run X86Encode.movzxRm16(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movzxRm16(&mut em.code, dst, mem)
   } else if bytes == 4 {
-    drop run X86Encode.movRm32(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movRm32(&mut em.code, dst, mem)
   } else {
-    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movRm64(&mut em.code, dst, mem)
   }
-  return run storeGp(&mut em.*, result, X86Encode.rax())
+  return run storeGp(&mut em.*, result, dst)
 }
 
 effect fn emitStore(em: &mut Emitter, function: &SsaFunction, val: u64, addrVal: u64, offset: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let kind = function.value(val).kind
-  run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rdi())
   if kind.isVector() {
+    run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rdi())
     let sz = kind.storeSize()
     run vectorAddr(&mut em.*, function, val, X86Encode.rsi())
     if sz == 16 {
@@ -893,31 +1256,52 @@ effect fn emitStore(em: &mut Emitter, function: &SsaFunction, val: u64, addrVal:
     return run X86Encode.repMovsb(&mut em.code)
   }
   if kind.isFloat() {
+    let mem = run resolveAddrMem(&mut em.*, function, addrVal, offset, X86Encode.rdi())
     run loadFloat(&mut em.*, function, val, 0, X86Encode.rax())
     if kind.bits == 64 {
-      drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), 0)
+      drop run X86Encode.movsdMr(&mut em.code, mem, 0)
     } else {
-      drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), 0)
+      drop run X86Encode.movssMr(&mut em.code, mem, 0)
     }
     return ()
   }
   if kind.bits > 64 {
+    run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rdi())
     run loadPair(&mut em.*, function, val, X86Encode.rax(), X86Encode.rdx())
     drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
     drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 8), X86Encode.rdx())
     return ()
   }
-  run loadGp(&mut em.*, function, val, X86Encode.rax())
+  let mem = run resolveAddrMem(&mut em.*, function, addrVal, offset, X86Encode.rdi())
   let bytes = kind.elementBytes()
-  if bytes == 1 {
-    if kind.bits == 1 { run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rax(), 1) }
-    drop run X86Encode.movMr8(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
-  } else if bytes == 2 {
-    drop run X86Encode.movMr16(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+  if bytes == 8 {
+    let imm = constBitsImm32(function, val, 64)
+    if imm.ok {
+      drop run X86Encode.movMi64(&mut em.code, mem, imm.value)
+      return ()
+    }
   } else if bytes == 4 {
-    drop run X86Encode.movMr32(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+    let imm = constBitsImm32(function, val, 32)
+    if imm.ok {
+      drop run X86Encode.movMi32(&mut em.code, mem, i32.wrappingToU64(imm.value) & 0xFFFFFFFF)
+      return ()
+    }
+  }
+  if bytes == 1 && kind.bits == 1 {
+    run loadGp(&mut em.*, function, val, X86Encode.rax())
+    run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rax(), 1)
+    drop run X86Encode.movMr8(&mut em.code, mem, X86Encode.rax())
+    return ()
+  }
+  let srcReg = run regOrLoad(&mut em.*, function, val, X86Encode.rax())
+  if bytes == 1 {
+    drop run X86Encode.movMr8(&mut em.code, mem, srcReg)
+  } else if bytes == 2 {
+    drop run X86Encode.movMr16(&mut em.code, mem, srcReg)
+  } else if bytes == 4 {
+    drop run X86Encode.movMr32(&mut em.code, mem, srcReg)
   } else {
-    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+    drop run X86Encode.movMr64(&mut em.code, mem, srcReg)
   }
   return ()
 }
@@ -1014,9 +1398,109 @@ effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind:
   if kind.bits > 64 {
     return run emitI128Binary(&mut em.*, function, op, left, right, result)
   }
+  let bits = kind.bits
+  // Direct register + immediate fast path for Add/Sub/And/Or/Xor.
+  if op == Binary.Add || op == Binary.Sub || op == Binary.And || op == Binary.Or || op == Binary.Xor {
+    let aluOp = match op {
+      Binary.Add => Alu.Add
+      Binary.Sub => Alu.Sub
+      Binary.And => Alu.And
+      Binary.Or => Alu.Or
+      _ => Alu.Xor
+    }
+    let mut lhs = left
+    let mut rhs = right
+    let mut imm = constBitsImm32(function, rhs, bits)
+    if !imm.ok && op != Binary.Sub {
+      let lhsImm = constBitsImm32(function, lhs, bits)
+      if lhsImm.ok {
+        lhs = right
+        rhs = left
+        imm = lhsImm
+      }
+    }
+    let rDst = valReg(&em.*, result)
+    let rRhs = if imm.ok { X86Frame.regNone() } else { valReg(&em.*, rhs) }
+    let workDst = if rDst != X86Frame.regNone() && rDst != rRhs { rDst } else { X86Encode.rax() }
+    run loadGp(&mut em.*, function, lhs, workDst)
+    if imm.ok {
+      if bits == 32 {
+        run X86Encode.aluRi32(&mut em.code, aluOp, workDst, imm.value)
+      } else {
+        run X86Encode.aluRi64(&mut em.code, aluOp, workDst, imm.value)
+        if bits < 64 { run normalizeInt(&mut em.*, workDst, bits, false) }
+      }
+    } else {
+      let rhsReg = run regOrLoad(&mut em.*, function, rhs, X86Encode.rcx())
+      if bits == 32 {
+        run X86Encode.aluRr32(&mut em.code, aluOp, workDst, rhsReg)
+      } else {
+        run X86Encode.aluRr64(&mut em.code, aluOp, workDst, rhsReg)
+        if bits < 64 { run normalizeInt(&mut em.*, workDst, bits, false) }
+      }
+    }
+    return run storeGp(&mut em.*, result, workDst)
+  }
+  // Direct register fast path for 32-bit and 64-bit multiply.
+  if op == Binary.Mul && (bits == 32 || bits == 64) {
+    let rDst = valReg(&em.*, result)
+    let rRhs = valReg(&em.*, right)
+    let workDst = if rDst != X86Frame.regNone() && rDst != rRhs { rDst } else { X86Encode.rax() }
+    run loadGp(&mut em.*, function, left, workDst)
+    let rhsReg = run regOrLoad(&mut em.*, function, right, X86Encode.rcx())
+    if bits == 32 {
+      run X86Encode.imulRr32(&mut em.code, workDst, rhsReg)
+    } else {
+      run X86Encode.imulRr64(&mut em.code, workDst, rhsReg)
+    }
+    return run storeGp(&mut em.*, result, workDst)
+  }
+  // Constant-count shift fast path.
+  if op == Binary.Shl || op == Binary.LShr || op == Binary.AShr {
+    let rhsInfo = function.value(right)
+    if rhsInfo.definition == Definition.Constant {
+      let c = function.constantOf(right)
+      if c.form == ConstantForm.Bits {
+        let amt: u8 = if bits == usize.ONE {
+          0
+        } else if bits < 64 {
+          u64.wrappingToU8(c.low & usize.toU64(bits - usize.ONE))
+        } else {
+          u64.wrappingToU8(c.low & 63)
+        }
+        let shOp = match op {
+          Binary.Shl => Shift.Shl
+          Binary.LShr => Shift.Shr
+          _ => Shift.Sar
+        }
+        let workDst = dstRegOrScratch(&em.*, result, X86Encode.rax())
+        run loadGp(&mut em.*, function, left, workDst)
+        if bits == 64 {
+          if amt != 0 { run X86Encode.shiftImm64(&mut em.code, shOp, workDst, amt) }
+        } else if bits == 32 {
+          if amt == 0 {
+            run X86Encode.movRr32(&mut em.code, workDst, workDst)
+          } else {
+            run X86Encode.shiftImm32(&mut em.code, shOp, workDst, amt)
+          }
+        } else if op == Binary.Shl {
+          if amt != 0 { run X86Encode.shiftImm64(&mut em.code, Shift.Shl, workDst, amt) }
+          run normalizeInt(&mut em.*, workDst, bits, false)
+        } else if op == Binary.LShr {
+          run normalizeInt(&mut em.*, workDst, bits, false)
+          if amt != 0 { run X86Encode.shiftImm64(&mut em.code, Shift.Shr, workDst, amt) }
+        } else {
+          run normalizeInt(&mut em.*, workDst, bits, true)
+          if amt != 0 { run X86Encode.shiftImm64(&mut em.code, Shift.Sar, workDst, amt) }
+          run normalizeInt(&mut em.*, workDst, bits, false)
+        }
+        return run storeGp(&mut em.*, result, workDst)
+      }
+    }
+  }
   run loadGp(&mut em.*, function, left, X86Encode.rax())
   run loadGp(&mut em.*, function, right, X86Encode.rcx())
-  run emitScalarIntBinaryRegs(&mut em.*, op, kind.bits)
+  run emitScalarIntBinaryRegs(&mut em.*, op, bits)
   return run storeGp(&mut em.*, result, X86Encode.rax())
 }
 
@@ -1067,7 +1551,7 @@ effect fn emitScalarIntBinaryRegs(em: &mut Emitter, op: Binary, bits: usize) -> 
       run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
       run normalizeInt(&mut em.*, X86Encode.rcx(), bits, false)
       run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
-      let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+      let ok = run emitJcc(&mut em.*, X86Encode.ccNe())
       run X86Encode.ud2(&mut em.code)
       patchHere(&mut em.*, ok)
       run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
@@ -1077,7 +1561,7 @@ effect fn emitScalarIntBinaryRegs(em: &mut Emitter, op: Binary, bits: usize) -> 
       run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
       run normalizeInt(&mut em.*, X86Encode.rcx(), bits, false)
       run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
-      let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+      let ok = run emitJcc(&mut em.*, X86Encode.ccNe())
       run X86Encode.ud2(&mut em.code)
       patchHere(&mut em.*, ok)
       run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
@@ -1110,21 +1594,21 @@ effect fn emitSignedDivRem64(em: &mut Emitter, bits: usize, wantRem: bool) -> ()
   run normalizeInt(&mut em.*, X86Encode.rcx(), bits, true)
   // Trap on divisor == 0.
   run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
-  let nonZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let nonZero = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.ud2(&mut em.code)
   patchHere(&mut em.*, nonZero)
   // Trap on INT_MIN / -1.
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.rcx(), -1)
-  let notNegOne = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let notNegOne = run emitJcc(&mut em.*, X86Encode.ccNe())
   let minVal = u64.shiftLeft(1, usize.toU64(bits - usize.ONE))
   let signExtMin = if bits == 64 { minVal } else { u64.MAX - (minVal - 1) }
   run X86Encode.movImm64(&mut em.code, X86Encode.r8(), signExtMin)
   run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.r8())
-  let notMin = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let notMin = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.ud2(&mut em.code)
   let doDiv = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, notNegOne, doDiv)
-  X86Encode.patchRel32(&mut em.code, notMin, doDiv)
+  patchTo(&mut em.*, notNegOne, doDiv)
+  patchTo(&mut em.*, notMin, doDiv)
   run X86Encode.cqo(&mut em.code)
   run X86Encode.idiv64(&mut em.code, X86Encode.rcx())
   if wantRem {
@@ -1189,10 +1673,10 @@ effect fn emitI128Binary(em: &mut Emitter, function: &SsaFunction, op: Binary, l
       run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
       run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
       run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
-      let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+      let wide = run emitJcc(&mut em.*, X86Encode.ccAe())
       run X86Encode.shldCl64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
       run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rax())
-      let done = run X86Encode.jmpRel32(&mut em.code)
+      let done = run emitJmp(&mut em.*)
       patchHere(&mut em.*, wide)
       run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
       run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rdx())
@@ -1203,10 +1687,10 @@ effect fn emitI128Binary(em: &mut Emitter, function: &SsaFunction, op: Binary, l
       run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
       run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
       run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
-      let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+      let wide = run emitJcc(&mut em.*, X86Encode.ccAe())
       run X86Encode.shrdCl64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
       run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rdx())
-      let done = run X86Encode.jmpRel32(&mut em.code)
+      let done = run emitJmp(&mut em.*)
       patchHere(&mut em.*, wide)
       run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
       run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rax())
@@ -1217,10 +1701,10 @@ effect fn emitI128Binary(em: &mut Emitter, function: &SsaFunction, op: Binary, l
       run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
       run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
       run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
-      let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+      let wide = run emitJcc(&mut em.*, X86Encode.ccAe())
       run X86Encode.shrdCl64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
       run X86Encode.shiftCl64(&mut em.code, Shift.Sar, X86Encode.rdx())
-      let done = run X86Encode.jmpRel32(&mut em.code)
+      let done = run emitJmp(&mut em.*)
       patchHere(&mut em.*, wide)
       run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
       run X86Encode.shiftCl64(&mut em.code, Shift.Sar, X86Encode.rax())
@@ -1239,7 +1723,7 @@ effect fn emitI128DivCall(em: &mut Emitter, signed: bool, rem: bool) -> () ! Out
   // Check divisor (r8:r9) != 0 -> else ud2.
   run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.r8())
   run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r10(), X86Encode.r9())
-  let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let ok = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.ud2(&mut em.code)
   patchHere(&mut em.*, ok)
   if signed {
@@ -1247,17 +1731,17 @@ effect fn emitI128DivCall(em: &mut Emitter, signed: bool, rem: bool) -> () ! Out
     run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.r8())
     run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.r10(), X86Encode.r9())
     run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r10(), -1)
-    let ok1 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    let ok1 = run emitJcc(&mut em.*, X86Encode.ccNe())
     run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-    let ok2 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    let ok2 = run emitJcc(&mut em.*, X86Encode.ccNe())
     run X86Encode.movImm64(&mut em.code, X86Encode.r11(), 0x8000000000000000)
     run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rdx(), X86Encode.r11())
-    let ok3 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    let ok3 = run emitJcc(&mut em.*, X86Encode.ccNe())
     run X86Encode.ud2(&mut em.code)
     let pass = Bytes.length(&em.code)
-    X86Encode.patchRel32(&mut em.code, ok1, pass)
-    X86Encode.patchRel32(&mut em.code, ok2, pass)
-    X86Encode.patchRel32(&mut em.code, ok3, pass)
+    patchTo(&mut em.*, ok1, pass)
+    patchTo(&mut em.*, ok2, pass)
+    patchTo(&mut em.*, ok3, pass)
   }
   run X86Encode.movRr64(&mut em.code, X86Encode.rdi(), X86Encode.rax())
   run X86Encode.movRr64(&mut em.code, X86Encode.rsi(), X86Encode.rdx())
@@ -1294,6 +1778,61 @@ effect fn emitNegate(em: &mut Emitter, function: &SsaFunction, kind: Kind, src: 
   return run storeFloat(&mut em.*, result, 0, false)
 }
 
+// Emits a scalar integer (`bits <= 64`) comparison setting CPU flags and returning the matching
+// x86 condition code `cc`. Used both by `emitCompare` and by fused compare-branch exits.
+effect fn emitScalarIntCmpFlags(em: &mut Emitter, function: &SsaFunction, pred: Predicate, left: u64, right: u64) -> u8
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let bits = function.value(left).kind.bits
+  let cc = intPredCc(pred)
+  let zeroTestOk = pred == Predicate.Eq || pred == Predicate.Ne || isSignedPred(pred)
+  if bits == 64 {
+    let imm = constBitsImm32(function, right, 64)
+    let lhsReg = run regOrLoad(&mut em.*, function, left, X86Encode.rax())
+    if imm.ok {
+      if imm.value == 0 && zeroTestOk {
+        run X86Encode.testRr64(&mut em.code, lhsReg, lhsReg)
+      } else {
+        run X86Encode.aluRi64(&mut em.code, Alu.Cmp, lhsReg, imm.value)
+      }
+      return cc
+    }
+    let rhsReg = run regOrLoad(&mut em.*, function, right, X86Encode.rcx())
+    run X86Encode.aluRr64(&mut em.code, Alu.Cmp, lhsReg, rhsReg)
+    return cc
+  }
+  if bits == 32 {
+    let imm = constBitsImm32(function, right, 32)
+    let lhsReg = run regOrLoad(&mut em.*, function, left, X86Encode.rax())
+    if imm.ok {
+      if imm.value == 0 && zeroTestOk {
+        run X86Encode.testRr32(&mut em.code, lhsReg, lhsReg)
+      } else {
+        run X86Encode.aluRi32(&mut em.code, Alu.Cmp, lhsReg, imm.value)
+      }
+      return cc
+    }
+    let rhsReg = run regOrLoad(&mut em.*, function, right, X86Encode.rcx())
+    run X86Encode.aluRr32(&mut em.code, Alu.Cmp, lhsReg, rhsReg)
+    return cc
+  }
+  let signed = isSignedPred(pred)
+  run loadGp(&mut em.*, function, left, X86Encode.rax())
+  run normalizeInt(&mut em.*, X86Encode.rax(), bits, signed)
+  let imm = constBitsImm32(function, right, bits)
+  if imm.ok && !signed {
+    if imm.value == 0 && zeroTestOk {
+      run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+    } else {
+      run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.rax(), imm.value)
+    }
+    return cc
+  }
+  run loadGp(&mut em.*, function, right, X86Encode.rcx())
+  run normalizeInt(&mut em.*, X86Encode.rcx(), bits, signed)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.rcx())
+  return cc
+}
+
 effect fn emitCompare(em: &mut Emitter, function: &SsaFunction, pred: Predicate, left: u64, right: u64, result: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let opKind = function.value(left).kind
@@ -1312,10 +1851,11 @@ effect fn emitCompare(em: &mut Emitter, function: &SsaFunction, pred: Predicate,
     run emitI128CompareRegs(&mut em.*, pred)
     return run storeGp(&mut em.*, result, X86Encode.rax())
   }
-  run loadGp(&mut em.*, function, left, X86Encode.rax())
-  run loadGp(&mut em.*, function, right, X86Encode.rcx())
-  run emitIntCompareRegs(&mut em.*, pred, opKind.bits)
-  return run storeGp(&mut em.*, result, X86Encode.rax())
+  let cc = run emitScalarIntCmpFlags(&mut em.*, function, pred, left, right)
+  let dst = dstRegOrScratch(&em.*, result, X86Encode.rax())
+  run X86Encode.setcc(&mut em.code, cc, dst)
+  run X86Encode.movzxRr8(&mut em.code, dst, dst)
+  return run storeGp(&mut em.*, result, dst)
 }
 
 fn isSignedPred(pred: Predicate) -> bool {
@@ -1358,7 +1898,7 @@ effect fn emitI128CompareRegs(em: &mut Emitter, pred: Predicate) -> () ! OutOfMe
   }
   // Compare high words first; if equal, compare unsigned low words!
   run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rdx(), X86Encode.r9())
-  let eqHi = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let eqHi = run emitJcc(&mut em.*, X86Encode.ccE())
   let hiCc = match pred {
     Predicate.Sgt => X86Encode.ccG()
     Predicate.Sge => X86Encode.ccG()
@@ -1370,7 +1910,7 @@ effect fn emitI128CompareRegs(em: &mut Emitter, pred: Predicate) -> () ! OutOfMe
     _ => X86Encode.ccB()
   }
   run X86Encode.setcc(&mut em.code, hiCc, X86Encode.rax())
-  let done = run X86Encode.jmpRel32(&mut em.code)
+  let done = run emitJmp(&mut em.*)
   patchHere(&mut em.*, eqHi)
   run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.r8())
   let loCc = match pred {
@@ -1464,17 +2004,18 @@ effect fn emitSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind, cond:
   if kind.isVector() {
     return run emitVectorSelect(&mut em.*, function, kind, cond, yes, no, result)
   }
-  run loadGp(&mut em.*, function, cond, X86Encode.r10())
   if kind.isFloat() {
+    run loadGp(&mut em.*, function, cond, X86Encode.r10())
     run loadFloat(&mut em.*, function, yes, 0, X86Encode.rax())
     run loadFloat(&mut em.*, function, no, 1, X86Encode.rax())
     run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
-    let takeYes = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    let takeYes = run emitJcc(&mut em.*, X86Encode.ccNe())
     run X86Encode.movapsRr(&mut em.code, 0, 1)
     patchHere(&mut em.*, takeYes)
     return run storeFloat(&mut em.*, result, 0, kind.bits == 64)
   }
   if kind.bits > 64 {
+    run loadGp(&mut em.*, function, cond, X86Encode.r10())
     run loadPair(&mut em.*, function, yes, X86Encode.rax(), X86Encode.rdx())
     run loadPair(&mut em.*, function, no, X86Encode.r8(), X86Encode.r9())
     run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
@@ -1482,11 +2023,14 @@ effect fn emitSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind, cond:
     run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rdx(), X86Encode.r9())
     return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
   }
-  run loadGp(&mut em.*, function, yes, X86Encode.rax())
-  run loadGp(&mut em.*, function, no, X86Encode.rcx())
-  run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
-  run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rax(), X86Encode.rcx())
-  return run storeGp(&mut em.*, result, X86Encode.rax())
+  let condReg = run regOrLoad(&mut em.*, function, cond, X86Encode.r10())
+  let noReg = run regOrLoad(&mut em.*, function, no, X86Encode.rcx())
+  let rDst = valReg(&em.*, result)
+  let workDst = if rDst != X86Frame.regNone() && rDst != condReg && rDst != noReg { rDst } else { X86Encode.rax() }
+  run loadGp(&mut em.*, function, yes, workDst)
+  run X86Encode.testRi8(&mut em.code, condReg, 1)
+  run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), workDst, noReg)
+  return run storeGp(&mut em.*, result, workDst)
 }
 
 // ---- Casts (All 12 Cast Operations) ----
@@ -1577,9 +2121,9 @@ effect fn emitCast(em: &mut Emitter, function: &SsaFunction, op: Cast, dstKind: 
         // Unsigned 64-bit -> float: if high bit clear, direct `cvtsi2s*`; else `(x >> 1) | (x & 1)`,
         // convert, and double (`addss`/`addsd xmm0, xmm0`) to preserve exact round-to-nearest-even!
         run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-        let highSet = run X86Encode.jccRel32(&mut em.code, X86Encode.ccS())
+        let highSet = run emitJcc(&mut em.*, X86Encode.ccS())
         run X86Encode.cvtsi2Float(&mut em.code, double, true, 0, X86Encode.rax())
-        let done = run X86Encode.jmpRel32(&mut em.code)
+        let done = run emitJmp(&mut em.*)
         patchHere(&mut em.*, highSet)
         run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
         run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rax(), 1)
@@ -1663,7 +2207,7 @@ effect fn emitFloatToIntSat(
   }
   // Check NaN: `ucomisd xmm0, xmm0; jp isNan`.
   run X86Encode.ucomiFloat(&mut em.code, true, 0, 0)
-  let isNan = run X86Encode.jccRel32(&mut em.code, X86Encode.ccP())
+  let isNan = run emitJcc(&mut em.*, X86Encode.ccP())
 
   if signed {
     // Signed dstBits (1..64): min = -2^(bits-1), maxUpper = +2^(bits-1) (exact power of 2 in f64!).
@@ -1676,42 +2220,42 @@ effect fn emitFloatToIntSat(
     run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), lowerF64)
     run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
     run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
-    let belowMin = run X86Encode.jccRel32(&mut em.code, X86Encode.ccBe())
+    let belowMin = run emitJcc(&mut em.*, X86Encode.ccBe())
     // Check x >= upperF64 -> clamp maxInt.
     run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), upperF64)
     run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
     run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
-    let aboveMax = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+    let aboveMax = run emitJcc(&mut em.*, X86Encode.ccAe())
     // In range: `cvttsd2si rax, xmm0`.
     run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
     run normalizeInt(&mut em.*, X86Encode.rax(), dstBits, false)
-    let done1 = run X86Encode.jmpRel32(&mut em.code)
+    let done1 = run emitJmp(&mut em.*)
     patchHere(&mut em.*, isNan)
     run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
-    let done2 = run X86Encode.jmpRel32(&mut em.code)
+    let done2 = run emitJmp(&mut em.*)
     patchHere(&mut em.*, belowMin)
     run X86Encode.movImm64(&mut em.code, X86Encode.rax(), maskBits(minInt, dstBits))
-    let done3 = run X86Encode.jmpRel32(&mut em.code)
+    let done3 = run emitJmp(&mut em.*)
     patchHere(&mut em.*, aboveMax)
     run X86Encode.movImm64(&mut em.code, X86Encode.rax(), maxInt)
     let end = Bytes.length(&em.code)
-    X86Encode.patchRel32(&mut em.code, done1, end)
-    X86Encode.patchRel32(&mut em.code, done2, end)
-    X86Encode.patchRel32(&mut em.code, done3, end)
+    patchTo(&mut em.*, done1, end)
+    patchTo(&mut em.*, done2, end)
+    patchTo(&mut em.*, done3, end)
     return run storeGp(&mut em.*, result, X86Encode.rax())
   }
 
   // Unsigned dstBits (1..64): <= 0.0 -> 0; >= 2^dstBits -> (2^dstBits - 1).
   run X86Encode.pxor(&mut em.code, 1, 1)
   run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
-  let belowZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccBe())
+  let belowZero = run emitJcc(&mut em.*, X86Encode.ccBe())
   let upperExp: u64 = 1023 + usize.toU64(dstBits)
   let upperF64 = u64.shiftLeft(upperExp, 52)
   let maxUint = if dstBits == 64 { u64.MAX } else { u64.shiftLeft(1, usize.toU64(dstBits)) - 1 }
   run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), upperF64)
   run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
   run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
-  let aboveMax = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let aboveMax = run emitJcc(&mut em.*, X86Encode.ccAe())
   if dstBits < 64 {
     run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
   } else {
@@ -1720,9 +2264,9 @@ effect fn emitFloatToIntSat(
     run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), two63)
     run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
     run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
-    let geHalf = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+    let geHalf = run emitJcc(&mut em.*, X86Encode.ccAe())
     run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
-    let uDone = run X86Encode.jmpRel32(&mut em.code)
+    let uDone = run emitJmp(&mut em.*)
     patchHere(&mut em.*, geHalf)
     run X86Encode.subFloat(&mut em.code, true, 0, 1)
     run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
@@ -1730,17 +2274,17 @@ effect fn emitFloatToIntSat(
     run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx())
     patchHere(&mut em.*, uDone)
   }
-  let done1 = run X86Encode.jmpRel32(&mut em.code)
+  let done1 = run emitJmp(&mut em.*)
   let zeroLbl = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, isNan, zeroLbl)
-  X86Encode.patchRel32(&mut em.code, belowZero, zeroLbl)
+  patchTo(&mut em.*, isNan, zeroLbl)
+  patchTo(&mut em.*, belowZero, zeroLbl)
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
-  let done2 = run X86Encode.jmpRel32(&mut em.code)
+  let done2 = run emitJmp(&mut em.*)
   patchHere(&mut em.*, aboveMax)
   run X86Encode.movImm64(&mut em.code, X86Encode.rax(), maxUint)
   let end = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, done1, end)
-  X86Encode.patchRel32(&mut em.code, done2, end)
+  patchTo(&mut em.*, done1, end)
+  patchTo(&mut em.*, done2, end)
   return run storeGp(&mut em.*, result, X86Encode.rax())
 }
 
@@ -1750,7 +2294,7 @@ effect fn emitI128ToFloat(em: &mut Emitter, signed: bool, double: bool) -> () ! 
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r9(), X86Encode.r9())
   if signed {
     run X86Encode.testRr64(&mut em.code, X86Encode.rsi(), X86Encode.rsi())
-    let nonNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNs())
+    let nonNeg = run emitJcc(&mut em.*, X86Encode.ccNs())
     run X86Encode.movImm32(&mut em.code, X86Encode.r9(), 1)
     run X86Encode.neg64(&mut em.code, X86Encode.rdi())
     run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.rsi(), 0)
@@ -1767,7 +2311,7 @@ effect fn emitI128ToFloat(em: &mut Emitter, signed: bool, double: bool) -> () ! 
   run X86Encode.addFloat(&mut em.code, true, 0, 1)
   if signed {
     run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-    let keepPos = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    let keepPos = run emitJcc(&mut em.*, X86Encode.ccE())
     run X86Encode.movqFromXmm(&mut em.code, X86Encode.rax(), 0)
     run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), 0x8000000000000000)
     run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
@@ -1783,9 +2327,9 @@ effect fn emitI128ToFloat(em: &mut Emitter, signed: bool, double: bool) -> () ! 
 effect fn emitU64ToF64(em: &mut Emitter, srcReg: u8, dstXmm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
   run X86Encode.movRr64(&mut em.code, X86Encode.rax(), srcReg)
   run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-  let highSet = run X86Encode.jccRel32(&mut em.code, X86Encode.ccS())
+  let highSet = run emitJcc(&mut em.*, X86Encode.ccS())
   run X86Encode.cvtsi2Float(&mut em.code, true, true, dstXmm, X86Encode.rax())
-  let done = run X86Encode.jmpRel32(&mut em.code)
+  let done = run emitJmp(&mut em.*)
   patchHere(&mut em.*, highSet)
   run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
   run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rax(), 1)
@@ -1812,86 +2356,86 @@ effect fn emitFloat64ToI128Sat(em: &mut Emitter, signed: bool) -> () ! OutOfMemo
   run X86Encode.movImm64(&mut em.code, X86Encode.r10(), 0x000FFFFFFFFFFFFF)
   run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.r8(), X86Encode.r10())
   run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 0x7FF)
-  let notSpecial = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let notSpecial = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.testRr64(&mut em.code, X86Encode.r8(), X86Encode.r8())
-  let isInf = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let isInf = run emitJcc(&mut em.*, X86Encode.ccE())
   // NaN -> 0.
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
-  let doneNan = run X86Encode.jmpRel32(&mut em.code)
+  let doneNan = run emitJmp(&mut em.*)
 
   patchHere(&mut em.*, notSpecial)
   // If exp < 1023 (|x| < 1.0) -> return 0.
   run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 1023)
-  let geOne = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let geOne = run emitJcc(&mut em.*, X86Encode.ccAe())
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
-  let doneSmall = run X86Encode.jmpRel32(&mut em.code)
+  let doneSmall = run emitJmp(&mut em.*)
 
   patchHere(&mut em.*, geOne)
   if !signed {
     // Negative -> 0.
     run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-    let posOk = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    let posOk = run emitJcc(&mut em.*, X86Encode.ccE())
     run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
     run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
-    let doneNeg = run X86Encode.jmpRel32(&mut em.code)
+    let doneNeg = run emitJmp(&mut em.*)
     patchHere(&mut em.*, posOk)
     // If exp >= 1023 + 128 -> clamp u128::MAX.
     run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 1151)
-    let inRange = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+    let inRange = run emitJcc(&mut em.*, X86Encode.ccB())
     let satMaxU = Bytes.length(&em.code)
-    X86Encode.patchRel32(&mut em.code, isInf, satMaxU)
+    patchTo(&mut em.*, isInf, satMaxU)
     run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-    let infNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    let infNeg = run emitJcc(&mut em.*, X86Encode.ccNe())
     run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u64.MAX)
     run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), u64.MAX)
-    let doneMax = run X86Encode.jmpRel32(&mut em.code)
+    let doneMax = run emitJmp(&mut em.*)
     patchHere(&mut em.*, infNeg)
     run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
     run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
-    let doneInfNeg = run X86Encode.jmpRel32(&mut em.code)
+    let doneInfNeg = run emitJmp(&mut em.*)
 
     // In-range magnitude: `(1 << 52) | mantissa` shifted by `exp - 1023 - 52`.
     patchHere(&mut em.*, inRange)
     run emitMantissaShift128(&mut em.*)
     let end = Bytes.length(&em.code)
-    X86Encode.patchRel32(&mut em.code, doneNan, end)
-    X86Encode.patchRel32(&mut em.code, doneSmall, end)
-    X86Encode.patchRel32(&mut em.code, doneNeg, end)
-    X86Encode.patchRel32(&mut em.code, doneMax, end)
-    X86Encode.patchRel32(&mut em.code, doneInfNeg, end)
+    patchTo(&mut em.*, doneNan, end)
+    patchTo(&mut em.*, doneSmall, end)
+    patchTo(&mut em.*, doneNeg, end)
+    patchTo(&mut em.*, doneMax, end)
+    patchTo(&mut em.*, doneInfNeg, end)
     return ()
   }
 
   // Signed i128: if exp >= 1023 + 127 (1150) -> clamp INT128_MIN (neg) or INT128_MAX (pos).
   run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 1150)
-  let inRange = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+  let inRange = run emitJcc(&mut em.*, X86Encode.ccB())
   let satS = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, isInf, satS)
+  patchTo(&mut em.*, isInf, satS)
   run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-  let clampNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let clampNeg = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u64.MAX)
   run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x7FFFFFFFFFFFFFFF)
-  let doneMaxS = run X86Encode.jmpRel32(&mut em.code)
+  let doneMaxS = run emitJmp(&mut em.*)
   patchHere(&mut em.*, clampNeg)
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
   run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x8000000000000000)
-  let doneMinS = run X86Encode.jmpRel32(&mut em.code)
+  let doneMinS = run emitJmp(&mut em.*)
 
   patchHere(&mut em.*, inRange)
   run emitMantissaShift128(&mut em.*)
   run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-  let posDone = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let posDone = run emitJcc(&mut em.*, X86Encode.ccE())
   run X86Encode.neg64(&mut em.code, X86Encode.rax())
   run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.rdx(), 0)
   run X86Encode.neg64(&mut em.code, X86Encode.rdx())
   let end = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, doneNan, end)
-  X86Encode.patchRel32(&mut em.code, doneSmall, end)
-  X86Encode.patchRel32(&mut em.code, doneMaxS, end)
-  X86Encode.patchRel32(&mut em.code, doneMinS, end)
-  X86Encode.patchRel32(&mut em.code, posDone, end)
+  patchTo(&mut em.*, doneNan, end)
+  patchTo(&mut em.*, doneSmall, end)
+  patchTo(&mut em.*, doneMaxS, end)
+  patchTo(&mut em.*, doneMinS, end)
+  patchTo(&mut em.*, posDone, end)
   return ()
 }
 
@@ -1902,24 +2446,24 @@ effect fn emitMantissaShift128(em: &mut Emitter) -> () ! OutOfMemoryError ? &mut
   run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.r8())
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
   run X86Encode.aluRi32(&mut em.code, Alu.Sub, X86Encode.rcx(), 1075)
-  let shiftLeft = run X86Encode.jccRel32(&mut em.code, X86Encode.ccGe())
+  let shiftLeft = run emitJcc(&mut em.*, X86Encode.ccGe())
   // Shift right by `-rcx`.
   run X86Encode.neg32(&mut em.code, X86Encode.rcx())
   run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rax())
-  let doneR = run X86Encode.jmpRel32(&mut em.code)
+  let doneR = run emitJmp(&mut em.*)
   patchHere(&mut em.*, shiftLeft)
   run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
-  let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let wide = run emitJcc(&mut em.*, X86Encode.ccAe())
   run X86Encode.shldCl64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
   run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rax())
-  let doneL = run X86Encode.jmpRel32(&mut em.code)
+  let doneL = run emitJmp(&mut em.*)
   patchHere(&mut em.*, wide)
   run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
   run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rdx())
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
   let end = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, doneR, end)
-  X86Encode.patchRel32(&mut em.code, doneL, end)
+  patchTo(&mut em.*, doneR, end)
+  patchTo(&mut em.*, doneL, end)
   return ()
 }
 
@@ -2073,14 +2617,14 @@ effect fn emitI128Overflow(em: &mut Emitter, function: &SsaFunction, op: Binary,
   run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 63)
   // abs(a) -> rsi:rdi
   run X86Encode.testRr64(&mut em.code, X86Encode.rdi(), X86Encode.rdi())
-  let aPos = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNs())
+  let aPos = run emitJcc(&mut em.*, X86Encode.ccNs())
   run X86Encode.neg64(&mut em.code, X86Encode.rsi())
   run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.rdi(), 0)
   run X86Encode.neg64(&mut em.code, X86Encode.rdi())
   patchHere(&mut em.*, aPos)
   // abs(b) -> r8:r9
   run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-  let bPos = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNs())
+  let bPos = run emitJcc(&mut em.*, X86Encode.ccNs())
   run X86Encode.neg64(&mut em.code, X86Encode.r8())
   run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.r9(), 0)
   run X86Encode.neg64(&mut em.code, X86Encode.r9())
@@ -2114,24 +2658,24 @@ effect fn emitI128Overflow(em: &mut Emitter, function: &SsaFunction, op: Binary,
   // Check limit: if r11 != 0 -> ovf. Else if magHi > 0x8000...0 -> ovf.
   // If magHi == 0x8000...0 -> ok iff (rcx == 1 && magLo == 0).
   run X86Encode.testRr64(&mut em.code, X86Encode.r11(), X86Encode.r11())
-  let ovf1 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let ovf1 = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x8000000000000000)
   run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.r10(), X86Encode.rdx())
-  let okSmall = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
-  let ovf2 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccA())
+  let okSmall = run emitJcc(&mut em.*, X86Encode.ccB())
+  let ovf2 = run emitJcc(&mut em.*, X86Encode.ccA())
   // magHi == 2^63: ok iff resNeg == 1 && magLo == 0.
   run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-  let ovf3 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let ovf3 = run emitJcc(&mut em.*, X86Encode.ccNe())
   run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
-  let ovf4 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let ovf4 = run emitJcc(&mut em.*, X86Encode.ccE())
   patchHere(&mut em.*, okSmall)
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
-  let doneOk = run X86Encode.jmpRel32(&mut em.code)
+  let doneOk = run emitJmp(&mut em.*)
   let ovfLbl = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, ovf1, ovfLbl)
-  X86Encode.patchRel32(&mut em.code, ovf2, ovfLbl)
-  X86Encode.patchRel32(&mut em.code, ovf3, ovfLbl)
-  X86Encode.patchRel32(&mut em.code, ovf4, ovfLbl)
+  patchTo(&mut em.*, ovf1, ovfLbl)
+  patchTo(&mut em.*, ovf2, ovfLbl)
+  patchTo(&mut em.*, ovf3, ovfLbl)
+  patchTo(&mut em.*, ovf4, ovfLbl)
   run X86Encode.movImm32(&mut em.code, X86Encode.rax(), 1)
   patchHere(&mut em.*, doneOk)
   return run storeGp(&mut em.*, result + 1, X86Encode.rax())
@@ -2155,7 +2699,7 @@ effect fn emitScalarSaturateRegs(em: &mut Emitter, op: Binary, signed: bool, bit
   run emitScalarOverflowRegs(&mut em.*, op, signed, bits)
   // `rax` = wrapped result, `rdx` = 1 if overflowed else 0.
   run X86Encode.testRr64(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
-  let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let ok = run emitJcc(&mut em.*, X86Encode.ccE())
   if !signed {
     let clamp = if op == Binary.Add { maskBits(u64.MAX, bits) } else { 0 }
     run X86Encode.movImm64(&mut em.code, X86Encode.rax(), clamp)
@@ -2187,17 +2731,17 @@ effect fn emitI128Saturate(em: &mut Emitter, function: &SsaFunction, op: Binary,
     run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.r8())
     run X86Encode.aluRr64(&mut em.code, Alu.Sbb, X86Encode.rdx(), X86Encode.r9())
   }
-  let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.invertCc(flagCc))
+  let ok = run emitJcc(&mut em.*, X86Encode.invertCc(flagCc))
   if !signed {
     let v = if op == Binary.Add { u64.MAX } else { 0 }
     run X86Encode.movImm64(&mut em.code, X86Encode.rax(), v)
     run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), v)
   } else {
     run X86Encode.testRr64(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
-    let wasNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccS())
+    let wasNeg = run emitJcc(&mut em.*, X86Encode.ccS())
     run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
     run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x8000000000000000)
-    let done = run X86Encode.jmpRel32(&mut em.code)
+    let done = run emitJmp(&mut em.*)
     patchHere(&mut em.*, wasNeg)
     run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u64.MAX)
     run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x7FFFFFFFFFFFFFFF)
@@ -2218,7 +2762,7 @@ effect fn emitRotate(em: &mut Emitter, function: &SsaFunction, left: bool, kind:
     run loadGp(&mut em.*, function, amt, X86Encode.rcx())
     run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
     run X86Encode.testRr32(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
-    let zero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    let zero = run emitJcc(&mut em.*, X86Encode.ccE())
     if !left {
       run X86Encode.movImm32(&mut em.code, X86Encode.r8(), 128)
       run X86Encode.aluRr32(&mut em.code, Alu.Sub, X86Encode.r8(), X86Encode.rcx())
@@ -2226,7 +2770,7 @@ effect fn emitRotate(em: &mut Emitter, function: &SsaFunction, left: bool, kind:
     }
     // Rotate left by rcx in 1..127.
     run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
-    let lt64 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+    let lt64 = run emitJcc(&mut em.*, X86Encode.ccB())
     // Swap halves and subtract 64.
     run X86Encode.movRr64(&mut em.code, X86Encode.r8(), X86Encode.rax())
     run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
@@ -2278,10 +2822,10 @@ effect fn emitCount(em: &mut Emitter, function: &SsaFunction, which: Count, kind
       }
       Count.LeadingZeros => {
         run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
-        let hiZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+        let hiZero = run emitJcc(&mut em.*, X86Encode.ccE())
         run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
         run emitClz64(&mut em.*, 64)
-        let done = run X86Encode.jmpRel32(&mut em.code)
+        let done = run emitJmp(&mut em.*)
         patchHere(&mut em.*, hiZero)
         run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r8())
         run emitClz64(&mut em.*, 64)
@@ -2290,10 +2834,10 @@ effect fn emitCount(em: &mut Emitter, function: &SsaFunction, which: Count, kind
       }
       Count.TrailingZeros => {
         run X86Encode.testRr64(&mut em.code, X86Encode.r8(), X86Encode.r8())
-        let loZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+        let loZero = run emitJcc(&mut em.*, X86Encode.ccE())
         run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r8())
         run emitCtz64(&mut em.*, 64)
-        let done = run X86Encode.jmpRel32(&mut em.code)
+        let done = run emitJmp(&mut em.*)
         patchHere(&mut em.*, loZero)
         run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
         run emitCtz64(&mut em.*, 64)
@@ -2342,11 +2886,11 @@ effect fn emitPopcount64(em: &mut Emitter) -> () ! OutOfMemoryError ? &mut Alloc
 
 effect fn emitClz64(em: &mut Emitter, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-  let isZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let isZero = run emitJcc(&mut em.*, X86Encode.ccE())
   run X86Encode.bsr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
   run X86Encode.movImm64(&mut em.code, X86Encode.rax(), usize.toU64(bits - usize.ONE))
   run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.rcx())
-  let done = run X86Encode.jmpRel32(&mut em.code)
+  let done = run emitJmp(&mut em.*)
   patchHere(&mut em.*, isZero)
   run X86Encode.movImm64(&mut em.code, X86Encode.rax(), usize.toU64(bits))
   patchHere(&mut em.*, done)
@@ -2355,9 +2899,9 @@ effect fn emitClz64(em: &mut Emitter, bits: usize) -> () ! OutOfMemoryError ? &m
 
 effect fn emitCtz64(em: &mut Emitter, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-  let isZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let isZero = run emitJcc(&mut em.*, X86Encode.ccE())
   run X86Encode.bsf64(&mut em.code, X86Encode.rax(), X86Encode.rax())
-  let done = run X86Encode.jmpRel32(&mut em.code)
+  let done = run emitJmp(&mut em.*)
   patchHere(&mut em.*, isZero)
   run X86Encode.movImm64(&mut em.code, X86Encode.rax(), usize.toU64(bits))
   patchHere(&mut em.*, done)
@@ -2414,16 +2958,16 @@ effect fn emitExtreme(em: &mut Emitter, function: &SsaFunction, which: Extreme, 
 // IEEE 754 minimum/maximum on `xmm0` and `xmm1` -> `xmm0` (NaN propagates, -0.0 < +0.0).
 effect fn emitIeeeFloatExtremeRegs(em: &mut Emitter, isMax: bool, double: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
-  let unordered = run X86Encode.jccRel32(&mut em.code, X86Encode.ccP())
-  let equal = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
-  let keep0 = run X86Encode.jccRel32(&mut em.code, if isMax { X86Encode.ccA() } else { X86Encode.ccB() })
+  let unordered = run emitJcc(&mut em.*, X86Encode.ccP())
+  let equal = run emitJcc(&mut em.*, X86Encode.ccE())
+  let keep0 = run emitJcc(&mut em.*, if isMax { X86Encode.ccA() } else { X86Encode.ccB() })
   run X86Encode.movapsRr(&mut em.code, 0, 1)
-  let done1 = run X86Encode.jmpRel32(&mut em.code)
+  let done1 = run emitJmp(&mut em.*)
 
   // Unordered: return whichever is NaN (`addFloat` propagates quiet NaN cleanly).
   patchHere(&mut em.*, unordered)
   run X86Encode.addFloat(&mut em.code, double, 0, 1)
-  let done2 = run X86Encode.jmpRel32(&mut em.code)
+  let done2 = run emitJmp(&mut em.*)
 
   // Equal (+0.0 vs -0.0): for min, OR bits (picks -0.0); for max, AND bits (picks +0.0)!
   patchHere(&mut em.*, equal)
@@ -2431,9 +2975,9 @@ effect fn emitIeeeFloatExtremeRegs(em: &mut Emitter, isMax: bool, double: bool) 
   else { run X86Encode.por(&mut em.code, 0, 1) }
 
   let end = Bytes.length(&em.code)
-  X86Encode.patchRel32(&mut em.code, keep0, end)
-  X86Encode.patchRel32(&mut em.code, done1, end)
-  X86Encode.patchRel32(&mut em.code, done2, end)
+  patchTo(&mut em.*, keep0, end)
+  patchTo(&mut em.*, done1, end)
+  patchTo(&mut em.*, done2, end)
   return ()
 }
 
@@ -2531,8 +3075,8 @@ effect fn emitAtomicModify(em: &mut Emitter, function: &SsaFunction, which: Modi
     }
   }
   drop run X86Encode.lockCmpxchg(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rcx(), w)
-  let back = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
-  X86Encode.patchRel32(&mut em.code, back, retry)
+  let back = run emitJcc(&mut em.*, X86Encode.ccNe())
+  patchTo(&mut em.*, back, retry)
   run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
   return run storeGp(&mut em.*, result, X86Encode.rax())
 }
@@ -2965,7 +3509,7 @@ effect fn emitVectorBinary(em: &mut Emitter, function: &SsaFunction, op: Binary,
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
 
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
@@ -2992,8 +3536,8 @@ effect fn emitVectorBinary(em: &mut Emitter, function: &SsaFunction, op: Binary,
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3013,7 +3557,7 @@ effect fn emitVectorUnary(em: &mut Emitter, function: &SsaFunction, mode: u8, ki
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
   if mode == 0 {
@@ -3035,8 +3579,8 @@ effect fn emitVectorUnary(em: &mut Emitter, function: &SsaFunction, mode: u8, ki
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3059,7 +3603,7 @@ effect fn emitVectorCompare(em: &mut Emitter, function: &SsaFunction, pred: Pred
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(opKind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, opKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
@@ -3075,8 +3619,8 @@ effect fn emitVectorCompare(em: &mut Emitter, function: &SsaFunction, pred: Pred
   run storeVectorLane(&mut em.*, maskKind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3105,7 +3649,7 @@ effect fn emitVectorSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind,
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   if condKind.isVector() {
     drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 24))
     run loadVectorLane(&mut em.*, condKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
@@ -3113,9 +3657,9 @@ effect fn emitVectorSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind,
     drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), 24))
   }
   run X86Encode.testRi8(&mut em.code, X86Encode.rax(), 1)
-  let pickNo = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let pickNo = run emitJcc(&mut em.*, X86Encode.ccE())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
-  let gotSrc = run X86Encode.jmpRel32(&mut em.code)
+  let gotSrc = run emitJmp(&mut em.*)
   patchHere(&mut em.*, pickNo)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
   patchHere(&mut em.*, gotSrc)
@@ -3124,8 +3668,8 @@ effect fn emitVectorSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind,
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
 }
@@ -3145,7 +3689,7 @@ effect fn emitVectorCast(em: &mut Emitter, function: &SsaFunction, op: Cast, src
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(dstKind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, srcKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
   match op {
@@ -3183,8 +3727,8 @@ effect fn emitVectorCast(em: &mut Emitter, function: &SsaFunction, op: Cast, src
   run storeVectorLane(&mut em.*, dstKind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3209,7 +3753,7 @@ effect fn emitVectorOverflow(em: &mut Emitter, function: &SsaFunction, op: Binar
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 24))
@@ -3224,8 +3768,8 @@ effect fn emitVectorOverflow(em: &mut Emitter, function: &SsaFunction, op: Binar
   if ovfOff != 0 { run storeVectorLane(&mut em.*, maskKind, X86Encode.rdi(), X86Encode.r11(), X86Encode.r9(), 0) }
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
 }
@@ -3246,7 +3790,7 @@ effect fn emitVectorSaturate(em: &mut Emitter, function: &SsaFunction, op: Binar
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
@@ -3258,8 +3802,8 @@ effect fn emitVectorSaturate(em: &mut Emitter, function: &SsaFunction, op: Binar
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3280,7 +3824,7 @@ effect fn emitVectorRotate(em: &mut Emitter, function: &SsaFunction, left: bool,
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
@@ -3292,8 +3836,8 @@ effect fn emitVectorRotate(em: &mut Emitter, function: &SsaFunction, left: bool,
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3312,7 +3856,7 @@ effect fn emitVectorCount(em: &mut Emitter, function: &SsaFunction, which: Count
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
   run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
@@ -3326,8 +3870,8 @@ effect fn emitVectorCount(em: &mut Emitter, function: &SsaFunction, which: Count
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3348,7 +3892,7 @@ effect fn emitVectorExtreme(em: &mut Emitter, function: &SsaFunction, which: Ext
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
@@ -3375,8 +3919,8 @@ effect fn emitVectorExtreme(em: &mut Emitter, function: &SsaFunction, which: Ext
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
 }
@@ -3400,7 +3944,7 @@ effect fn emitVectorFma(em: &mut Emitter, function: &SsaFunction, kind: Kind, a:
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
   run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
@@ -3413,8 +3957,8 @@ effect fn emitVectorFma(em: &mut Emitter, function: &SsaFunction, kind: Kind, a:
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
 }
@@ -3433,11 +3977,11 @@ effect fn emitSplat(em: &mut Emitter, function: &SsaFunction, kind: Kind, scalar
   run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r11(), X86Encode.r11())
   let loopHead = Bytes.length(&em.code)
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   return ()
 }
@@ -3449,10 +3993,10 @@ effect fn emitExtract(em: &mut Emitter, function: &SsaFunction, kind: Kind, vecV
   run normalizeInt(&mut em.*, X86Encode.r11(), function.value(idxVal).kind.bits, false)
   // Out-of-range index returns zero per `SsaFunction` spec.
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(vecKind.elements))
-  let oob = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let oob = run emitJcc(&mut em.*, X86Encode.ccAe())
   run vectorAddr(&mut em.*, function, vecVal, X86Encode.rsi())
   run loadVectorLane(&mut em.*, vecKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
-  let done = run X86Encode.jmpRel32(&mut em.code)
+  let done = run emitJmp(&mut em.*)
   patchHere(&mut em.*, oob)
   if kind.isFloat() { run X86Encode.pxor(&mut em.code, 0, 0) }
   else { run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax()) }
@@ -3474,7 +4018,7 @@ effect fn emitInsert(em: &mut Emitter, function: &SsaFunction, kind: Kind, vecVa
   run loadGp(&mut em.*, function, idxVal, X86Encode.r11())
   run normalizeInt(&mut em.*, X86Encode.r11(), function.value(idxVal).kind.bits, false)
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
-  let oob = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let oob = run emitJcc(&mut em.*, X86Encode.ccAe())
   if kind.isFloat() { run loadFloat(&mut em.*, function, elemVal, 0, X86Encode.rax()) }
   else { run loadGp(&mut em.*, function, elemVal, X86Encode.rax()) }
   drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
@@ -3541,7 +4085,7 @@ effect fn emitReduce(em: &mut Emitter, function: &SsaFunction, which: Reduction,
   let loopHead = Bytes.length(&em.code)
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
   run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(vecKind.elements))
-  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  let done = run emitJcc(&mut em.*, X86Encode.ccAe())
   drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 0))
   run loadVectorLane(&mut em.*, vecKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 1)
   if isFloat {
@@ -3584,8 +4128,8 @@ effect fn emitReduce(em: &mut Emitter, function: &SsaFunction, which: Reduction,
   drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
   run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
-  let back = run X86Encode.jmpRel32(&mut em.code)
-  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  let back = run emitJmp(&mut em.*)
+  patchTo(&mut em.*, back, loopHead)
   patchHere(&mut em.*, done)
   if isFloat {
     if double { drop run X86Encode.movsdRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), 8)) }
@@ -3672,7 +4216,21 @@ effect fn emitArchIntrinsic(
 
 // ---- Block Exits & Parallel Edge Copies ----
 
-effect fn emitExit(em: &mut Emitter, function: &SsaFunction, blockIdx: usize, naked: bool) -> ()
+struct GpMove {
+  // 0 = physical GPR (`srcReg`), 1 = stack slot (`[rbp + srcOff]`), 2 = constant (`srcVal`), 3 = zero.
+  srcKind: u8,
+  srcVal: u64,
+  srcReg: u8,
+  srcOff: i32,
+  dstIsReg: bool,
+  dstReg: u8,
+  dstOff: i32,
+  done: bool,
+}
+
+impl Copy for GpMove {}
+
+effect fn emitExit(em: &mut Emitter, function: &SsaFunction, blockIdx: usize, naked: bool, fusedCmp: usize) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let blk = function.block(blockIdx)
   let edges = List<Edge>.asSlice(&blk.edges)
@@ -3680,62 +4238,110 @@ effect fn emitExit(em: &mut Emitter, function: &SsaFunction, blockIdx: usize, na
     Exit.Jump => {
       run emitEdgeCopies(&mut em.*, function, &edges[0])
       if edges[0].block != blockIdx + usize.ONE {
-        let jAt = run X86Encode.jmpRel32(&mut em.code)
-        run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jAt, targetBlock: edges[0].block})
+        run emitJmpBlock(&mut em.*, edges[0].block)
       }
       return ()
     }
     Exit.Branch => {
-      run loadGp(&mut em.*, function, blk.value, X86Encode.rax())
-      run X86Encode.testRi8(&mut em.code, X86Encode.rax(), 1)
-      let takeFalse = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+      let mut trueCc = X86Encode.ccNe()
+      if fusedCmp != usize.MAX {
+        let cmpInst = function.instruction(fusedCmp)
+        if cmpInst.place != 0 {
+          run recordLocation(&mut em.*, cmpInst.place)
+        }
+        let cmpOps = function.operandsOf(fusedCmp)
+        if let Operation.Compare {predicate} = cmpInst.operation {
+          trueCc = run emitScalarIntCmpFlags(&mut em.*, function, predicate, cmpOps[0], cmpOps[1])
+        }
+      } else {
+        let condReg = run regOrLoad(&mut em.*, function, blk.value, X86Encode.rax())
+        run X86Encode.testRi8(&mut em.code, condReg, 1)
+      }
+      let falseCc = X86Encode.invertCc(trueCc)
+      let trueHasCopies = List<u64>.length(&edges[0].arguments) > usize.ZERO
+      let falseHasCopies = List<u64>.length(&edges[1].arguments) > usize.ZERO
+      if !trueHasCopies && !falseHasCopies && edges[0].block == blockIdx + usize.ONE {
+        return run emitJccBlock(&mut em.*, falseCc, edges[1].block)
+      }
+      if !trueHasCopies {
+        run emitJccBlock(&mut em.*, trueCc, edges[0].block)
+        run emitEdgeCopies(&mut em.*, function, &edges[1])
+        if edges[1].block != blockIdx + usize.ONE {
+          run emitJmpBlock(&mut em.*, edges[1].block)
+        }
+        return ()
+      }
+      if !falseHasCopies {
+        run emitJccBlock(&mut em.*, falseCc, edges[1].block)
+        run emitEdgeCopies(&mut em.*, function, &edges[0])
+        if edges[0].block != blockIdx + usize.ONE {
+          run emitJmpBlock(&mut em.*, edges[0].block)
+        }
+        return ()
+      }
+      let takeFalse = run emitJcc(&mut em.*, falseCc)
       // Edge 0 (true branch).
       run emitEdgeCopies(&mut em.*, function, &edges[0])
-      let jTrue = run X86Encode.jmpRel32(&mut em.code)
-      run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jTrue, targetBlock: edges[0].block})
+      run emitJmpBlock(&mut em.*, edges[0].block)
       // Edge 1 (false branch).
       patchHere(&mut em.*, takeFalse)
       run emitEdgeCopies(&mut em.*, function, &edges[1])
       if edges[1].block != blockIdx + usize.ONE {
-        let jFalse = run X86Encode.jmpRel32(&mut em.code)
-        run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jFalse, targetBlock: edges[1].block})
+        run emitJmpBlock(&mut em.*, edges[1].block)
       }
       return ()
     }
     Exit.Switch => {
       let valKind = function.value(blk.value).kind
-      run loadGp(&mut em.*, function, blk.value, X86Encode.r9())
-      run normalizeInt(&mut em.*, X86Encode.r9(), valKind.bits, false)
+      let swReg = if valKind.bits == 64 {
+        run regOrLoad(&mut em.*, function, blk.value, X86Encode.r9())
+      } else {
+        run loadGp(&mut em.*, function, blk.value, X86Encode.r9())
+        run normalizeInt(&mut em.*, X86Encode.r9(), valKind.bits, false)
+        X86Encode.r9()
+      }
       let cases = List<u64>.asSlice(&blk.cases)
-      // Emit case comparisons (preserving `r9` across comparisons).
-      let mut caseJumps = run List<usize>.makeWithCapacity(cases.length)
+      // Emit case comparisons (preserving `swReg` across comparisons). Cases with no edge copies
+      // jump straight to their target block without emitting a trampoline stub.
+      let mut caseStubJumps = run List<usize>.makeWithCapacity(cases.length)
+      let mut hasStubs = false
       let mut c = usize.ZERO
       while c < cases.length {
         let cv = maskBits(cases[c], valKind.bits)
         let signed = u64.wrappingToI64(cv)
         if signed >= -2147483648 && signed <= 2147483647 {
-          run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r9(), i64.wrappingToI32(signed))
+          run X86Encode.aluRi64(&mut em.code, Alu.Cmp, swReg, i64.wrappingToI32(signed))
         } else {
           run X86Encode.movImm64(&mut em.code, X86Encode.r10(), cv)
-          run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.r9(), X86Encode.r10())
+          run X86Encode.aluRr64(&mut em.code, Alu.Cmp, swReg, X86Encode.r10())
         }
-        let eqAt = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
-        run List<usize>.append(&mut caseJumps, eqAt)
+        if List<u64>.length(&edges[c + usize.ONE].arguments) == usize.ZERO {
+          run emitJccBlock(&mut em.*, X86Encode.ccE(), edges[c + usize.ONE].block)
+          run List<usize>.append(&mut caseStubJumps, usize.MAX)
+        } else {
+          let eqAt = run emitJcc(&mut em.*, X86Encode.ccE())
+          run List<usize>.append(&mut caseStubJumps, eqAt)
+          hasStubs = true
+        }
         c = c + usize.ONE
       }
       // Default edge (edge 0).
       run emitEdgeCopies(&mut em.*, function, &edges[0])
-      let jDef = run X86Encode.jmpRel32(&mut em.code)
-      run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jDef, targetBlock: edges[0].block})
-      // Case stubs (edge `c + 1`).
-      let cj = List<usize>.asSlice(&caseJumps)
-      c = usize.ZERO
-      while c < cases.length {
-        patchHere(&mut em.*, cj[c])
-        run emitEdgeCopies(&mut em.*, function, &edges[c + usize.ONE])
-        let jCase = run X86Encode.jmpRel32(&mut em.code)
-        run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jCase, targetBlock: edges[c + usize.ONE].block})
-        c = c + usize.ONE
+      if hasStubs || edges[0].block != blockIdx + usize.ONE {
+        run emitJmpBlock(&mut em.*, edges[0].block)
+      }
+      // Case stubs for cases that carry edge arguments (edge `c + 1`).
+      if hasStubs {
+        let cj = List<usize>.asSlice(&caseStubJumps)
+        c = usize.ZERO
+        while c < cases.length {
+          if cj[c] != usize.MAX {
+            patchHere(&mut em.*, cj[c])
+            run emitEdgeCopies(&mut em.*, function, &edges[c + usize.ONE])
+            run emitJmpBlock(&mut em.*, edges[c + usize.ONE].block)
+          }
+          c = c + usize.ONE
+        }
       }
       return ()
     }
@@ -3793,9 +4399,188 @@ effect fn loadReturnPiece(em: &mut Emitter, function: &SsaFunction, val: u64, ki
   return ()
 }
 
-// Emits parallel copies from `edge.arguments` into `targetBlock.parameters`, staging all source
-// values onto a temporary stack buffer whenever more than one copy is present so cycles and
-// overlapping home slots are resolved with zero interference.
+// Emits one single GP move (`Reg`, `Mem`, `Const`, or `Zero` -> `Reg` or `Mem`), using only
+// `rax` (and `r11` inside `loadConstantGp`) so cycle-breaker `r10` is preserved intact.
+effect fn emitSingleGpMove(em: &mut Emitter, function: &SsaFunction, mv: GpMove) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if mv.dstIsReg {
+    if mv.srcKind == 0 {
+      if mv.srcReg != mv.dstReg {
+        return run X86Encode.movRr64(&mut em.code, mv.dstReg, mv.srcReg)
+      }
+      return ()
+    }
+    if mv.srcKind == 1 {
+      drop run X86Encode.movRm64(&mut em.code, mv.dstReg, Mem.baseDisp(X86Encode.rbp(), mv.srcOff))
+      return ()
+    }
+    if mv.srcKind == 2 {
+      let info = function.value(mv.srcVal)
+      let c = function.constantOf(mv.srcVal)
+      return run loadConstantGp(&mut em.*, function, c, info.kind, mv.dstReg)
+    }
+    if mv.srcKind == 4 {
+      drop run X86Encode.lea64(&mut em.code, mv.dstReg, Mem.baseDisp(X86Encode.rbp(), mv.srcOff))
+      return ()
+    }
+    return run X86Encode.movImm64(&mut em.code, mv.dstReg, 0)
+  }
+  // Destination is `[rbp + mv.dstOff]`.
+  if mv.srcKind == 0 {
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), mv.dstOff), mv.srcReg)
+    return ()
+  }
+  if mv.srcKind == 1 {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), mv.srcOff))
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), mv.dstOff), X86Encode.rax())
+    return ()
+  }
+  if mv.srcKind == 2 {
+    let info = function.value(mv.srcVal)
+    let imm = constBitsImm32(function, mv.srcVal, info.kind.bits)
+    if imm.ok {
+      drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), mv.dstOff), imm.value)
+      return ()
+    }
+    let c = function.constantOf(mv.srcVal)
+    run loadConstantGp(&mut em.*, function, c, info.kind, X86Encode.rax())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), mv.dstOff), X86Encode.rax())
+    return ()
+  }
+  if mv.srcKind == 4 {
+    drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), mv.srcOff))
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), mv.dstOff), X86Encode.rax())
+    return ()
+  }
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), mv.dstOff), 0)
+  return ()
+}
+
+// Resolves arbitrary parallel <=64-bit GP edge moves (`Reg`/`Mem`/`Const`/`SlotBase` -> `Reg`/`Mem`)
+// in place with zero stack traffic, breaking cycles via `r10`.
+effect fn emitParallelGpMoves(em: &mut Emitter, function: &SsaFunction, args: &[u64], params: &[u64]) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut moves = run List<GpMove>.makeWithCapacity(args.length)
+  let mut i = usize.ZERO
+  while i < args.length {
+    let dstParam = params[i]
+    let dstKind = function.value(dstParam).kind
+    if !dstKind.isUnit() {
+      let dstReg = valReg(&em.*, dstParam)
+      let dstOff = valOff(&em.*, dstParam)
+      if dstReg != X86Frame.regNone() || dstOff != 0 {
+        let dstIsReg = dstReg != X86Frame.regNone()
+        let srcVal = args[i]
+        let srcInfo = function.value(srcVal)
+        let mut srcKind: u8 = 3
+        let mut srcReg: u8 = X86Frame.regNone()
+        let mut srcOff: i32 = 0
+        if srcInfo.definition == Definition.Constant {
+          srcKind = 2
+        } else {
+          let sb = valSlotBase(&em.*, srcVal)
+          if sb != 0 {
+            srcKind = 4
+            srcOff = sb
+          } else {
+            let sr = valReg(&em.*, srcVal)
+            if sr != X86Frame.regNone() {
+              srcKind = 0
+              srcReg = sr
+            } else {
+              let so = valOff(&em.*, srcVal)
+              if so != 0 {
+                srcKind = 1
+                srcOff = so
+              }
+            }
+          }
+        }
+        let isNoOp = (dstIsReg && srcKind == 0 && srcReg == dstReg) || (!dstIsReg && srcKind == 1 && srcOff == dstOff)
+        if !isNoOp {
+          run List<GpMove>.append(&mut moves, GpMove {
+            srcKind: srcKind, srcVal: srcVal, srcReg: srcReg, srcOff: srcOff,
+            dstIsReg: dstIsReg, dstReg: dstReg, dstOff: dstOff, done: false,
+          })
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+  let ms = List<GpMove>.asMutSlice(&mut moves)
+  let mut remaining = ms.length
+  while remaining > usize.ZERO {
+    // Find a ready move whose destination is not read by any other remaining move.
+    let mut ready = usize.MAX
+    let mut k = usize.ZERO
+    while k < ms.length {
+      if !ms[k].done {
+        let mut blocked = false
+        let mut m = usize.ZERO
+        while m < ms.length {
+          if m != k && !ms[m].done {
+            if ms[k].dstIsReg {
+              if ms[m].srcKind == 0 && ms[m].srcReg == ms[k].dstReg {
+                blocked = true
+                break
+              }
+            } else {
+              if ms[m].srcKind == 1 && ms[m].srcOff == ms[k].dstOff {
+                blocked = true
+                break
+              }
+            }
+          }
+          m = m + usize.ONE
+        }
+        if !blocked {
+          ready = k
+          break
+        }
+      }
+      k = k + usize.ONE
+    }
+    if ready != usize.MAX {
+      let mv = ms[ready]
+      ms[ready].done = true
+      remaining = remaining - usize.ONE
+      run emitSingleGpMove(&mut em.*, function, mv)
+    } else {
+      // Every remaining move belongs to a disjoint cycle; break one cycle via `r10`.
+      let mut pick = usize.ZERO
+      while pick < ms.length && ms[pick].done {
+        pick = pick + usize.ONE
+      }
+      let mv = ms[pick]
+      if mv.dstIsReg {
+        run X86Encode.movRr64(&mut em.code, X86Encode.r10(), mv.dstReg)
+      } else {
+        drop run X86Encode.movRm64(&mut em.code, X86Encode.r10(), Mem.baseDisp(X86Encode.rbp(), mv.dstOff))
+      }
+      ms[pick].done = true
+      remaining = remaining - usize.ONE
+      run emitSingleGpMove(&mut em.*, function, mv)
+      // Redirect remaining readers of `mv.dst` to read the saved value in `r10`.
+      let mut m = usize.ZERO
+      while m < ms.length {
+        if !ms[m].done {
+          if mv.dstIsReg && ms[m].srcKind == 0 && ms[m].srcReg == mv.dstReg {
+            ms[m].srcKind = 0
+            ms[m].srcReg = X86Encode.r10()
+          } else if !mv.dstIsReg && ms[m].srcKind == 1 && ms[m].srcOff == mv.dstOff {
+            ms[m].srcKind = 0
+            ms[m].srcReg = X86Encode.r10()
+          }
+        }
+        m = m + usize.ONE
+      }
+    }
+  }
+  return ()
+}
+
+// Emits parallel copies from `edge.arguments` into `targetBlock.parameters`. Uses zero-stack
+// parallel move scheduling for scalar GP edges and stack staging when wider/FP/vector params exist.
 effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let args = List<u64>.asSlice(&edge.arguments)
@@ -3804,10 +4589,24 @@ effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) 
   if args.length == usize.ONE {
     return run copyValueToParam(&mut em.*, function, args[0], params[0])
   }
-  // Compute temporary staging buffer size on `rsp` (16-byte aligned).
+  // Check whether all non-unit edge parameters are <=64-bit scalar GP values.
+  let mut allGp = true
+  let mut i = usize.ZERO
+  while i < args.length {
+    let k = function.value(params[i]).kind
+    if !k.isUnit() && (k.isVector() || k.isFloat() || k.bits > 64) {
+      allGp = false
+      break
+    }
+    i = i + usize.ONE
+  }
+  if allGp {
+    return run emitParallelGpMoves(&mut em.*, function, args, params)
+  }
+  // Mixed / wide edge fallback: stage all source values on `rsp` (16-byte aligned).
   let mut stageBytes: u64 = 0
   let mut stageOffs = run List<i32>.makeWithCapacity(args.length)
-  let mut i = usize.ZERO
+  i = usize.ZERO
   while i < args.length {
     let sz = usize.toU64(X86Frame.valueSlotBytes(function.value(params[i]).kind))
     let align: u64 = if sz >= 16 { 16 } else { 8 }
@@ -3824,29 +4623,36 @@ effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) 
   i = usize.ZERO
   while i < args.length {
     let dstKind = function.value(params[i]).kind
-    if !dstKind.isUnit() && valOff(&em.*, params[i]) != 0 {
+    let dstReg = valReg(&em.*, params[i])
+    let dstOff = valOff(&em.*, params[i])
+    if !dstKind.isUnit() && (dstReg != X86Frame.regNone() || dstOff != 0) {
       run copyValueToMem(&mut em.*, function, args[i], dstKind, X86Encode.rsp(), offs[i])
     }
     i = i + usize.ONE
   }
-  // Pass 2: copy every staged value into its parameter's home slot `[rbp + valOff(params[i])]`.
+  // Pass 2: copy every staged value into its parameter's register or stack home slot.
   i = usize.ZERO
   while i < args.length {
     let dstKind = function.value(params[i]).kind
+    let dstReg = valReg(&em.*, params[i])
     let dstOff = valOff(&em.*, params[i])
-    if !dstKind.isUnit() && dstOff != 0 {
-      let sz = X86Frame.valueSlotBytes(dstKind)
-      if sz == 8 {
-        drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), offs[i]))
-        drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), X86Encode.rax())
-      } else if sz == 16 {
-        drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), offs[i]))
-        drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), 0)
+    if !dstKind.isUnit() && (dstReg != X86Frame.regNone() || dstOff != 0) {
+      if dstReg != X86Frame.regNone() {
+        drop run X86Encode.movRm64(&mut em.code, dstReg, Mem.baseDisp(X86Encode.rsp(), offs[i]))
       } else {
-        drop run X86Encode.lea64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), offs[i]))
-        drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
-        run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
-        run X86Encode.repMovsb(&mut em.code)
+        let sz = X86Frame.valueSlotBytes(dstKind)
+        if sz == 8 {
+          drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), offs[i]))
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), X86Encode.rax())
+        } else if sz == 16 {
+          drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), offs[i]))
+          drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), 0)
+        } else {
+          drop run X86Encode.lea64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), offs[i]))
+          drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+          run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
+          run X86Encode.repMovsb(&mut em.code)
+        }
       }
     }
     i = i + usize.ONE
@@ -3856,11 +4662,20 @@ effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) 
 
 effect fn copyValueToParam(em: &mut Emitter, function: &SsaFunction, src: u64, dstParam: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
-  let dstOff = valOff(&em.*, dstParam)
-  if dstOff == 0 { return () }
   let kind = function.value(dstParam).kind
   if kind.isUnit() { return () }
-  if function.value(src).definition != Definition.Constant && valOff(&em.*, src) == dstOff { return () }
+  let dstReg = valReg(&em.*, dstParam)
+  if dstReg != X86Frame.regNone() {
+    if function.value(src).definition != Definition.Constant && valReg(&em.*, src) == dstReg {
+      return ()
+    }
+    return run loadGp(&mut em.*, function, src, dstReg)
+  }
+  let dstOff = valOff(&em.*, dstParam)
+  if dstOff == 0 { return () }
+  if function.value(src).definition != Definition.Constant && valReg(&em.*, src) == X86Frame.regNone() && valOff(&em.*, src) == dstOff {
+    return ()
+  }
   return run copyValueToMem(&mut em.*, function, src, kind, X86Encode.rbp(), dstOff)
 }
 
@@ -3890,8 +4705,8 @@ effect fn copyValueToMem(em: &mut Emitter, function: &SsaFunction, src: u64, kin
     drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(baseReg, disp + 8), X86Encode.rdx())
     return ()
   }
-  run loadGp(&mut em.*, function, src, X86Encode.rax())
-  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(baseReg, disp), X86Encode.rax())
+  let srcReg = run regOrLoad(&mut em.*, function, src, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(baseReg, disp), srcReg)
   return ()
 }
 
