@@ -1,0 +1,836 @@
+//! Target-neutral MIR to SSA lowering checks on `x86_64-unknown-linux-gnu` and
+//! `wasm32-unknown-unknown`: native 2-register SysV C returns and calls, validated native inline
+//! assembly, x86-64 architecture intrinsics, variadic C exports and `va_list` bodies,
+//! `StackLifetimes` slot markers, and `_Unwind_Backtrace` trap frame helpers.
+
+import backend.CAbi {Extension as CExtension, Lane as CLane, Passing as CPassing, Piece as CPiece, Signature as CSignature, VariadicArgument}
+import backend.Coroutine {Facts}
+import backend.Gap {Gap, Source as GapSource}
+import backend.InstanceIdentity {InstanceIdentity}
+import backend.InstanceKey {InstanceKey}
+import backend.Layout {Abi, Field as LayoutField, Layout, Metrics, Storage, TypeLayout}
+import backend.Mir {
+  AssemblyFragment,
+  Block,
+  Callee,
+  Cancel,
+  ContextText,
+  Diagnostics,
+  ErasureFact,
+  EscapeSite,
+  FailureEdge,
+  Inlining,
+  Local,
+  LocalKind,
+  MirFunction,
+  NonParkingRun,
+  Operand,
+  Place,
+  Projection,
+  Reference,
+  Rvalue,
+  SharedAccess,
+  Statement,
+  Terminator,
+  TrapSite,
+  Variable,
+}
+import backend.SsaFunction {
+  ArchOperation,
+  CallingConvention,
+  Kind,
+  Operation,
+  SsaFunction,
+  none,
+}
+import backend.SsaLower
+import backend.SsaLower {Lowered, LoweredFunction, Unsupported}
+import backend.SsaPipeline {Level}
+import backend.SsaVerification
+import backend.SsaVerification {Violation}
+import hir.Hir {Access, Multiplicity, OwnerKind}
+import semantic.DeclarationId {DeclarationId, OwnerStep}
+import semantic.ForeignContract {ForeignContract}
+import semantic.Intrinsic {Primitive as IntrinsicPrimitive}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.NativeAssembly {Memory as AssemblyMemory}
+import semantic.SourceLocations {Location}
+import semantic.Target {Id as TargetId, Target}
+import semantic.Type {Argument, Type}
+import semantic.TypedBody {BorrowStatus, Origin}
+import semantic.Types {TypeTable, Types}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.box {Box}
+import silk.mem.interned {Interned}
+import silk.mem.shared {Shared}
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn origin0() -> Origin {
+  return Origin {node: usize.ZERO, location: Location.make(usize.ZERO, usize.ZERO)}
+}
+
+fn placeOf(local: usize) -> Place {
+  return Place {local: local, projections: List<Projection>.make()}
+}
+
+effect fn declId(name: &[u8]) -> Interned<DeclarationId> ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let module = run ModuleId.make(b"test", b"test", b"test")
+  let mut owners = List<OwnerStep>.make()
+  run List<OwnerStep>.append(&mut owners, OwnerStep {kind: OwnerKind.Function, name: Option<Bytes>.some(run Bytes.copy(name)), occurrence: usize.ZERO})
+  let id = run DeclarationId.fromParts(move module, move owners)
+  return run Interned<DeclarationId>.make(move id)
+}
+
+effect fn structDeclId(name: &[u8]) -> DeclarationId ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  let module = run ModuleId.make(b"test", b"test", b"test")
+  let mut owners = List<OwnerStep>.make()
+  run List<OwnerStep>.append(&mut owners, OwnerStep {kind: OwnerKind.Struct, name: Option<Bytes>.some(run Bytes.copy(name)), occurrence: usize.ZERO})
+  return run DeclarationId.fromParts(move module, move owners)
+}
+
+effect fn primitiveType(name: &[u8]) -> Interned<Type> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  return run Types.intern(Type.Primitive {name: run Bytes.copy(name)})
+}
+
+effect fn vectorType(element: &[u8], lanes: usize) -> Interned<Type> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let elem = run primitiveType(element)
+  return run Types.intern(Type.Vector {element: move elem, lanes: run Type.extentText(lanes)})
+}
+
+effect fn pointerType(pointee: &Interned<Type>) -> Interned<Type> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  return run Types.intern(Type.Pointer {
+    pointee: Interned<Type>.clone(pointee),
+    access: Access.Mutable,
+    nullable: true,
+    multiplicity: Multiplicity.Single,
+    alignment: Option<u64>.none(),
+  })
+}
+
+effect fn scalarLayout(ty: &Interned<Type>, size: usize, alignment: usize, abi: Abi) -> TypeLayout ! OutOfMemoryError ? &mut Allocator {
+  return TypeLayout {
+    ty: Interned<Type>.clone(ty),
+    layout: run Shared<Layout>.make(Layout {size: size, alignment: alignment, abi: abi, storage: Storage.Scalar, head: usize.ZERO}),
+  }
+}
+
+effect fn pair16TypeAndLayouts() -> PairSetup ! InvalidModulePath | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let i64Ty = run primitiveType(b"i64")
+  let f64Ty = run primitiveType(b"f64")
+  let id = run structDeclId(b"Pair16")
+  let pairTy = run Types.intern(Type.Nominal {declaration: move id, isPublic: true, arguments: List<Argument>.make()})
+  let mut fields = List<LayoutField>.make()
+  run List<LayoutField>.append(&mut fields, LayoutField {ty: Interned<Type>.clone(&i64Ty), offset: usize.ZERO})
+  run List<LayoutField>.append(&mut fields, LayoutField {ty: Interned<Type>.clone(&f64Ty), offset: 8})
+  let mut layouts = List<TypeLayout>.make()
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&i64Ty, 8, 8, Abi.Integer))
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&f64Ty, 8, 8, Abi.Floating))
+  run List<TypeLayout>.append(
+    &mut layouts,
+    TypeLayout {
+      ty: Interned<Type>.clone(&pairTy),
+      layout: run Shared<Layout>.make(Layout {
+        size: 16,
+        alignment: 8,
+        abi: Abi.Indirect,
+        storage: Storage.Record {fields: move fields},
+        head: usize.ZERO,
+      }),
+    },
+  )
+  return PairSetup {i64Ty: move i64Ty, f64Ty: move f64Ty, pairTy: move pairTy, layouts: move layouts}
+}
+
+struct PairSetup {
+  i64Ty: Interned<Type>,
+  f64Ty: Interned<Type>,
+  pairTy: Interned<Type>,
+  layouts: List<TypeLayout>,
+}
+
+effect fn makeMir(
+  key: InstanceKey,
+  result: Interned<Type>,
+  parameters: List<Interned<Type>>,
+  locals: List<Local>,
+  blocks: List<Block>,
+  variadic: bool,
+) -> MirFunction ! OutOfMemoryError ? &mut Allocator {
+  return MirFunction {
+    key: move key,
+    borrow: BorrowStatus.Checked,
+    result: move result,
+    parameters: move parameters,
+    locals: move locals,
+    blocks: move blocks,
+    references: List<Reference>.make(),
+    externs: List<Interned<DeclarationId>>.make(),
+    observes: false,
+    contexts: List<ContextText>.make(),
+    traps: List<TrapSite>.make(),
+    suspension: Option<Origin>.none(),
+    parks: Option<Origin>.none(),
+    releasesPackages: false,
+    nonParking: List<NonParkingRun>.make(),
+    cancels: List<Cancel>.make(),
+    accesses: List<SharedAccess>.make(),
+    escapes: List<EscapeSite>.make(),
+    erasures: List<ErasureFact>.make(),
+    features: Bytes.make(),
+    inlining: Inlining.Default,
+    optimizeSize: false,
+    variadic: variadic,
+    frame: Bytes.make(),
+    lines: List<u64>.make(),
+    variables: List<Variable>.make(),
+    inlined: List<InstanceKey>.make(),
+    quiet: List<InstanceKey>.make(),
+  }
+}
+
+fn findFunction(lowered: &Lowered, name: &[u8]) -> usize {
+  let listed = List<LoweredFunction>.asSlice(&lowered.functions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(listed[at].function.name(), name) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn callsSymbol(function: &SsaFunction, symbol: &[u8]) -> bool {
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let inst = function.instruction(listed[at])
+      if let Operation.Call {symbol: sym, ..} = inst.operation {
+        if same(function.symbolName(sym), symbol) { return true }
+      }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return false
+}
+
+fn countOperationKind(function: &SsaFunction, tag: usize) -> usize {
+  let mut total = usize.ZERO
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let inst = function.instruction(listed[at])
+      let hit = match inst.operation {
+        Operation.InlineAsm {..} => tag == 1
+        Operation.ArchIntrinsic {..} => tag == 2
+        Operation.VaStart => tag == 3
+        Operation.VaEnd => tag == 4
+        Operation.SlotStart {..} => tag == 5
+        Operation.SlotEnd {..} => tag == 6
+        Operation.Call {..} => tag == 7 && !inst.secondKind.isUnit()
+        _ => false
+      }
+      if hit { total = total + usize.ONE }
+      at = at + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  return total
+}
+
+test effect fn declarationsEmitsNativeUnwindAndWasmStepWalk() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run declarationsClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn declarationsClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let x86 = Target.forId(TargetId.X8664UnknownLinuxGnu)
+  let wasm = Target.forId(TargetId.Wasm32UnknownUnknown)
+  let nativeLowered = match move run Effect.result(SsaLower.declarations(&x86, false, true, true)) {
+    Result<Lowered, Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "native x86-64 declarations should not fail")
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let fatalIdx = findFunction(&nativeLowered, b"silk.diagnostic.fatal")
+  let frameIdx = findFunction(&nativeLowered, b"silk.diagnostic.frame")
+  let reclaimIdx = findFunction(&nativeLowered, b"__silk_guarded_reclaim")
+  run Testing.expect(fatalIdx != usize.MAX, "native declarations define silk.diagnostic.fatal")
+  run Testing.expect(frameIdx != usize.MAX, "native declarations define silk.diagnostic.frame")
+  run Testing.expect(reclaimIdx != usize.MAX, "native declarations define __silk_guarded_reclaim")
+  let listed = List<LoweredFunction>.asSlice(&nativeLowered.functions)
+  let fatalFn = &listed[fatalIdx].function
+  let frameFn = &listed[frameIdx].function
+  run Testing.expect(callsSymbol(fatalFn, b"_Unwind_Backtrace"), "native fatal dispatch calls _Unwind_Backtrace")
+  run Testing.expect(frameFn.callingConvention == CallingConvention.C, "silk.diagnostic.frame uses C calling convention")
+  run Testing.expect(callsSymbol(frameFn, b"_Unwind_GetRegionStart"), "silk.diagnostic.frame calls _Unwind_GetRegionStart")
+  run Testing.expect(!Option<Violation>.isSome(&(run SsaVerification.check(fatalFn))), "native fatal dispatch verifies")
+  run Testing.expect(!Option<Violation>.isSome(&(run SsaVerification.check(frameFn))), "native frame callback verifies")
+
+  let wasmLowered = match move run Effect.result(SsaLower.declarations(&wasm, false, true, true)) {
+    Result<Lowered, Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "wasm declarations should not fail")
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let wasmFatalIdx = findFunction(&wasmLowered, b"silk.diagnostic.fatal")
+  run Testing.expect(wasmFatalIdx != usize.MAX, "wasm declarations define silk.diagnostic.fatal")
+  run Testing.expect(findFunction(&wasmLowered, b"silk.diagnostic.frame") == usize.MAX, "wasm declarations omit native silk.diagnostic.frame")
+  let wasmListed = List<LoweredFunction>.asSlice(&wasmLowered.functions)
+  run Testing.expect(!callsSymbol(&wasmListed[wasmFatalIdx].function, b"_Unwind_Backtrace"), "wasm fatal dispatch walks step records without _Unwind_Backtrace")
+}
+
+test effect fn lowersTwoRegisterSysvCExportAndCCall() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run sysvPairClaims()
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sysvPairClaims() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let x86 = Target.forId(TargetId.X8664UnknownLinuxGnu)
+  let wasm = Target.forId(TargetId.Wasm32UnknownUnknown)
+  let setup = run pair16TypeAndLayouts()
+
+  // Part A: C export returning 16-byte struct { i64, f64 } in two SysV registers (rax + xmm0).
+  let exportId = run declId(b"make_pair_export")
+  let exportKey = InstanceKey.Export {function: Interned<DeclarationId>.clone(&exportId), symbol: run Shared<Bytes>.make(run Bytes.copy(b"make_pair_export"))}
+  let mut params = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut params, Interned<Type>.clone(&setup.i64Ty))
+  run List<Interned<Type>>.append(&mut params, Interned<Type>.clone(&setup.f64Ty))
+  let mut locals = List<Local>.make()
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&setup.pairTy), kind: LocalKind.Return, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&setup.i64Ty), kind: LocalKind.Parameter {index: 0}, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&setup.f64Ty), kind: LocalKind.Parameter {index: 1}, origin: origin0()})
+  let mut f0Projs = List<Projection>.make()
+  run List<Projection>.append(&mut f0Projs, Projection.Field {index: 0})
+  let mut f1Projs = List<Projection>.make()
+  run List<Projection>.append(&mut f1Projs, Projection.Field {index: 1})
+  let mut stmts = List<Statement>.make()
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: Place {local: 0, projections: move f0Projs},
+    value: Rvalue.Use {value: Operand.Copy {place: placeOf(1)}},
+    origin: origin0(),
+  })
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: Place {local: 0, projections: move f1Projs},
+    value: Rvalue.Use {value: Operand.Copy {place: placeOf(2)}},
+    origin: origin0(),
+  })
+  let mut blocks = List<Block>.make()
+  run List<Block>.append(&mut blocks, Block {suspends: false, statements: move stmts, terminator: Terminator.Return {origin: origin0()}})
+  let exportMir = run makeMir(InstanceKey.copy(&exportKey), Interned<Type>.clone(&setup.pairTy), move params, move locals, move blocks, false)
+  let mut identities = List<InstanceIdentity>.make()
+  run List<InstanceIdentity>.append(&mut identities, InstanceIdentity {key: InstanceKey.copy(&exportKey), symbol: run Bytes.copy(b"make_pair_export")})
+  let noSuspension = Option<Facts>.none()
+
+  let lowered = match move run Effect.result(SsaLower.lower(
+    &exportMir, &x86, List<TypeLayout>.asSlice(&setup.layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, true, Level.Speed, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "x86-64 lowering of 2-register C struct export should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(List<LoweredFunction>.length(&lowered.functions) == usize.ONE, "one lowered C export function")
+  let f = &List<LoweredFunction>.asSlice(&lowered.functions)[usize.ZERO].function
+  run Testing.expect(f.callingConvention == CallingConvention.C, "C export records CallingConvention.C")
+  run Testing.expect(f.result.equals(Kind.integer(64)) && f.secondResultKind.equals(Kind.float(64)),
+    "16-byte { i64, f64 } SysV C export lowers to (i64, f64) pair return")
+  run Testing.expect(f.block(usize.ZERO).value != none() && f.block(usize.ZERO).secondValue != none(),
+    "C export returns both register lanes via retPair")
+
+  // Verify Wasm still refuses a 2-register C struct return if classified as 2 coerced pieces,
+  // or uses Indirect on Wasm (on wasm32 a 2-field struct is Indirect, so check cResultKinds refusal directly).
+  let mut twoPieces = List<CPiece>.make()
+  run List<CPiece>.append(&mut twoPieces, CPiece {offset: 0, abi: Abi.Integer, bits: 64, lanes: 0})
+  run List<CPiece>.append(&mut twoPieces, CPiece {offset: 8, abi: Abi.Floating, bits: 64, lanes: 0})
+  let coercedPairLane = CLane {
+    ty: Interned<Type>.clone(&setup.pairTy),
+    layout: Metrics {size: 16, alignment: 8, abi: Abi.Indirect, tagged: false, head: 0},
+    extension: CExtension.None,
+    passing: CPassing.Coerce,
+    pieces: move twoPieces,
+    grouped: false,
+    byval: false,
+    stackAlignment: 0,
+  }
+  let wasmRefused = match move run Effect.result(SsaLower.cResultKinds(&coercedPairLane, 32, false, b"pair")) {
+    Result<SsaLower.ResultKinds, Unsupported | OutOfMemoryError>.Success {..} => false
+    Result<SsaLower.ResultKinds, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => true
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(wasmRefused, "Wasm target still refuses 2-register coerced C results")
+
+  // Part B: Calling an extern "C" function returning 16-byte { i64, f64 } in two SysV registers.
+  let externId = run declId(b"c_make_pair")
+  let callerId = run declId(b"call_pair")
+  let callerKey = run InstanceKey.named(&callerId)
+  let mut extPieces = List<CPiece>.make()
+  run List<CPiece>.append(&mut extPieces, CPiece {offset: 0, abi: Abi.Integer, bits: 64, lanes: 0})
+  run List<CPiece>.append(&mut extPieces, CPiece {offset: 8, abi: Abi.Floating, bits: 64, lanes: 0})
+  let mut extParams = List<CLane>.make()
+  run List<CLane>.append(&mut extParams, CLane {
+    ty: Interned<Type>.clone(&setup.i64Ty),
+    layout: Metrics {size: 8, alignment: 8, abi: Abi.Integer, tagged: false, head: 0},
+    extension: CExtension.None,
+    passing: CPassing.Direct,
+    pieces: List<CPiece>.make(),
+    grouped: false,
+    byval: false,
+    stackAlignment: 0,
+  })
+  let extSig = CSignature {
+    behavior: ForeignContract.conservative(),
+    callbackContracts: Bytes.make(),
+    declaration: Interned<DeclarationId>.clone(&externId),
+    symbol: run Bytes.copy(b"c_make_pair"),
+    importModule: Bytes.make(),
+    importName: Bytes.make(),
+    source: GapSource.Generated {declaration: Interned<DeclarationId>.clone(&externId)},
+    result: CLane {
+      ty: Interned<Type>.clone(&setup.pairTy),
+      layout: Metrics {size: 16, alignment: 8, abi: Abi.Indirect, tagged: false, head: 0},
+      extension: CExtension.None,
+      passing: CPassing.Coerce,
+      pieces: move extPieces,
+      grouped: false,
+      byval: false,
+      stackAlignment: 0,
+    },
+    parameters: move extParams,
+    variadic: false,
+    global: false,
+  }
+  let mut foreign = List<CSignature>.make()
+  run List<CSignature>.append(&mut foreign, move extSig)
+
+  let mut callParams = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut callParams, Interned<Type>.clone(&setup.i64Ty))
+  let mut callLocals = List<Local>.make()
+  run List<Local>.append(&mut callLocals, Local {ty: Interned<Type>.clone(&setup.i64Ty), kind: LocalKind.Return, origin: origin0()})
+  run List<Local>.append(&mut callLocals, Local {ty: Interned<Type>.clone(&setup.i64Ty), kind: LocalKind.Parameter {index: 0}, origin: origin0()})
+  run List<Local>.append(&mut callLocals, Local {ty: Interned<Type>.clone(&setup.pairTy), kind: LocalKind.Temp, origin: origin0()})
+  let mut callArgs = List<Operand>.make()
+  run List<Operand>.append(&mut callArgs, Operand.Copy {place: placeOf(1)})
+  let mut callBlocks = List<Block>.make()
+  run List<Block>.append(&mut callBlocks, Block {
+    suspends: false,
+    statements: List<Statement>.make(),
+    terminator: Terminator.Call {
+      callee: Callee.Extern {declaration: Interned<DeclarationId>.clone(&externId), variadicArguments: List<VariadicArgument>.make()},
+      arguments: move callArgs,
+      providers: List<Operand>.make(),
+      diagnostics: Option<Diagnostics>.none(),
+      destination: placeOf(2),
+      normal: 1,
+      failure: Option<FailureEdge>.none(),
+      origin: origin0(),
+    },
+  })
+  let mut readF0 = List<Projection>.make()
+  run List<Projection>.append(&mut readF0, Projection.Field {index: 0})
+  let mut b1Stmts = List<Statement>.make()
+  run List<Statement>.append(&mut b1Stmts, Statement.Assign {
+    destination: placeOf(0),
+    value: Rvalue.Use {value: Operand.Copy {place: Place {local: 2, projections: move readF0}}},
+    origin: origin0(),
+  })
+  run List<Block>.append(&mut callBlocks, Block {suspends: false, statements: move b1Stmts, terminator: Terminator.Return {origin: origin0()}})
+  let callMir = run makeMir(InstanceKey.copy(&callerKey), Interned<Type>.clone(&setup.i64Ty), move callParams, move callLocals, move callBlocks, false)
+  let mut callIds = List<InstanceIdentity>.make()
+  run List<InstanceIdentity>.append(&mut callIds, InstanceIdentity {key: InstanceKey.copy(&callerKey), symbol: run Bytes.copy(b"call_pair")})
+
+  let callLowered = match move run Effect.result(SsaLower.lower(
+    &callMir, &x86, List<TypeLayout>.asSlice(&setup.layouts), List<CSignature>.asSlice(&foreign),
+    List<InstanceIdentity>.asSlice(&callIds), &noSuspension, false, false, Level.Speed, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "x86-64 lowering of 2-register C call should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let cf = &List<LoweredFunction>.asSlice(&callLowered.functions)[usize.ZERO].function
+  run Testing.expect(countOperationKind(cf, 7) == usize.ONE, "extern C call returning 16-byte struct emits a 2-result Call instruction")
+  run Testing.expect(cf.callAbiCount() == usize.ONE && cf.callAbi(0).callingConvention == CallingConvention.C,
+    "extern C call attaches a CallingConvention.C CallAbi descriptor")
+  // Also confirm Wasm target refuses lowering the 2-register coerced C call.
+  let wasmCallRefused = match move run Effect.result(SsaLower.lower(
+    &callMir, &wasm, List<TypeLayout>.asSlice(&setup.layouts), List<CSignature>.asSlice(&foreign),
+    List<InstanceIdentity>.asSlice(&callIds), &noSuspension, false, false, Level.None, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {..} => false
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => true
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(wasmCallRefused, "Wasm lowering still refuses a 2-register coerced C call")
+}
+
+test effect fn lowersNativeInlineAsmAndX86ArchIntrinsics() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run nativeAsmAndArchClaims()
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn nativeAsmAndArchClaims() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let x86 = Target.forId(TargetId.X8664UnknownLinuxGnu)
+  let wasm = Target.forId(TargetId.Wasm32UnknownUnknown)
+  let u64Ty = run primitiveType(b"u64")
+  let v2u64 = run vectorType(b"u64", 2)
+  let v4u32 = run vectorType(b"u32", 4)
+  let mut layouts = List<TypeLayout>.make()
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&u64Ty, 8, 8, Abi.Integer))
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&v2u64, 16, 16, Abi.Vector))
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&v4u32, 16, 16, Abi.Vector))
+
+  let fnId = run declId(b"native_asm_and_crypto")
+  let fnKey = run InstanceKey.named(&fnId)
+  let mut params = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut params, Interned<Type>.clone(&u64Ty))
+  run List<Interned<Type>>.append(&mut params, Interned<Type>.clone(&v2u64))
+  run List<Interned<Type>>.append(&mut params, Interned<Type>.clone(&v4u32))
+  let mut locals = List<Local>.make()
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&u64Ty), kind: LocalKind.Return, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&u64Ty), kind: LocalKind.Parameter {index: 0}, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&v2u64), kind: LocalKind.Parameter {index: 1}, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&v4u32), kind: LocalKind.Parameter {index: 2}, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&v2u64), kind: LocalKind.Temp, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&v4u32), kind: LocalKind.Temp, origin: origin0()})
+
+  let mut aesArgs = List<Operand>.make()
+  run List<Operand>.append(&mut aesArgs, Operand.Copy {place: placeOf(2)})
+  run List<Operand>.append(&mut aesArgs, Operand.Copy {place: placeOf(2)})
+  let mut shaArgs = List<Operand>.make()
+  run List<Operand>.append(&mut shaArgs, Operand.Copy {place: placeOf(3)})
+  run List<Operand>.append(&mut shaArgs, Operand.Copy {place: placeOf(3)})
+  let mut asmInputs = List<Operand>.make()
+  run List<Operand>.append(&mut asmInputs, Operand.Copy {place: placeOf(1)})
+  let asmFrag = AssemblyFragment {
+    template: run Bytes.copy(b"inc $0"),
+    constraints: run Bytes.copy(b"=r,0"),
+    clobbers: run Bytes.copy(b"flags"),
+    memory: AssemblyMemory.None,
+    sideEffects: true,
+    noReturn: false,
+    inputs: move asmInputs,
+    ty: Interned<Type>.clone(&u64Ty),
+  }
+
+  let mut stmts = List<Statement>.make()
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: placeOf(4),
+    value: Rvalue.Vector {primitive: IntrinsicPrimitive.X86AesEncrypt, operands: move aesArgs, ty: Interned<Type>.clone(&v2u64)},
+    origin: origin0(),
+  })
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: placeOf(5),
+    value: Rvalue.Vector {primitive: IntrinsicPrimitive.X86Sha1Rounds4Stage2, operands: move shaArgs, ty: Interned<Type>.clone(&v4u32)},
+    origin: origin0(),
+  })
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: placeOf(0),
+    value: Rvalue.Assembly {fragment: run Box<AssemblyFragment>.make(move asmFrag)},
+    origin: origin0(),
+  })
+  let mut blocks = List<Block>.make()
+  run List<Block>.append(&mut blocks, Block {suspends: false, statements: move stmts, terminator: Terminator.Return {origin: origin0()}})
+  let mir = run makeMir(InstanceKey.copy(&fnKey), Interned<Type>.clone(&u64Ty), move params, move locals, move blocks, false)
+  let mut identities = List<InstanceIdentity>.make()
+  run List<InstanceIdentity>.append(&mut identities, InstanceIdentity {key: InstanceKey.copy(&fnKey), symbol: run Bytes.copy(b"native_asm_and_crypto")})
+  let noSuspension = Option<Facts>.none()
+
+  // Lower at Level.None so unused AES/SHA results stay visible and verified.
+  let lowered = match move run Effect.result(SsaLower.lower(
+    &mir, &x86, List<TypeLayout>.asSlice(&layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, false, Level.None, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "x86-64 lowering of native inline asm + arch intrinsics should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let f = &List<LoweredFunction>.asSlice(&lowered.functions)[usize.ZERO].function
+  run Testing.expect(countOperationKind(f, 1) == usize.ONE && f.asmCount() == usize.ONE,
+    "native inline assembly lowers to one Operation.InlineAsm entry")
+  run Testing.expect(same(Bytes.asSlice(&f.asm(0).template), b"inc $0"), "inline assembly template is preserved")
+  run Testing.expect(countOperationKind(f, 2) == 2, "both x86 arch intrinsics lower to Operation.ArchIntrinsic")
+
+  let mut sawShaStage2 = false
+  let mut sawAes = false
+  let listed = List<usize>.asSlice(&f.block(usize.ZERO).instructions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Operation.ArchIntrinsic {operation, immediate} = f.instruction(listed[at]).operation {
+      if operation == ArchOperation.X86AesEncrypt { sawAes = true }
+      if operation == ArchOperation.X86Sha1Rounds4 && immediate == 2 { sawShaStage2 = true }
+    }
+    at = at + usize.ONE
+  }
+  run Testing.expect(sawAes && sawShaStage2, "AES-NI and SHA1 stage-2 immediate are preserved accurately")
+
+  let wasmRefused = match move run Effect.result(SsaLower.lower(
+    &mir, &wasm, List<TypeLayout>.asSlice(&layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, false, Level.None, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {..} => false
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => true
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(wasmRefused, "Wasm lowering still refuses x86 arch intrinsics and result-bearing inline asm")
+}
+
+test effect fn lowersVariadicCExportAndVaListBody() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run variadicClaims()
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn variadicClaims() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let x86 = Target.forId(TargetId.X8664UnknownLinuxGnu)
+  let wasm = Target.forId(TargetId.Wasm32UnknownUnknown)
+  let i64Ty = run primitiveType(b"i64")
+  let u8Ty = run primitiveType(b"u8")
+  let ptrTy = run pointerType(&u8Ty)
+  let mut layouts = List<TypeLayout>.make()
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&i64Ty, 8, 8, Abi.Integer))
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&u8Ty, 1, 1, Abi.Integer))
+  run List<TypeLayout>.append(&mut layouts, run scalarLayout(&ptrTy, 8, 8, Abi.Pointer))
+
+  let bodyId = run declId(b"varargs_body")
+  let bodyKey = run InstanceKey.named(&bodyId)
+  let entryKey = InstanceKey.Export {function: Interned<DeclarationId>.clone(&bodyId), symbol: run Shared<Bytes>.make(run Bytes.copy(b"varargs_c_entry"))}
+  let mut identities = List<InstanceIdentity>.make()
+  run List<InstanceIdentity>.append(&mut identities, InstanceIdentity {key: InstanceKey.copy(&bodyKey), symbol: run Bytes.copy(b"varargs_body")})
+  run List<InstanceIdentity>.append(&mut identities, InstanceIdentity {key: InstanceKey.copy(&entryKey), symbol: run Bytes.copy(b"varargs_c_entry")})
+  let noSuspension = Option<Facts>.none()
+
+  // Variadic C entry: calls body (forwarding va_list) and returns i64.
+  let mut entryParams = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut entryParams, Interned<Type>.clone(&i64Ty))
+  let mut entryLocals = List<Local>.make()
+  run List<Local>.append(&mut entryLocals, Local {ty: Interned<Type>.clone(&i64Ty), kind: LocalKind.Return, origin: origin0()})
+  run List<Local>.append(&mut entryLocals, Local {ty: Interned<Type>.clone(&i64Ty), kind: LocalKind.Parameter {index: 0}, origin: origin0()})
+  let mut callArgs = List<Operand>.make()
+  run List<Operand>.append(&mut callArgs, Operand.Copy {place: placeOf(1)})
+  let mut entryBlocks = List<Block>.make()
+  run List<Block>.append(&mut entryBlocks, Block {
+    suspends: false,
+    statements: List<Statement>.make(),
+    terminator: Terminator.Call {
+      callee: Callee.Instance {key: InstanceKey.copy(&bodyKey)},
+      arguments: move callArgs,
+      providers: List<Operand>.make(),
+      diagnostics: Option<Diagnostics>.none(),
+      destination: placeOf(0),
+      normal: 1,
+      failure: Option<FailureEdge>.none(),
+      origin: origin0(),
+    },
+  })
+  run List<Block>.append(&mut entryBlocks, Block {suspends: false, statements: List<Statement>.make(), terminator: Terminator.Return {origin: origin0()}})
+  let entryMir = run makeMir(InstanceKey.copy(&entryKey), Interned<Type>.clone(&i64Ty), move entryParams, move entryLocals, move entryBlocks, true)
+
+  let entryLowered = match move run Effect.result(SsaLower.lower(
+    &entryMir, &x86, List<TypeLayout>.asSlice(&layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, true, Level.Speed, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "x86-64 lowering of variadic C export should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let ef = &List<LoweredFunction>.asSlice(&entryLowered.functions)[usize.ZERO].function
+  run Testing.expect(ef.callingConvention == CallingConvention.C && ef.variadic, "variadic C export sets C convention and variadic flag")
+  run Testing.expect(countOperationKind(ef, 3) == usize.ONE, "variadic C export emits VaStart")
+  run Testing.expect(countOperationKind(ef, 4) == usize.ONE, "variadic C export emits VaEnd before return")
+
+  let wasmVariadicRefused = match move run Effect.result(SsaLower.lower(
+    &entryMir, &wasm, List<TypeLayout>.asSlice(&layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, true, Level.None, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {..} => false
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => true
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(wasmVariadicRefused, "Wasm lowering still refuses variadic C exports")
+
+  // Variadic body: receives hidden va_list pointer parameter and reads it via Rvalue.VariadicArguments.
+  let mut bodyParams = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut bodyParams, Interned<Type>.clone(&i64Ty))
+  let mut bodyLocals = List<Local>.make()
+  run List<Local>.append(&mut bodyLocals, Local {ty: Interned<Type>.clone(&ptrTy), kind: LocalKind.Return, origin: origin0()})
+  run List<Local>.append(&mut bodyLocals, Local {ty: Interned<Type>.clone(&i64Ty), kind: LocalKind.Parameter {index: 0}, origin: origin0()})
+  let mut bodyStmts = List<Statement>.make()
+  run List<Statement>.append(&mut bodyStmts, Statement.Assign {
+    destination: placeOf(0),
+    value: Rvalue.VariadicArguments,
+    origin: origin0(),
+  })
+  let mut bodyBlocks = List<Block>.make()
+  run List<Block>.append(&mut bodyBlocks, Block {suspends: false, statements: move bodyStmts, terminator: Terminator.Return {origin: origin0()}})
+  let bodyMir = run makeMir(InstanceKey.copy(&bodyKey), Interned<Type>.clone(&ptrTy), move bodyParams, move bodyLocals, move bodyBlocks, true)
+
+  let bodyLowered = match move run Effect.result(SsaLower.lower(
+    &bodyMir, &x86, List<TypeLayout>.asSlice(&layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, false, Level.Speed, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "x86-64 lowering of variadic body should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let bf = &List<LoweredFunction>.asSlice(&bodyLowered.functions)[usize.ZERO].function
+  run Testing.expect(List<u64>.length(&bf.arguments) == 2, "variadic body takes written param plus trailing va_list pointer")
+  let vaArg = List<u64>.get(&bf.arguments, usize.ONE)
+  run Testing.expect(bf.kindOf(vaArg).equals(Kind.address(64)), "trailing variadic argument is a 64-bit address")
+  run Testing.expect(bf.block(usize.ZERO).value == vaArg, "Rvalue.VariadicArguments lowers directly to the va_list argument")
+}
+
+test effect fn emitsStackSlotLifetimeMarkersForAggregatesOnNative() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run stackLifetimeClaims()
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn stackLifetimeClaims() -> () ! InvalidModulePath | Gap | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let x86 = Target.forId(TargetId.X8664UnknownLinuxGnu)
+  let wasm = Target.forId(TargetId.Wasm32UnknownUnknown)
+  let setup = run pair16TypeAndLayouts()
+
+  let fnId = run declId(b"aggregate_lifetime")
+  let fnKey = run InstanceKey.named(&fnId)
+  let mut params = List<Interned<Type>>.make()
+  run List<Interned<Type>>.append(&mut params, Interned<Type>.clone(&setup.pairTy))
+  let mut locals = List<Local>.make()
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&setup.i64Ty), kind: LocalKind.Return, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&setup.pairTy), kind: LocalKind.Parameter {index: 0}, origin: origin0()})
+  run List<Local>.append(&mut locals, Local {ty: Interned<Type>.clone(&setup.pairTy), kind: LocalKind.Temp, origin: origin0()})
+
+  let mut r0 = List<Projection>.make()
+  run List<Projection>.append(&mut r0, Projection.Field {index: 0})
+  let mut stmts = List<Statement>.make()
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: placeOf(2),
+    value: Rvalue.Use {value: Operand.Copy {place: placeOf(1)}},
+    origin: origin0(),
+  })
+  run List<Statement>.append(&mut stmts, Statement.Assign {
+    destination: placeOf(0),
+    value: Rvalue.Use {value: Operand.Copy {place: Place {local: 2, projections: move r0}}},
+    origin: origin0(),
+  })
+  let mut blocks = List<Block>.make()
+  run List<Block>.append(&mut blocks, Block {suspends: false, statements: move stmts, terminator: Terminator.Return {origin: origin0()}})
+  let mir = run makeMir(InstanceKey.copy(&fnKey), Interned<Type>.clone(&setup.i64Ty), move params, move locals, move blocks, false)
+  let mut identities = List<InstanceIdentity>.make()
+  run List<InstanceIdentity>.append(&mut identities, InstanceIdentity {key: InstanceKey.copy(&fnKey), symbol: run Bytes.copy(b"aggregate_lifetime")})
+  let noSuspension = Option<Facts>.none()
+
+  // At Level.None, promotion does not promote stack slots, so aggregate SlotStart/SlotEnd remain.
+  let nativeLowered = match move run Effect.result(SsaLower.lower(
+    &mir, &x86, List<TypeLayout>.asSlice(&setup.layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, false, Level.None, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "native aggregate lowering should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let nf = &List<LoweredFunction>.asSlice(&nativeLowered.functions)[usize.ZERO].function
+  run Testing.expect(countOperationKind(nf, 5) >= usize.ONE && countOperationKind(nf, 6) >= usize.ONE,
+    "native lowering emits SlotStart and SlotEnd markers for aggregate stack slots")
+
+  let wasmLowered = match move run Effect.result(SsaLower.lower(
+    &mir, &wasm, List<TypeLayout>.asSlice(&setup.layouts), &[], List<InstanceIdentity>.asSlice(&identities),
+    &noSuspension, false, false, Level.None, true,
+  )) {
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Success {value} => move value
+    Result<Lowered, Gap | Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => {
+        run Testing.expect(false, "wasm aggregate lowering should succeed")
+        return ()
+      }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let wf = &List<LoweredFunction>.asSlice(&wasmLowered.functions)[usize.ZERO].function
+  run Testing.expect(countOperationKind(wf, 5) == usize.ZERO && countOperationKind(wf, 6) == usize.ZERO,
+    "Wasm lowering emits no SlotStart/SlotEnd markers")
+}
