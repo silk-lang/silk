@@ -1,0 +1,306 @@
+//! DWARF v4 `.debug_line` builder for Linux x86-64 ELF64 executables and shared libraries.
+//!
+//! # When to use
+//! Call [`DebugLineMap.addFile`] and [`DebugLineMap.addSymbol`] in the driver from `EmissionPlan`
+//! source locations, then pass the [`DebugLineMap`] into `ElfLink` so `--debug true` binaries
+//! carry a valid DWARF v4 `.debug_line` section readable by `gdb`, `lldb`, `llvm-dwarfdump`,
+//! `llvm-symbolizer`, and `perf`.
+
+import backend.X86Encode
+import semantic.SourceLocations {absolutePlace}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import semantic.InternIndex {InternIndex}
+
+/// Maps emitted Silk function symbols to their 1-based DWARF file index and declaration origin.
+pub struct DebugLineMap {
+  files: List<Bytes>,
+  symbols: List<Bytes>,
+  fileIndices: List<usize>,
+  origins: List<u64>,
+  index: InternIndex,
+}
+
+/// One emitted function's address range and `(codeOffset, relativePlace)` pairs for `.debug_line`.
+pub struct FunctionLineSpan {
+  /// Virtual address of the function's machine code body.
+  pub vaddr: u64,
+  /// Byte length of the function's machine code body.
+  pub codeSize: u64,
+  /// 1-based file index into `DebugLineMap.files`.
+  pub fileIndex: usize,
+  /// Packed declaration origin `(line << 24) | column` for `absolutePlace`.
+  pub origin: u64,
+  /// Flat pairs `[codeOffset0, relPlace0, codeOffset1, relPlace1, ...]`.
+  pub locations: List<u64>,
+}
+
+/// Resolved `(fileIndex, origin)` lookup result for one symbol.
+pub struct SymbolSource {
+  /// 1-based file index into `DebugLineMap.files` (0 if unknown).
+  pub fileIndex: usize,
+  /// Packed declaration origin `(line << 24) | column`.
+  pub origin: u64,
+}
+impl Copy for SymbolSource {}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+effect fn writeUleb128(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut v = value
+  while true {
+    let mut b = u64.toU8(u64.bitAnd(v, 0x7F))
+    v = u64.shiftRight(v, 7)
+    if v != 0 {
+      b = u8.bitOr(b, 0x80)
+      run X86Encode.byte(&mut out.*, b)
+    } else {
+      run X86Encode.byte(&mut out.*, b)
+      return ()
+    }
+  }
+}
+
+effect fn writeSleb128(out: &mut Bytes, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut v = value
+  while true {
+    let raw = i64.wrappingToU64(v)
+    let mut b = u64.toU8(u64.bitAnd(raw, 0x7F))
+    v = i64.shiftRight(v, 7)
+    let signBit = u8.bitAnd(b, 0x40) != 0
+    if (v == 0 && !signBit) || (v == -1 && signBit) {
+      run X86Encode.byte(&mut out.*, b)
+      return ()
+    }
+    b = u8.bitOr(b, 0x80)
+    run X86Encode.byte(&mut out.*, b)
+  }
+}
+
+fn patchU32Le(out: &mut Bytes, at: usize, value: u64) -> () {
+  let s = Bytes.asMutSlice(&mut out.*)
+  s[at] = u64.toU8(u64.bitAnd(value, 0xFF))
+  s[at + 1] = u64.toU8(u64.bitAnd(u64.shiftRight(value, 8), 0xFF))
+  s[at + 2] = u64.toU8(u64.bitAnd(u64.shiftRight(value, 16), 0xFF))
+  s[at + 3] = u64.toU8(u64.bitAnd(u64.shiftRight(value, 24), 0xFF))
+}
+
+impl DebugLineMap {
+  /// Creates an empty debug line map.
+  pub fn make() -> DebugLineMap {
+    return DebugLineMap {
+      files: List<Bytes>.make(),
+      symbols: List<Bytes>.make(),
+      fileIndices: List<usize>.make(),
+      origins: List<u64>.make(),
+      index: InternIndex.make(),
+    }
+  }
+
+  /// True when at least one file and symbol have been registered.
+  pub fn isEmpty(self: &Self) -> bool {
+    return List<Bytes>.length(&self.files) == usize.ZERO || List<Bytes>.length(&self.symbols) == usize.ZERO
+  }
+
+  /// Appends a source file path and returns its 1-based DWARF file index.
+  pub effect fn addFile(self: &mut Self, path: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    run List<Bytes>.append(&mut self.files, run Bytes.copy(path))
+    return List<Bytes>.length(&self.files)
+  }
+
+  /// Registers `symbol` with its 1-based `fileIndex` and packed declaration `origin`.
+  pub effect fn addSymbol(
+    self: &mut Self,
+    symbol: &[u8],
+    fileIndex: usize,
+    origin: u64,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let h = InternIndex.hashBytes(0, symbol)
+    run List<Bytes>.append(&mut self.symbols, run Bytes.copy(symbol))
+    run List<usize>.append(&mut self.fileIndices, fileIndex)
+    run List<u64>.append(&mut self.origins, origin)
+    return run InternIndex.record(&mut self.index, h)
+  }
+
+  /// Looks up the registered `(fileIndex, origin)` for `symbol`, returning `fileIndex == 0` when absent.
+  pub fn lookup(self: &Self, symbol: &[u8]) -> SymbolSource {
+    let syms = List<Bytes>.asSlice(&self.symbols)
+    let h = InternIndex.hashBytes(0, symbol)
+    let mut at = InternIndex.first(&self.index, h)
+    while at != usize.MAX {
+      if sameBytes(Bytes.asSlice(&syms[at]), symbol) {
+        return SymbolSource {
+          fileIndex: List<usize>.get(&self.fileIndices, at),
+          origin: List<u64>.get(&self.origins, at),
+        }
+      }
+      at = InternIndex.after(&self.index, at)
+    }
+    return SymbolSource {fileIndex: usize.ZERO, origin: 0}
+  }
+
+  /// Returns all registered source file paths in 1-based DWARF file-table order.
+  pub fn filePaths(self: &Self) -> &[Bytes] {
+    return List<Bytes>.asSlice(&self.files)
+  }
+}
+
+/// Encodes a complete DWARF v4 `.debug_line` section from `files` and `spans`.
+/// Returns an empty `Bytes` when `files` or `spans` is empty.
+pub effect fn encodeDebugLine(
+  files: &[Bytes],
+  spans: &[FunctionLineSpan],
+) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  if files.length == usize.ZERO || spans.length == usize.ZERO {
+    return move out
+  }
+
+  // Reserve 4-byte `unit_length`.
+  run X86Encode.u32Le(&mut out, 0)
+  // DWARF version 4.
+  run X86Encode.u16Le(&mut out, 4)
+  // Reserve 4-byte `header_length`.
+  let headerLenPos = Bytes.length(&out)
+  run X86Encode.u32Le(&mut out, 0)
+  let headerStart = Bytes.length(&out)
+
+  // Standard DWARF v4 line number program prologue.
+  run X86Encode.byte(&mut out, 1) // minimum_instruction_length = 1
+  run X86Encode.byte(&mut out, 1) // maximum_operations_per_instruction = 1
+  run X86Encode.byte(&mut out, 1) // default_is_stmt = 1
+  run X86Encode.byte(&mut out, 251) // line_base = -5 (signed byte 0xFB)
+  run X86Encode.byte(&mut out, 14) // line_range = 14
+  run X86Encode.byte(&mut out, 13) // opcode_base = 13
+  // Standard opcode operand counts for opcodes 1..12.
+  let stdLens: [u8; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+  run Bytes.append(&mut out, &stdLens)
+
+  // `include_directories`: empty (NUL terminator only; full paths stored in `file_names`).
+  run X86Encode.byte(&mut out, 0)
+
+  // `file_names`: each entry is `<path>\0`, dir=0, mtime=0, size=0.
+  let mut fi = usize.ZERO
+  while fi < files.length {
+    let p = Bytes.asSlice(&files[fi])
+    if p.length == usize.ZERO {
+      run Bytes.append(&mut out, b"<unknown>")
+    } else {
+      run Bytes.append(&mut out, p)
+    }
+    run X86Encode.byte(&mut out, 0)
+    run X86Encode.byte(&mut out, 0) // directory_index = 0
+    run X86Encode.byte(&mut out, 0) // mtime = 0
+    run X86Encode.byte(&mut out, 0) // size = 0
+    fi = fi + usize.ONE
+  }
+  // Terminate `file_names` table.
+  run X86Encode.byte(&mut out, 0)
+
+  let headerEnd = Bytes.length(&out)
+  patchU32Le(&mut out, headerLenPos, usize.toU64(headerEnd - headerStart))
+
+  // Emit one DWARF line sequence per function span.
+  let mut si = usize.ZERO
+  while si < spans.length {
+    let sp = &spans[si]
+    if sp.codeSize > 0 && sp.fileIndex > usize.ZERO {
+      // `DW_LNE_set_address`: 0x00, len=9, opcode=0x02, u64(vaddr)
+      run X86Encode.byte(&mut out, 0)
+      run X86Encode.byte(&mut out, 9)
+      run X86Encode.byte(&mut out, 2)
+      run X86Encode.u64Le(&mut out, sp.vaddr)
+
+      // Set file if different from default 1.
+      if sp.fileIndex != usize.ONE {
+        run X86Encode.byte(&mut out, 4) // DW_LNS_set_file
+        run writeUleb128(&mut out, usize.toU64(sp.fileIndex))
+      }
+
+      let mut curOff: u64 = 0
+      let mut curLine: i64 = 1
+      let mut curCol: u64 = 0
+      let mut emittedAny = false
+
+      let locs = List<u64>.asSlice(&sp.locations)
+      let mut li = usize.ZERO
+      while li + usize.ONE < locs.length {
+        let off = locs[li]
+        let relPlace = locs[li + usize.ONE]
+        let placed = absolutePlace(sp.origin, relPlace)
+        if placed != 0 && off >= curOff && off < sp.codeSize {
+          let line = u64.shiftRight(placed, 24)
+          let col = u64.bitAnd(placed, 16777215)
+          if line > 0 {
+            let deltaPc = off - curOff
+            if deltaPc > 0 {
+              run X86Encode.byte(&mut out, 2) // DW_LNS_advance_pc
+              run writeUleb128(&mut out, deltaPc)
+              curOff = off
+            }
+            let targetLine = u64.toI64(line)
+            if targetLine != curLine {
+              run X86Encode.byte(&mut out, 3) // DW_LNS_advance_line
+              run writeSleb128(&mut out, targetLine - curLine)
+              curLine = targetLine
+            }
+            if col != curCol {
+              run X86Encode.byte(&mut out, 5) // DW_LNS_set_column
+              run writeUleb128(&mut out, col)
+              curCol = col
+            }
+            run X86Encode.byte(&mut out, 1) // DW_LNS_copy
+            emittedAny = true
+          }
+        }
+        li = li + 2
+      }
+
+      // If no inner locations were recorded, emit a single row at the function's declaration origin.
+      if !emittedAny && sp.origin != 0 {
+        let origLine = u64.shiftRight(sp.origin, 24)
+        let origCol = u64.bitAnd(sp.origin, 16777215)
+        if origLine > 0 {
+          let targetLine = u64.toI64(origLine)
+          if targetLine != curLine {
+            run X86Encode.byte(&mut out, 3) // DW_LNS_advance_line
+            run writeSleb128(&mut out, targetLine - curLine)
+          }
+          if origCol != curCol {
+            run X86Encode.byte(&mut out, 5) // DW_LNS_set_column
+            run writeUleb128(&mut out, origCol)
+          }
+          run X86Encode.byte(&mut out, 1) // DW_LNS_copy
+        }
+      }
+
+      // Advance PC to end of function and emit `DW_LNE_end_sequence` (resets state machine).
+      if sp.codeSize > curOff {
+        run X86Encode.byte(&mut out, 2) // DW_LNS_advance_pc
+        run writeUleb128(&mut out, sp.codeSize - curOff)
+      }
+      run X86Encode.byte(&mut out, 0)
+      run X86Encode.byte(&mut out, 1)
+      run X86Encode.byte(&mut out, 1) // DW_LNE_end_sequence
+    }
+    si = si + usize.ONE
+  }
+
+  let totalLen = Bytes.length(&out) - 4
+  patchU32Le(&mut out, usize.ZERO, usize.toU64(totalLen))
+  return move out
+}

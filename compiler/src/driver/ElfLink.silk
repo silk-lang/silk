@@ -8,6 +8,8 @@
 //! `ld.lld` invocation for pure Silk builds.
 
 import backend.X86Encode
+import driver.ElfDebug
+import driver.ElfDebug {DebugLineMap, FunctionLineSpan}
 import driver.ElfInput
 import driver.ElfInput {
   ArchiveIndex,
@@ -22,6 +24,8 @@ import driver.ElfInput {
   SectionKind,
   SharedFile,
   SharedLib,
+  SilkFuncMeta,
+  SilkObjMeta,
 }
 import driver.WasmNames {FunctionNames}
 import semantic.InternIndex {InternIndex}
@@ -37,13 +41,16 @@ import silk.num.u8
 import silk.num.usize
 import silk.system.filesystem {FileError, FileSystem, Path}
 
-/// Configuration and native inputs passed to [`link`].
+/// Configuration and native inputs passed to [`link`] and [`linkWithOptions`].
 pub struct LinkOptions {
   /// Emit a shared library (`ET_DYN` without `PT_INTERP`) instead of a PIE executable.
   pub shared: bool,
   /// Include the built-in glibc `_start` / `silk_gnu_initialize` startup code (true for normal
   /// Silk executables with a runtime or exporting `main`).
   pub includeStart: bool,
+  /// Enable incremental-ready PIE layout (fixed-slot Silk call thunks + 2x segment headroom +
+  /// emitted [`IncrementalState`] for in-place `pwrite` patching on subsequent dev builds).
+  pub incremental: bool,
   /// Precompiled `.o` object files (from `[native].sources` or `NativeLinkInput.Object`).
   pub objects: List<Path>,
   /// Static archives (`.a`).
@@ -64,6 +71,7 @@ impl LinkOptions {
     return LinkOptions {
       shared: false,
       includeStart: true,
+      incremental: false,
       objects: List<Path>.make(),
       archives: List<Path>.make(),
       searchPaths: List<Path>.make(),
@@ -72,6 +80,160 @@ impl LinkOptions {
       soname: Bytes.make(),
     }
   }
+}
+
+/// One free reusable block inside a segment's headroom pool for incremental ELF patching.
+pub struct IncFreeBlock {
+  /// Virtual address of the free block.
+  pub vaddr: u64,
+  /// File offset of the free block.
+  pub fileOff: u64,
+  /// Allocated byte capacity of the free block.
+  pub cap: u64,
+}
+impl Copy for IncFreeBlock {}
+
+/// One native (non-Silk) `.eh_frame_hdr` entry preserved for incremental FDE table re-sorting.
+pub struct IncEhEntry {
+  /// Virtual address of the native function.
+  pub funcVaddr: u64,
+  /// Virtual address of the native function's FDE in `.eh_frame`.
+  pub fdeVaddr: u64,
+}
+impl Copy for IncEhEntry {}
+
+/// Tracked placement and digest of one Silk function in an incremental-ready ELF64 binary.
+pub struct IncFuncRecord {
+  /// Primary Silk symbol name.
+  pub symbol: Bytes,
+  /// Optional exported C alias (empty if none).
+  pub exported: Bytes,
+  /// High 64 bits of SipHash-1-3 content digest.
+  pub digestHigh: u64,
+  /// Low 64 bits of SipHash-1-3 content digest.
+  pub digestLow: u64,
+  /// Current virtual address of the function's machine code body.
+  pub bodyVaddr: u64,
+  /// Current file offset of the function's machine code body.
+  pub bodyFileOff: u64,
+  /// Current byte length of the function's machine code body.
+  pub bodySize: u64,
+  /// Allocated capacity at `bodyVaddr` (allows in-place rewrites up to `bodyCap` without moving).
+  pub bodyCap: u64,
+  /// Fixed 8-byte slot index in `.silk.thunks`.
+  pub thunkSlot: usize,
+  /// Current virtual address of the function's local `.rodata` slice (0 if none).
+  pub rodataVaddr: u64,
+  /// Current file offset of the function's local `.rodata` slice (0 if none).
+  pub rodataFileOff: u64,
+  /// Current byte length of the function's local `.rodata` slice.
+  pub rodataSize: u64,
+  /// Allocated capacity at `rodataVaddr`.
+  pub rodataCap: u64,
+  /// File offset of the function's `.eh_frame` FDE record (0 if none).
+  pub fdeFileOff: u64,
+  /// Virtual address of the function's `.eh_frame` FDE record (0 if none).
+  pub fdeVaddr: u64,
+  /// File offset of this function's entry-address word inside `silk_frames` (0 if none).
+  pub silkFrameFileOff: u64,
+  /// File offset of the corresponding `R_X86_64_RELATIVE` `r_addend` word in `.rela.dyn` (0 if none).
+  pub silkFrameRelaAddendFileOff: u64,
+}
+
+/// Tracked placement and digest of one Silk data object in an incremental-ready ELF64 binary.
+pub struct IncObjRecord {
+  /// Object symbol name.
+  pub symbol: Bytes,
+  /// High 64 bits of SipHash-1-3 content digest.
+  pub digestHigh: u64,
+  /// Low 64 bits of SipHash-1-3 content digest.
+  pub digestLow: u64,
+  /// Virtual address (or TLS block offset when `isTls == true`).
+  pub vaddr: u64,
+  /// File offset in the ELF64 binary.
+  pub fileOff: u64,
+  /// Byte length of the object's image.
+  pub size: u64,
+  /// True for thread-local `.tdata` objects.
+  pub isTls: bool,
+  /// True for `silk_frames` descriptors.
+  pub isFramed: bool,
+}
+
+/// Resolved address entry for every global symbol in an incremental-ready ELF64 binary.
+pub struct IncGlobalRecord {
+  /// Symbol name.
+  pub name: Bytes,
+  /// Resolved address (fixed thunk vaddr for Silk functions; runtime vaddr or TLS offset otherwise).
+  pub vaddr: u64,
+  /// `.got` slot vaddr (0 if none).
+  pub gotSlotVaddr: u64,
+  /// `.plt` stub vaddr (0 if none).
+  pub pltSlotVaddr: u64,
+  /// GOTTPOFF `.got` slot vaddr (0 if none).
+  pub gotTpOffSlotVaddr: u64,
+  /// True when imported dynamically from a shared library.
+  pub isDynamic: bool,
+  /// True when thread-local.
+  pub isTls: bool,
+}
+
+/// Complete persistent layout state emitted alongside an incremental-ready PIE ELF64 executable.
+pub struct IncrementalState {
+  /// Combined fingerprint of all native inputs and linker options (high 64 bits).
+  pub inputsHashHigh: u64,
+  /// Combined fingerprint of all native inputs and linker options (low 64 bits).
+  pub inputsHashLow: u64,
+  /// Exact byte size of the linked ELF64 output file.
+  pub binarySize: u64,
+  /// Base virtual address of `.silk.thunks`.
+  pub thunksVaddr: u64,
+  /// Base file offset of `.silk.thunks`.
+  pub thunksFileOff: u64,
+  /// Number of thunk slots currently assigned.
+  pub thunksCount: u64,
+  /// Total capacity of `.silk.thunks` in slots.
+  pub thunksCap: u64,
+  /// Next free virtual address in `.text` headroom.
+  pub textCursorVaddr: u64,
+  /// Next free file offset in `.text` headroom.
+  pub textCursorFileOff: u64,
+  /// Exclusive upper virtual address limit of `.text` headroom.
+  pub textLimitVaddr: u64,
+  /// Next free virtual address in `.rodata` headroom.
+  pub rodataCursorVaddr: u64,
+  /// Next free file offset in `.rodata` headroom.
+  pub rodataCursorFileOff: u64,
+  /// Exclusive upper virtual address limit of `.rodata` headroom.
+  pub rodataLimitVaddr: u64,
+  /// Base virtual address of `.eh_frame_hdr`.
+  pub ehFrameHdrVaddr: u64,
+  /// Base file offset of `.eh_frame_hdr`.
+  pub ehFrameHdrFileOff: u64,
+  /// Number of entries in `.eh_frame_hdr`.
+  pub ehFrameHdrCount: u64,
+  /// Aligned TLS block size (`alignUp(tlsMemSize, tlsAlign)`).
+  pub tlsBlockSize: u64,
+  /// Tracked Silk functions.
+  pub funcs: List<IncFuncRecord>,
+  /// Tracked Silk data objects.
+  pub objs: List<IncObjRecord>,
+  /// Resolved global symbol address table (allows patching without re-parsing native `.o`/`.a`/`.so`).
+  pub globals: List<IncGlobalRecord>,
+  /// Native (non-Silk) `.eh_frame_hdr` entries.
+  pub nativeEhEntries: List<IncEhEntry>,
+  /// Reusable free blocks in `.text`.
+  pub textFreeList: List<IncFreeBlock>,
+  /// Reusable free blocks in `.rodata`.
+  pub rodataFreeList: List<IncFreeBlock>,
+}
+
+/// Output of [`linkWithOptions`]: the linked ELF64 bytes plus optional [`IncrementalState`].
+pub struct LinkOutput {
+  /// Complete ELF64 executable or shared library image.
+  pub binary: Bytes,
+  /// Populated when `options.incremental && !options.shared`.
+  pub state: Option<IncrementalState>,
 }
 
 // ---- Internal Linker Data Structures ----
@@ -126,6 +288,9 @@ struct GlobalSym {
   copyBssOff: u64,
   hasCopy: bool,
   dynsymIdx: usize,
+  // Incremental thunk slot & Silk function index (usize.MAX when not a Silk function)
+  thunkSlot: usize,
+  silkFuncIdx: usize,
   // Resolved runtime virtual address (or TLS offset if `isTls`)
   vaddr: u64,
 }
@@ -326,6 +491,8 @@ effect fn symIntern(tab: &mut SymTab, name: &[u8]) -> usize ! OutOfMemoryError ?
     copyBssOff: 0,
     hasCopy: false,
     dynsymIdx: usize.MAX,
+    thunkSlot: usize.MAX,
+    silkFuncIdx: usize.MAX,
     vaddr: 0,
   })
   return idx
@@ -563,6 +730,34 @@ pub effect fn linkUnits(
   soname: &[u8],
   functionNames: &FunctionNames,
 ) -> Bytes ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let emptyDebug = DebugLineMap.make()
+  let res = run linkUnitsWithOptions(
+    move unitsIn,
+    move archivesIn,
+    move sharedLibsIn,
+    shared,
+    false,
+    rpaths,
+    soname,
+    functionNames,
+    &emptyDebug,
+  )
+  return move res.binary
+}
+
+/// Links `units`, optional `archives`, and `sharedLibs` purely in memory into a complete Linux
+/// x86-64 ELF64 binary image, optionally with incremental thunk/headroom layout and DWARF `.debug_line`.
+pub effect fn linkUnitsWithOptions(
+  unitsIn: List<InputUnit>,
+  archivesIn: List<ArchiveIndex>,
+  sharedLibsIn: List<SharedLib>,
+  shared: bool,
+  incremental: bool,
+  rpaths: &[Bytes],
+  soname: &[u8],
+  functionNames: &FunctionNames,
+  debugLines: &DebugLineMap,
+) -> LinkOutput ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut units = move unitsIn
   let archives = move archivesIn
   let sharedLibs = move sharedLibsIn
@@ -1335,6 +1530,52 @@ pub effect fn linkUnits(
   let pltCount = List<usize>.length(&pltSyms)
   let pltSize: u64 = usize.toU64(pltCount) * 8
 
+  // Identify the Silk unit (for DWARF `.debug_line` and incremental thunk/headroom layout).
+  let mut silkUnitIdx = usize.MAX
+  ui = usize.ZERO
+  while ui < unitSlice.length {
+    if unitSlice[ui].isSilk {
+      silkUnitIdx = ui
+      break
+    }
+    ui = ui + usize.ONE
+  }
+
+  let useThunks = incremental && !shared && silkUnitIdx != usize.MAX
+  let mut silkThunkCount = usize.ZERO
+  if useThunks {
+    let sFuncs = List<SilkFuncMeta>.asSlice(&unitSlice[silkUnitIdx].silkFunctions)
+    let mut sfi = usize.ZERO
+    while sfi < sFuncs.length {
+      let sName = Bytes.asSlice(&sFuncs[sfi].symbol)
+      let mut idx = InternIndex.first(&symtab.index, InternIndex.hashBytes(0, sName))
+      while idx != usize.MAX && !sameBytes(Bytes.asSlice(&entriesMut[idx].name), sName) {
+        idx = InternIndex.after(&symtab.index, idx)
+      }
+      if idx != usize.MAX && entriesMut[idx].state == SymState.Defined && entriesMut[idx].unitIdx == silkUnitIdx {
+        entriesMut[idx].thunkSlot = silkThunkCount
+        entriesMut[idx].silkFuncIdx = sfi
+      }
+      let expName = Bytes.asSlice(&sFuncs[sfi].exported)
+      if expName.length > usize.ZERO {
+        let mut eIdx = InternIndex.first(&symtab.index, InternIndex.hashBytes(0, expName))
+        while eIdx != usize.MAX && !sameBytes(Bytes.asSlice(&entriesMut[eIdx].name), expName) {
+          eIdx = InternIndex.after(&symtab.index, eIdx)
+        }
+        if eIdx != usize.MAX && entriesMut[eIdx].state == SymState.Defined && entriesMut[eIdx].unitIdx == silkUnitIdx {
+          entriesMut[eIdx].thunkSlot = silkThunkCount
+          entriesMut[eIdx].silkFuncIdx = sfi
+        }
+      }
+      silkThunkCount = silkThunkCount + usize.ONE
+      sfi = sfi + usize.ONE
+    }
+  }
+  let thunkSlotsCap: u64 = if useThunks { maxU64(256, usize.toU64(silkThunkCount) * 2) } else { 0 }
+  let thunksSize: u64 = thunkSlotsCap * 8
+  let textHeadroom: u64 = if useThunks { alignUp(maxU64(262144, textSize), 16) } else { 0 }
+  let rodataHeadroom: u64 = if useThunks { alignUp(maxU64(65536, rodataSize), 16) } else { 0 }
+
   // Segment 1 (PF_R, vaddr = 0x0, fileOff = 0x0):
   let mut cur: u64 = 64 + phnum * 56
   let interpOff = cur
@@ -1361,15 +1602,15 @@ pub effect fn linkUnits(
   let relaDynOff = cur
   let relaDynSize: u64 = usize.toU64(relaDynCount) * 24
   cur = cur + relaDynSize
-  cur = alignUp(cur, 16)
-  let rodataVaddr = cur
-  cur = cur + rodataSize
   cur = alignUp(cur, 4)
   let ehFrameHdrVaddr = cur
   cur = cur + ehFrameHdrSize
   cur = alignUp(cur, 8)
   let ehFrameVaddr = cur
   cur = cur + ehFrameSize
+  cur = alignUp(cur, 16)
+  let rodataVaddr = cur
+  cur = cur + rodataSize + rodataHeadroom
   let seg1FileSz = cur
 
   // Segment 2 (PF_R | PF_X, page-aligned):
@@ -1379,8 +1620,11 @@ pub effect fn linkUnits(
   let pltVaddr = cur
   cur = cur + pltSize
   cur = alignUp(cur, 16)
+  let thunksVaddr = cur
+  cur = cur + thunksSize
+  cur = alignUp(cur, 16)
   let textVaddr = cur
-  cur = cur + textSize
+  cur = cur + textSize + textHeadroom
   let seg2FileSz = cur - seg2Off
 
   // Segment 3 (PF_R | PF_W -> PT_GNU_RELRO, page-aligned):
@@ -1573,12 +1817,17 @@ pub effect fn linkUnits(
         addend: 0,
       })
     } else if st == SymState.Defined || st == SymState.Common || st == SymState.Synthetic {
-      putU64Le(&mut gotBuf, gi * 8, entriesMut[sIdx].vaddr)
+      let gotTarget = if useThunks && entriesMut[sIdx].thunkSlot != usize.MAX {
+        thunksVaddr + usize.toU64(entriesMut[sIdx].thunkSlot) * 8
+      } else {
+        entriesMut[sIdx].vaddr
+      }
+      putU64Le(&mut gotBuf, gi * 8, gotTarget)
       run List<DynRela>.append(&mut dynRelas, DynRela {
         offset: slotVaddr,
         dynsym: usize.ZERO,
         relType: ElfInput.rRelative(),
-        addend: u64.wrappingToI64(entriesMut[sIdx].vaddr),
+        addend: u64.wrappingToI64(gotTarget),
       })
     }
     gi = gi + usize.ONE
@@ -1665,11 +1914,62 @@ pub effect fn linkUnits(
     pi = pi + usize.ONE
   }
 
+  // Build fixed-slot `.silk.thunks` (8 bytes each: `E9 <rel32> CC CC CC`) and `incFuncs` table.
+  let mut thunksBuf = Bytes.make()
+  let mut incFuncs = List<IncFuncRecord>.make()
+  let mut nativeEhEntries = List<IncEhEntry>.make()
+  if useThunks {
+    let silkSecP = List<SecPlacement>.asSlice(&placeMut[silkUnitIdx])
+    let silkTextBaseVaddr = silkSecP[0].vaddr
+    let silkRoBaseVaddr = silkSecP[1].vaddr
+    let sFuncs = List<SilkFuncMeta>.asSlice(&unitSlice[silkUnitIdx].silkFunctions)
+    let mut sfi = usize.ZERO
+    while sfi < sFuncs.length {
+      let fm = &sFuncs[sfi]
+      let bodyVaddr = silkTextBaseVaddr + fm.textOff
+      let bodyCap = if sfi + usize.ONE < sFuncs.length {
+        sFuncs[sfi + usize.ONE].textOff - fm.textOff
+      } else {
+        fm.codeSize
+      }
+      let thunkSlotVaddr = thunksVaddr + usize.toU64(sfi) * 8
+      let jmpRel = u64.wrappingToI64(bodyVaddr) - u64.wrappingToI64(thunkSlotVaddr + 5)
+      run X86Encode.byte(&mut thunksBuf, 0xE9)
+      run X86Encode.u32Le(&mut thunksBuf, i64.wrappingToU64(jmpRel))
+      run X86Encode.byte(&mut thunksBuf, 0xCC)
+      run X86Encode.byte(&mut thunksBuf, 0xCC)
+      run X86Encode.byte(&mut thunksBuf, 0xCC)
+      let roVaddr = if fm.rodataSize > 0 { silkRoBaseVaddr + fm.rodataOff } else { 0 }
+      run List<IncFuncRecord>.append(&mut incFuncs, IncFuncRecord {
+        symbol: run Bytes.copy(Bytes.asSlice(&fm.symbol)),
+        exported: run Bytes.copy(Bytes.asSlice(&fm.exported)),
+        digestHigh: fm.digestHigh,
+        digestLow: fm.digestLow,
+        bodyVaddr: bodyVaddr,
+        bodyFileOff: bodyVaddr, // Segment 2 has fileOff == vaddr
+        bodySize: fm.codeSize,
+        bodyCap: bodyCap,
+        thunkSlot: sfi,
+        rodataVaddr: roVaddr,
+        rodataFileOff: roVaddr, // Segment 1 has fileOff == vaddr
+        rodataSize: fm.rodataSize,
+        rodataCap: fm.rodataSize,
+        fdeFileOff: 0,
+        fdeVaddr: 0,
+        silkFrameFileOff: 0,
+        silkFrameRelaAddendFileOff: 0,
+      })
+      sfi = sfi + usize.ONE
+    }
+    run padToOffset(&mut thunksBuf, u64.toUsize(thunksSize), 0xCC)
+  }
+
   // Apply all input relocations across all merged sections (and record `.eh_frame_hdr` entries!).
   let mut fdeEntries = List<FdeEntry>.make()
   let ehFdeSlice = List<EhFdePlace>.asSlice(&ehFdes)
   let mut localGotCursor = usize.ZERO
   let mut ehFdeCursor = usize.ZERO
+  let mut silkFdeCursor = usize.ZERO
 
   ui = usize.ZERO
   while ui < unitSlice.length {
@@ -1721,7 +2021,14 @@ pub effect fn linkUnits(
               sIdx = InternIndex.after(&symtab.index, sIdx)
             }
             if sIdx != usize.MAX {
-              sVaddr = entriesMut[sIdx].vaddr
+              let useThunkHere = useThunks && entriesMut[sIdx].thunkSlot != usize.MAX
+                && secP[sc].kind != SectionKind.SilkFrames
+                && secP[sc].kind != SectionKind.EhFrame
+              sVaddr = if useThunkHere {
+                thunksVaddr + usize.toU64(entriesMut[sIdx].thunkSlot) * 8
+              } else {
+                entriesMut[sIdx].vaddr
+              }
               sSize = entriesMut[sIdx].size
               isDynamic = entriesMut[sIdx].state == SymState.Dynamic
             }
@@ -1729,10 +2036,30 @@ pub effect fn linkUnits(
 
           if matchedFde != usize.MAX {
             let funcAddr = i64.wrappingToU64(u64.wrappingToI64(sVaddr) + r.addend)
+            let fdeAddr = ehFrameVaddr + ehFdeSlice[matchedFde].outFdeOff
             run List<FdeEntry>.append(&mut fdeEntries, FdeEntry {
               funcVaddr: funcAddr,
-              fdeVaddr: ehFrameVaddr + ehFdeSlice[matchedFde].outFdeOff,
+              fdeVaddr: fdeAddr,
             })
+            if useThunks {
+              if ui == silkUnitIdx {
+                let sFuncs = List<SilkFuncMeta>.asSlice(&unitSlice[silkUnitIdx].silkFunctions)
+                while silkFdeCursor < sFuncs.length && sFuncs[silkFdeCursor].fdeInitInOff != r.offset {
+                  silkFdeCursor = silkFdeCursor + usize.ONE
+                }
+                let incF = List<IncFuncRecord>.asMutSlice(&mut incFuncs)
+                if silkFdeCursor < incF.length {
+                  incF[silkFdeCursor].fdeFileOff = fdeAddr
+                  incF[silkFdeCursor].fdeVaddr = fdeAddr
+                  silkFdeCursor = silkFdeCursor + usize.ONE
+                }
+              } else {
+                run List<IncEhEntry>.append(&mut nativeEhEntries, IncEhEntry {
+                  funcVaddr: funcAddr,
+                  fdeVaddr: fdeAddr,
+                })
+              }
+            }
           }
 
           // Compute patched value and apply to destination buffer.
@@ -1751,6 +2078,14 @@ pub effect fn linkUnits(
             } else if r.targetLocal || (sIdx != usize.MAX && entriesMut[sIdx].state != SymState.Undefined) {
               let v = u64.wrappingToI64(sVaddr) + r.addend
               writeVal = i64.wrappingToU64(v)
+              if useThunks && secP[sc].kind == SectionKind.SilkFrames && sIdx != usize.MAX && entriesMut[sIdx].silkFuncIdx != usize.MAX {
+                let sf = entriesMut[sIdx].silkFuncIdx
+                let incF = List<IncFuncRecord>.asMutSlice(&mut incFuncs)
+                if sf < incF.length {
+                  incF[sf].silkFrameFileOff = (seg4Off + framesOffInSeg4) + dstOff
+                  incF[sf].silkFrameRelaAddendFileOff = relaDynOff + usize.toU64(List<DynRela>.length(&dynRelas)) * 24 + 16
+                }
+              }
               run List<DynRela>.append(&mut dynRelas, DynRela {
                 offset: pVaddr,
                 dynsym: usize.ZERO,
@@ -1988,6 +2323,39 @@ pub effect fn linkUnits(
     si = si + usize.ONE
   }
 
+  // ---- Build DWARF v4 `.debug_line` (when requested) ----
+  let mut debugLineBytes = Bytes.make()
+  if !DebugLineMap.isEmpty(debugLines) && silkUnitIdx != usize.MAX {
+    let silkSecP = List<SecPlacement>.asSlice(&placeMut[silkUnitIdx])
+    let silkTextBaseVaddr = silkSecP[0].vaddr
+    let sFuncs = List<SilkFuncMeta>.asSlice(&unitSlice[silkUnitIdx].silkFunctions)
+    let mut spans = List<FunctionLineSpan>.make()
+    let mut sfi = usize.ZERO
+    while sfi < sFuncs.length {
+      let fm = &sFuncs[sfi]
+      let src = DebugLineMap.lookup(debugLines, Bytes.asSlice(&fm.symbol))
+      if src.fileIndex > usize.ZERO {
+        let srcLocs = List<u64>.asSlice(&fm.locations)
+        let mut locsCopy = run List<u64>.makeWithCapacity(srcLocs.length)
+        let mut li = usize.ZERO
+        while li < srcLocs.length {
+          run List<u64>.append(&mut locsCopy, srcLocs[li])
+          li = li + usize.ONE
+        }
+        run List<FunctionLineSpan>.append(&mut spans, FunctionLineSpan {
+          vaddr: silkTextBaseVaddr + fm.textOff,
+          codeSize: fm.codeSize,
+          fileIndex: src.fileIndex,
+          origin: src.origin,
+          locations: move locsCopy,
+        })
+      }
+      sfi = sfi + usize.ONE
+    }
+    debugLineBytes = run ElfDebug.encodeDebugLine(DebugLineMap.filePaths(debugLines), List<FunctionLineSpan>.asSlice(&spans))
+  }
+  let hasDebugLine = Bytes.length(&debugLineBytes) > usize.ZERO
+
   // ---- Assemble Complete ELF64 Binary Image ----
 
   let mut out = Bytes.make()
@@ -2039,18 +2407,28 @@ pub effect fn linkUnits(
   run Bytes.append(&mut out, Bytes.asSlice(&verneedBytes))
   run padToOffset(&mut out, u64.toUsize(relaDynOff), 0)
   run Bytes.append(&mut out, Bytes.asSlice(&relaDynBytes))
-  run padToOffset(&mut out, u64.toUsize(rodataVaddr), 0)
-  run Bytes.append(&mut out, Bytes.asSlice(&rodataBuf))
   run padToOffset(&mut out, u64.toUsize(ehFrameHdrVaddr), 0)
   run Bytes.append(&mut out, Bytes.asSlice(&ehHdrBytes))
   run padToOffset(&mut out, u64.toUsize(ehFrameVaddr), 0)
   run Bytes.append(&mut out, Bytes.asSlice(&ehMerged))
+  run padToOffset(&mut out, u64.toUsize(rodataVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&rodataBuf))
+  if rodataHeadroom > 0 {
+    run padToOffset(&mut out, u64.toUsize(seg1FileSz), 0)
+  }
 
   // 4. Segment 2 payload (PF_R | PF_X).
   run padToOffset(&mut out, u64.toUsize(pltVaddr), 0)
   run Bytes.append(&mut out, Bytes.asSlice(&pltBuf))
+  if thunksSize > 0 {
+    run padToOffset(&mut out, u64.toUsize(thunksVaddr), 0xCC)
+    run Bytes.append(&mut out, Bytes.asSlice(&thunksBuf))
+  }
   run padToOffset(&mut out, u64.toUsize(textVaddr), 0x90)
   run Bytes.append(&mut out, Bytes.asSlice(&textBuf))
+  if textHeadroom > 0 {
+    run padToOffset(&mut out, u64.toUsize(seg2Off + seg2FileSz), 0xCC)
+  }
 
   // 5. Segment 3 payload (RELRO).
   run padToOffset(&mut out, u64.toUsize(initArrayVaddr), 0)
@@ -2072,7 +2450,7 @@ pub effect fn linkUnits(
   run padToOffset(&mut out, u64.toUsize(seg4Off + seenOffInSeg4), 0)
   run Bytes.append(&mut out, Bytes.asSlice(&seenBuf))
 
-  // 7. Non-loadable `.symtab`, `.strtab`, `.shstrtab`, and 22 Section Headers for gdb/readelf/perf.
+  // 7. Non-loadable `.symtab`, `.strtab`, optional `.debug_line`, `.shstrtab`, and Section Headers.
   let mut shstrtab = Bytes.make()
   run X86Encode.byte(&mut shstrtab, 0)
   let nInterp = run appendCstr(&mut shstrtab, b".interp")
@@ -2097,19 +2475,24 @@ pub effect fn linkUnits(
   let nSymtab = run appendCstr(&mut shstrtab, b".symtab")
   let nStrtab = run appendCstr(&mut shstrtab, b".strtab")
   let nShstrtab = run appendCstr(&mut shstrtab, b".shstrtab")
+  let nDebugLine: u64 = if hasDebugLine { run appendCstr(&mut shstrtab, b".debug_line") } else { 0 }
 
   let symtabFileOff = alignUp(usize.toU64(Bytes.length(&out)), 8)
   run padToOffset(&mut out, u64.toUsize(symtabFileOff), 0)
   run Bytes.append(&mut out, Bytes.asSlice(&symtabBytes))
   let strtabFileOff = usize.toU64(Bytes.length(&out))
   run Bytes.append(&mut out, Bytes.asSlice(&strtab))
+  let debugLineFileOff = usize.toU64(Bytes.length(&out))
+  if hasDebugLine {
+    run Bytes.append(&mut out, Bytes.asSlice(&debugLineBytes))
+  }
   let shstrtabFileOff = usize.toU64(Bytes.length(&out))
   run Bytes.append(&mut out, Bytes.asSlice(&shstrtab))
 
   let shoff = alignUp(usize.toU64(Bytes.length(&out)), 8)
   run padToOffset(&mut out, u64.toUsize(shoff), 0)
 
-  // 23 Section Headers (indices 0..22):
+  // 23 (or 24 with `.debug_line`) Section Headers (indices 0..22, optional 23):
   // 0: NULL
   run appendShdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
   // 1: .interp
@@ -2128,13 +2511,13 @@ pub effect fn linkUnits(
   // 7: .rela.dyn
   run appendShdr(&mut out, nRelaDyn, 4, 0x2, relaDynOff, relaDynOff, usize.toU64(Bytes.length(&relaDynBytes)), 3, 0, 8, 24)
   // 8: .rodata
-  run appendShdr(&mut out, nRodata, 1, 0x2, rodataVaddr, rodataVaddr, rodataSize, 0, 0, 16, 0)
+  run appendShdr(&mut out, nRodata, 1, 0x2, rodataVaddr, rodataVaddr, rodataSize + rodataHeadroom, 0, 0, 16, 0)
   // 9: .eh_frame_hdr
   run appendShdr(&mut out, nEhHdr, 1, 0x2, ehFrameHdrVaddr, ehFrameHdrVaddr, ehFrameHdrSize, 0, 0, 4, 0)
   // 10: .eh_frame
   run appendShdr(&mut out, nEhFrame, 1, 0x2, ehFrameVaddr, ehFrameVaddr, ehFrameSize, 0, 0, 8, 0)
   // 11: .text (placed at index 11 to match static symtab shndx = 11)
-  run appendShdr(&mut out, nText, 1, 0x6, textVaddr, textVaddr, textSize, 0, 0, 16, 0)
+  run appendShdr(&mut out, nText, 1, 0x6, textVaddr, textVaddr, textSize + textHeadroom, 0, 0, 16, 0)
   // 12: .plt
   run appendShdr(&mut out, nPlt, 1, 0x6, pltVaddr, pltVaddr, pltSize, 0, 0, 16, 8)
   // 13: .init_array
@@ -2157,8 +2540,13 @@ pub effect fn linkUnits(
   run appendShdr(&mut out, nStrtab, 3, 0, 0, strtabFileOff, usize.toU64(Bytes.length(&strtab)), 0, 0, 1, 0)
   // 22: .shstrtab
   run appendShdr(&mut out, nShstrtab, 3, 0, 0, shstrtabFileOff, usize.toU64(Bytes.length(&shstrtab)), 0, 0, 1, 0)
+  if hasDebugLine {
+    // 23: .debug_line
+    run appendShdr(&mut out, nDebugLine, 1, 0, 0, debugLineFileOff, usize.toU64(Bytes.length(&debugLineBytes)), 0, 0, 1, 0)
+  }
 
   // 8. Patch the 64-byte Elf64_Ehdr (`ET_DYN = 3`, `EM_X86_64 = 62`).
+  let shnum: u64 = if hasDebugLine { 24 } else { 23 }
   let buf = Bytes.asMutSlice(&mut out)
   buf[0] = 0x7F
   buf[1] = 0x45
@@ -2178,10 +2566,102 @@ pub effect fn linkUnits(
   putU16Le(&mut out, 54, 56)        // e_phentsize
   putU16Le(&mut out, 56, phnum)     // e_phnum
   putU16Le(&mut out, 58, 64)        // e_shentsize
-  putU16Le(&mut out, 60, 23)        // e_shnum
+  putU16Le(&mut out, 60, shnum)     // e_shnum
   putU16Le(&mut out, 62, 22)        // e_shstrndx = .shstrtab
 
-  return move out
+  // 9. Populate IncrementalState when incremental layout was requested.
+  let mut incState = Option<IncrementalState>.none()
+  if useThunks {
+    let mut incObjs = List<IncObjRecord>.make()
+    let silkSecP = List<SecPlacement>.asSlice(&placeMut[silkUnitIdx])
+    let sObjs = List<SilkObjMeta>.asSlice(&unitSlice[silkUnitIdx].silkObjects)
+    let mut oi = usize.ZERO
+    while oi < sObjs.length {
+      let om = &sObjs[oi]
+      let sp = &silkSecP[om.section]
+      let objVaddr = sp.vaddr + om.offset
+      let objFileOff: u64 = match sp.kind {
+        SectionKind.Rodata => objVaddr
+        SectionKind.Data => seg4Off + dataOffInSeg4 + sp.outOffset + om.offset
+        SectionKind.Tdata => tdataFileOff + sp.outOffset + om.offset
+        SectionKind.SilkFrames => seg4Off + framesOffInSeg4 + sp.outOffset + om.offset
+        _ => 0
+      }
+      run List<IncObjRecord>.append(&mut incObjs, IncObjRecord {
+        symbol: run Bytes.copy(Bytes.asSlice(&om.symbol)),
+        digestHigh: om.digestHigh,
+        digestLow: om.digestLow,
+        vaddr: objVaddr,
+        fileOff: objFileOff,
+        size: om.size,
+        isTls: om.isTls,
+        isFramed: om.isFramed,
+      })
+      oi = oi + usize.ONE
+    }
+
+    let mut incGlobals = run List<IncGlobalRecord>.makeWithCapacity(symCount)
+    si = usize.ZERO
+    while si < symCount {
+      let st = entriesMut[si].state
+      if st != SymState.Undefined {
+        let resolvedAddr = if entriesMut[si].thunkSlot != usize.MAX {
+          thunksVaddr + usize.toU64(entriesMut[si].thunkSlot) * 8
+        } else {
+          entriesMut[si].vaddr
+        }
+        let gotAddr: u64 = if entriesMut[si].gotSlot != usize.MAX {
+          gotVaddr + usize.toU64(entriesMut[si].gotSlot) * 8
+        } else { 0 }
+        let pltAddr: u64 = if entriesMut[si].pltSlot != usize.MAX {
+          pltVaddr + usize.toU64(entriesMut[si].pltSlot) * 8
+        } else { 0 }
+        let gotTpAddr: u64 = if entriesMut[si].gotTpOffSlot != usize.MAX {
+          gotVaddr + usize.toU64(gotTpStart + entriesMut[si].gotTpOffSlot) * 8
+        } else { 0 }
+        run List<IncGlobalRecord>.append(&mut incGlobals, IncGlobalRecord {
+          name: run Bytes.copy(Bytes.asSlice(&entriesMut[si].name)),
+          vaddr: resolvedAddr,
+          gotSlotVaddr: gotAddr,
+          pltSlotVaddr: pltAddr,
+          gotTpOffSlotVaddr: gotTpAddr,
+          isDynamic: st == SymState.Dynamic,
+          isTls: entriesMut[si].isTls,
+        })
+      }
+      si = si + usize.ONE
+    }
+
+    let textCursor = alignUp(textVaddr + textSize, 16)
+    let rodataCursor = alignUp(rodataVaddr + rodataSize, 16)
+    incState = Option<IncrementalState>.some(IncrementalState {
+      inputsHashHigh: 0,
+      inputsHashLow: 0,
+      binarySize: usize.toU64(Bytes.length(&out)),
+      thunksVaddr: thunksVaddr,
+      thunksFileOff: thunksVaddr,
+      thunksCount: usize.toU64(silkThunkCount),
+      thunksCap: thunkSlotsCap,
+      textCursorVaddr: textCursor,
+      textCursorFileOff: textCursor,
+      textLimitVaddr: textVaddr + textSize + textHeadroom,
+      rodataCursorVaddr: rodataCursor,
+      rodataCursorFileOff: rodataCursor,
+      rodataLimitVaddr: rodataVaddr + rodataSize + rodataHeadroom,
+      ehFrameHdrVaddr: ehFrameHdrVaddr,
+      ehFrameHdrFileOff: ehFrameHdrVaddr,
+      ehFrameHdrCount: usize.toU64(fdeMut.length),
+      tlsBlockSize: tlsBlockSize,
+      funcs: move incFuncs,
+      objs: move incObjs,
+      globals: move incGlobals,
+      nativeEhEntries: move nativeEhEntries,
+      textFreeList: List<IncFreeBlock>.make(),
+      rodataFreeList: List<IncFreeBlock>.make(),
+    })
+  }
+
+  return LinkOutput {binary: move out, state: move incState}
 }
 
 /// Top-level Linux x86-64 direct linker entry point: ingests concatenated Silk
@@ -2193,6 +2673,19 @@ pub effect fn link(
   options: &LinkOptions,
   functionNames: &FunctionNames,
 ) -> Bytes ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let emptyDebug = DebugLineMap.make()
+  let res = run linkWithOptions(fragments, options, functionNames, &emptyDebug)
+  return move res.binary
+}
+
+/// Extended direct linker entry point supporting DWARF `.debug_line` emission and incremental-ready
+/// ELF64 layout (returning both the linked binary and optional [`IncrementalState`]).
+pub effect fn linkWithOptions(
+  fragments: &[u8],
+  options: &LinkOptions,
+  functionNames: &FunctionNames,
+  debugLines: &DebugLineMap,
+) -> LinkOutput ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
   let mut units = List<InputUnit>.make()
   let mut archives = List<ArchiveIndex>.make()
   let mut sharedLibs = List<SharedLib>.make()
@@ -2251,14 +2744,16 @@ pub effect fn link(
     run List<SharedLib>.append(&mut sharedLibs, List<SharedLib>.remove(&mut virtualLibs, usize.ZERO))
   }
 
-  return run linkUnits(
+  return run linkUnitsWithOptions(
     move units,
     move archives,
     move sharedLibs,
     options.shared,
+    options.incremental,
     List<Bytes>.asSlice(&options.rpaths),
     Bytes.asSlice(&options.soname),
     functionNames,
+    debugLines,
   )
 }
 

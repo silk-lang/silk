@@ -1,0 +1,157 @@
+//! Unit checks for `ElfDebug` (DWARF v4 `.debug_line`) and `ElfIncremental` (in-place ELF64 patching).
+
+import backend.SsaFunction {Binary, Kind, SsaFunction}
+import backend.X86Emit
+import backend.X86Object {Fragment, Function, Unsupported as X86Unsupported}
+import driver.ElfDebug {DebugLineMap}
+import driver.ElfIncremental
+import driver.ElfIncremental {LinkMode}
+import driver.ElfInput
+import driver.ElfInput {ArchiveIndex, InputUnit, LinkError}
+import driver.ElfLink
+import driver.ElfLink {IncrementalState, LinkOptions}
+import driver.WasmNames {FunctionNames}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.filesystem_native {OsFileSystem}
+import silk.testing.testing {AssertionError, Testing}
+
+fn readU16(b: &[u8], at: usize) -> u64 {
+  return u8.toU64(b[at]) | u64.shiftLeft(u8.toU64(b[at + 1]), 8)
+}
+
+effect fn emitConstFn(sym: &[u8], exported: &[u8], val: u64, extraOps: usize) -> Function
+! X86Unsupported | OutOfMemoryError ? &mut Allocator {
+  let i32K = Kind.integer(32)
+  let mut f = run SsaFunction.make(sym, 64)
+  f.setResult(i32K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+  let mut acc = run f.integer(32, val)
+  let one = run f.integer(32, 1)
+  let mut k = usize.ZERO
+  while k < extraOps {
+    acc = run f.binary(Binary.Add, acc, one)
+    k = k + usize.ONE
+  }
+  run f.ret(acc)
+  run f.finish()
+  return run X86Emit.emit(&f, sym, exported)
+}
+
+test effect fn emitsDwarfDebugLineAndPatchesIncrementalElf64InPlace() -> ()
+! LinkError | X86Unsupported | FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run incrementalClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn incrementalClaims() -> ()
+! LinkError | X86Unsupported | FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut fs = run OsFileSystem.make("/")
+  return run incrementalClaimsWithFs() |> Effect.provideMut<FileSystem>(&mut fs)
+}
+
+effect fn incrementalClaimsWithFs() -> ()
+! LinkError | X86Unsupported | FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  // 1. DWARF v4 `.debug_line` emission through `ElfLink.linkUnitsWithOptions`.
+  let mut fnMain = run emitConstFn(b"silk_main_dbg", b"main", 42, usize.ZERO)
+  // Attach synthetic `(codeOffset, relativePlace)` line locations (line +2, col 5).
+  run List<u64>.append(&mut fnMain.locations, 0)
+  run List<u64>.append(&mut fnMain.locations, u64.shiftLeft(2, 24) | 5)
+
+  let mut frag1 = Fragment.make()
+  run List<Function>.append(&mut frag1.functions, move fnMain)
+  let encoded1 = run frag1.encode()
+
+  let mut debugMap = DebugLineMap.make()
+  let fileIdx = run DebugLineMap.addFile(&mut debugMap, b"/tmp/demo.silk")
+  // Origin: line 10, col 1.
+  run DebugLineMap.addSymbol(&mut debugMap, b"silk_main_dbg", fileIdx, u64.shiftLeft(10, 24) | 1)
+
+  let mut units = List<InputUnit>.make()
+  run List<InputUnit>.append(&mut units, run ElfInput.ingestFragments(Bytes.asSlice(&encoded1)))
+  run List<InputUnit>.append(&mut units, run ElfInput.startupUnit(true))
+  let vLibs = run ElfInput.virtualGlibcLibraries()
+  let fnames = FunctionNames.make()
+  let emptyRpaths: [Bytes; 0] = []
+
+  let outDbg = run ElfLink.linkUnitsWithOptions(
+    move units,
+    List<ArchiveIndex>.make(),
+    move vLibs,
+    false,
+    true,
+    &emptyRpaths,
+    b"",
+    &fnames,
+    &debugMap,
+  )
+  let dbgBytes = Bytes.asSlice(&outDbg.binary)
+  run Testing.expect(readU16(dbgBytes, 60) == 24, "ELF with DWARF .debug_line has 24 section headers")
+
+  // 2. Round-trip `IncrementalState` sidecar binary encoding & decoding.
+  let st = match move outDbg.state {
+    Option<IncrementalState>.Some {value} => move value
+    Option<IncrementalState>.None => {
+      run Testing.expect(false, "incremental linkUnitsWithOptions emits IncrementalState")
+      return ()
+    }
+  }
+  run Testing.expect(st.thunksCap >= 256, "incremental layout reserves at least 256 thunk slots")
+  run Testing.expect(st.textLimitVaddr > st.textCursorVaddr, "incremental layout reserves .text headroom")
+  let encodedState = run ElfIncremental.encodeState(&st)
+  let decodedOk = match move run ElfIncremental.decodeState(Bytes.asSlice(&encodedState)) {
+    Option<IncrementalState>.Some {value: st2} =>
+      st2.binarySize == st.binarySize
+        && st2.thunksVaddr == st.thunksVaddr
+        && st2.thunksCap == st.thunksCap
+        && List<ElfLink.IncFuncRecord>.length(&st2.funcs) == List<ElfLink.IncFuncRecord>.length(&st.funcs)
+    Option<IncrementalState>.None => false
+  }
+  run Testing.expect(decodedOk, "IncrementalState binary sidecar round-trips losslessly")
+
+  // 3. End-to-end `ElfIncremental.linkOrPatch` lifecycle on a temporary binary:
+  //    Full -> Skipped (0 edits) -> Patched in-place (same size) -> Patched with move (grew past bodyCap).
+  let outPath = run Path.make("/tmp/silk_elf_incremental_unit_test_bin")
+  let statePath = run ElfIncremental.statePathFor(&outPath)
+  drop run Effect.result(FileSystem.removeFile(&outPath))
+  drop run Effect.result(FileSystem.removeFile(&statePath))
+
+  let mut opts = LinkOptions.executable()
+  opts.incremental = true
+  let emptyDbg = DebugLineMap.make()
+
+  let rFull = run ElfIncremental.linkOrPatch(&outPath, Bytes.asSlice(&encoded1), &opts, &fnames, &emptyDbg)
+  run Testing.expect(rFull.mode == LinkMode.Full, "initial incremental build runs Full link")
+
+  let rSkip = run ElfIncremental.linkOrPatch(&outPath, Bytes.asSlice(&encoded1), &opts, &fnames, &emptyDbg)
+  run Testing.expect(rSkip.mode == LinkMode.Skipped && rSkip.patchedCount == usize.ZERO,
+    "unchanged rebuild takes zero-write Skipped fast path")
+
+  // Edit 1: modify `main` return constant without exceeding `bodyCap` (in-place patch).
+  let mut frag2 = Fragment.make()
+  run List<Function>.append(&mut frag2.functions, run emitConstFn(b"silk_main_dbg", b"main", 99, usize.ZERO))
+  let encoded2 = run frag2.encode()
+  let rPatch1 = run ElfIncremental.linkOrPatch(&outPath, Bytes.asSlice(&encoded2), &opts, &fnames, &emptyDbg)
+  run Testing.expect(rPatch1.mode == LinkMode.Patched && rPatch1.patchedCount == usize.ONE,
+    "same-size function edit patches in place via pwrite")
+
+  // Edit 2: grow `main` significantly past `bodyCap` so it relocates into `.text` headroom and updates its thunk.
+  let mut frag3 = Fragment.make()
+  run List<Function>.append(&mut frag3.functions, run emitConstFn(b"silk_main_dbg", b"main", 10, 40))
+  let encoded3 = run frag3.encode()
+  let rPatch2 = run ElfIncremental.linkOrPatch(&outPath, Bytes.asSlice(&encoded3), &opts, &fnames, &emptyDbg)
+  run Testing.expect(rPatch2.mode == LinkMode.Patched && rPatch2.patchedCount == usize.ONE,
+    "growing function relocates into headroom and updates fixed thunk slot in place")
+
+  // Cleanup temp files.
+  drop run Effect.result(FileSystem.removeFile(&outPath))
+  drop run Effect.result(FileSystem.removeFile(&statePath))
+}
