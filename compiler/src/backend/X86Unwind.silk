@@ -1,0 +1,163 @@
+//! DWARF `.eh_frame` CIE and FDE emission for x86-64 Linux ELF64 objects.
+//!
+//! # When to use
+//! Call [`X86Unwind.appendCie`] once at the start of an `.eh_frame` section, then
+//! [`X86Unwind.appendFde`] once per emitted x86-64 function so `_Unwind_Backtrace` and
+//! `silk_frames` can walk Silk frames cleanly on traps and panics.
+//!
+//! # Details
+//! Every ordinary x86-64 function emitted by the direct backend maintains the standard frame
+//! pointer prologue (`push rbp; mov rbp, rsp`) followed by optional callee-saved GPR pushes.
+//! The CIE uses augmentation `"zR"` with `DW_EH_PE_pcrel | DW_EH_PE_sdata4` (`0x1B`) so every
+//! FDE's initial PC field is a single `R_X86_64_PC32` relocation targeting `.text + funcOffset`
+//! with addend `0`.
+
+import backend.X86Encode
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+// DWARF x86-64 register numbers:
+// rbx=3, rbp=6, rsp=7, r12=12, r13=13, r14=14, r15=15, rip=16.
+
+/// Converts an x86-64 GPR index (`0..15`) to its DWARF CFI register number.
+pub fn dwarfReg(gpr: u8) -> u8 {
+  if gpr == 0 { return 0 }  // rax
+  if gpr == 1 { return 2 }  // rcx
+  if gpr == 2 { return 1 }  // rdx
+  if gpr == 3 { return 3 }  // rbx
+  if gpr == 4 { return 7 }  // rsp
+  if gpr == 5 { return 6 }  // rbp
+  if gpr == 6 { return 4 }  // rsi
+  if gpr == 7 { return 5 }  // rdi
+  return gpr                // r8..r15 match 8..15
+}
+
+/// Prologue layout facts needed to describe one function's stack unwinding in `.eh_frame`.
+pub struct UnwindInfo {
+  /// True when the function has a standard `push rbp; mov rbp, rsp` prologue; false for `@naked`.
+  pub hasFramePointer: bool,
+  /// Byte offset after `push rbp` (typically 1).
+  pub pushRbpEnd: u8,
+  /// Byte offset after `mov rbp, rsp` (typically 4).
+  pub movRbpEnd: u8,
+  /// Bitmask of callee-saved GPRs pushed right after `mov rbp, rsp` (saved at `[rbp - 8]`,
+  /// `[rbp - 16]`, ... in ascending GPR index order: `rbx=3, r12=12, r13=13, r14=14, r15=15`).
+  pub savedCalleeMask: u64,
+  /// Byte offset right after all callee-saved pushes complete.
+  pub savesEnd: u8,
+}
+
+impl Copy for UnwindInfo {}
+
+impl UnwindInfo {
+  /// Default unwind info for a frame-pointer function with no extra callee-saved pushes.
+  pub fn frameOnly() -> UnwindInfo {
+    return UnwindInfo {hasFramePointer: true, pushRbpEnd: 1, movRbpEnd: 4, savedCalleeMask: 0, savesEnd: 4}
+  }
+
+  /// Minimal unwind info for a `@naked` function with no standard prologue.
+  pub fn naked() -> UnwindInfo {
+    return UnwindInfo {hasFramePointer: false, pushRbpEnd: 0, movRbpEnd: 0, savedCalleeMask: 0, savesEnd: 0}
+  }
+}
+
+/// Appends the single x86-64 Common Information Entry (CIE) at offset 0 of `ehFrame`.
+pub effect fn appendCie(ehFrame: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&ehFrame.*)
+  run X86Encode.u32Le(&mut ehFrame.*, 0)       // length placeholder
+  run X86Encode.u32Le(&mut ehFrame.*, 0)       // CIE_id = 0
+  run X86Encode.byte(&mut ehFrame.*, 1)        // version = 1
+  // Augmentation string: "zR\0" (augmentation data length + FDE pointer encoding).
+  run Bytes.append(&mut ehFrame.*, b"zR\0")
+  run X86Encode.byte(&mut ehFrame.*, 1)        // code_alignment_factor = 1 (ULEB128)
+  run X86Encode.byte(&mut ehFrame.*, 0x78)     // data_alignment_factor = -8 (SLEB128)
+  run X86Encode.byte(&mut ehFrame.*, 16)       // return_address_register = 16 (RIP)
+  // Augmentation data: length = 1, FDE encoding = DW_EH_PE_pcrel | DW_EH_PE_sdata4 (0x1B).
+  run X86Encode.byte(&mut ehFrame.*, 1)
+  run X86Encode.byte(&mut ehFrame.*, 0x1B)
+  // Initial instructions:
+  // DW_CFA_def_cfa (0x0C): reg 7 (rsp), offset 8
+  run Bytes.append(&mut ehFrame.*, &[0x0C, 7, 8])
+  // DW_CFA_offset (0x80 | 16): rip at CFA + (-1 * 8) = CFA - 8
+  run Bytes.append(&mut ehFrame.*, &[0x90, 1])
+  // Pad to 8-byte boundary with DW_CFA_nop (0x00).
+  run padAlign8(&mut ehFrame.*, start)
+  let total = Bytes.length(&ehFrame.*) - start - 4
+  X86Encode.patchU32(&mut ehFrame.*, start, usize.toU64(total))
+}
+
+/// Appends one Frame Description Entry (FDE) for a function of length `codeSize` bytes, referencing
+/// the CIE at offset 0 of `ehFrame`. Returns the byte offset inside `ehFrame` of the 4-byte
+/// `initial_location` field, which needs an `R_X86_64_PC32` relocation pointing to the function's
+/// start symbol (addend 0).
+pub effect fn appendFde(ehFrame: &mut Bytes, codeSize: u64, info: UnwindInfo) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&ehFrame.*)
+  run X86Encode.u32Le(&mut ehFrame.*, 0) // length placeholder
+  // CIE_pointer: offset from this field's address back to CIE at offset 0.
+  let ciePtrPos = Bytes.length(&ehFrame.*)
+  run X86Encode.u32Le(&mut ehFrame.*, usize.toU64(ciePtrPos))
+  // initial_location (PC-relative sdata4, patched via R_X86_64_PC32 relocation).
+  let relocOffset = Bytes.length(&ehFrame.*)
+  run X86Encode.u32Le(&mut ehFrame.*, 0)
+  // address_range (code length in bytes).
+  run X86Encode.u32Le(&mut ehFrame.*, codeSize)
+  // Augmentation data length = 0.
+  run X86Encode.byte(&mut ehFrame.*, 0)
+
+  if info.hasFramePointer {
+    // Advance past `push rbp`: CFA = rsp + 16, rbp saved at CFA - 16 (factored offset 2).
+    if info.pushRbpEnd > 0 {
+      run advanceLoc(&mut ehFrame.*, info.pushRbpEnd)
+      // DW_CFA_def_cfa_offset (0x0E), 16
+      run Bytes.append(&mut ehFrame.*, &[0x0E, 16])
+      // DW_CFA_offset (0x80 | 6 = 0x86), factored offset 2 (2 * -8 = -16)
+      run Bytes.append(&mut ehFrame.*, &[0x86, 2])
+    }
+    // Advance past `mov rbp, rsp`: CFA = rbp + 16.
+    if info.movRbpEnd > info.pushRbpEnd {
+      run advanceLoc(&mut ehFrame.*, info.movRbpEnd - info.pushRbpEnd)
+      // DW_CFA_def_cfa_register (0x0D), reg 6 (rbp)
+      run Bytes.append(&mut ehFrame.*, &[0x0D, 6])
+    }
+    // Callee-saved GPRs pushed after `mov rbp, rsp`: saved at CFA - 24, CFA - 32, ...
+    if info.savedCalleeMask != 0 && info.savesEnd > info.movRbpEnd {
+      run advanceLoc(&mut ehFrame.*, info.savesEnd - info.movRbpEnd)
+      let mut factored: u8 = 3
+      let mut gpr: u8 = 0
+      while gpr < 16 {
+        if (info.savedCalleeMask & u64.shiftLeft(1, u8.toU64(gpr))) != 0 {
+          let dreg = dwarfReg(gpr)
+          run X86Encode.byte(&mut ehFrame.*, u8.bitOr(0x80, dreg))
+          run X86Encode.byte(&mut ehFrame.*, factored)
+          factored = factored + 1
+        }
+        gpr = gpr + 1
+      }
+    }
+  }
+
+  run padAlign8(&mut ehFrame.*, start)
+  let total = Bytes.length(&ehFrame.*) - start - 4
+  X86Encode.patchU32(&mut ehFrame.*, start, usize.toU64(total))
+  return relocOffset
+}
+
+effect fn advanceLoc(out: &mut Bytes, delta: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if delta <= 63 {
+    return run X86Encode.byte(&mut out.*, u8.bitOr(0x40, delta))
+  }
+  run X86Encode.byte(&mut out.*, 0x02) // DW_CFA_advance_loc1
+  return run X86Encode.byte(&mut out.*, delta)
+}
+
+effect fn padAlign8(out: &mut Bytes, start: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while (Bytes.length(&out.*) - start) % 8 != usize.ZERO {
+    run X86Encode.byte(&mut out.*, 0)
+  }
+  return ()
+}

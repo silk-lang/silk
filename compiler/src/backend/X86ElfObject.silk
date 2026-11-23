@@ -1,0 +1,689 @@
+//! Standard Linux x86-64 relocatable ELF64 (`.o`) writer.
+//!
+//! # When to use
+//! Call [`X86ElfObject.pack`] with concatenated encoded [`X86Object.Fragment`]s to emit a standard
+//! `ET_REL` / `EM_X86_64` ELF64 object file ready for linking by `lld`, `clang`, or Phase 2's
+//! `ElfLink`.
+//!
+//! # Details
+//! Sections are laid out in a fixed order:
+//! `0: (null)`, `1: .text`, `2: .rodata`, `3: .data`, `4: .tdata`, `5: silk_frames`,
+//! `6: .eh_frame`, `7: .note.GNU-stack`, `8: .rela.text`, `9: .rela.rodata`, `10: .rela.data`,
+//! `11: .rela.tdata`, `12: .rela.silk_frames`, `13: .rela.eh_frame`, `14: .symtab`,
+//! `15: .strtab`, `16: .shstrtab`.
+//!
+//! Local section symbols precede all `STB_GLOBAL` and `STB_WEAK` symbols in `.symtab`, satisfying
+//! the ELF64 `sh_info` invariant required by `ld.lld` and GNU `ld`. When any fragment carries a
+//! refusal entry, [`pack`] fails with [`X86Object.Unsupported`].
+
+import backend.X86Encode
+import backend.X86Object
+import backend.X86Object {Fragment, Function, Object, Pointer, Relocation, RelocationKind, RodataJumpEntry, Unsupported}
+import backend.X86Unwind
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+// Fixed section header indices.
+fn shNull() -> u64 { return 0 }
+fn shText() -> u64 { return 1 }
+fn shRodata() -> u64 { return 2 }
+fn shData() -> u64 { return 3 }
+fn shTdata() -> u64 { return 4 }
+fn shFrames() -> u64 { return 5 }
+fn shEhFrame() -> u64 { return 6 }
+fn shGnuStack() -> u64 { return 7 }
+fn shRelaText() -> u64 { return 8 }
+fn shRelaRodata() -> u64 { return 9 }
+fn shRelaData() -> u64 { return 10 }
+fn shRelaTdata() -> u64 { return 11 }
+fn shRelaFrames() -> u64 { return 12 }
+fn shRelaEhFrame() -> u64 { return 13 }
+fn shSymtab() -> u64 { return 14 }
+fn shStrtab() -> u64 { return 15 }
+fn shShstrtab() -> u64 { return 16 }
+fn shSeen() -> u64 { return 17 }
+fn sectionCount() -> u64 { return 18 }
+
+// ELF64 x86-64 relocation type codes.
+fn rX866464() -> u64 { return 1 }
+fn rX8664Pc32() -> u64 { return 2 }
+fn rX8664Plt32() -> u64 { return 4 }
+fn rX8664GotPcRel() -> u64 { return 9 }
+fn rX8664GotTpOff() -> u64 { return 22 }
+
+// ELF64 symbol binding/type helpers.
+fn stbLocal() -> u8 { return 0 }
+fn stbGlobal() -> u8 { return 1 }
+fn stbWeak() -> u8 { return 2 }
+fn sttNoType() -> u8 { return 0 }
+fn sttObject() -> u8 { return 1 }
+fn sttFunc() -> u8 { return 2 }
+fn sttSection() -> u8 { return 3 }
+fn sttTls() -> u8 { return 6 }
+fn stInfo(bind: u8, kind: u8) -> u8 { return u8.bitOr(u8.shiftLeft(bind, 4), u8.bitAnd(kind, 15)) }
+
+// Symbol record queued before final `.symtab` emission.
+struct ElfSym {
+  name: Bytes,
+  nameOff: u64,
+  bind: u8,
+  kind: u8,
+  shndx: u64,
+  value: u64,
+  size: u64,
+  defined: bool,
+  weak: bool,
+}
+
+// Relocation record queued before final `.rela.*` emission.
+struct ElfRela {
+  offset: u64,
+  symIndex: usize, // index in `globalSyms`, or `usize.MAX - sectionShndx` for section symbols
+  relType: u64,
+  addend: i64,
+  isSectionSym: bool,
+  sectionSym: u64,
+}
+
+impl Copy for ElfRela {}
+
+// Open-addressed hash table for deduplicating symbol names in O(1) amortized time.
+struct SymTable {
+  entries: List<ElfSym>,
+  buckets: List<usize>,
+  hashes: List<u64>,
+}
+
+effect fn symTableMake() -> SymTable ! OutOfMemoryError ? &mut Allocator {
+  let mut buckets = run List<usize>.makeWithCapacity(64)
+  let mut at = usize.ZERO
+  while at < 64 {
+    run List<usize>.append(&mut buckets, usize.MAX)
+    at = at + usize.ONE
+  }
+  return SymTable {entries: List<ElfSym>.make(), buckets: move buckets, hashes: List<u64>.make()}
+}
+
+fn hashName(name: &[u8]) -> u64 {
+  return InternIndex.hashBytes(Hash.mix(&Hash.seed(0), 0), name)
+}
+
+effect fn symTableGrow(table: &mut SymTable) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nextCap = List<usize>.length(&table.buckets) * 2
+  let mut buckets = run List<usize>.makeWithCapacity(nextCap)
+  let mut at = usize.ZERO
+  while at < nextCap {
+    run List<usize>.append(&mut buckets, usize.MAX)
+    at = at + usize.ONE
+  }
+  let mask = nextCap - usize.ONE
+  let hashes = List<u64>.asSlice(&table.hashes)
+  let bucketSlice = List<usize>.asMutSlice(&mut buckets)
+  at = usize.ZERO
+  while at < hashes.length {
+    let mut slot = u64.toUsize(hashes[at]) & mask
+    while bucketSlice[slot] != usize.MAX { slot = (slot + usize.ONE) & mask }
+    bucketSlice[slot] = at
+    at = at + usize.ONE
+  }
+  table.buckets = move buckets
+}
+
+effect fn symTableIntern(table: &mut SymTable, name: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let h = hashName(name)
+  let cap = List<usize>.length(&table.buckets)
+  if List<ElfSym>.length(&table.entries) * 2 >= cap {
+    run symTableGrow(&mut table.*)
+  }
+  let mask = List<usize>.length(&table.buckets) - usize.ONE
+  let buckets = List<usize>.asSlice(&table.buckets)
+  let entries = List<ElfSym>.asSlice(&table.entries)
+  let hashes = List<u64>.asSlice(&table.hashes)
+  let mut slot = u64.toUsize(h) & mask
+  while buckets[slot] != usize.MAX {
+    let idx = buckets[slot]
+    if hashes[idx] == h && same(Bytes.asSlice(&entries[idx].name), name) {
+      return idx
+    }
+    slot = (slot + usize.ONE) & mask
+  }
+  let idx = List<ElfSym>.length(&table.entries)
+  run List<ElfSym>.append(&mut table.entries, ElfSym {
+    name: run Bytes.copy(name),
+    nameOff: 0,
+    bind: stbGlobal(),
+    kind: sttNoType(),
+    shndx: 0,
+    value: 0,
+    size: 0,
+    defined: false,
+    weak: false,
+  })
+  run List<u64>.append(&mut table.hashes, h)
+  let bucketSlice = List<usize>.asMutSlice(&mut table.buckets)
+  bucketSlice[slot] = idx
+  return idx
+}
+
+/// Packs back-to-back encoded [`X86Object.Fragment`]s into a relocatable Linux x86-64 ELF64 `.o`
+/// byte buffer.
+pub effect fn pack(fragments: &[u8]) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let decoded = run X86Object.decode(fragments)
+  return run packFragment(&decoded)
+}
+
+/// Packs one decoded [`X86Object.Fragment`] into a relocatable Linux x86-64 ELF64 `.o` byte buffer.
+pub effect fn packFragment(fragment: &Fragment) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let refused = List<Bytes>.asSlice(&fragment.refused)
+  if refused.length > usize.ZERO {
+    fail Unsupported {detail: run Bytes.copy(Bytes.asSlice(&refused[usize.ZERO]))}
+  }
+
+  let mut text = Bytes.make()
+  let mut rodata = Bytes.make()
+  let mut data = Bytes.make()
+  let mut tdata = Bytes.make()
+  let mut frames = Bytes.make()
+  let mut ehFrame = Bytes.make()
+  run X86Unwind.appendCie(&mut ehFrame)
+
+  let mut relaText = List<ElfRela>.make()
+  let mut relaRodata = List<ElfRela>.make()
+  let mut relaData = List<ElfRela>.make()
+  let mut relaTdata = List<ElfRela>.make()
+  let mut relaFrames = List<ElfRela>.make()
+  let mut relaEhFrame = List<ElfRela>.make()
+
+  let mut syms = run symTableMake()
+
+  // Mark declared weak functions & objects (if not overridden by a strong definition).
+  let weakFns = List<Bytes>.asSlice(&fragment.weakFunctions)
+  let mut at = usize.ZERO
+  while at < weakFns.length {
+    let idx = run symTableIntern(&mut syms, Bytes.asSlice(&weakFns[at]))
+    let e = &mut List<ElfSym>.asMutSlice(&mut syms.entries)[idx]
+    if !e.defined {
+      e.bind = stbWeak()
+      e.kind = sttFunc()
+      e.weak = true
+    }
+    at = at + usize.ONE
+  }
+  let weakObjs = List<Bytes>.asSlice(&fragment.weakObjects)
+  at = usize.ZERO
+  while at < weakObjs.length {
+    let idx = run symTableIntern(&mut syms, Bytes.asSlice(&weakObjs[at]))
+    let e = &mut List<ElfSym>.asMutSlice(&mut syms.entries)[idx]
+    if !e.defined {
+      e.bind = stbWeak()
+      e.kind = sttObject()
+      e.weak = true
+    }
+    at = at + usize.ONE
+  }
+
+  // Emit all defined functions into `.text`, their local `.rodata`, and their `.eh_frame` FDEs.
+  let functions = List<Function>.asSlice(&fragment.functions)
+  at = usize.ZERO
+  while at < functions.length {
+    let f = &functions[at]
+    let symIdx = run symTableIntern(&mut syms, Bytes.asSlice(&f.symbol))
+    if List<ElfSym>.asSlice(&syms.entries)[symIdx].defined {
+      at = at + usize.ONE
+      continue
+    }
+    run alignTo(&mut text, 16, 0x90)
+    let codeBase = Bytes.length(&text)
+    let codeSlice = Bytes.asSlice(&f.code)
+    let codeSize = codeSlice.length
+    run Bytes.append(&mut text, codeSlice)
+
+    // Local `.rodata` pool for this function (16-byte aligned for XMM vector loads).
+    let roSlice = Bytes.asSlice(&f.rodata)
+    let mut roBase = Bytes.length(&rodata)
+    if roSlice.length > usize.ZERO {
+      run alignTo(&mut rodata, 16, 0)
+      roBase = Bytes.length(&rodata)
+      run Bytes.append(&mut rodata, roSlice)
+    }
+
+    // Define the function's primary symbol (and optional export alias).
+    let entry = &mut List<ElfSym>.asMutSlice(&mut syms.entries)[symIdx]
+    entry.bind = stbGlobal()
+    entry.kind = sttFunc()
+    entry.shndx = shText()
+    entry.value = usize.toU64(codeBase)
+    entry.size = usize.toU64(codeSize)
+    entry.defined = true
+
+    let exp = Bytes.asSlice(&f.exported)
+    if exp.length > usize.ZERO && !same(exp, Bytes.asSlice(&f.symbol)) {
+      let expIdx = run symTableIntern(&mut syms, exp)
+      let expEntry = &mut List<ElfSym>.asMutSlice(&mut syms.entries)[expIdx]
+      expEntry.bind = stbGlobal()
+      expEntry.kind = sttFunc()
+      expEntry.shndx = shText()
+      expEntry.value = usize.toU64(codeBase)
+      expEntry.size = usize.toU64(codeSize)
+      expEntry.defined = true
+    }
+
+    // Emit `.text` relocations.
+    let fSyms = List<Bytes>.asSlice(&f.symbols)
+    let fRelocs = List<Relocation>.asSlice(&f.relocations)
+    let mut r = usize.ZERO
+    while r < fRelocs.length {
+      let rel = fRelocs[r]
+      let patchOffset = usize.toU64(codeBase + rel.offset)
+      match rel.kind {
+        RelocationKind.LocalRodataPc32 => {
+          // Target is `.rodata + roBase + rel.addend`, PC-relative displacement sits 4 bytes before
+          // next RIP (caller includes any trailing immediate adjustment in `rel.addend`? Here
+          // `rel.addend` is the exact offset in `f.rodata`, so ELF addend = roBase + rel.addend - 4).
+          let addend = usize.toI64(roBase) + rel.addend - 4
+          run List<ElfRela>.append(&mut relaText, ElfRela {
+            offset: patchOffset, symIndex: usize.ZERO, relType: rX8664Pc32(), addend: addend,
+            isSectionSym: true, sectionSym: shRodata(),
+          })
+        }
+        _ => {
+          let targetIdx = run symTableIntern(&mut syms, Bytes.asSlice(&fSyms[rel.target]))
+          let relType = match rel.kind {
+            RelocationKind.Pc32 => rX8664Pc32()
+            RelocationKind.Plt32 => rX8664Plt32()
+            RelocationKind.Abs64 => rX866464()
+            RelocationKind.GotPcRel => rX8664GotPcRel()
+            RelocationKind.GotTpOff => rX8664GotTpOff()
+            RelocationKind.LocalRodataPc32 => rX8664Pc32()
+          }
+          run List<ElfRela>.append(&mut relaText, ElfRela {
+            offset: patchOffset, symIndex: targetIdx, relType: relType, addend: rel.addend,
+            isSectionSym: false, sectionSym: 0,
+          })
+        }
+      }
+      r = r + usize.ONE
+    }
+
+    // Emit `.rodata` PIC jump-table entries: each 4-byte slot computes
+    // `(text + codeBase + targetCodeOffset) - (rodata + roBase + tableOffset)`.
+    // Since `R_X86_64_PC32` computes `S + A - P` where `P = rodata + roBase + rodataOffset`,
+    // setting `S = .text`, `A = codeBase + targetCodeOffset + (rodataOffset - tableOffset)` yields
+    // `S + A - P = (text + codeBase + targetCodeOffset) - (rodata + roBase + tableOffset)`!
+    let fJumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+    let mut j = usize.ZERO
+    while j < fJumps.length {
+      let je = fJumps[j]
+      let addend = usize.toI64(codeBase + je.targetCodeOffset) + usize.toI64(je.rodataOffset) - usize.toI64(je.tableOffset)
+      run List<ElfRela>.append(&mut relaRodata, ElfRela {
+        offset: usize.toU64(roBase + je.rodataOffset), symIndex: usize.ZERO, relType: rX8664Pc32(),
+        addend: addend, isSectionSym: true, sectionSym: shText(),
+      })
+      j = j + usize.ONE
+    }
+
+    // Emit `.eh_frame` FDE referencing `.text + codeBase` via `R_X86_64_PC32`!
+    let fdeReloc = run X86Unwind.appendFde(&mut ehFrame, usize.toU64(codeSize), f.unwind)
+    run List<ElfRela>.append(&mut relaEhFrame, ElfRela {
+      offset: usize.toU64(fdeReloc), symIndex: usize.ZERO, relType: rX8664Pc32(),
+      addend: usize.toI64(codeBase), isSectionSym: true, sectionSym: shText(),
+    })
+
+    at = at + usize.ONE
+  }
+
+  // Emit all static data objects into `.rodata`, `.data`, `.tdata`, or `silk_frames`.
+  let objects = List<Object>.asSlice(&fragment.objects)
+  at = usize.ZERO
+  while at < objects.length {
+    let obj = &objects[at]
+    let mut objSymIdx = usize.MAX
+    if Bytes.length(&obj.symbol) > usize.ZERO {
+      objSymIdx = run symTableIntern(&mut syms, Bytes.asSlice(&obj.symbol))
+      if List<ElfSym>.asSlice(&syms.entries)[objSymIdx].defined {
+        at = at + usize.ONE
+        continue
+      }
+    }
+    let align = if obj.alignment == 0 { usize.ONE } else { u64.toUsize(obj.alignment) }
+    let img = Bytes.asSlice(&obj.image)
+    let ptrs = List<Pointer>.asSlice(&obj.pointers)
+    let mut targetShndx = shData()
+    let mut base = usize.ZERO
+    let mut symKind = sttObject()
+    if obj.framed {
+      targetShndx = shFrames()
+      run alignTo(&mut frames, align, 0)
+      base = Bytes.length(&frames)
+      run Bytes.append(&mut frames, img)
+    } else if obj.local {
+      targetShndx = shTdata()
+      symKind = sttTls()
+      run alignTo(&mut tdata, align, 0)
+      base = Bytes.length(&tdata)
+      run Bytes.append(&mut tdata, img)
+    } else if obj.readonly && ptrs.length == usize.ZERO {
+      targetShndx = shRodata()
+      run alignTo(&mut rodata, align, 0)
+      base = Bytes.length(&rodata)
+      run Bytes.append(&mut rodata, img)
+    } else {
+      targetShndx = shData()
+      run alignTo(&mut data, align, 0)
+      base = Bytes.length(&data)
+      run Bytes.append(&mut data, img)
+    }
+
+    if objSymIdx != usize.MAX {
+      let e = &mut List<ElfSym>.asMutSlice(&mut syms.entries)[objSymIdx]
+      e.bind = stbGlobal()
+      e.kind = symKind
+      e.shndx = targetShndx
+      e.value = usize.toU64(base)
+      e.size = usize.toU64(img.length)
+      e.defined = true
+    }
+
+    let mut p = usize.ZERO
+    while p < ptrs.length {
+      let ptr = &ptrs[p]
+      let targetIdx = run symTableIntern(&mut syms, Bytes.asSlice(&ptr.symbol))
+      let rela = ElfRela {
+        offset: usize.toU64(base + ptr.offset),
+        symIndex: targetIdx,
+        relType: rX866464(),
+        addend: u64.wrappingToI64(ptr.addend),
+        isSectionSym: false,
+        sectionSym: 0,
+      }
+      if targetShndx == shFrames() {
+        run List<ElfRela>.append(&mut relaFrames, rela)
+      } else if targetShndx == shTdata() {
+        run List<ElfRela>.append(&mut relaTdata, rela)
+      } else {
+        run List<ElfRela>.append(&mut relaData, rela)
+      }
+      p = p + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+
+  // Build `.shstrtab` (section header string table).
+  let mut shstrtab = Bytes.make()
+  run X86Encode.byte(&mut shstrtab, 0)
+  let nameText = run appendStr(&mut shstrtab, b".text")
+  let nameRodata = run appendStr(&mut shstrtab, b".rodata")
+  let nameData = run appendStr(&mut shstrtab, b".data")
+  let nameTdata = run appendStr(&mut shstrtab, b".tdata")
+  let nameFrames = run appendStr(&mut shstrtab, b"silk_frames")
+  let nameEhFrame = run appendStr(&mut shstrtab, b".eh_frame")
+  let nameGnuStack = run appendStr(&mut shstrtab, b".note.GNU-stack")
+  let nameRelaText = run appendStr(&mut shstrtab, b".rela.text")
+  let nameRelaRodata = run appendStr(&mut shstrtab, b".rela.rodata")
+  let nameRelaData = run appendStr(&mut shstrtab, b".rela.data")
+  let nameRelaTdata = run appendStr(&mut shstrtab, b".rela.tdata")
+  let nameRelaFrames = run appendStr(&mut shstrtab, b".rela.silk_frames")
+  let nameRelaEhFrame = run appendStr(&mut shstrtab, b".rela.eh_frame")
+  let nameSymtab = run appendStr(&mut shstrtab, b".symtab")
+  let nameStrtab = run appendStr(&mut shstrtab, b".strtab")
+  let nameShstrtab = run appendStr(&mut shstrtab, b".shstrtab")
+  let nameSeen = run appendStr(&mut shstrtab, b"silk_seen")
+
+  // Build `.strtab` and `.symtab`.
+  // Local symbols come first:
+  //   0: STN_UNDEF
+  //   1: SECTION .text (shText)
+  //   2: SECTION .rodata (shRodata)
+  //   3: SECTION .data (shData)
+  //   4: SECTION .tdata (shTdata)
+  //   5: SECTION silk_frames (shFrames)
+  //   6: SECTION .eh_frame (shEhFrame)
+  // First global symbol index (`sh_info` of `.symtab`) = 7!
+  let firstGlobal: u64 = 7
+  let mut strtab = Bytes.make()
+  run X86Encode.byte(&mut strtab, 0)
+  let mut symtab = Bytes.make()
+  // 0: null symbol (24 bytes of zero).
+  run appendElfSym(&mut symtab, 0, 0, 0, 0, 0)
+  // 1..6: section symbols for sections 1..6.
+  let mut sec: u64 = 1
+  while sec <= 6 {
+    run appendElfSym(&mut symtab, 0, stInfo(stbLocal(), sttSection()), sec, 0, 0)
+    sec = sec + 1
+  }
+  // 7..: global and weak symbols from `syms.entries`.
+  let symList = List<ElfSym>.asMutSlice(&mut syms.entries)
+  at = usize.ZERO
+  while at < symList.length {
+    let off = run appendStr(&mut strtab, Bytes.asSlice(&symList[at].name))
+    symList[at].nameOff = off
+    run appendElfSym(
+      &mut symtab,
+      off,
+      stInfo(symList[at].bind, symList[at].kind),
+      symList[at].shndx,
+      symList[at].value,
+      symList[at].size,
+    )
+    at = at + usize.ONE
+  }
+
+  // Encode all `.rela.*` sections.
+  let relaTextBytes = run encodeRelas(List<ElfRela>.asSlice(&relaText), firstGlobal)
+  let relaRodataBytes = run encodeRelas(List<ElfRela>.asSlice(&relaRodata), firstGlobal)
+  let relaDataBytes = run encodeRelas(List<ElfRela>.asSlice(&relaData), firstGlobal)
+  let relaTdataBytes = run encodeRelas(List<ElfRela>.asSlice(&relaTdata), firstGlobal)
+  let relaFramesBytes = run encodeRelas(List<ElfRela>.asSlice(&relaFrames), firstGlobal)
+  let relaEhFrameBytes = run encodeRelas(List<ElfRela>.asSlice(&relaEhFrame), firstGlobal)
+
+  // Assemble final ELF64 file image: 64-byte Elf64_Ehdr, section payloads, then 18 Elf64_Shdr.
+  let mut out = Bytes.make()
+  // Reserve 64-byte ELF64 header (patched once `e_shoff` is known).
+  let mut z = usize.ZERO
+  while z < 64 {
+    run X86Encode.byte(&mut out, 0)
+    z = z + usize.ONE
+  }
+
+  let offText = run appendSectionPayload(&mut out, Bytes.asSlice(&text), 16)
+  let offRodata = run appendSectionPayload(&mut out, Bytes.asSlice(&rodata), 16)
+  let offData = run appendSectionPayload(&mut out, Bytes.asSlice(&data), 16)
+  let offTdata = run appendSectionPayload(&mut out, Bytes.asSlice(&tdata), 16)
+  let offFrames = run appendSectionPayload(&mut out, Bytes.asSlice(&frames), 8)
+  let offEhFrame = run appendSectionPayload(&mut out, Bytes.asSlice(&ehFrame), 8)
+  let offGnuStack = usize.toU64(Bytes.length(&out))
+  let offRelaText = run appendSectionPayload(&mut out, Bytes.asSlice(&relaTextBytes), 8)
+  let offRelaRodata = run appendSectionPayload(&mut out, Bytes.asSlice(&relaRodataBytes), 8)
+  let offRelaData = run appendSectionPayload(&mut out, Bytes.asSlice(&relaDataBytes), 8)
+  let offRelaTdata = run appendSectionPayload(&mut out, Bytes.asSlice(&relaTdataBytes), 8)
+  let offRelaFrames = run appendSectionPayload(&mut out, Bytes.asSlice(&relaFramesBytes), 8)
+  let offRelaEhFrame = run appendSectionPayload(&mut out, Bytes.asSlice(&relaEhFrameBytes), 8)
+  let offSymtab = run appendSectionPayload(&mut out, Bytes.asSlice(&symtab), 8)
+  let offStrtab = run appendSectionPayload(&mut out, Bytes.asSlice(&strtab), 1)
+  let offShstrtab = run appendSectionPayload(&mut out, Bytes.asSlice(&shstrtab), 1)
+  let offSeen = usize.toU64(Bytes.length(&out))
+
+  run alignTo(&mut out, 8, 0)
+  let shoff = usize.toU64(Bytes.length(&out))
+
+  // Write the 18 section headers (64 bytes each).
+  // 0: SHT_NULL
+  run appendShdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+  // 1: .text (SHT_PROGBITS=1, SHF_ALLOC|SHF_EXECINSTR=0x6)
+  run appendShdr(&mut out, nameText, 1, 0x6, offText, usize.toU64(Bytes.length(&text)), 0, 0, 16, 0)
+  // 2: .rodata (SHT_PROGBITS=1, SHF_ALLOC=0x2)
+  run appendShdr(&mut out, nameRodata, 1, 0x2, offRodata, usize.toU64(Bytes.length(&rodata)), 0, 0, 16, 0)
+  // 3: .data (SHT_PROGBITS=1, SHF_WRITE|SHF_ALLOC=0x3)
+  run appendShdr(&mut out, nameData, 1, 0x3, offData, usize.toU64(Bytes.length(&data)), 0, 0, 16, 0)
+  // 4: .tdata (SHT_PROGBITS=1, SHF_WRITE|SHF_ALLOC|SHF_TLS=0x403)
+  run appendShdr(&mut out, nameTdata, 1, 0x403, offTdata, usize.toU64(Bytes.length(&tdata)), 0, 0, 16, 0)
+  // 5: silk_frames (SHT_PROGBITS=1, SHF_WRITE|SHF_ALLOC=0x3)
+  run appendShdr(&mut out, nameFrames, 1, 0x3, offFrames, usize.toU64(Bytes.length(&frames)), 0, 0, 8, 0)
+  // 6: .eh_frame (SHT_PROGBITS=1, SHF_ALLOC=0x2)
+  run appendShdr(&mut out, nameEhFrame, 1, 0x2, offEhFrame, usize.toU64(Bytes.length(&ehFrame)), 0, 0, 8, 0)
+  // 7: .note.GNU-stack (SHT_PROGBITS=1, flags=0 -> non-executable stack)
+  run appendShdr(&mut out, nameGnuStack, 1, 0, offGnuStack, 0, 0, 0, 1, 0)
+  // 8..13: .rela.* (SHT_RELA=4, SHF_INFO_LINK=0x40, link=.symtab, info=target section, entsize=24)
+  run appendShdr(&mut out, nameRelaText, 4, 0x40, offRelaText, usize.toU64(Bytes.length(&relaTextBytes)), shSymtab(), shText(), 8, 24)
+  run appendShdr(&mut out, nameRelaRodata, 4, 0x40, offRelaRodata, usize.toU64(Bytes.length(&relaRodataBytes)), shSymtab(), shRodata(), 8, 24)
+  run appendShdr(&mut out, nameRelaData, 4, 0x40, offRelaData, usize.toU64(Bytes.length(&relaDataBytes)), shSymtab(), shData(), 8, 24)
+  run appendShdr(&mut out, nameRelaTdata, 4, 0x40, offRelaTdata, usize.toU64(Bytes.length(&relaTdataBytes)), shSymtab(), shTdata(), 8, 24)
+  run appendShdr(&mut out, nameRelaFrames, 4, 0x40, offRelaFrames, usize.toU64(Bytes.length(&relaFramesBytes)), shSymtab(), shFrames(), 8, 24)
+  run appendShdr(&mut out, nameRelaEhFrame, 4, 0x40, offRelaEhFrame, usize.toU64(Bytes.length(&relaEhFrameBytes)), shSymtab(), shEhFrame(), 8, 24)
+  // 14: .symtab (SHT_SYMTAB=2, link=.strtab, info=firstGlobal, entsize=24)
+  run appendShdr(&mut out, nameSymtab, 2, 0, offSymtab, usize.toU64(Bytes.length(&symtab)), shStrtab(), firstGlobal, 8, 24)
+  // 15: .strtab (SHT_STRTAB=3)
+  run appendShdr(&mut out, nameStrtab, 3, 0, offStrtab, usize.toU64(Bytes.length(&strtab)), 0, 0, 1, 0)
+  // 16: .shstrtab (SHT_STRTAB=3)
+  run appendShdr(&mut out, nameShstrtab, 3, 0, offShstrtab, usize.toU64(Bytes.length(&shstrtab)), 0, 0, 1, 0)
+  // 17: silk_seen (SHT_PROGBITS=1, SHF_WRITE|SHF_ALLOC=0x3 -> defines __start_silk_seen / __stop_silk_seen)
+  run appendShdr(&mut out, nameSeen, 1, 0x3, offSeen, 0, 0, 0, 1, 0)
+
+  // Patch the 64-byte Elf64_Ehdr at offset 0.
+  writeEhdr(&mut out, shoff)
+  return move out
+}
+
+fn writeEhdr(out: &mut Bytes, shoff: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  // e_ident: 0x7F 'E' 'L' 'F', ELFCLASS64(2), ELFDATA2LSB(1), EV_CURRENT(1), ELFOSABI_NONE(0)
+  buf[0] = 0x7F
+  buf[1] = 0x45
+  buf[2] = 0x4C
+  buf[3] = 0x46
+  buf[4] = 2
+  buf[5] = 1
+  buf[6] = 1
+  buf[7] = 0
+  // e_type = ET_REL (1) at offset 16
+  putU16(&mut out.*, 16, 1)
+  // e_machine = EM_X86_64 (62) at offset 18
+  putU16(&mut out.*, 18, 62)
+  // e_version = EV_CURRENT (1) at offset 20
+  putU32(&mut out.*, 20, 1)
+  // e_shoff at offset 40
+  putU64(&mut out.*, 40, shoff)
+  // e_ehsize = 64 at offset 52
+  putU16(&mut out.*, 52, 64)
+  // e_shentsize = 64 at offset 58
+  putU16(&mut out.*, 58, 64)
+  // e_shnum at offset 60
+  putU16(&mut out.*, 60, sectionCount())
+  // e_shstrndx at offset 62
+  putU16(&mut out.*, 62, shShstrtab())
+}
+
+fn putU16(out: &mut Bytes, at: usize, value: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  buf[at] = u64.wrappingToU8(value & 255)
+  buf[at + 1] = u64.wrappingToU8(u64.shiftRight(value, 8) & 255)
+}
+
+fn putU32(out: &mut Bytes, at: usize, value: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  buf[at] = u64.wrappingToU8(value & 255)
+  buf[at + 1] = u64.wrappingToU8(u64.shiftRight(value, 8) & 255)
+  buf[at + 2] = u64.wrappingToU8(u64.shiftRight(value, 16) & 255)
+  buf[at + 3] = u64.wrappingToU8(u64.shiftRight(value, 24) & 255)
+}
+
+fn putU64(out: &mut Bytes, at: usize, value: u64) -> () {
+  putU32(&mut out.*, at, value)
+  putU32(&mut out.*, at + 4, u64.shiftRight(value, 32))
+}
+
+effect fn alignTo(out: &mut Bytes, align: usize, fill: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= usize.ONE { return () }
+  let rem = Bytes.length(&out.*) % align
+  if rem == usize.ZERO { return () }
+  let mut pad = align - rem
+  while pad > usize.ZERO {
+    run X86Encode.byte(&mut out.*, fill)
+    pad = pad - usize.ONE
+  }
+  return ()
+}
+
+effect fn appendSectionPayload(out: &mut Bytes, payload: &[u8], align: usize) -> u64
+! OutOfMemoryError ? &mut Allocator {
+  run alignTo(&mut out.*, align, 0)
+  let off = usize.toU64(Bytes.length(&out.*))
+  if payload.length > usize.ZERO {
+    run Bytes.append(&mut out.*, payload)
+  }
+  return off
+}
+
+effect fn appendStr(table: &mut Bytes, text: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let off = usize.toU64(Bytes.length(&table.*))
+  run Bytes.append(&mut table.*, text)
+  run X86Encode.byte(&mut table.*, 0)
+  return off
+}
+
+effect fn appendElfSym(out: &mut Bytes, nameOff: u64, info: u8, shndx: u64, value: u64, size: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.u32Le(&mut out.*, nameOff)
+  run X86Encode.byte(&mut out.*, info)
+  run X86Encode.byte(&mut out.*, 0) // st_other = STV_DEFAULT
+  run X86Encode.u16Le(&mut out.*, shndx)
+  run X86Encode.u64Le(&mut out.*, value)
+  return run X86Encode.u64Le(&mut out.*, size)
+}
+
+effect fn encodeRelas(relas: &[ElfRela], firstGlobal: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  let mut at = usize.ZERO
+  while at < relas.length {
+    let r = relas[at]
+    let elfSym = if r.isSectionSym { r.sectionSym } else { firstGlobal + usize.toU64(r.symIndex) }
+    let rInfo = u64.shiftLeft(elfSym, 32) | (r.relType & 0xFFFFFFFF)
+    run X86Encode.u64Le(&mut out, r.offset)
+    run X86Encode.u64Le(&mut out, rInfo)
+    run X86Encode.u64Le(&mut out, i64.wrappingToU64(r.addend))
+    at = at + usize.ONE
+  }
+  return move out
+}
+
+effect fn appendShdr(
+  out: &mut Bytes,
+  name: u64,
+  shType: u64,
+  flags: u64,
+  offset: u64,
+  size: u64,
+  link: u64,
+  info: u64,
+  addralign: u64,
+  entsize: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.u32Le(&mut out.*, name)
+  run X86Encode.u32Le(&mut out.*, shType)
+  run X86Encode.u64Le(&mut out.*, flags)
+  run X86Encode.u64Le(&mut out.*, 0) // sh_addr = 0 for ET_REL
+  run X86Encode.u64Le(&mut out.*, offset)
+  run X86Encode.u64Le(&mut out.*, size)
+  run X86Encode.u32Le(&mut out.*, link)
+  run X86Encode.u32Le(&mut out.*, info)
+  run X86Encode.u64Le(&mut out.*, addralign)
+  return run X86Encode.u64Le(&mut out.*, entsize)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}

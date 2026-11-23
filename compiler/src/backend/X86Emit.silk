@@ -1,0 +1,3920 @@
+//! Linux x86-64 machine-code emitter translating one finished [`SsaFunction`] into an
+//! [`X86Object.Function`] (System V AMD64 ABI).
+//!
+//! # When to use
+//! Call [`X86Emit.emit`] on each lowered, prepared [`SsaFunction`] produced by `SsaLower` for
+//! `x86_64-unknown-linux-gnu`.
+//!
+//! # Details
+//! - Uses `X86Frame.plan` for `StackLifetimes`-colored MIR stack slots and live-interval-colored
+//!   SSA value home slots, keeping `rbp` as the frame pointer and maintaining 16-byte `rsp`
+//!   alignment at every `call`.
+//! - Covers all target-neutral `SsaFunction` operations: `i1`..`i128` integers, IEEE 754 `f32`/
+//!   `f64`, saturating float-to-int conversions, 128-bit div/rem via built-in `__silk_*ti3`
+//!   helpers, `memmove`/`rep stosb` bulk memory, Initial-Exec TLS (`R_X86_64_GOTTPOFF` + `fs:[0]`),
+//!   TSO/LOCK atomics, SysV AMD64 C ABI calls & 2-register coerced struct returns, `sret`/`byval`,
+//!   variadic C calls and exports (`VaStart`/`VaEnd`), validated native inline assembly via
+//!   `X86Asm`, SIMD vectors of arbitrary lane width, and all 19 x86-64 `ArchOperation` intrinsics.
+
+import backend.SsaFunction {
+  AbiExtension,
+  ArchOperation,
+  Binary,
+  CallAbi,
+  CallingConvention,
+  Cast,
+  Constant,
+  ConstantForm,
+  Count,
+  Definition,
+  Edge,
+  Exit,
+  Extreme,
+  InlineAsm,
+  Instruction,
+  Kind,
+  Modify,
+  Operation,
+  ParameterAbi,
+  Predicate,
+  Reduction,
+  SsaFunction,
+  none,
+}
+import backend.X86Asm
+import backend.X86Asm {AsmCallReloc, Constraint, ConstraintKind, OperandBinding, UnsupportedAsm}
+import backend.X86Encode
+import backend.X86Encode {Alu, Mem, Shift}
+import backend.X86Frame
+import backend.X86Frame {FramePlan}
+import backend.X86Object
+import backend.X86Object {Function, Relocation, RelocationKind, RodataJumpEntry, Unsupported}
+import backend.X86Unwind {UnwindInfo}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i32
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+struct BlockPatch {
+  patchAt: usize,
+  targetBlock: usize,
+}
+
+impl Copy for BlockPatch {}
+
+struct JumpEntryRef {
+  rodataOffset: usize,
+  tableOffset: usize,
+  targetBlock: usize,
+}
+
+impl Copy for JumpEntryRef {}
+
+struct Emitter {
+  code: Bytes,
+  relocations: List<Relocation>,
+  symbols: List<Bytes>,
+  rodata: Bytes,
+  rodataJumps: List<RodataJumpEntry>,
+  jumpRefs: List<JumpEntryRef>,
+  locations: List<u64>,
+  blockOffsets: List<usize>,
+  blockPatches: List<BlockPatch>,
+  frame: FramePlan,
+  fixedGpCount: usize,
+  fixedFpCount: usize,
+  fixedStackBytes: u64,
+  unwind: UnwindInfo,
+  symbol: Bytes,
+}
+
+/// Emits x86-64 Linux ELF64 machine code for `function` under `symbol` (and optional `exported`
+/// C alias).
+pub effect fn emit(function: &SsaFunction, symbol: &[u8], exported: &[u8]) -> Function
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let frame = run X86Frame.plan(function)
+  let blockCount = function.blockCount()
+  let mut blockOffsets = run List<usize>.makeWithCapacity(blockCount)
+  let mut b = usize.ZERO
+  while b < blockCount {
+    run List<usize>.append(&mut blockOffsets, usize.ZERO)
+    b = b + usize.ONE
+  }
+  let mut em = Emitter {
+    code: Bytes.make(),
+    relocations: List<Relocation>.make(),
+    symbols: List<Bytes>.make(),
+    rodata: Bytes.make(),
+    rodataJumps: List<RodataJumpEntry>.make(),
+    jumpRefs: List<JumpEntryRef>.make(),
+    locations: List<u64>.make(),
+    blockOffsets: move blockOffsets,
+    blockPatches: List<BlockPatch>.make(),
+    frame: move frame,
+    fixedGpCount: usize.ZERO,
+    fixedFpCount: usize.ZERO,
+    fixedStackBytes: 0,
+    unwind: UnwindInfo.frameOnly(),
+    symbol: run Bytes.copy(symbol),
+  }
+
+  let naked = isNakedFunction(function)
+  if naked {
+    em.unwind = UnwindInfo.naked()
+  } else {
+    run emitPrologue(&mut em, function)
+    run emitIncomingParams(&mut em, function)
+  }
+
+  b = usize.ZERO
+  while b < blockCount {
+    let off = Bytes.length(&em.code)
+    let bOffMut = List<usize>.asMutSlice(&mut em.blockOffsets)
+    bOffMut[b] = off
+    let blk = function.block(b)
+    if blk.startPlace != 0 {
+      run recordLocation(&mut em, blk.startPlace)
+    }
+    let insts = List<usize>.asSlice(&blk.instructions)
+    let mut i = usize.ZERO
+    while i < insts.length {
+      let inst = function.instruction(insts[i])
+      if !inst.removed {
+        if inst.place != 0 {
+          run recordLocation(&mut em, inst.place)
+        }
+        run emitInstruction(&mut em, function, insts[i])
+      }
+      i = i + usize.ONE
+    }
+    if blk.place != 0 {
+      run recordLocation(&mut em, blk.place)
+    }
+    run emitExit(&mut em, function, b, naked)
+    b = b + usize.ONE
+  }
+
+  // Patch all local block jumps and record jump-table entries.
+  let bOffs = List<usize>.asSlice(&em.blockOffsets)
+  let patches = List<BlockPatch>.asSlice(&em.blockPatches)
+  let mut p = usize.ZERO
+  while p < patches.length {
+    X86Encode.patchRel32(&mut em.code, patches[p].patchAt, bOffs[patches[p].targetBlock])
+    p = p + usize.ONE
+  }
+  let jRefs = List<JumpEntryRef>.asSlice(&em.jumpRefs)
+  p = usize.ZERO
+  while p < jRefs.length {
+    run List<RodataJumpEntry>.append(&mut em.rodataJumps, RodataJumpEntry {
+      rodataOffset: jRefs[p].rodataOffset,
+      tableOffset: jRefs[p].tableOffset,
+      targetCodeOffset: bOffs[jRefs[p].targetBlock],
+    })
+    p = p + usize.ONE
+  }
+
+  return Function {
+    symbol: move em.symbol,
+    exported: run Bytes.copy(exported),
+    code: move em.code,
+    relocations: move em.relocations,
+    symbols: move em.symbols,
+    rodata: move em.rodata,
+    rodataJumps: move em.rodataJumps,
+    unwind: em.unwind,
+    locations: move em.locations,
+  }
+}
+
+fn isNakedFunction(function: &SsaFunction) -> bool {
+  if List<u64>.length(&function.arguments) != usize.ZERO || function.slotCount() != usize.ZERO || function.blockCount() != usize.ONE {
+    return false
+  }
+  let blk = function.block(usize.ZERO)
+  if blk.exit != Exit.Unreachable { return false }
+  let insts = List<usize>.asSlice(&blk.instructions)
+  let mut liveCount = usize.ZERO
+  let mut hasNoReturnAsm = false
+  let mut i = usize.ZERO
+  while i < insts.length {
+    let inst = function.instruction(insts[i])
+    if !inst.removed {
+      liveCount = liveCount + usize.ONE
+      if let Operation.InlineAsm {noReturn, ..} = inst.operation {
+        if noReturn && inst.operandCount == usize.ZERO && inst.kind.isUnit() {
+          hasNoReturnAsm = true
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+  return liveCount == usize.ONE && hasNoReturnAsm
+}
+
+effect fn recordLocation(em: &mut Emitter, place: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let off = usize.toU64(Bytes.length(&em.code))
+  run List<u64>.append(&mut em.locations, off)
+  return run List<u64>.append(&mut em.locations, place)
+}
+
+effect fn internSymbol(em: &mut Emitter, name: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let syms = List<Bytes>.asSlice(&em.symbols)
+  let mut at = usize.ZERO
+  while at < syms.length {
+    if same(Bytes.asSlice(&syms[at]), name) { return at }
+    at = at + usize.ONE
+  }
+  let idx = syms.length
+  run List<Bytes>.append(&mut em.symbols, run Bytes.copy(name))
+  return idx
+}
+
+effect fn addReloc(em: &mut Emitter, offset: usize, kind: RelocationKind, name: &[u8], addend: i64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let target = run internSymbol(&mut em.*, name)
+  return run List<Relocation>.append(&mut em.relocations, Relocation {
+    offset: offset, kind: kind, target: target, addend: addend,
+  })
+}
+
+effect fn addRodata16(em: &mut Emitter, bytes: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  while Bytes.length(&em.rodata) % 16 != usize.ZERO {
+    run X86Encode.byte(&mut em.rodata, 0)
+  }
+  let off = Bytes.length(&em.rodata)
+  run Bytes.append(&mut em.rodata, bytes)
+  return off
+}
+
+effect fn addRodataReloc(em: &mut Emitter, codeOffset: usize, rodataOffset: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  return run List<Relocation>.append(&mut em.relocations, Relocation {
+    offset: codeOffset, kind: RelocationKind.LocalRodataPc32, target: usize.ZERO, addend: usize.toI64(rodataOffset),
+  })
+}
+
+fn patchHere(em: &mut Emitter, patchAt: usize) -> () {
+  let here = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, patchAt, here)
+}
+
+effect fn callExternal(em: &mut Emitter, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let callAt = run X86Encode.callRel32(&mut em.code)
+  return run addReloc(&mut em.*, callAt, RelocationKind.Plt32, name, -4)
+}
+
+// SysV AMD64 GP argument registers: rdi, rsi, rdx, rcx, r8, r9.
+fn sysvGpArg(index: usize) -> u8 {
+  if index == 0 { return X86Encode.rdi() }
+  if index == 1 { return X86Encode.rsi() }
+  if index == 2 { return X86Encode.rdx() }
+  if index == 3 { return X86Encode.rcx() }
+  if index == 4 { return X86Encode.r8() }
+  return X86Encode.r9()
+}
+
+// ---- Prologue, Incoming Parameters, Epilogue ----
+
+effect fn emitPrologue(em: &mut Emitter, function: &SsaFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&em.code)
+  run X86Encode.push(&mut em.code, X86Encode.rbp())
+  let pushEnd = u64.wrappingToU8(usize.toU64(Bytes.length(&em.code) - start))
+  run X86Encode.movRr64(&mut em.code, X86Encode.rbp(), X86Encode.rsp())
+  let movEnd = u64.wrappingToU8(usize.toU64(Bytes.length(&em.code) - start))
+
+  // Push any callee-saved GPRs needed by inline asm or cmpxchg16b.
+  let mask = em.frame.savedCalleeMask
+  let mut r: u8 = 0
+  while r < 16 {
+    if (mask & u64.shiftLeft(1, u8.toU64(r))) != 0 {
+      run X86Encode.push(&mut em.code, r)
+    }
+    r = r + 1
+  }
+  let savesEnd = u64.wrappingToU8(usize.toU64(Bytes.length(&em.code) - start))
+  em.unwind = UnwindInfo {
+    hasFramePointer: true,
+    pushRbpEnd: pushEnd,
+    movRbpEnd: movEnd,
+    savedCalleeMask: mask,
+    savesEnd: savesEnd,
+  }
+
+  let subBytes = em.frame.subRspBytes
+  if subBytes > 0 {
+    if subBytes <= 2147483647 {
+      run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), u64.wrappingToI32(subBytes))
+    } else {
+      run X86Encode.movImm64(&mut em.code, X86Encode.r11(), subBytes)
+      run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rsp(), X86Encode.r11())
+    }
+  }
+
+  // Variadic C export prologue: save all 6 GP arg regs + 8 XMM arg regs (when AL != 0) into
+  // `[rbp + regSaveOffset]`.
+  if em.frame.hasVaStart {
+    let base = em.frame.regSaveOffset
+    let mut g = usize.ZERO
+    while g < 6 {
+      drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), base + usize.toI32(g * 8)), sysvGpArg(g))
+      g = g + usize.ONE
+    }
+    run X86Encode.testRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+    let skipFp = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    let mut x: u8 = 0
+    while x < 8 {
+      drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), base + 48 + u8.toI32(x) * 16), x)
+      x = x + 1
+    }
+    patchHere(&mut em.*, skipFp)
+  }
+  drop function
+  return ()
+}
+
+effect fn emitIncomingParams(em: &mut Emitter, function: &SsaFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  let argCount = List<u64>.length(&function.arguments)
+  let mut gpIdx = usize.ZERO
+  let mut fpIdx = usize.ZERO
+  let mut stackOff: i32 = 16 // [rbp + 16] is first incoming stack argument
+  let mut a = usize.ZERO
+  while a < argCount {
+    let val = List<u64>.asSlice(&function.arguments)[a]
+    let kind = function.value(val).kind
+    let abi = function.argumentAbi(a)
+    let home = valOff(&em.*, val)
+    if abi.byvalSize > 0 {
+      // `byval` aggregate lives on the caller's stack; the SSA argument is its address!
+      let align: i32 = if abi.byvalAlignment > 8 { usize.toI32(abi.byvalAlignment) } else { 8 }
+      stackOff = alignI32(stackOff, align)
+      if home != 0 {
+        drop run X86Encode.lea64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff))
+        drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), X86Encode.r11())
+      }
+      stackOff = stackOff + u64.wrappingToI32(((abi.byvalSize + 7) / 8) * 8)
+    } else if kind.isVector() {
+      let sz = kind.storeSize()
+      if sz <= 16 && fpIdx < 8 {
+        if home != 0 {
+          drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), usize.toU8(fpIdx))
+        }
+        fpIdx = fpIdx + usize.ONE
+      } else {
+        let align: i32 = if sz >= 16 { 16 } else { 8 }
+        stackOff = alignI32(stackOff, align)
+        if home != 0 {
+          let mut off = usize.ZERO
+          while off < sz {
+            drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff + usize.toI32(off)))
+            drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home + usize.toI32(off)), X86Encode.r11())
+            off = off + 8
+          }
+        }
+        stackOff = stackOff + usize.toI32(((sz + 7) / 8) * 8)
+      }
+    } else if kind.isFloat() {
+      if fpIdx < 8 {
+        if home != 0 {
+          if kind.bits == 64 {
+            drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), usize.toU8(fpIdx))
+          } else {
+            drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), usize.toU8(fpIdx))
+          }
+        }
+        fpIdx = fpIdx + usize.ONE
+      } else {
+        if home != 0 {
+          drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff))
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), X86Encode.r11())
+        }
+        stackOff = stackOff + 8
+      }
+    } else if kind.bits > 64 {
+      // `i128`: two consecutive GP registers if both fit, else 16 bytes on stack.
+      if gpIdx + 2 <= 6 {
+        if home != 0 {
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), sysvGpArg(gpIdx))
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home + 8), sysvGpArg(gpIdx + usize.ONE))
+        }
+        gpIdx = gpIdx + 2
+      } else {
+        if home != 0 {
+          drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff))
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), X86Encode.r11())
+          drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff + 8))
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home + 8), X86Encode.r11())
+        }
+        stackOff = stackOff + 16
+      }
+    } else {
+      // Ordinary <=64-bit integer or address.
+      if gpIdx < 6 {
+        if home != 0 {
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), sysvGpArg(gpIdx))
+        }
+        gpIdx = gpIdx + usize.ONE
+      } else {
+        if home != 0 {
+          drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rbp(), stackOff))
+          drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), home), X86Encode.r11())
+        }
+        stackOff = stackOff + 8
+      }
+    }
+    a = a + usize.ONE
+  }
+  em.fixedGpCount = gpIdx
+  em.fixedFpCount = fpIdx
+  em.fixedStackBytes = i32.toU64(stackOff - 16)
+  return ()
+}
+
+effect fn emitEpilogue(em: &mut Emitter) -> () ! OutOfMemoryError ? &mut Allocator {
+  if em.frame.savedCount == usize.ZERO {
+    run X86Encode.leave(&mut em.code)
+    return run X86Encode.ret(&mut em.code)
+  }
+  // Restore `rsp` to just below the pushed callee-saved registers, pop them in reverse order.
+  let savedBytes = usize.toI32(em.frame.savedCount * 8)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rsp(), Mem.baseDisp(X86Encode.rbp(), 0 - savedBytes))
+  let mask = em.frame.savedCalleeMask
+  let mut r: usize = 16
+  while r > usize.ZERO {
+    r = r - usize.ONE
+    if (mask & u64.shiftLeft(1, usize.toU64(r))) != 0 {
+      run X86Encode.pop(&mut em.code, usize.toU8(r))
+    }
+  }
+  run X86Encode.pop(&mut em.code, X86Encode.rbp())
+  return run X86Encode.ret(&mut em.code)
+}
+
+// ---- Value Load / Store Helpers ----
+
+fn valOff(em: &Emitter, val: u64) -> i32 {
+  if val == none() { return 0 }
+  return List<i32>.asSlice(&em.frame.valueOffsets)[u64.toUsize(val)]
+}
+
+fn slotOff(em: &Emitter, slot: usize) -> i32 {
+  return List<i32>.asSlice(&em.frame.slotOffsets)[slot]
+}
+
+// Loads any <=64-bit integer, flag, or address value into `dstReg` (clobbers only `dstReg` and
+// `r11` for TLS if `dstReg != r11`, or `r10` if `dstReg == r11`).
+effect fn loadGp(em: &mut Emitter, function: &SsaFunction, value: u64, dstReg: u8) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition == Definition.Constant {
+    let c = function.constantOf(value)
+    return run loadConstantGp(&mut em.*, function, c, info.kind, dstReg)
+  }
+  let off = valOff(&em.*, value)
+  if off == 0 {
+    return run X86Encode.movImm64(&mut em.code, dstReg, 0)
+  }
+  drop run X86Encode.movRm64(&mut em.code, dstReg, Mem.baseDisp(X86Encode.rbp(), off))
+  return ()
+}
+
+effect fn loadConstantGp(em: &mut Emitter, function: &SsaFunction, c: Constant, kind: Kind, dstReg: u8) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  match c.form {
+    ConstantForm.Bits => {
+      return run X86Encode.movImm64(&mut em.code, dstReg, maskBits(c.low, kind.bits))
+    }
+    ConstantForm.Symbol => {
+      // Load address via GOT (`mov dst, [rip + sym@GOTPCREL]`) for full PIE & weak-symbol safety.
+      let sym = function.symbolName(c.symbol)
+      let dispAt = run X86Encode.movRm64(&mut em.code, dstReg, Mem.ripRel(0))
+      run addReloc(&mut em.*, dispAt, RelocationKind.GotPcRel, sym, -4)
+      if c.low != 0 {
+        let signed = u64.wrappingToI64(c.low)
+        if signed >= -2147483648 && signed <= 2147483647 {
+          run X86Encode.aluRi64(&mut em.code, Alu.Add, dstReg, i64.wrappingToI32(signed))
+        } else {
+          let tmp = if dstReg == X86Encode.r11() { X86Encode.r10() } else { X86Encode.r11() }
+          run X86Encode.movImm64(&mut em.code, tmp, c.low)
+          run X86Encode.aluRr64(&mut em.code, Alu.Add, dstReg, tmp)
+        }
+      }
+      return ()
+    }
+    ConstantForm.ThreadLocal => {
+      // Initial-Exec TLS: `mov dst, [rip + sym@GOTTPOFF]; add dst, fs:[0]`.
+      let sym = function.symbolName(c.symbol)
+      let dispAt = run X86Encode.movRm64(&mut em.code, dstReg, Mem.ripRel(0))
+      run addReloc(&mut em.*, dispAt, RelocationKind.GotTpOff, sym, -4)
+      drop run X86Encode.aluRm64(&mut em.code, Alu.Add, dstReg, Mem.fsDisp(0))
+      if c.low != 0 {
+        let signed = u64.wrappingToI64(c.low)
+        if signed >= -2147483648 && signed <= 2147483647 {
+          run X86Encode.aluRi64(&mut em.code, Alu.Add, dstReg, i64.wrappingToI32(signed))
+        } else {
+          let tmp = if dstReg == X86Encode.r11() { X86Encode.r10() } else { X86Encode.r11() }
+          run X86Encode.movImm64(&mut em.code, tmp, c.low)
+          run X86Encode.aluRr64(&mut em.code, Alu.Add, dstReg, tmp)
+        }
+      }
+      return ()
+    }
+    ConstantForm.Link => {
+      return run X86Object.unsupported(b"wasm link constant on x86-64", Bytes.asSlice(&em.symbol))
+    }
+  }
+}
+
+effect fn storeGp(em: &mut Emitter, value: u64, srcReg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let off = valOff(&em.*, value)
+  if off == 0 { return () }
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off), srcReg)
+  return ()
+}
+
+effect fn loadPair(em: &mut Emitter, function: &SsaFunction, value: u64, loReg: u8, hiReg: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition == Definition.Constant {
+    let c = function.constantOf(value)
+    run X86Encode.movImm64(&mut em.code, loReg, c.low)
+    return run X86Encode.movImm64(&mut em.code, hiReg, c.high)
+  }
+  let off = valOff(&em.*, value)
+  if off == 0 {
+    run X86Encode.movImm64(&mut em.code, loReg, 0)
+    return run X86Encode.movImm64(&mut em.code, hiReg, 0)
+  }
+  drop run X86Encode.movRm64(&mut em.code, loReg, Mem.baseDisp(X86Encode.rbp(), off))
+  drop run X86Encode.movRm64(&mut em.code, hiReg, Mem.baseDisp(X86Encode.rbp(), off + 8))
+  return ()
+}
+
+effect fn storePair(em: &mut Emitter, value: u64, loReg: u8, hiReg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let off = valOff(&em.*, value)
+  if off == 0 { return () }
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off), loReg)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off + 8), hiReg)
+  return ()
+}
+
+effect fn loadFloat(em: &mut Emitter, function: &SsaFunction, value: u64, xmmReg: u8, scratchGp: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  let double = info.kind.bits == 64
+  if info.definition == Definition.Constant {
+    let c = function.constantOf(value)
+    run X86Encode.movImm64(&mut em.code, scratchGp, c.low)
+    if double { return run X86Encode.movqToXmm(&mut em.code, xmmReg, scratchGp) }
+    return run X86Encode.movdToXmm(&mut em.code, xmmReg, scratchGp)
+  }
+  let off = valOff(&em.*, value)
+  if off == 0 {
+    return run X86Encode.pxor(&mut em.code, xmmReg, xmmReg)
+  }
+  if double {
+    drop run X86Encode.movsdRm(&mut em.code, xmmReg, Mem.baseDisp(X86Encode.rbp(), off))
+  } else {
+    drop run X86Encode.movssRm(&mut em.code, xmmReg, Mem.baseDisp(X86Encode.rbp(), off))
+  }
+  return ()
+}
+
+effect fn storeFloat(em: &mut Emitter, value: u64, xmmReg: u8, double: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let off = valOff(&em.*, value)
+  if off == 0 { return () }
+  if double {
+    drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off), xmmReg)
+  } else {
+    drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off), xmmReg)
+  }
+  return ()
+}
+
+// Loads the memory address of a vector value into `dstReg` (for constants, materializes the
+// repeated-lane byte image into `.rodata` and emits RIP-relative LEA).
+effect fn vectorAddr(em: &mut Emitter, function: &SsaFunction, value: u64, dstReg: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition == Definition.Constant {
+    let c = function.constantOf(value)
+    let img = run buildVectorConstantBytes(info.kind, c.low)
+    let roOff = run addRodata16(&mut em.*, Bytes.asSlice(&img))
+    let dispAt = run X86Encode.lea64(&mut em.code, dstReg, Mem.ripRel(0))
+    return run addRodataReloc(&mut em.*, dispAt, roOff)
+  }
+  let off = valOff(&em.*, value)
+  drop run X86Encode.lea64(&mut em.code, dstReg, Mem.baseDisp(X86Encode.rbp(), off))
+  return ()
+}
+
+effect fn buildVectorConstantBytes(kind: Kind, laneBits: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let sz = kind.storeSize()
+  let mut out = run Bytes.zeroed(if sz < 16 { 16 } else { sz })
+  let buf = Bytes.asMutSlice(&mut out)
+  if kind.bits == 1 {
+    // Bit-packed mask vector: element `i` lives at bit `i`.
+    if (laneBits & 1) != 0 {
+      let mut i = usize.ZERO
+      while i < kind.elements {
+        let byteIdx = i / 8
+        let bitIdx = usize.toU8(i % 8)
+        buf[byteIdx] = u8.bitOr(buf[byteIdx], u8.shiftLeft(1, bitIdx))
+        i = i + usize.ONE
+      }
+    }
+    return move out
+  }
+  let elemBytes = kind.elementBytes()
+  let mut lane = usize.ZERO
+  while lane < kind.elements {
+    let mut b = usize.ZERO
+    while b < elemBytes {
+      buf[lane * elemBytes + b] = u64.wrappingToU8(u64.shiftRight(laneBits, usize.toU64(b * 8)) & 255)
+      b = b + usize.ONE
+    }
+    lane = lane + usize.ONE
+  }
+  return move out
+}
+
+// Masks `reg` to `bits` bits (zero-extending when `!signed`, sign-extending when `signed`).
+effect fn normalizeInt(em: &mut Emitter, reg: u8, bits: usize, signed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits >= 64 { return () }
+  if signed {
+    if bits == 8 { return run X86Encode.movsxRr8(&mut em.code, reg, reg) }
+    if bits == 16 { return run X86Encode.movsxRr16(&mut em.code, reg, reg) }
+    if bits == 32 { return run X86Encode.movsxdRr(&mut em.code, reg, reg) }
+    let shift = usize.toU8(64 - bits)
+    run X86Encode.shiftImm64(&mut em.code, Shift.Shl, reg, shift)
+    return run X86Encode.shiftImm64(&mut em.code, Shift.Sar, reg, shift)
+  }
+  if bits == 1 { return run X86Encode.aluRi64(&mut em.code, Alu.And, reg, 1) }
+  if bits == 8 { return run X86Encode.movzxRr8(&mut em.code, reg, reg) }
+  if bits == 16 { return run X86Encode.movzxRr16(&mut em.code, reg, reg) }
+  if bits == 32 { return run X86Encode.movRr32(&mut em.code, reg, reg) }
+  let shift = usize.toU8(64 - bits)
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shl, reg, shift)
+  return run X86Encode.shiftImm64(&mut em.code, Shift.Shr, reg, shift)
+}
+
+fn maskBits(value: u64, bits: usize) -> u64 {
+  if bits == usize.ZERO || bits >= 64 { return value }
+  return value & (u64.shiftLeft(1, usize.toU64(bits)) - 1)
+}
+
+// ---- Instruction Dispatch ----
+
+effect fn emitInstruction(em: &mut Emitter, function: &SsaFunction, instIdx: usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let inst = function.instruction(instIdx)
+  let ops = function.operandsOf(instIdx)
+  match inst.operation {
+    Operation.SlotStart {..} => { return () }
+    Operation.SlotEnd {..} => { return () }
+    Operation.VaEnd => { return () }
+    Operation.VaStart => { return run emitVaStart(&mut em.*, function, ops[0]) }
+    Operation.SlotAddress {slot} => {
+      let sOff = slotOff(&em.*, slot)
+      drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), sOff))
+      return run storeGp(&mut em.*, inst.result, X86Encode.rax())
+    }
+    Operation.FrameAddress => {
+      return run storeGp(&mut em.*, inst.result, X86Encode.rbp())
+    }
+    Operation.DynamicSlot {alignment} => {
+      return run emitDynamicSlot(&mut em.*, function, ops[0], alignment, inst.result)
+    }
+    Operation.Offset {offset} => {
+      run loadGp(&mut em.*, function, ops[0], X86Encode.rax())
+      if offset != 0 {
+        let signed = u64.wrappingToI64(offset)
+        if signed >= -2147483648 && signed <= 2147483647 {
+          run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rax(), i64.wrappingToI32(signed))
+        } else {
+          run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), offset)
+          run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
+        }
+      }
+      return run storeGp(&mut em.*, inst.result, X86Encode.rax())
+    }
+    Operation.Index => {
+      run loadGp(&mut em.*, function, ops[0], X86Encode.rax())
+      run loadGp(&mut em.*, function, ops[1], X86Encode.rcx())
+      let idxBits = function.value(ops[1]).kind.bits
+      run normalizeInt(&mut em.*, X86Encode.rcx(), idxBits, false)
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
+      return run storeGp(&mut em.*, inst.result, X86Encode.rax())
+    }
+    Operation.Load {offset, ..} => {
+      return run emitLoad(&mut em.*, function, ops[0], offset, inst.kind, inst.result)
+    }
+    Operation.Store {offset, ..} => {
+      return run emitStore(&mut em.*, function, ops[0], ops[1], offset)
+    }
+    Operation.CopyBytes {size} => {
+      return run emitCopyBytes(&mut em.*, function, ops[0], ops[1], size)
+    }
+    Operation.Fill {byte, size} => {
+      return run emitFill(&mut em.*, function, ops[0], byte, size)
+    }
+    Operation.CopyCounted => {
+      return run emitCopyCounted(&mut em.*, function, ops[0], ops[1], ops[2])
+    }
+    Operation.FillCounted => {
+      return run emitFillCounted(&mut em.*, function, ops[0], ops[1], ops[2])
+    }
+    Operation.Binary {operation} => {
+      return run emitBinary(&mut em.*, function, operation, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.Negate => {
+      return run emitNegate(&mut em.*, function, inst.kind, ops[0], inst.result)
+    }
+    Operation.Compare {predicate} => {
+      return run emitCompare(&mut em.*, function, predicate, ops[0], ops[1], inst.result)
+    }
+    Operation.Select => {
+      return run emitSelect(&mut em.*, function, inst.kind, ops[0], ops[1], ops[2], inst.result)
+    }
+    Operation.Cast {operation} => {
+      return run emitCast(&mut em.*, function, operation, inst.kind, ops[0], inst.result)
+    }
+    Operation.Overflow {operation, signed} => {
+      return run emitOverflow(&mut em.*, function, operation, signed, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.Saturate {operation, signed} => {
+      return run emitSaturate(&mut em.*, function, operation, signed, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.Rotate {left} => {
+      return run emitRotate(&mut em.*, function, left, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.Count {which} => {
+      return run emitCount(&mut em.*, function, which, inst.kind, ops[0], inst.result)
+    }
+    Operation.Extreme {which} => {
+      return run emitExtreme(&mut em.*, function, which, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.FusedMultiplyAdd => {
+      return run emitFma(&mut em.*, function, inst.kind, ops[0], ops[1], ops[2], inst.result)
+    }
+    Operation.SquareRoot => {
+      return run emitSqrt(&mut em.*, function, inst.kind, ops[0], inst.result)
+    }
+    Operation.Splat {..} => {
+      return run emitSplat(&mut em.*, function, inst.kind, ops[0], inst.result)
+    }
+    Operation.Extract => {
+      return run emitExtract(&mut em.*, function, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.Insert => {
+      return run emitInsert(&mut em.*, function, inst.kind, ops[0], ops[1], ops[2], inst.result)
+    }
+    Operation.Shuffle {start, count} => {
+      return run emitShuffle(&mut em.*, function, inst.kind, ops[0], ops[1], start, count, inst.result)
+    }
+    Operation.Reduce {which} => {
+      let init = if ops.length >= 2 { ops[1] } else { none() }
+      return run emitReduce(&mut em.*, function, which, inst.kind, ops[0], init, inst.result)
+    }
+    Operation.ArchIntrinsic {operation, immediate} => {
+      return run emitArchIntrinsic(&mut em.*, function, operation, immediate, inst.kind, ops, inst.result)
+    }
+    Operation.InlineAsm {index, ..} => {
+      return run emitInlineAsm(&mut em.*, function, index, inst.kind, ops, inst.result)
+    }
+    Operation.Call {symbol, fixed, abi} => {
+      return run emitCall(&mut em.*, function, symbol, false, fixed, abi, inst, ops)
+    }
+    Operation.CallIndirect {abi} => {
+      return run emitCall(&mut em.*, function, usize.MAX, true, usize.MAX, abi, inst, ops)
+    }
+    Operation.AtomicLoad => {
+      return run emitAtomicLoad(&mut em.*, function, inst.kind, ops[0], inst.result)
+    }
+    Operation.AtomicStore => {
+      return run emitAtomicStore(&mut em.*, function, ops[0], ops[1])
+    }
+    Operation.AtomicModify {which} => {
+      return run emitAtomicModify(&mut em.*, function, which, inst.kind, ops[0], ops[1], inst.result)
+    }
+    Operation.CompareExchange => {
+      return run emitCompareExchange(&mut em.*, function, inst.kind, ops[0], ops[1], ops[2], inst.result)
+    }
+    Operation.Fence => {
+      return run X86Encode.mfence(&mut em.code)
+    }
+    _ => {
+      return run X86Object.unsupported(b"wasm-only operation on x86-64", Bytes.asSlice(&em.symbol))
+    }
+  }
+}
+
+// ---- Memory Operations ----
+
+effect fn emitAddrWithOffset(em: &mut Emitter, function: &SsaFunction, addrVal: u64, offset: u64, dstReg: u8) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run loadGp(&mut em.*, function, addrVal, dstReg)
+  if offset != 0 {
+    let signed = u64.wrappingToI64(offset)
+    if signed >= -2147483648 && signed <= 2147483647 {
+      run X86Encode.aluRi64(&mut em.code, Alu.Add, dstReg, i64.wrappingToI32(signed))
+    } else {
+      let tmp = if dstReg == X86Encode.r11() { X86Encode.r10() } else { X86Encode.r11() }
+      run X86Encode.movImm64(&mut em.code, tmp, offset)
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, dstReg, tmp)
+    }
+  }
+  return ()
+}
+
+effect fn emitLoad(em: &mut Emitter, function: &SsaFunction, addrVal: u64, offset: u64, kind: Kind, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rsi())
+  if kind.isVector() {
+    let sz = kind.storeSize()
+    let dstOff = valOff(&em.*, result)
+    if dstOff == 0 { return () }
+    if sz == 16 {
+      drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+      drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), 0)
+      return ()
+    }
+    // Copy exact `sz` bytes from `[rsi]` into `[rbp + dstOff]`.
+    drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
+    return run X86Encode.repMovsb(&mut em.code)
+  }
+  if kind.isFloat() {
+    if kind.bits == 64 {
+      drop run X86Encode.movsdRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+      return run storeFloat(&mut em.*, result, 0, true)
+    }
+    drop run X86Encode.movssRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+    return run storeFloat(&mut em.*, result, 0, false)
+  }
+  if kind.bits > 64 {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rdx(), Mem.baseDisp(X86Encode.rsi(), 8))
+    return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+  }
+  let bytes = kind.elementBytes()
+  if bytes == 1 {
+    drop run X86Encode.movzxRm8(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+    if kind.bits == 1 { run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rax(), 1) }
+  } else if bytes == 2 {
+    drop run X86Encode.movzxRm16(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+  } else if bytes == 4 {
+    drop run X86Encode.movRm32(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+  } else {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+  }
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+effect fn emitStore(em: &mut Emitter, function: &SsaFunction, val: u64, addrVal: u64, offset: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = function.value(val).kind
+  run emitAddrWithOffset(&mut em.*, function, addrVal, offset, X86Encode.rdi())
+  if kind.isVector() {
+    let sz = kind.storeSize()
+    run vectorAddr(&mut em.*, function, val, X86Encode.rsi())
+    if sz == 16 {
+      drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+      drop run X86Encode.movdquMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), 0)
+      return ()
+    }
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
+    return run X86Encode.repMovsb(&mut em.code)
+  }
+  if kind.isFloat() {
+    run loadFloat(&mut em.*, function, val, 0, X86Encode.rax())
+    if kind.bits == 64 {
+      drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), 0)
+    } else {
+      drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), 0)
+    }
+    return ()
+  }
+  if kind.bits > 64 {
+    run loadPair(&mut em.*, function, val, X86Encode.rax(), X86Encode.rdx())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 8), X86Encode.rdx())
+    return ()
+  }
+  run loadGp(&mut em.*, function, val, X86Encode.rax())
+  let bytes = kind.elementBytes()
+  if bytes == 1 {
+    if kind.bits == 1 { run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rax(), 1) }
+    drop run X86Encode.movMr8(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+  } else if bytes == 2 {
+    drop run X86Encode.movMr16(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+  } else if bytes == 4 {
+    drop run X86Encode.movMr32(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+  } else {
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+  }
+  return ()
+}
+
+effect fn emitDynamicSlot(em: &mut Emitter, function: &SsaFunction, sizeVal: u64, alignment: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let align = if alignment < 16 { 16 } else { alignment }
+  run loadGp(&mut em.*, function, sizeVal, X86Encode.rax())
+  // Round size up to multiple of `align` (power of 2 >= 16).
+  run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), align - 1)
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.not64(&mut em.code, X86Encode.rcx())
+  run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rsp(), X86Encode.rax())
+  if align > 16 {
+    run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rsp(), X86Encode.rcx())
+  }
+  return run storeGp(&mut em.*, result, X86Encode.rsp())
+}
+
+effect fn emitCopyBytes(em: &mut Emitter, function: &SsaFunction, dstVal: u64, srcVal: u64, size: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if size == 0 { return () }
+  run loadGp(&mut em.*, function, dstVal, X86Encode.rdi())
+  run loadGp(&mut em.*, function, srcVal, X86Encode.rsi())
+  if size == 8 {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax())
+    return ()
+  }
+  if size == 16 {
+    drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+    drop run X86Encode.movdquMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), 0)
+    return ()
+  }
+  // Use `memmove` to guarantee overlapping-copy safety per `SsaFunction` specification.
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), size)
+  return run callExternal(&mut em.*, b"memmove")
+}
+
+effect fn emitFill(em: &mut Emitter, function: &SsaFunction, dstVal: u64, fillByte: u8, size: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if size == 0 { return () }
+  run loadGp(&mut em.*, function, dstVal, X86Encode.rdi())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u8.toU64(fillByte))
+  run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), size)
+  return run X86Encode.repStosb(&mut em.code)
+}
+
+effect fn emitCopyCounted(em: &mut Emitter, function: &SsaFunction, dstVal: u64, srcVal: u64, countVal: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run loadGp(&mut em.*, function, dstVal, X86Encode.rdi())
+  run loadGp(&mut em.*, function, srcVal, X86Encode.rsi())
+  run loadGp(&mut em.*, function, countVal, X86Encode.rdx())
+  return run callExternal(&mut em.*, b"memmove")
+}
+
+effect fn emitFillCounted(em: &mut Emitter, function: &SsaFunction, dstVal: u64, byteVal: u64, countVal: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run loadGp(&mut em.*, function, dstVal, X86Encode.rdi())
+  run loadGp(&mut em.*, function, byteVal, X86Encode.rax())
+  run loadGp(&mut em.*, function, countVal, X86Encode.rcx())
+  return run X86Encode.repStosb(&mut em.code)
+}
+
+// ---- VaStart ----
+
+effect fn emitVaStart(em: &mut Emitter, function: &SsaFunction, vaPtrVal: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run loadGp(&mut em.*, function, vaPtrVal, X86Encode.rdi())
+  let gpOff: u64 = if em.fixedGpCount < 6 { usize.toU64(em.fixedGpCount * 8) } else { 48 }
+  let fpOff: u64 = if em.fixedFpCount < 8 { 48 + usize.toU64(em.fixedFpCount * 16) } else { 176 }
+  drop run X86Encode.movMi32(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), gpOff)
+  drop run X86Encode.movMi32(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 4), fpOff)
+  // overflow_arg_area = rbp + 16 + fixedStackBytes
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), 16 + u64.wrappingToI32(em.fixedStackBytes)))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 8), X86Encode.rax())
+  // reg_save_area = rbp + regSaveOffset
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), em.frame.regSaveOffset))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 16), X86Encode.rax())
+  return ()
+}
+
+// ---- Binary Arithmetic (Scalar <=64, i128, Float, Vector) ----
+
+effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorBinary(&mut em.*, function, op, kind, left, right, result)
+  }
+  if kind.isFloat() {
+    return run emitFloatBinary(&mut em.*, function, op, kind.bits == 64, left, right, result)
+  }
+  if kind.bits > 64 {
+    return run emitI128Binary(&mut em.*, function, op, left, right, result)
+  }
+  run loadGp(&mut em.*, function, left, X86Encode.rax())
+  run loadGp(&mut em.*, function, right, X86Encode.rcx())
+  run emitScalarIntBinaryRegs(&mut em.*, op, kind.bits)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+// Computes `rax = rax op rcx` for `bits <= 64` (may clobber `rdx`, `r8`).
+effect fn emitScalarIntBinaryRegs(em: &mut Emitter, op: Binary, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  match op {
+    Binary.Add => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.Sub => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.rcx())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.Mul => {
+      run X86Encode.imulRr64(&mut em.code, X86Encode.rax(), X86Encode.rcx())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.And => {
+      run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.Or => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.Xor => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.Shl => {
+      run maskShiftCount(&mut em.*, bits)
+      run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rax())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.LShr => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+      run maskShiftCount(&mut em.*, bits)
+      return run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rax())
+    }
+    Binary.AShr => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), bits, true)
+      run maskShiftCount(&mut em.*, bits)
+      run X86Encode.shiftCl64(&mut em.code, Shift.Sar, X86Encode.rax())
+      return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+    }
+    Binary.UDiv => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+      run normalizeInt(&mut em.*, X86Encode.rcx(), bits, false)
+      run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+      let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+      run X86Encode.ud2(&mut em.code)
+      patchHere(&mut em.*, ok)
+      run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+      return run X86Encode.div64(&mut em.code, X86Encode.rcx())
+    }
+    Binary.URem => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+      run normalizeInt(&mut em.*, X86Encode.rcx(), bits, false)
+      run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+      let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+      run X86Encode.ud2(&mut em.code)
+      patchHere(&mut em.*, ok)
+      run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+      run X86Encode.div64(&mut em.code, X86Encode.rcx())
+      return run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+    }
+    Binary.SDiv => {
+      run emitSignedDivRem64(&mut em.*, bits, false)
+      return ()
+    }
+    Binary.SRem => {
+      run emitSignedDivRem64(&mut em.*, bits, true)
+      return ()
+    }
+  }
+}
+
+effect fn maskShiftCount(em: &mut Emitter, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits == 1 {
+    return run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rcx(), X86Encode.rcx())
+  }
+  if bits < 64 {
+    return run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), usize.toI32(bits - usize.ONE))
+  }
+  return ()
+}
+
+effect fn emitSignedDivRem64(em: &mut Emitter, bits: usize, wantRem: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  run normalizeInt(&mut em.*, X86Encode.rax(), bits, true)
+  run normalizeInt(&mut em.*, X86Encode.rcx(), bits, true)
+  // Trap on divisor == 0.
+  run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+  let nonZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.ud2(&mut em.code)
+  patchHere(&mut em.*, nonZero)
+  // Trap on INT_MIN / -1.
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.rcx(), -1)
+  let notNegOne = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  let minVal = u64.shiftLeft(1, usize.toU64(bits - usize.ONE))
+  let signExtMin = if bits == 64 { minVal } else { u64.MAX - (minVal - 1) }
+  run X86Encode.movImm64(&mut em.code, X86Encode.r8(), signExtMin)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.r8())
+  let notMin = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.ud2(&mut em.code)
+  let doDiv = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, notNegOne, doDiv)
+  X86Encode.patchRel32(&mut em.code, notMin, doDiv)
+  run X86Encode.cqo(&mut em.code)
+  run X86Encode.idiv64(&mut em.code, X86Encode.rcx())
+  if wantRem {
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+  }
+  return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+}
+
+effect fn emitFloatBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, double: bool, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run loadFloat(&mut em.*, function, left, 0, X86Encode.rax())
+  run loadFloat(&mut em.*, function, right, 1, X86Encode.rax())
+  match op {
+    Binary.Add => { run X86Encode.addFloat(&mut em.code, double, 0, 1) }
+    Binary.Sub => { run X86Encode.subFloat(&mut em.code, double, 0, 1) }
+    Binary.Mul => { run X86Encode.mulFloat(&mut em.code, double, 0, 1) }
+    Binary.UDiv => { run X86Encode.divFloat(&mut em.code, double, 0, 1) }
+    Binary.SDiv => { run X86Encode.divFloat(&mut em.code, double, 0, 1) }
+    Binary.URem => { run callExternal(&mut em.*, if double { b"fmod" } else { b"fmodf" }) }
+    Binary.SRem => { run callExternal(&mut em.*, if double { b"fmod" } else { b"fmodf" }) }
+    _ => {}
+  }
+  return run storeFloat(&mut em.*, result, 0, double)
+}
+
+effect fn emitI128Binary(em: &mut Emitter, function: &SsaFunction, op: Binary, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run loadPair(&mut em.*, function, left, X86Encode.rax(), X86Encode.rdx())
+  run loadPair(&mut em.*, function, right, X86Encode.r8(), X86Encode.r9())
+  match op {
+    Binary.Add => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.r8())
+      run X86Encode.aluRr64(&mut em.code, Alu.Adc, X86Encode.rdx(), X86Encode.r9())
+    }
+    Binary.Sub => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.r8())
+      run X86Encode.aluRr64(&mut em.code, Alu.Sbb, X86Encode.rdx(), X86Encode.r9())
+    }
+    Binary.And => {
+      run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.r8())
+      run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rdx(), X86Encode.r9())
+    }
+    Binary.Or => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.r8())
+      run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rdx(), X86Encode.r9())
+    }
+    Binary.Xor => {
+      run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.r8())
+      run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.r9())
+    }
+    Binary.Mul => {
+      // r10 = lhsHi * rhsLo + lhsLo * rhsHi; rdx:rax = lhsLo * rhsLo; rdx += r10.
+      run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.rdx())
+      run X86Encode.imulRr64(&mut em.code, X86Encode.r10(), X86Encode.r8())
+      run X86Encode.movRr64(&mut em.code, X86Encode.r11(), X86Encode.rax())
+      run X86Encode.imulRr64(&mut em.code, X86Encode.r11(), X86Encode.r9())
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.r10(), X86Encode.r11())
+      run X86Encode.mul64(&mut em.code, X86Encode.r8())
+      run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rdx(), X86Encode.r10())
+    }
+    Binary.Shl => {
+      run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
+      run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
+      run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
+      let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+      run X86Encode.shldCl64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
+      run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rax())
+      let done = run X86Encode.jmpRel32(&mut em.code)
+      patchHere(&mut em.*, wide)
+      run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
+      run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rdx())
+      run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+      patchHere(&mut em.*, done)
+    }
+    Binary.LShr => {
+      run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
+      run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
+      run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
+      let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+      run X86Encode.shrdCl64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+      run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rdx())
+      let done = run X86Encode.jmpRel32(&mut em.code)
+      patchHere(&mut em.*, wide)
+      run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+      run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rax())
+      run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+      patchHere(&mut em.*, done)
+    }
+    Binary.AShr => {
+      run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
+      run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
+      run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
+      let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+      run X86Encode.shrdCl64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+      run X86Encode.shiftCl64(&mut em.code, Shift.Sar, X86Encode.rdx())
+      let done = run X86Encode.jmpRel32(&mut em.code)
+      patchHere(&mut em.*, wide)
+      run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+      run X86Encode.shiftCl64(&mut em.code, Shift.Sar, X86Encode.rax())
+      run X86Encode.shiftImm64(&mut em.code, Shift.Sar, X86Encode.rdx(), 63)
+      patchHere(&mut em.*, done)
+    }
+    Binary.UDiv => { run emitI128DivCall(&mut em.*, false, false) }
+    Binary.URem => { run emitI128DivCall(&mut em.*, false, true) }
+    Binary.SDiv => { run emitI128DivCall(&mut em.*, true, false) }
+    Binary.SRem => { run emitI128DivCall(&mut em.*, true, true) }
+  }
+  return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+}
+
+effect fn emitI128DivCall(em: &mut Emitter, signed: bool, rem: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Check divisor (r8:r9) != 0 -> else ud2.
+  run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.r8())
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r10(), X86Encode.r9())
+  let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.ud2(&mut em.code)
+  patchHere(&mut em.*, ok)
+  if signed {
+    // Check INT128_MIN / -1: (r8 == -1 && r9 == -1 && rax == 0 && rdx == 0x8000...0).
+    run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.r10(), X86Encode.r9())
+    run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r10(), -1)
+    let ok1 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+    let ok2 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    run X86Encode.movImm64(&mut em.code, X86Encode.r11(), 0x8000000000000000)
+    run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rdx(), X86Encode.r11())
+    let ok3 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    run X86Encode.ud2(&mut em.code)
+    let pass = Bytes.length(&em.code)
+    X86Encode.patchRel32(&mut em.code, ok1, pass)
+    X86Encode.patchRel32(&mut em.code, ok2, pass)
+    X86Encode.patchRel32(&mut em.code, ok3, pass)
+  }
+  run X86Encode.movRr64(&mut em.code, X86Encode.rdi(), X86Encode.rax())
+  run X86Encode.movRr64(&mut em.code, X86Encode.rsi(), X86Encode.rdx())
+  run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.r8())
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r9())
+  let helper = if signed {
+    if rem { b"__silk_modti3" } else { b"__silk_divti3" }
+  } else {
+    if rem { b"__silk_umodti3" } else { b"__silk_udivti3" }
+  }
+  return run callExternal(&mut em.*, helper)
+}
+
+// ---- Negate, Compare, Select ----
+
+effect fn emitNegate(em: &mut Emitter, function: &SsaFunction, kind: Kind, src: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorUnary(&mut em.*, function, 0, kind, src, result)
+  }
+  if kind.bits == 64 {
+    run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+    run X86Encode.movqFromXmm(&mut em.code, X86Encode.rax(), 0)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), 0x8000000000000000)
+    run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
+    run X86Encode.movqToXmm(&mut em.code, 0, X86Encode.rax())
+    return run storeFloat(&mut em.*, result, 0, true)
+  }
+  run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+  run X86Encode.movdFromXmm(&mut em.code, X86Encode.rax(), 0)
+  run X86Encode.movImm32(&mut em.code, X86Encode.rcx(), 0x80000000)
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.movdToXmm(&mut em.code, 0, X86Encode.rax())
+  return run storeFloat(&mut em.*, result, 0, false)
+}
+
+effect fn emitCompare(em: &mut Emitter, function: &SsaFunction, pred: Predicate, left: u64, right: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let opKind = function.value(left).kind
+  if opKind.isVector() {
+    return run emitVectorCompare(&mut em.*, function, pred, opKind, left, right, result)
+  }
+  if opKind.isFloat() {
+    run loadFloat(&mut em.*, function, left, 0, X86Encode.rax())
+    run loadFloat(&mut em.*, function, right, 1, X86Encode.rax())
+    run emitFloatCompareRegs(&mut em.*, pred, opKind.bits == 64)
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+  if opKind.bits > 64 {
+    run loadPair(&mut em.*, function, left, X86Encode.rax(), X86Encode.rdx())
+    run loadPair(&mut em.*, function, right, X86Encode.r8(), X86Encode.r9())
+    run emitI128CompareRegs(&mut em.*, pred)
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+  run loadGp(&mut em.*, function, left, X86Encode.rax())
+  run loadGp(&mut em.*, function, right, X86Encode.rcx())
+  run emitIntCompareRegs(&mut em.*, pred, opKind.bits)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+fn isSignedPred(pred: Predicate) -> bool {
+  return pred == Predicate.Sgt || pred == Predicate.Sge || pred == Predicate.Slt || pred == Predicate.Sle
+}
+
+fn intPredCc(pred: Predicate) -> u8 {
+  return match pred {
+    Predicate.Eq => X86Encode.ccE()
+    Predicate.Ne => X86Encode.ccNe()
+    Predicate.Ugt => X86Encode.ccA()
+    Predicate.Uge => X86Encode.ccAe()
+    Predicate.Ult => X86Encode.ccB()
+    Predicate.Ule => X86Encode.ccBe()
+    Predicate.Sgt => X86Encode.ccG()
+    Predicate.Sge => X86Encode.ccGe()
+    Predicate.Slt => X86Encode.ccL()
+    Predicate.Sle => X86Encode.ccLe()
+    _ => X86Encode.ccE()
+  }
+}
+
+effect fn emitIntCompareRegs(em: &mut Emitter, pred: Predicate, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let signed = isSignedPred(pred)
+  run normalizeInt(&mut em.*, X86Encode.rax(), bits, signed)
+  run normalizeInt(&mut em.*, X86Encode.rcx(), bits, signed)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.setcc(&mut em.code, intPredCc(pred), X86Encode.rax())
+  return run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+}
+
+// Compares 128-bit `(rax:rdx)` against `(r8:r9)`, setting `rax` to 0 or 1.
+effect fn emitI128CompareRegs(em: &mut Emitter, pred: Predicate) -> () ! OutOfMemoryError ? &mut Allocator {
+  if pred == Predicate.Eq || pred == Predicate.Ne {
+    run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.r9())
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rdx())
+    run X86Encode.setcc(&mut em.code, if pred == Predicate.Eq { X86Encode.ccE() } else { X86Encode.ccNe() }, X86Encode.rax())
+    return run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  }
+  // Compare high words first; if equal, compare unsigned low words!
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rdx(), X86Encode.r9())
+  let eqHi = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let hiCc = match pred {
+    Predicate.Sgt => X86Encode.ccG()
+    Predicate.Sge => X86Encode.ccG()
+    Predicate.Slt => X86Encode.ccL()
+    Predicate.Sle => X86Encode.ccL()
+    Predicate.Ugt => X86Encode.ccA()
+    Predicate.Uge => X86Encode.ccA()
+    Predicate.Ult => X86Encode.ccB()
+    _ => X86Encode.ccB()
+  }
+  run X86Encode.setcc(&mut em.code, hiCc, X86Encode.rax())
+  let done = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, eqHi)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.r8())
+  let loCc = match pred {
+    Predicate.Sgt => X86Encode.ccA()
+    Predicate.Ugt => X86Encode.ccA()
+    Predicate.Sge => X86Encode.ccAe()
+    Predicate.Uge => X86Encode.ccAe()
+    Predicate.Slt => X86Encode.ccB()
+    Predicate.Ult => X86Encode.ccB()
+    _ => X86Encode.ccBe()
+  }
+  run X86Encode.setcc(&mut em.code, loCc, X86Encode.rax())
+  patchHere(&mut em.*, done)
+  return run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+}
+
+// Compares float `xmm0` vs `xmm1`, setting `rax` to 0 or 1 with exact IEEE 754 NaN semantics.
+effect fn emitFloatCompareRegs(em: &mut Emitter, pred: Predicate, double: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  match pred {
+    Predicate.Ord => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccNp(), X86Encode.rax())
+    }
+    Predicate.Uno => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccP(), X86Encode.rax())
+    }
+    Predicate.Ogt => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccA(), X86Encode.rax())
+    }
+    Predicate.Oge => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccAe(), X86Encode.rax())
+    }
+    Predicate.Olt => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 1, 0)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccA(), X86Encode.rax())
+    }
+    Predicate.Ole => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 1, 0)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccAe(), X86Encode.rax())
+    }
+    Predicate.Oeq => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccE(), X86Encode.rax())
+      run X86Encode.setcc(&mut em.code, X86Encode.ccNp(), X86Encode.rdx())
+      run X86Encode.aluRr8(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rdx())
+    }
+    Predicate.One => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccNe(), X86Encode.rax())
+      run X86Encode.setcc(&mut em.code, X86Encode.ccNp(), X86Encode.rdx())
+      run X86Encode.aluRr8(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rdx())
+    }
+    Predicate.Ueq => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccE(), X86Encode.rax())
+    }
+    Predicate.Une => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccNe(), X86Encode.rax())
+      run X86Encode.setcc(&mut em.code, X86Encode.ccP(), X86Encode.rdx())
+      run X86Encode.aluRr8(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rdx())
+    }
+    Predicate.Ugtf => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 1, 0)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccB(), X86Encode.rax())
+    }
+    Predicate.Ugef => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 1, 0)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccBe(), X86Encode.rax())
+    }
+    Predicate.Ultf => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccB(), X86Encode.rax())
+    }
+    Predicate.Ulef => {
+      run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+      run X86Encode.setcc(&mut em.code, X86Encode.ccBe(), X86Encode.rax())
+    }
+    _ => {
+      run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+    }
+  }
+  return run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+}
+
+effect fn emitSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind, cond: u64, yes: u64, no: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorSelect(&mut em.*, function, kind, cond, yes, no, result)
+  }
+  run loadGp(&mut em.*, function, cond, X86Encode.r10())
+  if kind.isFloat() {
+    run loadFloat(&mut em.*, function, yes, 0, X86Encode.rax())
+    run loadFloat(&mut em.*, function, no, 1, X86Encode.rax())
+    run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
+    let takeYes = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    run X86Encode.movapsRr(&mut em.code, 0, 1)
+    patchHere(&mut em.*, takeYes)
+    return run storeFloat(&mut em.*, result, 0, kind.bits == 64)
+  }
+  if kind.bits > 64 {
+    run loadPair(&mut em.*, function, yes, X86Encode.rax(), X86Encode.rdx())
+    run loadPair(&mut em.*, function, no, X86Encode.r8(), X86Encode.r9())
+    run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
+    run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rax(), X86Encode.r8())
+    run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rdx(), X86Encode.r9())
+    return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+  }
+  run loadGp(&mut em.*, function, yes, X86Encode.rax())
+  run loadGp(&mut em.*, function, no, X86Encode.rcx())
+  run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
+  run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rax(), X86Encode.rcx())
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+// ---- Casts (All 12 Cast Operations) ----
+
+effect fn emitCast(em: &mut Emitter, function: &SsaFunction, op: Cast, dstKind: Kind, src: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let srcKind = function.value(src).kind
+  if op == Cast.Bitcast {
+    return run emitBitcast(&mut em.*, function, srcKind, dstKind, src, result)
+  }
+  if dstKind.isVector() || srcKind.isVector() {
+    return run emitVectorCast(&mut em.*, function, op, srcKind, dstKind, src, result)
+  }
+  match op {
+    Cast.Trunc => {
+      if srcKind.bits > 64 {
+        run loadPair(&mut em.*, function, src, X86Encode.rax(), X86Encode.rdx())
+      } else {
+        run loadGp(&mut em.*, function, src, X86Encode.rax())
+      }
+      run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false)
+      return run storeGp(&mut em.*, result, X86Encode.rax())
+    }
+    Cast.ZExt => {
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, false)
+      if dstKind.bits > 64 {
+        run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+        return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+      }
+      return run storeGp(&mut em.*, result, X86Encode.rax())
+    }
+    Cast.SExt => {
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, true)
+      if dstKind.bits > 64 {
+        run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
+        run X86Encode.shiftImm64(&mut em.code, Shift.Sar, X86Encode.rdx(), 63)
+        return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+      }
+      run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false)
+      return run storeGp(&mut em.*, result, X86Encode.rax())
+    }
+    Cast.IntToPtr => {
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, false)
+      return run storeGp(&mut em.*, result, X86Encode.rax())
+    }
+    Cast.PtrToInt => {
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+      run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false)
+      return run storeGp(&mut em.*, result, X86Encode.rax())
+    }
+    Cast.FPTrunc => {
+      run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+      run X86Encode.cvtsd2ss(&mut em.code, 0, 0)
+      return run storeFloat(&mut em.*, result, 0, false)
+    }
+    Cast.FPExt => {
+      run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+      run X86Encode.cvtss2sd(&mut em.code, 0, 0)
+      return run storeFloat(&mut em.*, result, 0, true)
+    }
+    Cast.SIToFP => {
+      let double = dstKind.bits == 64
+      if srcKind.bits > 64 {
+        run loadPair(&mut em.*, function, src, X86Encode.rdi(), X86Encode.rsi())
+        run emitI128ToFloat(&mut em.*, true, double)
+        return run storeFloat(&mut em.*, result, 0, double)
+      }
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, true)
+      run X86Encode.cvtsi2Float(&mut em.code, double, true, 0, X86Encode.rax())
+      return run storeFloat(&mut em.*, result, 0, double)
+    }
+    Cast.UIToFP => {
+      let double = dstKind.bits == 64
+      if srcKind.bits > 64 {
+        run loadPair(&mut em.*, function, src, X86Encode.rdi(), X86Encode.rsi())
+        run emitI128ToFloat(&mut em.*, false, double)
+        return run storeFloat(&mut em.*, result, 0, double)
+      }
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, false)
+      if srcKind.bits < 64 {
+        run X86Encode.cvtsi2Float(&mut em.code, double, true, 0, X86Encode.rax())
+      } else {
+        // Unsigned 64-bit -> float: if high bit clear, direct `cvtsi2s*`; else `(x >> 1) | (x & 1)`,
+        // convert, and double (`addss`/`addsd xmm0, xmm0`) to preserve exact round-to-nearest-even!
+        run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+        let highSet = run X86Encode.jccRel32(&mut em.code, X86Encode.ccS())
+        run X86Encode.cvtsi2Float(&mut em.code, double, true, 0, X86Encode.rax())
+        let done = run X86Encode.jmpRel32(&mut em.code)
+        patchHere(&mut em.*, highSet)
+        run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+        run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rax(), 1)
+        run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rcx(), 1)
+        run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx())
+        run X86Encode.cvtsi2Float(&mut em.code, double, true, 0, X86Encode.rax())
+        run X86Encode.addFloat(&mut em.code, double, 0, 0)
+        patchHere(&mut em.*, done)
+      }
+      return run storeFloat(&mut em.*, result, 0, double)
+    }
+    Cast.FPToSI => {
+      return run emitFloatToIntSat(&mut em.*, function, srcKind.bits == 64, dstKind.bits, true, src, result)
+    }
+    Cast.FPToUI => {
+      return run emitFloatToIntSat(&mut em.*, function, srcKind.bits == 64, dstKind.bits, false, src, result)
+    }
+    Cast.Bitcast => { return () }
+  }
+}
+
+effect fn emitBitcast(em: &mut Emitter, function: &SsaFunction, srcKind: Kind, dstKind: Kind, src: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let sz = srcKind.storeSize()
+  if !srcKind.isVector() && !dstKind.isVector() && sz <= 8 {
+    if srcKind.isFloat() {
+      run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+      if srcKind.bits == 64 { run X86Encode.movqFromXmm(&mut em.code, X86Encode.rax(), 0) }
+      else { run X86Encode.movdFromXmm(&mut em.code, X86Encode.rax(), 0) }
+    } else {
+      run loadGp(&mut em.*, function, src, X86Encode.rax())
+    }
+    if dstKind.isFloat() {
+      if dstKind.bits == 64 {
+        run X86Encode.movqToXmm(&mut em.code, 0, X86Encode.rax())
+        return run storeFloat(&mut em.*, result, 0, true)
+      }
+      run X86Encode.movdToXmm(&mut em.code, 0, X86Encode.rax())
+      return run storeFloat(&mut em.*, result, 0, false)
+    }
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+  // General byte-exact bitcast (vectors, i128 <-> v128, etc.).
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  if srcKind.isVector() {
+    run vectorAddr(&mut em.*, function, src, X86Encode.rsi())
+  } else if srcKind.bits > 64 {
+    run loadPair(&mut em.*, function, src, X86Encode.rax(), X86Encode.rdx())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), X86Encode.rax())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff + 8), X86Encode.rdx())
+    return ()
+  } else {
+    run loadGp(&mut em.*, function, src, X86Encode.rax())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), X86Encode.rax())
+    return ()
+  }
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
+  return run X86Encode.repMovsb(&mut em.code)
+}
+
+// Saturating float-to-integer conversion (NaN -> 0, out-of-range -> MIN / MAX).
+effect fn emitFloatToIntSat(
+  em: &mut Emitter,
+  function: &SsaFunction,
+  double: bool,
+  dstBits: usize,
+  signed: bool,
+  src: u64,
+  result: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+  // Promote f32 to f64 in xmm0 so threshold checks are uniform in double precision!
+  if !double {
+    run X86Encode.cvtss2sd(&mut em.code, 0, 0)
+  }
+  if dstBits > 64 {
+    run emitFloat64ToI128Sat(&mut em.*, signed)
+    return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+  }
+  // Check NaN: `ucomisd xmm0, xmm0; jp isNan`.
+  run X86Encode.ucomiFloat(&mut em.code, true, 0, 0)
+  let isNan = run X86Encode.jccRel32(&mut em.code, X86Encode.ccP())
+
+  if signed {
+    // Signed dstBits (1..64): min = -2^(bits-1), maxUpper = +2^(bits-1) (exact power of 2 in f64!).
+    let expBits: u64 = 1023 + usize.toU64(dstBits - usize.ONE)
+    let upperF64 = u64.shiftLeft(expBits, 52)
+    let lowerF64 = upperF64 | 0x8000000000000000
+    let minInt = u64.shiftLeft(1, usize.toU64(dstBits - usize.ONE))
+    let maxInt = minInt - 1
+    // Check x <= lowerF64 -> clamp minInt.
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), lowerF64)
+    run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
+    run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
+    let belowMin = run X86Encode.jccRel32(&mut em.code, X86Encode.ccBe())
+    // Check x >= upperF64 -> clamp maxInt.
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), upperF64)
+    run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
+    run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
+    let aboveMax = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+    // In range: `cvttsd2si rax, xmm0`.
+    run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
+    run normalizeInt(&mut em.*, X86Encode.rax(), dstBits, false)
+    let done1 = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, isNan)
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+    let done2 = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, belowMin)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), maskBits(minInt, dstBits))
+    let done3 = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, aboveMax)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), maxInt)
+    let end = Bytes.length(&em.code)
+    X86Encode.patchRel32(&mut em.code, done1, end)
+    X86Encode.patchRel32(&mut em.code, done2, end)
+    X86Encode.patchRel32(&mut em.code, done3, end)
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+
+  // Unsigned dstBits (1..64): <= 0.0 -> 0; >= 2^dstBits -> (2^dstBits - 1).
+  run X86Encode.pxor(&mut em.code, 1, 1)
+  run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
+  let belowZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccBe())
+  let upperExp: u64 = 1023 + usize.toU64(dstBits)
+  let upperF64 = u64.shiftLeft(upperExp, 52)
+  let maxUint = if dstBits == 64 { u64.MAX } else { u64.shiftLeft(1, usize.toU64(dstBits)) - 1 }
+  run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), upperF64)
+  run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
+  run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
+  let aboveMax = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  if dstBits < 64 {
+    run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
+  } else {
+    // Unsigned 64-bit in range (0, 2^64): if >= 2^63, subtract 2^63, cvttsd2si, add 2^63.
+    let two63 = u64.shiftLeft(1023 + 63, 52)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), two63)
+    run X86Encode.movqToXmm(&mut em.code, 1, X86Encode.rcx())
+    run X86Encode.ucomiFloat(&mut em.code, true, 0, 1)
+    let geHalf = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+    run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
+    let uDone = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, geHalf)
+    run X86Encode.subFloat(&mut em.code, true, 0, 1)
+    run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), 0x8000000000000000)
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx())
+    patchHere(&mut em.*, uDone)
+  }
+  let done1 = run X86Encode.jmpRel32(&mut em.code)
+  let zeroLbl = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, isNan, zeroLbl)
+  X86Encode.patchRel32(&mut em.code, belowZero, zeroLbl)
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  let done2 = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, aboveMax)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), maxUint)
+  let end = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, done1, end)
+  X86Encode.patchRel32(&mut em.code, done2, end)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+// Converts 128-bit `(rdi=lo, rsi=hi)` to float in `xmm0`.
+effect fn emitI128ToFloat(em: &mut Emitter, signed: bool, double: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Compute: f64(hi) * 2^64 + f64(unsigned lo) in xmm0, handling sign for signed i128.
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r9(), X86Encode.r9())
+  if signed {
+    run X86Encode.testRr64(&mut em.code, X86Encode.rsi(), X86Encode.rsi())
+    let nonNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNs())
+    run X86Encode.movImm32(&mut em.code, X86Encode.r9(), 1)
+    run X86Encode.neg64(&mut em.code, X86Encode.rdi())
+    run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.rsi(), 0)
+    run X86Encode.neg64(&mut em.code, X86Encode.rsi())
+    patchHere(&mut em.*, nonNeg)
+  }
+  // Convert unsigned `rsi` -> `xmm0`, multiply by 2^64 (`0x43F0000000000000`).
+  run emitU64ToF64(&mut em.*, X86Encode.rsi(), 0)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), 0x43F0000000000000)
+  run X86Encode.movqToXmm(&mut em.code, 2, X86Encode.rcx())
+  run X86Encode.mulFloat(&mut em.code, true, 0, 2)
+  // Convert unsigned `rdi` -> `xmm1`, add to `xmm0`.
+  run emitU64ToF64(&mut em.*, X86Encode.rdi(), 1)
+  run X86Encode.addFloat(&mut em.code, true, 0, 1)
+  if signed {
+    run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+    let keepPos = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    run X86Encode.movqFromXmm(&mut em.code, X86Encode.rax(), 0)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), 0x8000000000000000)
+    run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
+    run X86Encode.movqToXmm(&mut em.code, 0, X86Encode.rax())
+    patchHere(&mut em.*, keepPos)
+  }
+  if !double {
+    return run X86Encode.cvtsd2ss(&mut em.code, 0, 0)
+  }
+  return ()
+}
+
+effect fn emitU64ToF64(em: &mut Emitter, srcReg: u8, dstXmm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), srcReg)
+  run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  let highSet = run X86Encode.jccRel32(&mut em.code, X86Encode.ccS())
+  run X86Encode.cvtsi2Float(&mut em.code, true, true, dstXmm, X86Encode.rax())
+  let done = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, highSet)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rax(), 1)
+  run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rcx(), 1)
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.cvtsi2Float(&mut em.code, true, true, dstXmm, X86Encode.rax())
+  run X86Encode.addFloat(&mut em.code, true, dstXmm, dstXmm)
+  patchHere(&mut em.*, done)
+  return ()
+}
+
+// Saturating `f64` in `xmm0` -> 128-bit integer in `(rax, rdx)`.
+effect fn emitFloat64ToI128Sat(em: &mut Emitter, signed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Decode IEEE 754 f64 bits in `r8`: sign (bit 63), exp (bits 52..62), mantissa (bits 0..51).
+  run X86Encode.movqFromXmm(&mut em.code, X86Encode.r8(), 0)
+  // Extract biased exponent into `rcx`.
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.r8())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 52)
+  run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 0x7FF)
+  // Extract sign bit into `r9` (0 or 1).
+  run X86Encode.movRr64(&mut em.code, X86Encode.r9(), X86Encode.r8())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.r9(), 63)
+  // If exp == 0x7FF and mantissa != 0 -> NaN -> return 0.
+  run X86Encode.movImm64(&mut em.code, X86Encode.r10(), 0x000FFFFFFFFFFFFF)
+  run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.r8(), X86Encode.r10())
+  run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 0x7FF)
+  let notSpecial = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.testRr64(&mut em.code, X86Encode.r8(), X86Encode.r8())
+  let isInf = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  // NaN -> 0.
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+  let doneNan = run X86Encode.jmpRel32(&mut em.code)
+
+  patchHere(&mut em.*, notSpecial)
+  // If exp < 1023 (|x| < 1.0) -> return 0.
+  run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 1023)
+  let geOne = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+  let doneSmall = run X86Encode.jmpRel32(&mut em.code)
+
+  patchHere(&mut em.*, geOne)
+  if !signed {
+    // Negative -> 0.
+    run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+    let posOk = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+    let doneNeg = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, posOk)
+    // If exp >= 1023 + 128 -> clamp u128::MAX.
+    run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 1151)
+    let inRange = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+    let satMaxU = Bytes.length(&em.code)
+    X86Encode.patchRel32(&mut em.code, isInf, satMaxU)
+    run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+    let infNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u64.MAX)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), u64.MAX)
+    let doneMax = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, infNeg)
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+    let doneInfNeg = run X86Encode.jmpRel32(&mut em.code)
+
+    // In-range magnitude: `(1 << 52) | mantissa` shifted by `exp - 1023 - 52`.
+    patchHere(&mut em.*, inRange)
+    run emitMantissaShift128(&mut em.*)
+    let end = Bytes.length(&em.code)
+    X86Encode.patchRel32(&mut em.code, doneNan, end)
+    X86Encode.patchRel32(&mut em.code, doneSmall, end)
+    X86Encode.patchRel32(&mut em.code, doneNeg, end)
+    X86Encode.patchRel32(&mut em.code, doneMax, end)
+    X86Encode.patchRel32(&mut em.code, doneInfNeg, end)
+    return ()
+  }
+
+  // Signed i128: if exp >= 1023 + 127 (1150) -> clamp INT128_MIN (neg) or INT128_MAX (pos).
+  run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 1150)
+  let inRange = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+  let satS = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, isInf, satS)
+  run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+  let clampNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u64.MAX)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x7FFFFFFFFFFFFFFF)
+  let doneMaxS = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, clampNeg)
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x8000000000000000)
+  let doneMinS = run X86Encode.jmpRel32(&mut em.code)
+
+  patchHere(&mut em.*, inRange)
+  run emitMantissaShift128(&mut em.*)
+  run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+  let posDone = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  run X86Encode.neg64(&mut em.code, X86Encode.rax())
+  run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.rdx(), 0)
+  run X86Encode.neg64(&mut em.code, X86Encode.rdx())
+  let end = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, doneNan, end)
+  X86Encode.patchRel32(&mut em.code, doneSmall, end)
+  X86Encode.patchRel32(&mut em.code, doneMaxS, end)
+  X86Encode.patchRel32(&mut em.code, doneMinS, end)
+  X86Encode.patchRel32(&mut em.code, posDone, end)
+  return ()
+}
+
+// Given biased exponent `rcx` in [1023, 1150] and 52-bit mantissa `r8`, computes
+// `((1 << 52) | r8) << (rcx - 1075)` (or `>> (1075 - rcx)`) into `(rax, rdx)`.
+effect fn emitMantissaShift128(em: &mut Emitter) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), 0x0010000000000000)
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.r8())
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+  run X86Encode.aluRi32(&mut em.code, Alu.Sub, X86Encode.rcx(), 1075)
+  let shiftLeft = run X86Encode.jccRel32(&mut em.code, X86Encode.ccGe())
+  // Shift right by `-rcx`.
+  run X86Encode.neg32(&mut em.code, X86Encode.rcx())
+  run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.rax())
+  let doneR = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, shiftLeft)
+  run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
+  let wide = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  run X86Encode.shldCl64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
+  run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rax())
+  let doneL = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, wide)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
+  run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rdx())
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  let end = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, doneR, end)
+  X86Encode.patchRel32(&mut em.code, doneL, end)
+  return ()
+}
+
+// ---- Overflow, Saturate, Rotate, Count, Extreme, FMA, Sqrt ----
+
+effect fn emitOverflow(em: &mut Emitter, function: &SsaFunction, op: Binary, signed: bool, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorOverflow(&mut em.*, function, op, signed, kind, left, right, result)
+  }
+  if kind.bits > 64 {
+    return run emitI128Overflow(&mut em.*, function, op, signed, left, right, result)
+  }
+  run loadGp(&mut em.*, function, left, X86Encode.rax())
+  run loadGp(&mut em.*, function, right, X86Encode.rcx())
+  run emitScalarOverflowRegs(&mut em.*, op, signed, kind.bits)
+  run storeGp(&mut em.*, result, X86Encode.rax())
+  return run storeGp(&mut em.*, result + 1, X86Encode.rdx())
+}
+
+// Computes `(rax = wrapped, rdx = overflow 0/1)` for `bits <= 64` from inputs `(rax, rcx)`.
+effect fn emitScalarOverflowRegs(em: &mut Emitter, op: Binary, signed: bool, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let flagCc = if signed { X86Encode.ccO() } else { X86Encode.ccB() }
+  if op == Binary.Add || op == Binary.Sub {
+    let aluOp = if op == Binary.Add { Alu.Add } else { Alu.Sub }
+    if bits == 8 {
+      run X86Encode.aluRr8(&mut em.code, aluOp, X86Encode.rax(), X86Encode.rcx())
+      run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rdx())
+      run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+      return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+    }
+    if bits == 16 {
+      run X86Encode.aluRr16(&mut em.code, aluOp, X86Encode.rax(), X86Encode.rcx())
+      run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rdx())
+      run X86Encode.movzxRr16(&mut em.code, X86Encode.rax(), X86Encode.rax())
+      return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+    }
+    if bits == 32 {
+      run X86Encode.aluRr32(&mut em.code, aluOp, X86Encode.rax(), X86Encode.rcx())
+      run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rdx())
+      return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+    }
+    if bits == 64 {
+      run X86Encode.aluRr64(&mut em.code, aluOp, X86Encode.rax(), X86Encode.rcx())
+      run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rdx())
+      return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+    }
+    // Arbitrary bit width `1..63`: shift left by `64 - bits` so overflow lands in bit 63!
+    let sh = usize.toU8(64 - bits)
+    run X86Encode.shiftImm64(&mut em.code, Shift.Shl, X86Encode.rax(), sh)
+    run X86Encode.shiftImm64(&mut em.code, Shift.Shl, X86Encode.rcx(), sh)
+    run X86Encode.aluRr64(&mut em.code, aluOp, X86Encode.rax(), X86Encode.rcx())
+    run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rdx())
+    run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rax(), sh)
+    return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+  }
+  // Multiply with overflow (`Mul`).
+  if bits == 64 {
+    if signed { run X86Encode.imulOne64(&mut em.code, X86Encode.rcx()) }
+    else { run X86Encode.mul64(&mut em.code, X86Encode.rcx()) }
+    run X86Encode.setcc(&mut em.code, X86Encode.ccO(), X86Encode.rdx())
+    return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+  }
+  // For `bits < 64`, widen both operands to 64 bits, multiply in 64-bit, check if normalized
+  // product equals the exact 64-bit product!
+  run normalizeInt(&mut em.*, X86Encode.rax(), bits, signed)
+  run normalizeInt(&mut em.*, X86Encode.rcx(), bits, signed)
+  run X86Encode.imulRr64(&mut em.code, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.movRr64(&mut em.code, X86Encode.r8(), X86Encode.rax())
+  run normalizeInt(&mut em.*, X86Encode.r8(), bits, signed)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.r8())
+  run X86Encode.setcc(&mut em.code, X86Encode.ccNe(), X86Encode.rdx())
+  run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+  return run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+}
+
+effect fn emitI128Overflow(em: &mut Emitter, function: &SsaFunction, op: Binary, signed: bool, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run loadPair(&mut em.*, function, left, X86Encode.rax(), X86Encode.rdx())
+  run loadPair(&mut em.*, function, right, X86Encode.r8(), X86Encode.r9())
+  let flagCc = if signed { X86Encode.ccO() } else { X86Encode.ccB() }
+  if op == Binary.Add {
+    run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.Adc, X86Encode.rdx(), X86Encode.r9())
+    run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rcx())
+    run X86Encode.movzxRr8(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+    run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+    return run storeGp(&mut em.*, result + 1, X86Encode.rcx())
+  }
+  if op == Binary.Sub {
+    run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.Sbb, X86Encode.rdx(), X86Encode.r9())
+    run X86Encode.setcc(&mut em.code, flagCc, X86Encode.rcx())
+    run X86Encode.movzxRr8(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+    run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+    return run storeGp(&mut em.*, result + 1, X86Encode.rcx())
+  }
+  // 128-bit multiply overflow: save inputs in rsi:rdi and r8:r9, compute wrapped product and check
+  // high 128 bits of full 256-bit product!
+  run X86Encode.movRr64(&mut em.code, X86Encode.rsi(), X86Encode.rax()) // aLo
+  run X86Encode.movRr64(&mut em.code, X86Encode.rdi(), X86Encode.rdx()) // aHi
+  if !signed {
+    // Unsigned 128x128 -> overflow iff (aHi != 0 && bHi != 0) or high(aLo*bHi) != 0 or high(aHi*bLo) != 0
+    // or sum of cross terms carries into bit 128.
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r11(), X86Encode.r11()) // ovf = 0
+    // rdx:rax = aLo * bLo
+    run X86Encode.mul64(&mut em.code, X86Encode.r8())
+    run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax()) // pLo
+    run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.rdx()) // pHi_0
+    // aHi * bHi != 0 -> ovf
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdi())
+    run X86Encode.mul64(&mut em.code, X86Encode.r9())
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rdx())
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rax())
+    // aHi * bLo
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdi())
+    run X86Encode.mul64(&mut em.code, X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rdx())
+    run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.r10(), X86Encode.rax())
+    run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.r11(), 0)
+    // aLo * bHi
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+    run X86Encode.mul64(&mut em.code, X86Encode.r9())
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rdx())
+    run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.r10(), X86Encode.rax())
+    run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.r11(), 0)
+    // ovfFlag = r11 != 0
+    run X86Encode.testRr64(&mut em.code, X86Encode.r11(), X86Encode.r11())
+    run X86Encode.setcc(&mut em.code, X86Encode.ccNe(), X86Encode.r11())
+    run X86Encode.movzxRr8(&mut em.code, X86Encode.r11(), X86Encode.r11())
+    run storePair(&mut em.*, result, X86Encode.rcx(), X86Encode.r10())
+    return run storeGp(&mut em.*, result + 1, X86Encode.r11())
+  }
+  // Signed 128x128: compute wrapped product, then check exact overflow via |a|*|b| using the
+  // unsigned check: fits in signed 128 iff |a|*|b| <= 2^127 - (neg ? 0 : 1).
+  // First compute wrapped product in r10(lo):r11(hi) on stack temp? No, compute via signs!
+  // Record resNeg = (aHi ^ bHi) >> 63 in bit 0 of stack-free? Compute wrapped product first and store it!
+  run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.rdi())
+  run X86Encode.imulRr64(&mut em.code, X86Encode.r10(), X86Encode.r8())
+  run X86Encode.movRr64(&mut em.code, X86Encode.r11(), X86Encode.rsi())
+  run X86Encode.imulRr64(&mut em.code, X86Encode.r11(), X86Encode.r9())
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.r10(), X86Encode.r11())
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+  run X86Encode.mul64(&mut em.code, X86Encode.r8())
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rdx(), X86Encode.r10())
+  run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+
+  // Now check signed overflow: rcx = resSign = (aHi ^ bHi) < 0.
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rdi())
+  run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rcx(), X86Encode.r9())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 63)
+  // abs(a) -> rsi:rdi
+  run X86Encode.testRr64(&mut em.code, X86Encode.rdi(), X86Encode.rdi())
+  let aPos = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNs())
+  run X86Encode.neg64(&mut em.code, X86Encode.rsi())
+  run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.rdi(), 0)
+  run X86Encode.neg64(&mut em.code, X86Encode.rdi())
+  patchHere(&mut em.*, aPos)
+  // abs(b) -> r8:r9
+  run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+  let bPos = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNs())
+  run X86Encode.neg64(&mut em.code, X86Encode.r8())
+  run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.r9(), 0)
+  run X86Encode.neg64(&mut em.code, X86Encode.r9())
+  patchHere(&mut em.*, bPos)
+  // Unsigned |a| * |b| -> (magLo, magHi, hiCarry in r11).
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r11(), X86Encode.r11())
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+  run X86Encode.mul64(&mut em.code, X86Encode.r8())
+  run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.rdx())
+  let saveMagLo = X86Encode.rax()
+  // Need magLo later; push it? Just test if aHi*bHi, aHi*bLo, aLo*bHi overflow, and keep magLo in rsi after last use!
+  // Compute aLo * bHi first (last use of rsi!).
+  run X86Encode.push(&mut em.code, saveMagLo)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+  run X86Encode.mul64(&mut em.code, X86Encode.r9())
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rdx())
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.r10(), X86Encode.rax())
+  run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.r11(), 0)
+  // aHi * bLo
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdi())
+  run X86Encode.mul64(&mut em.code, X86Encode.r8())
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rdx())
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.r10(), X86Encode.rax())
+  run X86Encode.aluRi64(&mut em.code, Alu.Adc, X86Encode.r11(), 0)
+  // aHi * bHi
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdi())
+  run X86Encode.mul64(&mut em.code, X86Encode.r9())
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rax())
+  run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r11(), X86Encode.rdx())
+  run X86Encode.pop(&mut em.code, X86Encode.rax()) // magLo in rax, magHi in r10, hiCarry in r11
+  // Check limit: if r11 != 0 -> ovf. Else if magHi > 0x8000...0 -> ovf.
+  // If magHi == 0x8000...0 -> ok iff (rcx == 1 && magLo == 0).
+  run X86Encode.testRr64(&mut em.code, X86Encode.r11(), X86Encode.r11())
+  let ovf1 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x8000000000000000)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.r10(), X86Encode.rdx())
+  let okSmall = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+  let ovf2 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccA())
+  // magHi == 2^63: ok iff resNeg == 1 && magLo == 0.
+  run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  let ovf3 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  run X86Encode.testRr64(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+  let ovf4 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  patchHere(&mut em.*, okSmall)
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  let doneOk = run X86Encode.jmpRel32(&mut em.code)
+  let ovfLbl = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, ovf1, ovfLbl)
+  X86Encode.patchRel32(&mut em.code, ovf2, ovfLbl)
+  X86Encode.patchRel32(&mut em.code, ovf3, ovfLbl)
+  X86Encode.patchRel32(&mut em.code, ovf4, ovfLbl)
+  run X86Encode.movImm32(&mut em.code, X86Encode.rax(), 1)
+  patchHere(&mut em.*, doneOk)
+  return run storeGp(&mut em.*, result + 1, X86Encode.rax())
+}
+
+effect fn emitSaturate(em: &mut Emitter, function: &SsaFunction, op: Binary, signed: bool, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorSaturate(&mut em.*, function, op, signed, kind, left, right, result)
+  }
+  if kind.bits > 64 {
+    return run emitI128Saturate(&mut em.*, function, op, signed, left, right, result)
+  }
+  run loadGp(&mut em.*, function, left, X86Encode.rax())
+  run loadGp(&mut em.*, function, right, X86Encode.rcx())
+  run emitScalarSaturateRegs(&mut em.*, op, signed, kind.bits)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+effect fn emitScalarSaturateRegs(em: &mut Emitter, op: Binary, signed: bool, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitScalarOverflowRegs(&mut em.*, op, signed, bits)
+  // `rax` = wrapped result, `rdx` = 1 if overflowed else 0.
+  run X86Encode.testRr64(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+  let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  if !signed {
+    let clamp = if op == Binary.Add { maskBits(u64.MAX, bits) } else { 0 }
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), clamp)
+  } else {
+    // Signed overflow: if wrapped result is negative (sign bit set), positive overflow -> MAX;
+    // if wrapped result is non-negative, negative overflow -> MIN!
+    let signBit = u64.shiftLeft(1, usize.toU64(bits - usize.ONE))
+    let maxS = signBit - 1
+    let minS = maskBits(signBit, bits)
+    run X86Encode.movImm64(&mut em.code, X86Encode.r8(), signBit)
+    run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), minS)
+    run X86Encode.movImm64(&mut em.code, X86Encode.r9(), maxS)
+    run X86Encode.cmov64(&mut em.code, X86Encode.ccNe(), X86Encode.rax(), X86Encode.r9())
+  }
+  patchHere(&mut em.*, ok)
+  return ()
+}
+
+effect fn emitI128Saturate(em: &mut Emitter, function: &SsaFunction, op: Binary, signed: bool, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run loadPair(&mut em.*, function, left, X86Encode.rax(), X86Encode.rdx())
+  run loadPair(&mut em.*, function, right, X86Encode.r8(), X86Encode.r9())
+  let flagCc = if signed { X86Encode.ccO() } else { X86Encode.ccB() }
+  if op == Binary.Add {
+    run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.Adc, X86Encode.rdx(), X86Encode.r9())
+  } else {
+    run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.aluRr64(&mut em.code, Alu.Sbb, X86Encode.rdx(), X86Encode.r9())
+  }
+  let ok = run X86Encode.jccRel32(&mut em.code, X86Encode.invertCc(flagCc))
+  if !signed {
+    let v = if op == Binary.Add { u64.MAX } else { 0 }
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), v)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), v)
+  } else {
+    run X86Encode.testRr64(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+    let wasNeg = run X86Encode.jccRel32(&mut em.code, X86Encode.ccS())
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+    run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x8000000000000000)
+    let done = run X86Encode.jmpRel32(&mut em.code)
+    patchHere(&mut em.*, wasNeg)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rax(), u64.MAX)
+    run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x7FFFFFFFFFFFFFFF)
+    patchHere(&mut em.*, done)
+  }
+  patchHere(&mut em.*, ok)
+  return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+}
+
+effect fn emitRotate(em: &mut Emitter, function: &SsaFunction, left: bool, kind: Kind, val: u64, amt: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorRotate(&mut em.*, function, left, kind, val, amt, result)
+  }
+  if kind.bits > 64 {
+    // 128-bit rotate: `(x << k) | (x >> (128 - k))`.
+    run loadPair(&mut em.*, function, val, X86Encode.rax(), X86Encode.rdx())
+    run loadGp(&mut em.*, function, amt, X86Encode.rcx())
+    run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 127)
+    run X86Encode.testRr32(&mut em.code, X86Encode.rcx(), X86Encode.rcx())
+    let zero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+    if !left {
+      run X86Encode.movImm32(&mut em.code, X86Encode.r8(), 128)
+      run X86Encode.aluRr32(&mut em.code, Alu.Sub, X86Encode.r8(), X86Encode.rcx())
+      run X86Encode.movRr32(&mut em.code, X86Encode.rcx(), X86Encode.r8())
+    }
+    // Rotate left by rcx in 1..127.
+    run X86Encode.aluRi32(&mut em.code, Alu.Cmp, X86Encode.rcx(), 64)
+    let lt64 = run X86Encode.jccRel32(&mut em.code, X86Encode.ccB())
+    // Swap halves and subtract 64.
+    run X86Encode.movRr64(&mut em.code, X86Encode.r8(), X86Encode.rax())
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+    run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), X86Encode.r8())
+    run X86Encode.aluRi32(&mut em.code, Alu.Sub, X86Encode.rcx(), 64)
+    patchHere(&mut em.*, lt64)
+    run X86Encode.movRr64(&mut em.code, X86Encode.r8(), X86Encode.rdx())
+    run X86Encode.shldCl64(&mut em.code, X86Encode.rdx(), X86Encode.rax())
+    run X86Encode.shldCl64(&mut em.code, X86Encode.rax(), X86Encode.r8())
+    patchHere(&mut em.*, zero)
+    return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+  }
+  run loadGp(&mut em.*, function, val, X86Encode.rax())
+  run loadGp(&mut em.*, function, amt, X86Encode.rcx())
+  run emitScalarRotateRegs(&mut em.*, left, kind.bits)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+effect fn emitScalarRotateRegs(em: &mut Emitter, left: bool, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let op = if left { Shift.Rol } else { Shift.Ror }
+  if bits == 64 { return run X86Encode.shiftCl64(&mut em.code, op, X86Encode.rax()) }
+  if bits == 32 { return run X86Encode.shiftCl32(&mut em.code, op, X86Encode.rax()) }
+  if bits == 16 {
+    run X86Encode.shiftCl16(&mut em.code, op, X86Encode.rax())
+    return run X86Encode.movzxRr16(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  }
+  if bits == 8 {
+    run X86Encode.shiftCl8(&mut em.code, op, X86Encode.rax())
+    return run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  }
+  return run normalizeInt(&mut em.*, X86Encode.rax(), bits, false)
+}
+
+effect fn emitCount(em: &mut Emitter, function: &SsaFunction, which: Count, kind: Kind, src: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorCount(&mut em.*, function, which, kind, src, result)
+  }
+  if kind.bits > 64 {
+    run loadPair(&mut em.*, function, src, X86Encode.r8(), X86Encode.r9())
+    match which {
+      Count.Ones => {
+        run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r8())
+        run emitPopcount64(&mut em.*)
+        run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.rax())
+        run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+        run emitPopcount64(&mut em.*)
+        run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.r10())
+      }
+      Count.LeadingZeros => {
+        run X86Encode.testRr64(&mut em.code, X86Encode.r9(), X86Encode.r9())
+        let hiZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+        run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+        run emitClz64(&mut em.*, 64)
+        let done = run X86Encode.jmpRel32(&mut em.code)
+        patchHere(&mut em.*, hiZero)
+        run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r8())
+        run emitClz64(&mut em.*, 64)
+        run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rax(), 64)
+        patchHere(&mut em.*, done)
+      }
+      Count.TrailingZeros => {
+        run X86Encode.testRr64(&mut em.code, X86Encode.r8(), X86Encode.r8())
+        let loZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+        run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r8())
+        run emitCtz64(&mut em.*, 64)
+        let done = run X86Encode.jmpRel32(&mut em.code)
+        patchHere(&mut em.*, loZero)
+        run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+        run emitCtz64(&mut em.*, 64)
+        run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rax(), 64)
+        patchHere(&mut em.*, done)
+      }
+    }
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rdx(), X86Encode.rdx())
+    return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+  }
+  run loadGp(&mut em.*, function, src, X86Encode.rax())
+  run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+  match which {
+    Count.Ones => { run emitPopcount64(&mut em.*) }
+    Count.LeadingZeros => { run emitClz64(&mut em.*, kind.bits) }
+    Count.TrailingZeros => { run emitCtz64(&mut em.*, kind.bits) }
+  }
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+// Baseline-safe software SWAR popcount on `rax` (clobbers `rcx`, `rdx`). Works on all x86-64 CPUs.
+effect fn emitPopcount64(em: &mut Emitter) -> () ! OutOfMemoryError ? &mut Allocator {
+  // x = x - ((x >> 1) & 0x5555555555555555)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 1)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x5555555555555555)
+  run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rcx(), X86Encode.rdx())
+  run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.rcx())
+  // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x3333333333333333)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 2)
+  run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rdx())
+  run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rcx(), X86Encode.rdx())
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
+  // x = ((x + (x >> 4)) & 0x0F0F...) * 0x0101... >> 56
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+  run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 4)
+  run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x0F0F0F0F0F0F0F0F)
+  run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rdx())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rdx(), 0x0101010101010101)
+  run X86Encode.imulRr64(&mut em.code, X86Encode.rax(), X86Encode.rdx())
+  return run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rax(), 56)
+}
+
+effect fn emitClz64(em: &mut Emitter, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  let isZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  run X86Encode.bsr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), usize.toU64(bits - usize.ONE))
+  run X86Encode.aluRr64(&mut em.code, Alu.Sub, X86Encode.rax(), X86Encode.rcx())
+  let done = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, isZero)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), usize.toU64(bits))
+  patchHere(&mut em.*, done)
+  return ()
+}
+
+effect fn emitCtz64(em: &mut Emitter, bits: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  let isZero = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  run X86Encode.bsf64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+  let done = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, isZero)
+  run X86Encode.movImm64(&mut em.code, X86Encode.rax(), usize.toU64(bits))
+  patchHere(&mut em.*, done)
+  return ()
+}
+
+effect fn emitExtreme(em: &mut Emitter, function: &SsaFunction, which: Extreme, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorExtreme(&mut em.*, function, which, kind, left, right, result)
+  }
+  if kind.isFloat() {
+    let double = kind.bits == 64
+    run loadFloat(&mut em.*, function, left, 0, X86Encode.rax())
+    run loadFloat(&mut em.*, function, right, 1, X86Encode.rax())
+    run emitIeeeFloatExtremeRegs(&mut em.*, which == Extreme.FloatMaximum, double)
+    return run storeFloat(&mut em.*, result, 0, double)
+  }
+  if kind.bits > 64 {
+    let pred = match which {
+      Extreme.SignedMinimum => Predicate.Slt
+      Extreme.SignedMaximum => Predicate.Sgt
+      Extreme.UnsignedMinimum => Predicate.Ult
+      _ => Predicate.Ugt
+    }
+    run loadPair(&mut em.*, function, left, X86Encode.rax(), X86Encode.rdx())
+    run loadPair(&mut em.*, function, right, X86Encode.r8(), X86Encode.r9())
+    run emitI128CompareRegs(&mut em.*, pred)
+    run X86Encode.movRr64(&mut em.code, X86Encode.r10(), X86Encode.rax())
+    run loadPair(&mut em.*, function, left, X86Encode.rax(), X86Encode.rdx())
+    run loadPair(&mut em.*, function, right, X86Encode.r8(), X86Encode.r9())
+    run X86Encode.testRi8(&mut em.code, X86Encode.r10(), 1)
+    run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rax(), X86Encode.r8())
+    run X86Encode.cmov64(&mut em.code, X86Encode.ccE(), X86Encode.rdx(), X86Encode.r9())
+    return run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+  }
+  let signed = which == Extreme.SignedMinimum || which == Extreme.SignedMaximum
+  let cc = match which {
+    Extreme.SignedMinimum => X86Encode.ccG()
+    Extreme.SignedMaximum => X86Encode.ccL()
+    Extreme.UnsignedMinimum => X86Encode.ccA()
+    _ => X86Encode.ccB()
+  }
+  run loadGp(&mut em.*, function, left, X86Encode.rax())
+  run loadGp(&mut em.*, function, right, X86Encode.rcx())
+  run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, signed)
+  run normalizeInt(&mut em.*, X86Encode.rcx(), kind.bits, signed)
+  run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.rcx())
+  run X86Encode.cmov64(&mut em.code, cc, X86Encode.rax(), X86Encode.rcx())
+  run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+// IEEE 754 minimum/maximum on `xmm0` and `xmm1` -> `xmm0` (NaN propagates, -0.0 < +0.0).
+effect fn emitIeeeFloatExtremeRegs(em: &mut Emitter, isMax: bool, double: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.ucomiFloat(&mut em.code, double, 0, 1)
+  let unordered = run X86Encode.jccRel32(&mut em.code, X86Encode.ccP())
+  let equal = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  let keep0 = run X86Encode.jccRel32(&mut em.code, if isMax { X86Encode.ccA() } else { X86Encode.ccB() })
+  run X86Encode.movapsRr(&mut em.code, 0, 1)
+  let done1 = run X86Encode.jmpRel32(&mut em.code)
+
+  // Unordered: return whichever is NaN (`addFloat` propagates quiet NaN cleanly).
+  patchHere(&mut em.*, unordered)
+  run X86Encode.addFloat(&mut em.code, double, 0, 1)
+  let done2 = run X86Encode.jmpRel32(&mut em.code)
+
+  // Equal (+0.0 vs -0.0): for min, OR bits (picks -0.0); for max, AND bits (picks +0.0)!
+  patchHere(&mut em.*, equal)
+  if isMax { run X86Encode.pand(&mut em.code, 0, 1) }
+  else { run X86Encode.por(&mut em.code, 0, 1) }
+
+  let end = Bytes.length(&em.code)
+  X86Encode.patchRel32(&mut em.code, keep0, end)
+  X86Encode.patchRel32(&mut em.code, done1, end)
+  X86Encode.patchRel32(&mut em.code, done2, end)
+  return ()
+}
+
+effect fn emitFma(em: &mut Emitter, function: &SsaFunction, kind: Kind, a: u64, b: u64, c: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorFma(&mut em.*, function, kind, a, b, c, result)
+  }
+  let double = kind.bits == 64
+  run loadFloat(&mut em.*, function, a, 0, X86Encode.rax())
+  run loadFloat(&mut em.*, function, b, 1, X86Encode.rax())
+  run loadFloat(&mut em.*, function, c, 2, X86Encode.rax())
+  run callExternal(&mut em.*, if double { b"fma" } else { b"fmaf" })
+  return run storeFloat(&mut em.*, result, 0, double)
+}
+
+effect fn emitSqrt(em: &mut Emitter, function: &SsaFunction, kind: Kind, src: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    return run emitVectorUnary(&mut em.*, function, 1, kind, src, result)
+  }
+  let double = kind.bits == 64
+  run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+  run X86Encode.sqrtFloat(&mut em.code, double, 0, 0)
+  return run storeFloat(&mut em.*, result, 0, double)
+}
+
+// ---- Atomics ----
+
+effect fn emitAtomicLoad(em: &mut Emitter, function: &SsaFunction, kind: Kind, addrVal: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  // On x86-64 TSO, naturally aligned loads are acquire-atomic; `emitLoad` reads directly.
+  return run emitLoad(&mut em.*, function, addrVal, 0, kind, result)
+}
+
+effect fn emitAtomicStore(em: &mut Emitter, function: &SsaFunction, val: u64, addrVal: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let kind = function.value(val).kind
+  run loadGp(&mut em.*, function, addrVal, X86Encode.rdi())
+  run loadGp(&mut em.*, function, val, X86Encode.rax())
+  let w = kind.elementBytes()
+  drop run X86Encode.xchgMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax(), w)
+  return ()
+}
+
+effect fn emitAtomicModify(em: &mut Emitter, function: &SsaFunction, which: Modify, kind: Kind, addrVal: u64, val: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run loadGp(&mut em.*, function, addrVal, X86Encode.rdi())
+  run loadGp(&mut em.*, function, val, X86Encode.rsi())
+  let w = kind.elementBytes()
+  if which == Modify.Exchange {
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+    drop run X86Encode.xchgMr(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax(), w)
+    run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+  if which == Modify.Add {
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+    drop run X86Encode.lockXadd(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax(), w)
+    run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+  if which == Modify.Sub {
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.rsi())
+    run X86Encode.neg64(&mut em.code, X86Encode.rax())
+    drop run X86Encode.lockXadd(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rax(), w)
+    run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
+  // General `lock cmpxchg` retry loop for And/Or/Xor/SignedMin/Max/UnsignedMin/Max.
+  if w == 1 { drop run X86Encode.movzxRm8(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rdi(), 0)) }
+  else if w == 2 { drop run X86Encode.movzxRm16(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rdi(), 0)) }
+  else if w == 4 { drop run X86Encode.movRm32(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rdi(), 0)) }
+  else { drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rdi(), 0)) }
+  let retry = Bytes.length(&em.code)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), X86Encode.rax())
+  match which {
+    Modify.And => { run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rcx(), X86Encode.rsi()) }
+    Modify.Or => { run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rcx(), X86Encode.rsi()) }
+    Modify.Xor => { run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rcx(), X86Encode.rsi()) }
+    _ => {
+      let signed = which == Modify.SignedMinimum || which == Modify.SignedMaximum
+      let cc = match which {
+        Modify.SignedMinimum => X86Encode.ccG()
+        Modify.SignedMaximum => X86Encode.ccL()
+        Modify.UnsignedMinimum => X86Encode.ccA()
+        _ => X86Encode.ccB()
+      }
+      run X86Encode.movRr64(&mut em.code, X86Encode.r8(), X86Encode.rcx())
+      run X86Encode.movRr64(&mut em.code, X86Encode.r9(), X86Encode.rsi())
+      run normalizeInt(&mut em.*, X86Encode.r8(), kind.bits, signed)
+      run normalizeInt(&mut em.*, X86Encode.r9(), kind.bits, signed)
+      run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.r8(), X86Encode.r9())
+      run X86Encode.cmov64(&mut em.code, cc, X86Encode.rcx(), X86Encode.rsi())
+    }
+  }
+  drop run X86Encode.lockCmpxchg(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rcx(), w)
+  let back = run X86Encode.jccRel32(&mut em.code, X86Encode.ccNe())
+  X86Encode.patchRel32(&mut em.code, back, retry)
+  run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+effect fn emitCompareExchange(em: &mut Emitter, function: &SsaFunction, kind: Kind, addrVal: u64, expected: u64, replacement: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  run loadGp(&mut em.*, function, addrVal, X86Encode.rdi())
+  if kind.bits > 64 {
+    run loadPair(&mut em.*, function, expected, X86Encode.rax(), X86Encode.rdx())
+    run loadPair(&mut em.*, function, replacement, X86Encode.rbx(), X86Encode.rcx())
+    drop run X86Encode.lockCmpxchg16b(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0))
+    run X86Encode.setcc(&mut em.code, X86Encode.ccE(), X86Encode.r8())
+    run X86Encode.movzxRr8(&mut em.code, X86Encode.r8(), X86Encode.r8())
+    run storePair(&mut em.*, result, X86Encode.rax(), X86Encode.rdx())
+    return run storeGp(&mut em.*, result + 1, X86Encode.r8())
+  }
+  run loadGp(&mut em.*, function, expected, X86Encode.rax())
+  run loadGp(&mut em.*, function, replacement, X86Encode.rcx())
+  let w = kind.elementBytes()
+  drop run X86Encode.lockCmpxchg(&mut em.code, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rcx(), w)
+  run X86Encode.setcc(&mut em.code, X86Encode.ccE(), X86Encode.rdx())
+  run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+  run X86Encode.movzxRr8(&mut em.code, X86Encode.rdx(), X86Encode.rdx())
+  run storeGp(&mut em.*, result, X86Encode.rax())
+  return run storeGp(&mut em.*, result + 1, X86Encode.rdx())
+}
+
+// ---- Inline Assembly ----
+
+effect fn emitInlineAsm(em: &mut Emitter, function: &SsaFunction, asmIdx: usize, kind: Kind, ops: &[u64], result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let asm: &InlineAsm = function.asm(asmIdx)
+  let hasOut = !kind.isUnit()
+  let parsed = run X86Asm.parseConstraints(Bytes.asSlice(&asm.constraints), hasOut)
+  let cs = List<Constraint>.asSlice(&parsed)
+  let clobMask = X86Asm.parseClobberMask(Bytes.asSlice(&asm.clobbers))
+
+  // Reserve all fixed registers + clobbers + rsp(4) + rbp(5).
+  let mut used: u64 = clobMask | u64.shiftLeft(1, 4) | u64.shiftLeft(1, 5)
+  let mut c = usize.ZERO
+  while c < cs.length {
+    if cs[c].kind == ConstraintKind.FixedReg && cs[c].reg < 16 {
+      used = used | u64.shiftLeft(1, u8.toU64(cs[c].reg))
+    }
+    c = c + usize.ONE
+  }
+
+  // Assign a physical GPR to every operand slot `$0..$N`.
+  let mut bindings = run List<OperandBinding>.makeWithCapacity(cs.length)
+  let allocOrder: [u8; 9] = [0, 7, 6, 2, 1, 8, 9, 10, 11]
+  c = usize.ZERO
+  while c < cs.length {
+    let cur = cs[c]
+    if cur.kind == ConstraintKind.FixedReg {
+      run List<OperandBinding>.append(&mut bindings, OperandBinding {reg: cur.reg, isMemory: false})
+    } else if cur.kind == ConstraintKind.TiedOutput {
+      let outReg = List<OperandBinding>.asSlice(&bindings)[usize.ZERO].reg
+      run List<OperandBinding>.append(&mut bindings, OperandBinding {reg: outReg, isMemory: false})
+    } else {
+      let mut chosen: u8 = 0
+      let mut k = usize.ZERO
+      while k < 9 {
+        let cand = allocOrder[k]
+        if (used & u64.shiftLeft(1, u8.toU64(cand))) == 0 {
+          chosen = cand
+          used = used | u64.shiftLeft(1, u8.toU64(cand))
+          break
+        }
+        k = k + usize.ONE
+      }
+      run List<OperandBinding>.append(&mut bindings, OperandBinding {reg: chosen, isMemory: cur.kind == ConstraintKind.Memory})
+    }
+    c = c + usize.ONE
+  }
+
+  // Load input operands into their assigned GPRs.
+  let bound = List<OperandBinding>.asSlice(&bindings)
+  let mut opAt = usize.ZERO
+  while opAt < ops.length {
+    let slotIdx = if hasOut { opAt + usize.ONE } else { opAt }
+    if slotIdx < bound.length {
+      run loadGp(&mut em.*, function, ops[opAt], bound[slotIdx].reg)
+    }
+    opAt = opAt + usize.ONE
+  }
+
+  // Assemble the template directly into `em.code`.
+  let mut asmRelocs = List<AsmCallReloc>.make()
+  match move run Effect.result(X86Asm.assemble(&mut em.code, &mut asmRelocs, Bytes.asSlice(&asm.template), bound)) {
+    Result<(), UnsupportedAsm | OutOfMemoryError>.Success {..} => {}
+    Result<(), UnsupportedAsm | OutOfMemoryError>.Failure {error} => match move error {
+      UnsupportedAsm bad => { return run X86Object.unsupported(Bytes.asSlice(&bad.detail), Bytes.asSlice(&em.symbol)) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let rels = List<AsmCallReloc>.asSlice(&asmRelocs)
+  let mut r = usize.ZERO
+  while r < rels.length {
+    run addReloc(&mut em.*, rels[r].offset, RelocationKind.Plt32, Bytes.asSlice(&rels[r].symbol), -4)
+    r = r + usize.ONE
+  }
+
+  // Store the output GPR into `result`'s home slot.
+  if hasOut && bound.length > usize.ZERO {
+    run storeGp(&mut em.*, result, bound[usize.ZERO].reg)
+  }
+  return ()
+}
+
+// ---- Calls (SysV AMD64 C & Silk ABI, Direct & Indirect, 0/1/2-Value Returns) ----
+
+effect fn emitCall(
+  em: &mut Emitter,
+  function: &SsaFunction,
+  symbolIdx: usize,
+  indirect: bool,
+  fixed: usize,
+  abiIdx: usize,
+  inst: Instruction,
+  ops: &[u64],
+) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let argStart = if indirect { usize.ONE } else { usize.ZERO }
+  let argCount = ops.length - argStart
+  let hasAbi = abiIdx != usize.MAX
+  let callAbi = if hasAbi { function.callAbi(abiIdx) } else { CallAbi {callingConvention: CallingConvention.Silk, resultExtension: AbiExtension.None, parameterStart: usize.ZERO, parameterCount: usize.ZERO} }
+
+  // First pass: plan how each argument is passed (GP reg, XMM reg, or stack offset).
+  let mut gpCount = usize.ZERO
+  let mut fpCount = usize.ZERO
+  let mut stackSize: u64 = 0
+  let mut argClass = run List<u8>.makeWithCapacity(argCount) // 0=GP, 1=FP, 2=I128_GP, 3=STACK, 4=BYVAL, 5=VEC_FP, 6=VEC_STACK
+  let mut argLoc = run List<u64>.makeWithCapacity(argCount)  // reg index or stack byte offset
+  let mut a = usize.ZERO
+  while a < argCount {
+    let opVal = ops[argStart + a]
+    let k = function.value(opVal).kind
+    let pAbi = if hasAbi && a < callAbi.parameterCount { function.callParameterAbisOf(abiIdx)[a] } else { ParameterAbi.plain() }
+    if pAbi.byvalSize > 0 {
+      let align: u64 = if pAbi.byvalAlignment > 8 { usize.toU64(pAbi.byvalAlignment) } else { 8 }
+      stackSize = alignUpU64(stackSize, align)
+      run List<u8>.append(&mut argClass, 4)
+      run List<u64>.append(&mut argLoc, stackSize)
+      stackSize = stackSize + ((pAbi.byvalSize + 7) / 8) * 8
+    } else if k.isVector() {
+      let sz = usize.toU64(k.storeSize())
+      if sz <= 16 && fpCount < 8 {
+        run List<u8>.append(&mut argClass, 5)
+        run List<u64>.append(&mut argLoc, usize.toU64(fpCount))
+        fpCount = fpCount + usize.ONE
+      } else {
+        let align: u64 = if sz >= 16 { 16 } else { 8 }
+        stackSize = alignUpU64(stackSize, align)
+        run List<u8>.append(&mut argClass, 6)
+        run List<u64>.append(&mut argLoc, stackSize)
+        stackSize = stackSize + ((sz + 7) / 8) * 8
+      }
+    } else if k.isFloat() {
+      if fpCount < 8 {
+        run List<u8>.append(&mut argClass, 1)
+        run List<u64>.append(&mut argLoc, usize.toU64(fpCount))
+        fpCount = fpCount + usize.ONE
+      } else {
+        run List<u8>.append(&mut argClass, 3)
+        run List<u64>.append(&mut argLoc, stackSize)
+        stackSize = stackSize + 8
+      }
+    } else if k.bits > 64 {
+      if gpCount + 2 <= 6 {
+        run List<u8>.append(&mut argClass, 2)
+        run List<u64>.append(&mut argLoc, usize.toU64(gpCount))
+        gpCount = gpCount + 2
+      } else {
+        run List<u8>.append(&mut argClass, 3)
+        run List<u64>.append(&mut argLoc, stackSize)
+        stackSize = stackSize + 16
+      }
+    } else {
+      if gpCount < 6 {
+        run List<u8>.append(&mut argClass, 0)
+        run List<u64>.append(&mut argLoc, usize.toU64(gpCount))
+        gpCount = gpCount + usize.ONE
+      } else {
+        run List<u8>.append(&mut argClass, 3)
+        run List<u64>.append(&mut argLoc, stackSize)
+        stackSize = stackSize + 8
+      }
+    }
+    a = a + usize.ONE
+  }
+
+  let outgoingStack = alignUpU64(stackSize, 16)
+  if outgoingStack > 0 {
+    run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), u64.wrappingToI32(outgoingStack))
+  }
+
+  // Second pass: populate outgoing stack arguments first (so scratch regs are completely free).
+  let cls = List<u8>.asSlice(&argClass)
+  let loc = List<u64>.asSlice(&argLoc)
+  a = usize.ZERO
+  while a < argCount {
+    let opVal = ops[argStart + a]
+    let k = function.value(opVal).kind
+    let pAbi = if hasAbi && a < callAbi.parameterCount { function.callParameterAbisOf(abiIdx)[a] } else { ParameterAbi.plain() }
+    let off = u64.wrappingToI32(loc[a])
+    if cls[a] == 4 {
+      // `byval`: copy `pAbi.byvalSize` bytes from pointer operand to `[rsp + off]`.
+      run loadGp(&mut em.*, function, opVal, X86Encode.rsi())
+      drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), off))
+      run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), pAbi.byvalSize)
+      run X86Encode.repMovsb(&mut em.code)
+    } else if cls[a] == 6 {
+      // Wide vector on stack.
+      run vectorAddr(&mut em.*, function, opVal, X86Encode.rsi())
+      drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), off))
+      run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(k.storeSize()))
+      run X86Encode.repMovsb(&mut em.code)
+    } else if cls[a] == 3 {
+      if k.isFloat() {
+        run loadFloat(&mut em.*, function, opVal, 0, X86Encode.rax())
+        if k.bits == 64 { drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), off), 0) }
+        else { drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), off), 0) }
+      } else if k.bits > 64 {
+        run loadPair(&mut em.*, function, opVal, X86Encode.rax(), X86Encode.rdx())
+        drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), off), X86Encode.rax())
+        drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), off + 8), X86Encode.rdx())
+      } else {
+        run loadGp(&mut em.*, function, opVal, X86Encode.rax())
+        run applyParamExt(&mut em.*, X86Encode.rax(), k.bits, pAbi.extension)
+        drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), off), X86Encode.rax())
+      }
+    }
+    a = a + usize.ONE
+  }
+
+  // Third pass: load XMM register arguments (may clobber `rax` for float constants).
+  a = usize.ZERO
+  while a < argCount {
+    let opVal = ops[argStart + a]
+    if cls[a] == 1 {
+      run loadFloat(&mut em.*, function, opVal, u64.wrappingToU8(loc[a]), X86Encode.rax())
+    } else if cls[a] == 5 {
+      run vectorAddr(&mut em.*, function, opVal, X86Encode.rax())
+      drop run X86Encode.movdquRm(&mut em.code, u64.wrappingToU8(loc[a]), Mem.baseDisp(X86Encode.rax(), 0))
+    }
+    a = a + usize.ONE
+  }
+
+  // Fourth pass: load GP register arguments (uses `r10`/`r11` only if needed for TLS/constants).
+  a = usize.ZERO
+  while a < argCount {
+    let opVal = ops[argStart + a]
+    let k = function.value(opVal).kind
+    let pAbi = if hasAbi && a < callAbi.parameterCount { function.callParameterAbisOf(abiIdx)[a] } else { ParameterAbi.plain() }
+    if cls[a] == 0 {
+      let reg = sysvGpArg(u64.toUsize(loc[a]))
+      run loadGp(&mut em.*, function, opVal, reg)
+      run applyParamExt(&mut em.*, reg, k.bits, pAbi.extension)
+    } else if cls[a] == 2 {
+      let g = u64.toUsize(loc[a])
+      run loadPair(&mut em.*, function, opVal, sysvGpArg(g), sysvGpArg(g + usize.ONE))
+    }
+    a = a + usize.ONE
+  }
+
+  // SysV AMD64 variadic ABI: `al` carries the count of XMM registers used (`0..8`).
+  if fixed != usize.MAX {
+    run X86Encode.movImm32(&mut em.code, X86Encode.rax(), usize.toU64(fpCount))
+  }
+
+  // Emit `call`.
+  if indirect {
+    run loadGp(&mut em.*, function, ops[0], X86Encode.r10())
+    run X86Encode.callReg(&mut em.code, X86Encode.r10())
+  } else {
+    let sym = function.symbolName(symbolIdx)
+    let callAt = run X86Encode.callRel32(&mut em.code)
+    run addReloc(&mut em.*, callAt, RelocationKind.Plt32, sym, -4)
+  }
+
+  if outgoingStack > 0 {
+    run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), u64.wrappingToI32(outgoingStack))
+  }
+
+  // Store 0, 1, or 2 return values per SysV AMD64 register assignment (`rax`/`rdx`, `xmm0`/`xmm1`).
+  let rc = inst.resultCount()
+  if rc == usize.ZERO { return () }
+  let mut gpRet = usize.ZERO
+  let mut fpRet = usize.ZERO
+  run storeReturnPiece(&mut em.*, inst.kind, inst.result, &mut gpRet, &mut fpRet)
+  if rc >= 2 {
+    run storeReturnPiece(&mut em.*, inst.secondKind, inst.result + 1, &mut gpRet, &mut fpRet)
+  }
+  return ()
+}
+
+effect fn applyParamExt(em: &mut Emitter, reg: u8, bits: usize, ext: AbiExtension) -> () ! OutOfMemoryError ? &mut Allocator {
+  match ext {
+    AbiExtension.Signed => { return run normalizeInt(&mut em.*, reg, bits, true) }
+    AbiExtension.Unsigned => { return run normalizeInt(&mut em.*, reg, bits, false) }
+    AbiExtension.None => { return () }
+  }
+}
+
+effect fn storeReturnPiece(em: &mut Emitter, kind: Kind, dstVal: u64, gpRet: &mut usize, fpRet: &mut usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    let xmm = usize.toU8(fpRet.*)
+    fpRet.* = fpRet.* + usize.ONE
+    let off = valOff(&em.*, dstVal)
+    if off != 0 {
+      drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), off), xmm)
+    }
+    return ()
+  }
+  if kind.isFloat() {
+    let xmm = usize.toU8(fpRet.*)
+    fpRet.* = fpRet.* + usize.ONE
+    return run storeFloat(&mut em.*, dstVal, xmm, kind.bits == 64)
+  }
+  if kind.bits > 64 {
+    gpRet.* = gpRet.* + 2
+    return run storePair(&mut em.*, dstVal, X86Encode.rax(), X86Encode.rdx())
+  }
+  let reg = if gpRet.* == usize.ZERO { X86Encode.rax() } else { X86Encode.rdx() }
+  gpRet.* = gpRet.* + usize.ONE
+  return run storeGp(&mut em.*, dstVal, reg)
+}
+
+// ---- SIMD / Vector Operations & All 19 x86-64 Architecture Intrinsics ----
+
+// Loads lane `idxReg` (in `r11`) of vector at address `baseReg` into `dstReg` (or `xmm0` for float).
+effect fn loadVectorLane(em: &mut Emitter, kind: Kind, baseReg: u8, idxReg: u8, dstGp: u8, dstXmm: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if kind.bits == 1 {
+    // Bit-packed mask: byte = [base + (idx >> 3)], bit = (byte >> (idx & 7)) & 1.
+    // Load through `r10` so `dstGp == rcx` is never clobbered before the shift.
+    run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), idxReg)
+    run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.rcx(), 3)
+    drop run X86Encode.movzxRm8(&mut em.code, X86Encode.r10(), Mem.baseIndex(baseReg, X86Encode.rcx(), 1, 0))
+    run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), idxReg)
+    run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 7)
+    run X86Encode.shiftCl64(&mut em.code, Shift.Shr, X86Encode.r10())
+    run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.r10(), 1)
+    return run X86Encode.movRr64(&mut em.code, dstGp, X86Encode.r10())
+  }
+  let eb = kind.elementBytes()
+  let scale: u8 = usize.toU8(eb)
+  let mem = Mem.baseIndex(baseReg, idxReg, scale, 0)
+  if kind.isFloat() {
+    if kind.bits == 64 { drop run X86Encode.movsdRm(&mut em.code, dstXmm, mem) }
+    else { drop run X86Encode.movssRm(&mut em.code, dstXmm, mem) }
+    return ()
+  }
+  if eb == 1 { drop run X86Encode.movzxRm8(&mut em.code, dstGp, mem) }
+  else if eb == 2 { drop run X86Encode.movzxRm16(&mut em.code, dstGp, mem) }
+  else if eb == 4 { drop run X86Encode.movRm32(&mut em.code, dstGp, mem) }
+  else { drop run X86Encode.movRm64(&mut em.code, dstGp, mem) }
+  return ()
+}
+
+// Clears unused padding bits in a bit-packed `mask<N>` destination slot before lane writes.
+effect fn zeroMaskSlot(em: &mut Emitter, kind: Kind, dstOff: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if kind.bits != 1 || dstOff == 0 { return () }
+  let sz = kind.storeSize()
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax())
+  let mut at = usize.ZERO
+  while at + 8 <= sz {
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff + usize.toI32(at)), X86Encode.rax())
+    at = at + 8
+  }
+  while at < sz {
+    drop run X86Encode.movMr8(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff + usize.toI32(at)), X86Encode.rax())
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Stores lane `idxReg` (`r11`) into vector at address `baseReg` from `srcGp` / `srcXmm`.
+effect fn storeVectorLane(em: &mut Emitter, kind: Kind, baseReg: u8, idxReg: u8, srcGp: u8, srcXmm: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if kind.bits == 1 {
+    // Set or clear bit `idx & 7` in byte `[base + (idx >> 3)]` (clobbers `rcx`, `rdx`, `r8`).
+    run X86Encode.movRr64(&mut em.code, X86Encode.r8(), idxReg)
+    run X86Encode.shiftImm64(&mut em.code, Shift.Shr, X86Encode.r8(), 3)
+    run X86Encode.movRr64(&mut em.code, X86Encode.rcx(), idxReg)
+    run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rcx(), 7)
+    run X86Encode.movImm32(&mut em.code, X86Encode.rdx(), 1)
+    run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rdx())
+    // Clear bit, then OR in `(srcGp & 1) << (idx & 7)`.
+    drop run X86Encode.movzxRm8(&mut em.code, X86Encode.r10(), Mem.baseIndex(baseReg, X86Encode.r8(), 1, 0))
+    run X86Encode.not64(&mut em.code, X86Encode.rdx())
+    run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.r10(), X86Encode.rdx())
+    run X86Encode.movRr64(&mut em.code, X86Encode.rdx(), srcGp)
+    run X86Encode.aluRi64(&mut em.code, Alu.And, X86Encode.rdx(), 1)
+    run X86Encode.shiftCl64(&mut em.code, Shift.Shl, X86Encode.rdx())
+    run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.r10(), X86Encode.rdx())
+    drop run X86Encode.movMr8(&mut em.code, Mem.baseIndex(baseReg, X86Encode.r8(), 1, 0), X86Encode.r10())
+    return ()
+  }
+  let eb = kind.elementBytes()
+  let scale: u8 = usize.toU8(eb)
+  let mem = Mem.baseIndex(baseReg, idxReg, scale, 0)
+  if kind.isFloat() {
+    if kind.bits == 64 { drop run X86Encode.movsdMr(&mut em.code, mem, srcXmm) }
+    else { drop run X86Encode.movssMr(&mut em.code, mem, srcXmm) }
+    return ()
+  }
+  if eb == 1 { drop run X86Encode.movMr8(&mut em.code, mem, srcGp) }
+  else if eb == 2 { drop run X86Encode.movMr16(&mut em.code, mem, srcGp) }
+  else if eb == 4 { drop run X86Encode.movMr32(&mut em.code, mem, srcGp) }
+  else { drop run X86Encode.movMr64(&mut em.code, mem, srcGp) }
+  return ()
+}
+
+effect fn emitVectorBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run zeroMaskSlot(&mut em.*, kind, dstOff)
+  // Reserve 24 bytes on stack for lane loop state: [rsp+0]=dstPtr, [rsp+8]=lhsPtr, [rsp+16]=rhsPtr, [rsp+24]=idx.
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, left, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, right, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 1)
+  if kind.isFloat() {
+    let double = kind.bits == 64
+    match op {
+      Binary.Add => { run X86Encode.addFloat(&mut em.code, double, 0, 1) }
+      Binary.Sub => { run X86Encode.subFloat(&mut em.code, double, 0, 1) }
+      Binary.Mul => { run X86Encode.mulFloat(&mut em.code, double, 0, 1) }
+      Binary.UDiv => { run X86Encode.divFloat(&mut em.code, double, 0, 1) }
+      Binary.SDiv => { run X86Encode.divFloat(&mut em.code, double, 0, 1) }
+      Binary.URem => { run callExternal(&mut em.*, if double { b"fmod" } else { b"fmodf" }) }
+      Binary.SRem => { run callExternal(&mut em.*, if double { b"fmod" } else { b"fmodf" }) }
+      _ => {}
+    }
+  } else {
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+    run emitScalarIntBinaryRegs(&mut em.*, op, kind.bits)
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+// `mode == 0`: float negate; `mode == 1`: float sqrt.
+effect fn emitVectorUnary(em: &mut Emitter, function: &SsaFunction, mode: u8, kind: Kind, src: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, src, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  if mode == 0 {
+    if kind.bits == 64 {
+      run X86Encode.movqFromXmm(&mut em.code, X86Encode.rax(), 0)
+      run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), 0x8000000000000000)
+      run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
+      run X86Encode.movqToXmm(&mut em.code, 0, X86Encode.rax())
+    } else {
+      run X86Encode.movdFromXmm(&mut em.code, X86Encode.rax(), 0)
+      run X86Encode.movImm32(&mut em.code, X86Encode.rcx(), 0x80000000)
+      run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx())
+      run X86Encode.movdToXmm(&mut em.code, 0, X86Encode.rax())
+    }
+  } else {
+    run X86Encode.sqrtFloat(&mut em.code, kind.bits == 64, 0, 0)
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorCompare(em: &mut Emitter, function: &SsaFunction, pred: Predicate, opKind: Kind, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  let maskKind = opKind.flags()
+  run zeroMaskSlot(&mut em.*, maskKind, dstOff)
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, left, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, right, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(opKind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, opKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, opKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 1)
+  if opKind.isFloat() {
+    run emitFloatCompareRegs(&mut em.*, pred, opKind.bits == 64)
+  } else {
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+    run emitIntCompareRegs(&mut em.*, pred, opKind.bits)
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run storeVectorLane(&mut em.*, maskKind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind, cond: u64, yes: u64, no: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run zeroMaskSlot(&mut em.*, kind, dstOff)
+  let condKind = function.value(cond).kind
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 48)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, yes, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, no, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  if condKind.isVector() {
+    run vectorAddr(&mut em.*, function, cond, X86Encode.rax())
+  } else {
+    run loadGp(&mut em.*, function, cond, X86Encode.rax())
+  }
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  if condKind.isVector() {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 24))
+    run loadVectorLane(&mut em.*, condKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  } else {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), 24))
+  }
+  run X86Encode.testRi8(&mut em.code, X86Encode.rax(), 1)
+  let pickNo = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  let gotSrc = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, pickNo)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  patchHere(&mut em.*, gotSrc)
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
+}
+
+effect fn emitVectorCast(em: &mut Emitter, function: &SsaFunction, op: Cast, srcKind: Kind, dstKind: Kind, src: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run zeroMaskSlot(&mut em.*, dstKind, dstOff)
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, src, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(dstKind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, srcKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  match op {
+    Cast.Trunc => { run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false) }
+    Cast.ZExt => { run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, false) }
+    Cast.SExt => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, true)
+      run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false)
+    }
+    Cast.FPTrunc => { run X86Encode.cvtsd2ss(&mut em.code, 0, 0) }
+    Cast.FPExt => { run X86Encode.cvtss2sd(&mut em.code, 0, 0) }
+    Cast.SIToFP => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, true)
+      run X86Encode.cvtsi2Float(&mut em.code, dstKind.bits == 64, true, 0, X86Encode.rax())
+    }
+    Cast.UIToFP => {
+      run normalizeInt(&mut em.*, X86Encode.rax(), srcKind.bits, false)
+      run emitU64ToF64(&mut em.*, X86Encode.rax(), 0)
+      if dstKind.bits == 32 { run X86Encode.cvtsd2ss(&mut em.code, 0, 0) }
+    }
+    Cast.FPToSI => {
+      if srcKind.bits == 32 { run X86Encode.cvtss2sd(&mut em.code, 0, 0) }
+      run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
+      run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false)
+    }
+    Cast.FPToUI => {
+      if srcKind.bits == 32 { run X86Encode.cvtss2sd(&mut em.code, 0, 0) }
+      run X86Encode.cvttFloat2Si(&mut em.code, true, true, X86Encode.rax(), 0)
+      run normalizeInt(&mut em.*, X86Encode.rax(), dstKind.bits, false)
+    }
+    _ => {}
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run storeVectorLane(&mut em.*, dstKind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorOverflow(em: &mut Emitter, function: &SsaFunction, op: Binary, signed: bool, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  let ovfOff = valOff(&em.*, result + 1)
+  let maskKind = kind.flags()
+  run zeroMaskSlot(&mut em.*, maskKind, ovfOff)
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 48)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), ovfOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, left, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, right, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 0)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+  run emitScalarOverflowRegs(&mut em.*, op, signed, kind.bits)
+  run X86Encode.movRr64(&mut em.code, X86Encode.r9(), X86Encode.rdx())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
+  if dstOff != 0 { run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0) }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  if ovfOff != 0 { run storeVectorLane(&mut em.*, maskKind, X86Encode.rdi(), X86Encode.r11(), X86Encode.r9(), 0) }
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
+}
+
+effect fn emitVectorSaturate(em: &mut Emitter, function: &SsaFunction, op: Binary, signed: bool, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, left, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, right, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 0)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+  run emitScalarSaturateRegs(&mut em.*, op, signed, kind.bits)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorRotate(em: &mut Emitter, function: &SsaFunction, left: bool, kind: Kind, val: u64, amt: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, val, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, amt, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 0)
+  run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+  run emitScalarRotateRegs(&mut em.*, left, kind.bits)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorCount(em: &mut Emitter, function: &SsaFunction, which: Count, kind: Kind, src: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, src, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+  match which {
+    Count.Ones => { run emitPopcount64(&mut em.*) }
+    Count.LeadingZeros => { run emitClz64(&mut em.*, kind.bits) }
+    Count.TrailingZeros => { run emitCtz64(&mut em.*, kind.bits) }
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorExtreme(em: &mut Emitter, function: &SsaFunction, which: Extreme, kind: Kind, left: u64, right: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, left, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, right, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.r9(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 1)
+  if kind.isFloat() {
+    run emitIeeeFloatExtremeRegs(&mut em.*, which == Extreme.FloatMaximum, kind.bits == 64)
+  } else {
+    let signed = which == Extreme.SignedMinimum || which == Extreme.SignedMaximum
+    let cc = match which {
+      Extreme.SignedMinimum => X86Encode.ccG()
+      Extreme.SignedMaximum => X86Encode.ccL()
+      Extreme.UnsignedMinimum => X86Encode.ccA()
+      _ => X86Encode.ccB()
+    }
+    run X86Encode.movRr64(&mut em.code, X86Encode.rax(), X86Encode.r9())
+    run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, signed)
+    run normalizeInt(&mut em.*, X86Encode.rcx(), kind.bits, signed)
+    run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.rcx())
+    run X86Encode.cmov64(&mut em.code, cc, X86Encode.rax(), X86Encode.rcx())
+    run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+}
+
+effect fn emitVectorFma(em: &mut Emitter, function: &SsaFunction, kind: Kind, a: u64, b: u64, c: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  let double = kind.bits == 64
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 48)
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, a, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, b, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.rax())
+  run vectorAddr(&mut em.*, function, c, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 24), X86Encode.rax())
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), 0)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 1)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 24))
+  run loadVectorLane(&mut em.*, kind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 2)
+  run callExternal(&mut em.*, if double { b"fma" } else { b"fmaf" })
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 32))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 32), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
+}
+
+effect fn emitSplat(em: &mut Emitter, function: &SsaFunction, kind: Kind, scalar: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run zeroMaskSlot(&mut em.*, kind, dstOff)
+  if kind.isFloat() {
+    run loadFloat(&mut em.*, function, scalar, 0, X86Encode.rax())
+  } else {
+    run loadGp(&mut em.*, function, scalar, X86Encode.rax())
+  }
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r11(), X86Encode.r11())
+  let loopHead = Bytes.length(&em.code)
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  return ()
+}
+
+effect fn emitExtract(em: &mut Emitter, function: &SsaFunction, kind: Kind, vecVal: u64, idxVal: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let vecKind = function.value(vecVal).kind
+  run loadGp(&mut em.*, function, idxVal, X86Encode.r11())
+  run normalizeInt(&mut em.*, X86Encode.r11(), function.value(idxVal).kind.bits, false)
+  // Out-of-range index returns zero per `SsaFunction` spec.
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(vecKind.elements))
+  let oob = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  run vectorAddr(&mut em.*, function, vecVal, X86Encode.rsi())
+  run loadVectorLane(&mut em.*, vecKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  let done = run X86Encode.jmpRel32(&mut em.code)
+  patchHere(&mut em.*, oob)
+  if kind.isFloat() { run X86Encode.pxor(&mut em.code, 0, 0) }
+  else { run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax()) }
+  patchHere(&mut em.*, done)
+  if kind.isFloat() { return run storeFloat(&mut em.*, result, 0, kind.bits == 64) }
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+effect fn emitInsert(em: &mut Emitter, function: &SsaFunction, kind: Kind, vecVal: u64, elemVal: u64, idxVal: u64, result: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  // Copy `vecVal` into `result`'s slot first.
+  run vectorAddr(&mut em.*, function, vecVal, X86Encode.rsi())
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(kind.storeSize()))
+  run X86Encode.repMovsb(&mut em.code)
+  // Replace lane `idxVal` if in bounds.
+  run loadGp(&mut em.*, function, idxVal, X86Encode.r11())
+  run normalizeInt(&mut em.*, X86Encode.r11(), function.value(idxVal).kind.bits, false)
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(kind.elements))
+  let oob = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  if kind.isFloat() { run loadFloat(&mut em.*, function, elemVal, 0, X86Encode.rax()) }
+  else { run loadGp(&mut em.*, function, elemVal, X86Encode.rax()) }
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+  patchHere(&mut em.*, oob)
+  return ()
+}
+
+effect fn emitShuffle(em: &mut Emitter, function: &SsaFunction, kind: Kind, first: u64, second: u64, start: usize, count: usize, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  run zeroMaskSlot(&mut em.*, kind, dstOff)
+  let srcKind = function.value(first).kind
+  let srcElems = srcKind.elements
+  let mask = function.immediatesAt(start, count)
+  run vectorAddr(&mut em.*, function, first, X86Encode.rsi())
+  run vectorAddr(&mut em.*, function, second, X86Encode.r9())
+  drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+  let mut lane = usize.ZERO
+  while lane < count {
+    let pick = mask[lane]
+    if pick == u64.MAX || u64.toUsize(pick) >= srcElems * 2 {
+      if kind.isFloat() { run X86Encode.pxor(&mut em.code, 0, 0) }
+      else { run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rax()) }
+    } else {
+      let pickIdx = u64.toUsize(pick)
+      let fromSecond = pickIdx >= srcElems
+      let srcLane = if fromSecond { pickIdx - srcElems } else { pickIdx }
+      run X86Encode.movImm64(&mut em.code, X86Encode.r11(), usize.toU64(srcLane))
+      run loadVectorLane(&mut em.*, srcKind, if fromSecond { X86Encode.r9() } else { X86Encode.rsi() }, X86Encode.r11(), X86Encode.rax(), 0)
+    }
+    run X86Encode.movImm64(&mut em.code, X86Encode.r11(), usize.toU64(lane))
+    run storeVectorLane(&mut em.*, kind, X86Encode.rdi(), X86Encode.r11(), X86Encode.rax(), 0)
+    lane = lane + usize.ONE
+  }
+  return ()
+}
+
+effect fn emitReduce(em: &mut Emitter, function: &SsaFunction, which: Reduction, kind: Kind, vecVal: u64, initVal: u64, result: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let vecKind = function.value(vecVal).kind
+  let isFloat = kind.isFloat()
+  let double = kind.bits == 64
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
+  run vectorAddr(&mut em.*, function, vecVal, X86Encode.rsi())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rsi())
+  let mut startIdx: i32 = 1
+  if initVal != none() {
+    run loadFloat(&mut em.*, function, initVal, 0, X86Encode.rax())
+    startIdx = 0
+  } else {
+    run X86Encode.aluRr32(&mut em.code, Alu.Xor, X86Encode.r11(), X86Encode.r11())
+    run loadVectorLane(&mut em.*, vecKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rax(), 0)
+  }
+  if isFloat {
+    if double { drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), 0) }
+    else { drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), 0) }
+  } else {
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  }
+  drop run X86Encode.movMi64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), startIdx)
+
+  let loopHead = Bytes.length(&em.code)
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r11(), usize.toI32(vecKind.elements))
+  let done = run X86Encode.jccRel32(&mut em.code, X86Encode.ccAe())
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), 0))
+  run loadVectorLane(&mut em.*, vecKind, X86Encode.rsi(), X86Encode.r11(), X86Encode.rcx(), 1)
+  if isFloat {
+    if double { drop run X86Encode.movsdRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), 8)) }
+    else { drop run X86Encode.movssRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), 8)) }
+    match which {
+      Reduction.FloatAdd => { run X86Encode.addFloat(&mut em.code, double, 0, 1) }
+      Reduction.FloatMul => { run X86Encode.mulFloat(&mut em.code, double, 0, 1) }
+      Reduction.FloatMinimum => { run emitIeeeFloatExtremeRegs(&mut em.*, false, double) }
+      Reduction.FloatMaximum => { run emitIeeeFloatExtremeRegs(&mut em.*, true, double) }
+      _ => {}
+    }
+    if double { drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), 0) }
+    else { drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), 0) }
+  } else {
+    drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), 8))
+    match which {
+      Reduction.Add => { run X86Encode.aluRr64(&mut em.code, Alu.Add, X86Encode.rax(), X86Encode.rcx()) }
+      Reduction.Mul => { run X86Encode.imulRr64(&mut em.code, X86Encode.rax(), X86Encode.rcx()) }
+      Reduction.And => { run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx()) }
+      Reduction.Or => { run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx()) }
+      Reduction.Xor => { run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx()) }
+      _ => {
+        let signed = which == Reduction.SignedMinimum || which == Reduction.SignedMaximum
+        let cc = match which {
+          Reduction.SignedMinimum => X86Encode.ccG()
+          Reduction.SignedMaximum => X86Encode.ccL()
+          Reduction.UnsignedMinimum => X86Encode.ccA()
+          _ => X86Encode.ccB()
+        }
+        run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, signed)
+        run normalizeInt(&mut em.*, X86Encode.rcx(), kind.bits, signed)
+        run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.rcx())
+        run X86Encode.cmov64(&mut em.code, cc, X86Encode.rax(), X86Encode.rcx())
+      }
+    }
+    run normalizeInt(&mut em.*, X86Encode.rax(), kind.bits, false)
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 8), X86Encode.rax())
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.r11(), Mem.baseDisp(X86Encode.rsp(), 16))
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.r11(), 1)
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), X86Encode.r11())
+  let back = run X86Encode.jmpRel32(&mut em.code)
+  X86Encode.patchRel32(&mut em.code, back, loopHead)
+  patchHere(&mut em.*, done)
+  if isFloat {
+    if double { drop run X86Encode.movsdRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), 8)) }
+    else { drop run X86Encode.movssRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), 8)) }
+    run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+    return run storeFloat(&mut em.*, result, 0, double)
+  }
+  drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), 8))
+  run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 32)
+  return run storeGp(&mut em.*, result, X86Encode.rax())
+}
+
+// Emits all 19 x86-64 SIMD/crypto architecture intrinsics directly via SSE2/SSSE3/SSE4.1/AES-NI/PCLMUL/SHA.
+effect fn emitArchIntrinsic(
+  em: &mut Emitter,
+  function: &SsaFunction,
+  op: ArchOperation,
+  imm: u8,
+  kind: Kind,
+  ops: &[u64],
+  result: u64,
+) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, result)
+  if dstOff == 0 { return () }
+  let totalBytes = kind.storeSize()
+  let lanes16 = if totalBytes <= 16 { usize.ONE } else { totalBytes / 16 }
+  // Process each 128-bit chunk (supports both 128-bit SSE and 256-bit two-chunk forms cleanly).
+  run vectorAddr(&mut em.*, function, ops[0], X86Encode.rsi())
+  if ops.length >= 2 { run vectorAddr(&mut em.*, function, ops[1], X86Encode.rdi()) }
+  if ops.length >= 3 { run vectorAddr(&mut em.*, function, ops[2], X86Encode.r8()) }
+  let mut chunk = usize.ZERO
+  while chunk < lanes16 {
+    let off = usize.toI32(chunk * 16)
+    match op {
+      ArchOperation.X86AesInverseMixColumns => {
+        drop run X86Encode.movdquRm(&mut em.code, 1, Mem.baseDisp(X86Encode.rsi(), off))
+        run X86Encode.aesimc(&mut em.code, 1, 1)
+        drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff + off), 1)
+      }
+      ArchOperation.X86Sha256Rounds2 => {
+        // `sha256rnds2 dst(xmm1), src(xmm2)` uses implicit `xmm0` for round keys (ops[2]).
+        drop run X86Encode.movdquRm(&mut em.code, 1, Mem.baseDisp(X86Encode.rsi(), off))
+        drop run X86Encode.movdquRm(&mut em.code, 2, Mem.baseDisp(X86Encode.rdi(), off))
+        drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.r8(), off))
+        run X86Encode.sha256rnds2(&mut em.code, 1, 2)
+        drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff + off), 1)
+      }
+      _ => {
+        drop run X86Encode.movdquRm(&mut em.code, 1, Mem.baseDisp(X86Encode.rsi(), off))
+        drop run X86Encode.movdquRm(&mut em.code, 2, Mem.baseDisp(X86Encode.rdi(), off))
+        match op {
+          ArchOperation.X86ShuffleBytes => { run X86Encode.pshufb(&mut em.code, 1, 2) }
+          ArchOperation.X86MultiplyAddBytes => { run X86Encode.pmaddubsw(&mut em.code, 1, 2) }
+          ArchOperation.X86MultiplyAddWords => { run X86Encode.pmaddwd(&mut em.code, 1, 2) }
+          ArchOperation.X86PackUnsignedSaturate => {
+            if kind.bits == 8 { run X86Encode.packuswb(&mut em.code, 1, 2) }
+            else { run X86Encode.packusdw(&mut em.code, 1, 2) }
+          }
+          ArchOperation.X86PackSignedSaturate => {
+            if kind.bits == 8 { run X86Encode.packsswb(&mut em.code, 1, 2) }
+            else { run X86Encode.packssdw(&mut em.code, 1, 2) }
+          }
+          ArchOperation.X86SumAbsoluteDifferences => { run X86Encode.psadbw(&mut em.code, 1, 2) }
+          ArchOperation.X86AesEncrypt => { run X86Encode.aesenc(&mut em.code, 1, 2) }
+          ArchOperation.X86AesEncryptLast => { run X86Encode.aesenclast(&mut em.code, 1, 2) }
+          ArchOperation.X86AesDecrypt => { run X86Encode.aesdec(&mut em.code, 1, 2) }
+          ArchOperation.X86AesDecryptLast => { run X86Encode.aesdeclast(&mut em.code, 1, 2) }
+          ArchOperation.X86CarrylessMultiply => { run X86Encode.pclmulqdq(&mut em.code, 1, 2, imm) }
+          ArchOperation.X86Sha256Message1 => { run X86Encode.sha256msg1(&mut em.code, 1, 2) }
+          ArchOperation.X86Sha256Message2 => { run X86Encode.sha256msg2(&mut em.code, 1, 2) }
+          ArchOperation.X86Sha1Rounds4 => { run X86Encode.sha1rnds4(&mut em.code, 1, 2, imm) }
+          ArchOperation.X86Sha1NextE => { run X86Encode.sha1nexte(&mut em.code, 1, 2) }
+          ArchOperation.X86Sha1Message1 => { run X86Encode.sha1msg1(&mut em.code, 1, 2) }
+          ArchOperation.X86Sha1Message2 => { run X86Encode.sha1msg2(&mut em.code, 1, 2) }
+          _ => {}
+        }
+        drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff + off), 1)
+      }
+    }
+    chunk = chunk + usize.ONE
+  }
+  return ()
+}
+
+// ---- Block Exits & Parallel Edge Copies ----
+
+effect fn emitExit(em: &mut Emitter, function: &SsaFunction, blockIdx: usize, naked: bool) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let blk = function.block(blockIdx)
+  let edges = List<Edge>.asSlice(&blk.edges)
+  match blk.exit {
+    Exit.Jump => {
+      run emitEdgeCopies(&mut em.*, function, &edges[0])
+      if edges[0].block != blockIdx + usize.ONE {
+        let jAt = run X86Encode.jmpRel32(&mut em.code)
+        run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jAt, targetBlock: edges[0].block})
+      }
+      return ()
+    }
+    Exit.Branch => {
+      run loadGp(&mut em.*, function, blk.value, X86Encode.rax())
+      run X86Encode.testRi8(&mut em.code, X86Encode.rax(), 1)
+      let takeFalse = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+      // Edge 0 (true branch).
+      run emitEdgeCopies(&mut em.*, function, &edges[0])
+      let jTrue = run X86Encode.jmpRel32(&mut em.code)
+      run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jTrue, targetBlock: edges[0].block})
+      // Edge 1 (false branch).
+      patchHere(&mut em.*, takeFalse)
+      run emitEdgeCopies(&mut em.*, function, &edges[1])
+      if edges[1].block != blockIdx + usize.ONE {
+        let jFalse = run X86Encode.jmpRel32(&mut em.code)
+        run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jFalse, targetBlock: edges[1].block})
+      }
+      return ()
+    }
+    Exit.Switch => {
+      let valKind = function.value(blk.value).kind
+      run loadGp(&mut em.*, function, blk.value, X86Encode.r9())
+      run normalizeInt(&mut em.*, X86Encode.r9(), valKind.bits, false)
+      let cases = List<u64>.asSlice(&blk.cases)
+      // Emit case comparisons (preserving `r9` across comparisons).
+      let mut caseJumps = run List<usize>.makeWithCapacity(cases.length)
+      let mut c = usize.ZERO
+      while c < cases.length {
+        let cv = maskBits(cases[c], valKind.bits)
+        let signed = u64.wrappingToI64(cv)
+        if signed >= -2147483648 && signed <= 2147483647 {
+          run X86Encode.aluRi64(&mut em.code, Alu.Cmp, X86Encode.r9(), i64.wrappingToI32(signed))
+        } else {
+          run X86Encode.movImm64(&mut em.code, X86Encode.r10(), cv)
+          run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.r9(), X86Encode.r10())
+        }
+        let eqAt = run X86Encode.jccRel32(&mut em.code, X86Encode.ccE())
+        run List<usize>.append(&mut caseJumps, eqAt)
+        c = c + usize.ONE
+      }
+      // Default edge (edge 0).
+      run emitEdgeCopies(&mut em.*, function, &edges[0])
+      let jDef = run X86Encode.jmpRel32(&mut em.code)
+      run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jDef, targetBlock: edges[0].block})
+      // Case stubs (edge `c + 1`).
+      let cj = List<usize>.asSlice(&caseJumps)
+      c = usize.ZERO
+      while c < cases.length {
+        patchHere(&mut em.*, cj[c])
+        run emitEdgeCopies(&mut em.*, function, &edges[c + usize.ONE])
+        let jCase = run X86Encode.jmpRel32(&mut em.code)
+        run List<BlockPatch>.append(&mut em.blockPatches, BlockPatch {patchAt: jCase, targetBlock: edges[c + usize.ONE].block})
+        c = c + usize.ONE
+      }
+      return ()
+    }
+    Exit.Return => {
+      if blk.value != none() {
+        let mut gpRet = usize.ZERO
+        let mut fpRet = usize.ZERO
+        run loadReturnPiece(&mut em.*, function, blk.value, function.result, &mut gpRet, &mut fpRet)
+        if blk.secondValue != none() {
+          run loadReturnPiece(&mut em.*, function, blk.secondValue, function.secondResultKind, &mut gpRet, &mut fpRet)
+        }
+      }
+      if !naked {
+        return run emitEpilogue(&mut em.*)
+      }
+      return ()
+    }
+    Exit.Trap => {
+      return run X86Encode.ud2(&mut em.code)
+    }
+    Exit.Unreachable => {
+      if !naked {
+        return run X86Encode.ud2(&mut em.code)
+      }
+      return ()
+    }
+    Exit.Open => { return () }
+  }
+}
+
+effect fn loadReturnPiece(em: &mut Emitter, function: &SsaFunction, val: u64, kind: Kind, gpRet: &mut usize, fpRet: &mut usize) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    let xmm = usize.toU8(fpRet.*)
+    fpRet.* = fpRet.* + usize.ONE
+    run vectorAddr(&mut em.*, function, val, X86Encode.r10())
+    drop run X86Encode.movdquRm(&mut em.code, xmm, Mem.baseDisp(X86Encode.r10(), 0))
+    return ()
+  }
+  if kind.isFloat() {
+    let xmm = usize.toU8(fpRet.*)
+    fpRet.* = fpRet.* + usize.ONE
+    return run loadFloat(&mut em.*, function, val, xmm, X86Encode.r10())
+  }
+  if kind.bits > 64 {
+    gpRet.* = gpRet.* + 2
+    return run loadPair(&mut em.*, function, val, X86Encode.rax(), X86Encode.rdx())
+  }
+  let reg = if gpRet.* == usize.ZERO { X86Encode.rax() } else { X86Encode.rdx() }
+  gpRet.* = gpRet.* + usize.ONE
+  run loadGp(&mut em.*, function, val, reg)
+  if gpRet.* == usize.ONE {
+    run applyParamExt(&mut em.*, reg, kind.bits, function.resultExtension)
+  }
+  return ()
+}
+
+// Emits parallel copies from `edge.arguments` into `targetBlock.parameters`, staging all source
+// values onto a temporary stack buffer whenever more than one copy is present so cycles and
+// overlapping home slots are resolved with zero interference.
+effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let args = List<u64>.asSlice(&edge.arguments)
+  if args.length == usize.ZERO { return () }
+  let params = List<u64>.asSlice(&function.block(edge.block).parameters)
+  if args.length == usize.ONE {
+    return run copyValueToParam(&mut em.*, function, args[0], params[0])
+  }
+  // Compute temporary staging buffer size on `rsp` (16-byte aligned).
+  let mut stageBytes: u64 = 0
+  let mut stageOffs = run List<i32>.makeWithCapacity(args.length)
+  let mut i = usize.ZERO
+  while i < args.length {
+    let sz = usize.toU64(X86Frame.valueSlotBytes(function.value(params[i]).kind))
+    let align: u64 = if sz >= 16 { 16 } else { 8 }
+    stageBytes = alignUpU64(stageBytes, align)
+    run List<i32>.append(&mut stageOffs, u64.wrappingToI32(stageBytes))
+    stageBytes = stageBytes + sz
+    i = i + usize.ONE
+  }
+  let totalStage = alignUpU64(stageBytes, 16)
+  if totalStage == 0 { return () }
+  run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), u64.wrappingToI32(totalStage))
+  let offs = List<i32>.asSlice(&stageOffs)
+  // Pass 1: copy every edge argument into its staging slot on `[rsp + offs[i]]`.
+  i = usize.ZERO
+  while i < args.length {
+    let dstKind = function.value(params[i]).kind
+    if !dstKind.isUnit() && valOff(&em.*, params[i]) != 0 {
+      run copyValueToMem(&mut em.*, function, args[i], dstKind, X86Encode.rsp(), offs[i])
+    }
+    i = i + usize.ONE
+  }
+  // Pass 2: copy every staged value into its parameter's home slot `[rbp + valOff(params[i])]`.
+  i = usize.ZERO
+  while i < args.length {
+    let dstKind = function.value(params[i]).kind
+    let dstOff = valOff(&em.*, params[i])
+    if !dstKind.isUnit() && dstOff != 0 {
+      let sz = X86Frame.valueSlotBytes(dstKind)
+      if sz == 8 {
+        drop run X86Encode.movRm64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), offs[i]))
+        drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), X86Encode.rax())
+      } else if sz == 16 {
+        drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsp(), offs[i]))
+        drop run X86Encode.movdqaMr(&mut em.code, Mem.baseDisp(X86Encode.rbp(), dstOff), 0)
+      } else {
+        drop run X86Encode.lea64(&mut em.code, X86Encode.rsi(), Mem.baseDisp(X86Encode.rsp(), offs[i]))
+        drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
+        run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
+        run X86Encode.repMovsb(&mut em.code)
+      }
+    }
+    i = i + usize.ONE
+  }
+  return run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), u64.wrappingToI32(totalStage))
+}
+
+effect fn copyValueToParam(em: &mut Emitter, function: &SsaFunction, src: u64, dstParam: u64) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let dstOff = valOff(&em.*, dstParam)
+  if dstOff == 0 { return () }
+  let kind = function.value(dstParam).kind
+  if kind.isUnit() { return () }
+  if function.value(src).definition != Definition.Constant && valOff(&em.*, src) == dstOff { return () }
+  return run copyValueToMem(&mut em.*, function, src, kind, X86Encode.rbp(), dstOff)
+}
+
+effect fn copyValueToMem(em: &mut Emitter, function: &SsaFunction, src: u64, kind: Kind, baseReg: u8, disp: i32) -> ()
+! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if kind.isVector() {
+    let sz = kind.storeSize()
+    run vectorAddr(&mut em.*, function, src, X86Encode.rsi())
+    if sz == 16 {
+      drop run X86Encode.movdquRm(&mut em.code, 0, Mem.baseDisp(X86Encode.rsi(), 0))
+      drop run X86Encode.movdquMr(&mut em.code, Mem.baseDisp(baseReg, disp), 0)
+      return ()
+    }
+    drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(baseReg, disp))
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), usize.toU64(sz))
+    return run X86Encode.repMovsb(&mut em.code)
+  }
+  if kind.isFloat() {
+    run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
+    if kind.bits == 64 { drop run X86Encode.movsdMr(&mut em.code, Mem.baseDisp(baseReg, disp), 0) }
+    else { drop run X86Encode.movssMr(&mut em.code, Mem.baseDisp(baseReg, disp), 0) }
+    return ()
+  }
+  if kind.bits > 64 {
+    run loadPair(&mut em.*, function, src, X86Encode.rax(), X86Encode.rdx())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(baseReg, disp), X86Encode.rax())
+    drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(baseReg, disp + 8), X86Encode.rdx())
+    return ()
+  }
+  run loadGp(&mut em.*, function, src, X86Encode.rax())
+  drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(baseReg, disp), X86Encode.rax())
+  return ()
+}
+
+fn alignI32(value: i32, align: i32) -> i32 {
+  if align <= 1 { return value }
+  let rem = value % align
+  if rem == 0 { return value }
+  return value + (align - rem)
+}
+
+fn alignUpU64(value: u64, align: u64) -> u64 {
+  if align <= 1 { return value }
+  let rem = value % align
+  if rem == 0 { return value }
+  return value + (align - rem)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}

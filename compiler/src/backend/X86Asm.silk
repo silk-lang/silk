@@ -1,0 +1,558 @@
+//! Mini-assembler for validated AT&T x86-64 inline assembly templates.
+//!
+//! # When to use
+//! Use [`X86Asm.parseConstraints`] to inspect the register and memory constraints of an
+//! `SsaFunction.InlineAsm` node, and [`X86Asm.assemble`] to emit machine code bytes (and any
+//! symbolic call relocations) into a code buffer once each `$0..$N` operand has been assigned a
+//! physical GPR.
+//!
+//! # Details
+//! Supports the AT&T x86-64 instruction forms admitted by `NativeAssembly.silk` across the Silk
+//! standard library and compiler test suites: empty compiler barriers, `syscall`, `cpuid`,
+//! `rdtsc`, `xgetbv`, `ud2`, `nop`, `pause`, `mfence`/`lfence`/`sfence`, `movq`/`movl`,
+//! `addq`/`addl`/`subq`/`subl`/`andq`/`andl`/`orq`/`orl`/`xorq`/`xorl`, `shlq`/`shrq`/`sarq`,
+//! `leaq`, `call <sym>`, and `jmp <sym>`. Statements may be separated by `\n` or `;`.
+//! Operand placeholders `$0..$9` resolve to either a register or memory indirect `[reg]` when the
+//! constraint is `m`; `$$imm` parses decimal or `0x` hexadecimal signed immediates.
+
+import backend.X86Encode
+import backend.X86Encode {Alu, Mem, Shift}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i32
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// What kind of constraint one operand slot carries.
+pub enum ConstraintKind {
+  /// Allocator-chosen GPR (`=r`, `=&r`, or `r`).
+  AnyReg,
+  /// Fixed physical GPR (`={rax}`, `{rdi}`, ...).
+  FixedReg,
+  /// Memory address held in a GPR (`m`); `$k` in the template addresses `[reg]`.
+  Memory,
+  /// Tied to operand 0 (`0`).
+  TiedOutput,
+}
+
+/// One parsed operand constraint in `InlineAsm.constraints`.
+pub struct Constraint {
+  pub kind: ConstraintKind,
+  /// Physical GPR `0..15` when `kind == ConstraintKind.FixedReg`, else `255`.
+  pub reg: u8,
+  /// True for `=&r` / `=&{reg}` early-clobber outputs.
+  pub earlyClobber: bool,
+  /// True when this slot is the output operand (index 0 when `hasOutput`).
+  pub isOutput: bool,
+}
+
+impl Copy for Constraint {}
+
+/// One assigned operand for [`X86Asm.assemble`]: a physical GPR, or memory `[reg]`.
+pub struct OperandBinding {
+  pub reg: u8,
+  pub isMemory: bool,
+}
+
+impl Copy for OperandBinding {}
+
+/// One symbolic `call`/`jmp` relocation emitted by an inline assembly template.
+pub struct AsmCallReloc {
+  /// Byte offset of the 4-byte `rel32` field inside `code`.
+  pub offset: usize,
+  /// Target symbol name.
+  pub symbol: Bytes,
+}
+
+/// Error returned when an inline assembly template uses an instruction or operand form this
+/// assembler does not support yet.
+pub struct UnsupportedAsm {
+  pub detail: Bytes,
+}
+
+/// Parses an x86-64 register name (`rax`, `eax`, `r8`, `r9d`, ...) without a leading `%` into
+/// its GPR index `0..15`, or `Option.none()` if unrecognized.
+pub fn parseRegisterName(name: &[u8]) -> Option<u8> {
+  if same(name, b"rax") || same(name, b"eax") || same(name, b"ax") || same(name, b"al") { return Option<u8>.some(0) }
+  if same(name, b"rcx") || same(name, b"ecx") || same(name, b"cx") || same(name, b"cl") { return Option<u8>.some(1) }
+  if same(name, b"rdx") || same(name, b"edx") || same(name, b"dx") || same(name, b"dl") { return Option<u8>.some(2) }
+  if same(name, b"rbx") || same(name, b"ebx") || same(name, b"bx") || same(name, b"bl") { return Option<u8>.some(3) }
+  if same(name, b"rsp") || same(name, b"esp") || same(name, b"sp") || same(name, b"spl") { return Option<u8>.some(4) }
+  if same(name, b"rbp") || same(name, b"ebp") || same(name, b"bp") || same(name, b"bpl") { return Option<u8>.some(5) }
+  if same(name, b"rsi") || same(name, b"esi") || same(name, b"si") || same(name, b"sil") { return Option<u8>.some(6) }
+  if same(name, b"rdi") || same(name, b"edi") || same(name, b"di") || same(name, b"dil") { return Option<u8>.some(7) }
+  if same(name, b"r8") || same(name, b"r8d") || same(name, b"r8w") || same(name, b"r8b") { return Option<u8>.some(8) }
+  if same(name, b"r9") || same(name, b"r9d") || same(name, b"r9w") || same(name, b"r9b") { return Option<u8>.some(9) }
+  if same(name, b"r10") || same(name, b"r10d") || same(name, b"r10w") || same(name, b"r10b") { return Option<u8>.some(10) }
+  if same(name, b"r11") || same(name, b"r11d") || same(name, b"r11w") || same(name, b"r11b") { return Option<u8>.some(11) }
+  if same(name, b"r12") || same(name, b"r12d") || same(name, b"r12w") || same(name, b"r12b") { return Option<u8>.some(12) }
+  if same(name, b"r13") || same(name, b"r13d") || same(name, b"r13w") || same(name, b"r13b") { return Option<u8>.some(13) }
+  if same(name, b"r14") || same(name, b"r14d") || same(name, b"r14w") || same(name, b"r14b") { return Option<u8>.some(14) }
+  if same(name, b"r15") || same(name, b"r15d") || same(name, b"r15w") || same(name, b"r15b") { return Option<u8>.some(15) }
+  return Option<u8>.none()
+}
+
+/// Parses comma-separated operand constraints (`=r`, `=&r`, `={rax}`, `0`, `r`, `m`, `{rdi}`, ...).
+pub effect fn parseConstraints(constraints: &[u8], hasOutput: bool) -> List<Constraint>
+! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<Constraint>.make()
+  if constraints.length == usize.ZERO { return move result }
+  let mut start = usize.ZERO
+  let mut index = usize.ZERO
+  while start <= constraints.length {
+    let mut end = start
+    while end < constraints.length && constraints[end] != 44 { end = end + usize.ONE }
+    let part = Slice.view<u8>(constraints, start, end - start)
+    let isOut = hasOutput && index == usize.ZERO
+    let mut early = false
+    let mut bodyStart = usize.ZERO
+    if isOut {
+      if bodyStart < part.length && part[bodyStart] == 61 { bodyStart = bodyStart + usize.ONE }
+      if bodyStart < part.length && part[bodyStart] == 38 {
+        early = true
+        bodyStart = bodyStart + usize.ONE
+      }
+    }
+    let body = Slice.view<u8>(part, bodyStart, part.length - bodyStart)
+    if same(body, b"r") {
+      run List<Constraint>.append(&mut result, Constraint {kind: ConstraintKind.AnyReg, reg: 255, earlyClobber: early, isOutput: isOut})
+    } else if same(body, b"m") {
+      run List<Constraint>.append(&mut result, Constraint {kind: ConstraintKind.Memory, reg: 255, earlyClobber: early, isOutput: isOut})
+    } else if same(body, b"0") {
+      run List<Constraint>.append(&mut result, Constraint {kind: ConstraintKind.TiedOutput, reg: 255, earlyClobber: false, isOutput: false})
+    } else if body.length >= 2 && body[usize.ZERO] == 123 && body[body.length - usize.ONE] == 125 {
+      let regName = Slice.view<u8>(body, usize.ONE, body.length - 2)
+      let reg = match parseRegisterName(regName) {
+        Option<u8>.Some {value} => value
+        Option<u8>.None => 255
+      }
+      run List<Constraint>.append(&mut result, Constraint {kind: ConstraintKind.FixedReg, reg: reg, earlyClobber: early, isOutput: isOut})
+    } else {
+      run List<Constraint>.append(&mut result, Constraint {kind: ConstraintKind.AnyReg, reg: 255, earlyClobber: early, isOutput: isOut})
+    }
+    if end == constraints.length { break }
+    start = end + usize.ONE
+    index = index + usize.ONE
+  }
+  return move result
+}
+
+/// Parses comma-separated clobbers (`rcx,r11,flags`) into a 16-bit GPR bitmask (bit `r` = GPR `r`).
+pub fn parseClobberMask(clobbers: &[u8]) -> u64 {
+  if clobbers.length == usize.ZERO { return 0 }
+  let mut mask: u64 = 0
+  let mut start = usize.ZERO
+  while start <= clobbers.length {
+    let mut end = start
+    while end < clobbers.length && clobbers[end] != 44 { end = end + usize.ONE }
+    let part = Slice.view<u8>(clobbers, start, end - start)
+    if let Option<u8>.Some {value: reg} = parseRegisterName(part) {
+      mask = mask | u64.shiftLeft(1, u8.toU64(reg))
+    }
+    if end == clobbers.length { break }
+    start = end + usize.ONE
+  }
+  return mask
+}
+
+// One parsed AT&T operand.
+union ParsedOperand {
+  Reg {reg: u8},
+  Imm {value: i64},
+  MemOp {mem: Mem},
+  Symbol {start: usize, length: usize},
+}
+
+impl Copy for ParsedOperand {}
+
+/// Assembles an AT&T x86-64 inline assembly `template` using `bindings` for `$0..$N`, appending
+/// encoded machine bytes to `out` and any symbolic `call`/`jmp` relocations to `relocs`.
+pub effect fn assemble(
+  out: &mut Bytes,
+  relocs: &mut List<AsmCallReloc>,
+  template: &[u8],
+  bindings: &[OperandBinding],
+) -> () ! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  let mut pos = usize.ZERO
+  while pos < template.length {
+    // Split on `\n` (10) or `;` (59).
+    let mut end = pos
+    while end < template.length && template[end] != 10 && template[end] != 59 {
+      end = end + usize.ONE
+    }
+    let line = trim(Slice.view<u8>(template, pos, end - pos))
+    if line.length > usize.ZERO {
+      run assembleLine(&mut out.*, &mut relocs.*, line, bindings)
+    }
+    if end == template.length { break }
+    pos = end + usize.ONE
+  }
+  return ()
+}
+
+effect fn assembleLine(
+  out: &mut Bytes,
+  relocs: &mut List<AsmCallReloc>,
+  line: &[u8],
+  bindings: &[OperandBinding],
+) -> () ! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  // Split mnemonic and operand text.
+  let mut sp = usize.ZERO
+  while sp < line.length && !isSpace(line[sp]) { sp = sp + usize.ONE }
+  let mnemonic = Slice.view<u8>(line, usize.ZERO, sp)
+  let rest = trim(Slice.view<u8>(line, sp, line.length - sp))
+
+  // Zero-operand instructions.
+  if rest.length == usize.ZERO {
+    if same(mnemonic, b"syscall") { return run X86Encode.syscall(&mut out.*) }
+    if same(mnemonic, b"cpuid") { return run X86Encode.cpuid(&mut out.*) }
+    if same(mnemonic, b"rdtsc") { return run X86Encode.rdtsc(&mut out.*) }
+    if same(mnemonic, b"xgetbv") { return run X86Encode.xgetbv(&mut out.*) }
+    if same(mnemonic, b"ud2") { return run X86Encode.ud2(&mut out.*) }
+    if same(mnemonic, b"nop") { return run X86Encode.nop(&mut out.*) }
+    if same(mnemonic, b"pause") { return run X86Encode.pause(&mut out.*) }
+    if same(mnemonic, b"mfence") { return run X86Encode.mfence(&mut out.*) }
+    if same(mnemonic, b"lfence") { return run X86Encode.lfence(&mut out.*) }
+    if same(mnemonic, b"sfence") { return run X86Encode.sfence(&mut out.*) }
+    if same(mnemonic, b"ret") || same(mnemonic, b"retq") { return run X86Encode.ret(&mut out.*) }
+    return run failAsm(b"unsupported zero-operand inline asm instruction: ", line)
+  }
+
+  // Split operands at top-level commas (outside parentheses).
+  let mut commaPos = usize.MAX
+  let mut depth = usize.ZERO
+  let mut at = usize.ZERO
+  while at < rest.length {
+    let ch = rest[at]
+    if ch == 40 { depth = depth + usize.ONE }
+    else if ch == 41 && depth > usize.ZERO { depth = depth - usize.ONE }
+    else if ch == 44 && depth == usize.ZERO {
+      commaPos = at
+      break
+    }
+    at = at + usize.ONE
+  }
+
+  // One-operand instructions (`call sym`, `jmp sym`, `negq`, `notq`).
+  if commaPos == usize.MAX {
+    let op0 = run parseOperand(rest, bindings)
+    if same(mnemonic, b"call") || same(mnemonic, b"callq") {
+      match op0 {
+        ParsedOperand.Symbol {start, length} => {
+          let relOffset = run X86Encode.callRel32(&mut out.*)
+          let sym = run Bytes.copy(Slice.view<u8>(rest, start, length))
+          return run List<AsmCallReloc>.append(&mut relocs.*, AsmCallReloc {offset: relOffset, symbol: move sym})
+        }
+        ParsedOperand.Reg {reg} => { return run X86Encode.callReg(&mut out.*, reg) }
+        _ => { return run failAsm(b"unsupported call operand: ", line) }
+      }
+    }
+    if same(mnemonic, b"jmp") || same(mnemonic, b"jmpq") {
+      match op0 {
+        ParsedOperand.Symbol {start, length} => {
+          let relOffset = run X86Encode.jmpRel32(&mut out.*)
+          let sym = run Bytes.copy(Slice.view<u8>(rest, start, length))
+          return run List<AsmCallReloc>.append(&mut relocs.*, AsmCallReloc {offset: relOffset, symbol: move sym})
+        }
+        ParsedOperand.Reg {reg} => { return run X86Encode.jmpReg(&mut out.*, reg) }
+        _ => { return run failAsm(b"unsupported jmp operand: ", line) }
+      }
+    }
+    if same(mnemonic, b"negq") {
+      if let ParsedOperand.Reg {reg} = op0 { return run X86Encode.neg64(&mut out.*, reg) }
+    }
+    if same(mnemonic, b"notq") {
+      if let ParsedOperand.Reg {reg} = op0 { return run X86Encode.not64(&mut out.*, reg) }
+    }
+    return run failAsm(b"unsupported unary inline asm instruction: ", line)
+  }
+
+  // Two-operand AT&T instructions: `mnemonic src, dst`.
+  let srcText = trim(Slice.view<u8>(rest, usize.ZERO, commaPos))
+  let dstText = trim(Slice.view<u8>(rest, commaPos + usize.ONE, rest.length - commaPos - usize.ONE))
+  let src = run parseOperand(srcText, bindings)
+  let dst = run parseOperand(dstText, bindings)
+
+  if same(mnemonic, b"movq") {
+    return run emitMov(&mut out.*, true, src, dst, line)
+  }
+  if same(mnemonic, b"movl") {
+    return run emitMov(&mut out.*, false, src, dst, line)
+  }
+  if same(mnemonic, b"leaq") {
+    match src {
+      ParsedOperand.MemOp {mem} => match dst {
+        ParsedOperand.Reg {reg} => {
+          drop run X86Encode.lea64(&mut out.*, reg, mem)
+          return ()
+        }
+        _ => { return run failAsm(b"leaq requires register destination: ", line) }
+      }
+      _ => { return run failAsm(b"leaq requires memory source: ", line) }
+    }
+  }
+  if same(mnemonic, b"addq") { return run emitAlu(&mut out.*, true, Alu.Add, src, dst, line) }
+  if same(mnemonic, b"addl") { return run emitAlu(&mut out.*, false, Alu.Add, src, dst, line) }
+  if same(mnemonic, b"subq") { return run emitAlu(&mut out.*, true, Alu.Sub, src, dst, line) }
+  if same(mnemonic, b"subl") { return run emitAlu(&mut out.*, false, Alu.Sub, src, dst, line) }
+  if same(mnemonic, b"andq") { return run emitAlu(&mut out.*, true, Alu.And, src, dst, line) }
+  if same(mnemonic, b"andl") { return run emitAlu(&mut out.*, false, Alu.And, src, dst, line) }
+  if same(mnemonic, b"orq") { return run emitAlu(&mut out.*, true, Alu.Or, src, dst, line) }
+  if same(mnemonic, b"orl") { return run emitAlu(&mut out.*, false, Alu.Or, src, dst, line) }
+  if same(mnemonic, b"xorq") { return run emitAlu(&mut out.*, true, Alu.Xor, src, dst, line) }
+  if same(mnemonic, b"xorl") { return run emitAlu(&mut out.*, false, Alu.Xor, src, dst, line) }
+  if same(mnemonic, b"shlq") { return run emitShift(&mut out.*, true, Shift.Shl, src, dst, line) }
+  if same(mnemonic, b"shll") { return run emitShift(&mut out.*, false, Shift.Shl, src, dst, line) }
+  if same(mnemonic, b"shrq") { return run emitShift(&mut out.*, true, Shift.Shr, src, dst, line) }
+  if same(mnemonic, b"shrl") { return run emitShift(&mut out.*, false, Shift.Shr, src, dst, line) }
+  if same(mnemonic, b"sarq") { return run emitShift(&mut out.*, true, Shift.Sar, src, dst, line) }
+  if same(mnemonic, b"sarl") { return run emitShift(&mut out.*, false, Shift.Sar, src, dst, line) }
+  return run failAsm(b"unsupported inline asm instruction: ", line)
+}
+
+effect fn emitMov(out: &mut Bytes, wide: bool, src: ParsedOperand, dst: ParsedOperand, line: &[u8]) -> ()
+! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  match dst {
+    ParsedOperand.Reg {reg: d} => match src {
+      ParsedOperand.Reg {reg: s} => {
+        if wide { return run X86Encode.movRr64(&mut out.*, d, s) }
+        return run X86Encode.movRr32(&mut out.*, d, s)
+      }
+      ParsedOperand.Imm {value} => {
+        if wide { return run X86Encode.movImm64(&mut out.*, d, i64.wrappingToU64(value)) }
+        return run X86Encode.movImm32(&mut out.*, d, i64.wrappingToU64(value))
+      }
+      ParsedOperand.MemOp {mem} => {
+        if wide { drop run X86Encode.movRm64(&mut out.*, d, mem) } else { drop run X86Encode.movRm32(&mut out.*, d, mem) }
+        return ()
+      }
+      _ => { return run failAsm(b"unsupported mov source: ", line) }
+    }
+    ParsedOperand.MemOp {mem} => match src {
+      ParsedOperand.Reg {reg: s} => {
+        if wide { drop run X86Encode.movMr64(&mut out.*, mem, s) } else { drop run X86Encode.movMr32(&mut out.*, mem, s) }
+        return ()
+      }
+      _ => { return run failAsm(b"unsupported mov store source: ", line) }
+    }
+    _ => { return run failAsm(b"unsupported mov destination: ", line) }
+  }
+}
+
+effect fn emitAlu(out: &mut Bytes, wide: bool, op: Alu, src: ParsedOperand, dst: ParsedOperand, line: &[u8]) -> ()
+! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  match dst {
+    ParsedOperand.Reg {reg: d} => match src {
+      ParsedOperand.Reg {reg: s} => {
+        if wide { return run X86Encode.aluRr64(&mut out.*, op, d, s) }
+        return run X86Encode.aluRr32(&mut out.*, op, d, s)
+      }
+      ParsedOperand.Imm {value} => {
+        if wide { return run X86Encode.aluRi64(&mut out.*, op, d, i64.wrappingToI32(value)) }
+        return run X86Encode.aluRi32(&mut out.*, op, d, i64.wrappingToI32(value))
+      }
+      ParsedOperand.MemOp {mem} => {
+        if wide {
+          drop run X86Encode.aluRm64(&mut out.*, op, d, mem)
+          return ()
+        }
+        return run failAsm(b"unsupported 32-bit memory ALU operand: ", line)
+      }
+      _ => { return run failAsm(b"unsupported ALU source: ", line) }
+    }
+    _ => { return run failAsm(b"unsupported ALU destination: ", line) }
+  }
+}
+
+effect fn emitShift(out: &mut Bytes, wide: bool, op: Shift, src: ParsedOperand, dst: ParsedOperand, line: &[u8]) -> ()
+! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  match dst {
+    ParsedOperand.Reg {reg: d} => match src {
+      ParsedOperand.Imm {value} => {
+        let count = u64.wrappingToU8(i64.wrappingToU64(value) & 63)
+        if wide { return run X86Encode.shiftImm64(&mut out.*, op, d, count) }
+        return run X86Encode.shiftImm32(&mut out.*, op, d, count)
+      }
+      ParsedOperand.Reg {reg: s} => {
+        if s != X86Encode.rcx() { return run failAsm(b"shift register count must be %cl: ", line) }
+        if wide { return run X86Encode.shiftCl64(&mut out.*, op, d) }
+        return run X86Encode.shiftCl32(&mut out.*, op, d)
+      }
+      _ => { return run failAsm(b"unsupported shift count: ", line) }
+    }
+    _ => { return run failAsm(b"unsupported shift destination: ", line) }
+  }
+}
+
+effect fn parseOperand(text: &[u8], bindings: &[OperandBinding]) -> ParsedOperand
+! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  if text.length == usize.ZERO { return run failAsm(b"empty inline asm operand", text) }
+  // `$$imm`: AT&T immediate literal escaped with `$$` in Silk templates.
+  if text.length >= 2 && text[usize.ZERO] == 36 && text[usize.ONE] == 36 {
+    let immText = Slice.view<u8>(text, 2, text.length - 2)
+    return ParsedOperand.Imm {value: run parseSignedInt(immText)}
+  }
+  // `$N`: operand placeholder referencing `bindings[N]`.
+  if text[usize.ZERO] == 36 {
+    let idx = run parsePlaceholder(text, bindings)
+    let bound = bindings[idx]
+    if bound.isMemory {
+      return ParsedOperand.MemOp {mem: Mem.baseDisp(bound.reg, 0)}
+    }
+    return ParsedOperand.Reg {reg: bound.reg}
+  }
+  // `%reg` or `%%reg`: explicit physical register.
+  if text[usize.ZERO] == 37 {
+    let mut start = usize.ONE
+    if start < text.length && text[start] == 37 { start = start + usize.ONE }
+    let name = Slice.view<u8>(text, start, text.length - start)
+    match parseRegisterName(name) {
+      Option<u8>.Some {value: reg} => { return ParsedOperand.Reg {reg: reg} }
+      Option<u8>.None => { return run failAsm(b"unknown register in inline asm: ", text) }
+    }
+  }
+  // Memory form `[disp](base[,index[,scale]])`.
+  let mut lparen = usize.MAX
+  let mut at = usize.ZERO
+  while at < text.length {
+    if text[at] == 40 {
+      lparen = at
+      break
+    }
+    at = at + usize.ONE
+  }
+  if lparen != usize.MAX && text[text.length - usize.ONE] == 41 {
+    let mut disp: i32 = 0
+    if lparen > usize.ZERO {
+      disp = i64.wrappingToI32(run parseSignedInt(Slice.view<u8>(text, usize.ZERO, lparen)))
+    }
+    let inside = trim(Slice.view<u8>(text, lparen + usize.ONE, text.length - lparen - 2))
+    let mut c1 = usize.MAX
+    at = usize.ZERO
+    while at < inside.length {
+      if inside[at] == 44 {
+        c1 = at
+        break
+      }
+      at = at + usize.ONE
+    }
+    if c1 == usize.MAX {
+      let baseReg = run parseRegToken(inside, bindings)
+      return ParsedOperand.MemOp {mem: Mem.baseDisp(baseReg, disp)}
+    }
+    let baseText = trim(Slice.view<u8>(inside, usize.ZERO, c1))
+    let afterBase = trim(Slice.view<u8>(inside, c1 + usize.ONE, inside.length - c1 - usize.ONE))
+    let mut c2 = usize.MAX
+    at = usize.ZERO
+    while at < afterBase.length {
+      if afterBase[at] == 44 {
+        c2 = at
+        break
+      }
+      at = at + usize.ONE
+    }
+    let mut scale: u8 = 1
+    let mut idxText = afterBase
+    if c2 != usize.MAX {
+      idxText = trim(Slice.view<u8>(afterBase, usize.ZERO, c2))
+      let scaleText = trim(Slice.view<u8>(afterBase, c2 + usize.ONE, afterBase.length - c2 - usize.ONE))
+      scale = u64.wrappingToU8(i64.wrappingToU64(run parseSignedInt(scaleText)) & 255)
+    }
+    let baseReg = run parseRegToken(baseText, bindings)
+    let idxReg = run parseRegToken(idxText, bindings)
+    return ParsedOperand.MemOp {mem: Mem.baseIndex(baseReg, idxReg, scale, disp)}
+  }
+  // Plain symbol name (for `call sym` / `jmp sym`).
+  return ParsedOperand.Symbol {start: usize.ZERO, length: text.length}
+}
+
+effect fn parseRegToken(text: &[u8], bindings: &[OperandBinding]) -> u8
+! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  if text.length >= 2 && text[usize.ZERO] == 36 {
+    let idx = run parsePlaceholder(text, bindings)
+    return bindings[idx].reg
+  }
+  if text.length >= 2 && text[usize.ZERO] == 37 {
+    let mut start = usize.ONE
+    if start < text.length && text[start] == 37 { start = start + usize.ONE }
+    if let Option<u8>.Some {value: reg} = parseRegisterName(Slice.view<u8>(text, start, text.length - start)) {
+      return reg
+    }
+  }
+  return run failAsm(b"expected register in memory operand: ", text)
+}
+
+effect fn parsePlaceholder(text: &[u8], bindings: &[OperandBinding]) -> usize
+! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  if text.length < 2 || text[usize.ZERO] != 36 { return run failAsm(b"bad placeholder: ", text) }
+  let digit = text[usize.ONE]
+  if text.length != 2 || digit < 48 || digit > 57 { return run failAsm(b"bad placeholder index: ", text) }
+  let idx = u8.toUsize(digit - 48)
+  if idx >= bindings.length { return run failAsm(b"placeholder out of range: ", text) }
+  return idx
+}
+
+effect fn parseSignedInt(text: &[u8]) -> i64 ! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  if text.length == usize.ZERO { return run failAsm(b"empty immediate", text) }
+  let mut neg = false
+  let mut pos = usize.ZERO
+  if text[pos] == 45 {
+    neg = true
+    pos = pos + usize.ONE
+  } else if text[pos] == 43 {
+    pos = pos + usize.ONE
+  }
+  let mut base: u64 = 10
+  if pos + 2 <= text.length && text[pos] == 48 && (text[pos + usize.ONE] == 120 || text[pos + usize.ONE] == 88) {
+    base = 16
+    pos = pos + 2
+  }
+  if pos >= text.length { return run failAsm(b"malformed immediate: ", text) }
+  let mut acc: u64 = 0
+  while pos < text.length {
+    let ch = text[pos]
+    let mut digit: u64 = 255
+    if ch >= 48 && ch <= 57 { digit = u8.toU64(ch - 48) }
+    else if base == 16 && ch >= 97 && ch <= 102 { digit = u8.toU64(ch - 97) + 10 }
+    else if base == 16 && ch >= 65 && ch <= 70 { digit = u8.toU64(ch - 65) + 10 }
+    if digit >= base { return run failAsm(b"invalid digit in immediate: ", text) }
+    acc = acc * base + digit
+    pos = pos + usize.ONE
+  }
+  if neg { return 0 - u64.wrappingToI64(acc) }
+  return u64.wrappingToI64(acc)
+}
+
+effect fn failAsm(prefix: &[u8], text: &[u8]) -> never ! UnsupportedAsm | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(prefix)
+  run Bytes.append(&mut detail, text)
+  fail UnsupportedAsm {detail: move detail}
+}
+
+fn isSpace(ch: u8) -> bool {
+  return ch == 32 || ch == 9 || ch == 13
+}
+
+fn trim(text: &[u8]) -> &[u8] {
+  let mut start = usize.ZERO
+  let mut end = text.length
+  while start < end && isSpace(text[start]) { start = start + usize.ONE }
+  while end > start && isSpace(text[end - usize.ONE]) { end = end - usize.ONE }
+  return Slice.view<u8>(text, start, end - start)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}

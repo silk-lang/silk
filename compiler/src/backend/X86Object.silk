@@ -1,0 +1,507 @@
+//! Per-instance x86-64 object fragments for the Linux direct backend.
+//!
+//! # When to use
+//! `X86Lower` emits one encoded [`Fragment`] per lowered Silk instance (and one for the program's
+//! shared runtime declarations), stored in `SemanticCache` alongside any other backend text.
+//! `X86ElfObject` (Phase 1) and `ElfLink` (Phase 2) decode concatenated fragments back to back.
+//!
+//! # Details
+//! A fragment starts with the little-endian magic word `0x36387800` (`\0x86`), followed by its
+//! total byte length as a little-endian `u32`, then tagged entries (`Function`, `Object`,
+//! `WeakFunction`, `WeakObject`, `Refused`, `DeclaredObject`). Every cross-function reference is
+//! symbolic so each fragment depends only on its own instance.
+
+import backend.X86Encode
+import backend.X86Unwind {UnwindInfo}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// A construct the Linux x86-64 direct backend cannot emit yet.
+pub struct Unsupported {
+  pub detail: Bytes,
+}
+
+/// Fails with `what` in `symbol` as an [`Unsupported`] refusal.
+pub effect fn unsupported(what: &[u8], symbol: &[u8]) -> never ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(what)
+  run Bytes.append(&mut detail, b" in ")
+  run Bytes.append(&mut detail, symbol)
+  fail Unsupported {detail: move detail}
+}
+
+/// How an ELF64 relocation inside one function's code is resolved.
+pub enum RelocationKind {
+  /// `R_X86_64_PC32` against symbol `target`.
+  Pc32,
+  /// `R_X86_64_PLT32` against symbol `target` (function call or tail jump).
+  Plt32,
+  /// `R_X86_64_64` 64-bit absolute symbol address.
+  Abs64,
+  /// `R_X86_64_GOTPCREL` GOT slot address for external/PIC symbol load.
+  GotPcRel,
+  /// `R_X86_64_GOTTPOFF` Initial-Exec TLS GOT offset.
+  GotTpOff,
+  /// `R_X86_64_PC32` targeting this function's own `.rodata` block at `addend` (minus 4).
+  LocalRodataPc32,
+}
+
+/// One relocation inside a function's machine code.
+pub struct Relocation {
+  /// Byte offset of the relocation field inside `Function.code`.
+  pub offset: usize,
+  /// Relocation kind.
+  pub kind: RelocationKind,
+  /// Index into `Function.symbols` (unused for `LocalRodataPc32`).
+  pub target: usize,
+  /// Signed ELF64 addend (for `LocalRodataPc32`, the byte offset inside `Function.rodata`).
+  pub addend: i64,
+}
+
+impl Copy for Relocation {}
+
+/// One PC-relative 32-bit jump-table entry inside `Function.rodata` targeting `targetCodeOffset`
+/// relative to `tableBaseOffset` in `Function.rodata`.
+pub struct RodataJumpEntry {
+  /// Byte offset of the 4-byte entry inside `Function.rodata`.
+  pub rodataOffset: usize,
+  /// Byte offset of the start of the jump table inside `Function.rodata`.
+  pub tableOffset: usize,
+  /// Target byte offset inside `Function.code`.
+  pub targetCodeOffset: usize,
+}
+
+impl Copy for RodataJumpEntry {}
+
+/// One compiled x86-64 function.
+pub struct Function {
+  /// Link symbol name.
+  pub symbol: Bytes,
+  /// Optional host C export alias (empty or equal to `symbol` when none).
+  pub exported: Bytes,
+  /// Machine code bytes placed in `.text`.
+  pub code: Bytes,
+  /// Code relocations in offset order.
+  pub relocations: List<Relocation>,
+  /// Symbol names indexed by `Relocation.target`.
+  pub symbols: List<Bytes>,
+  /// Function-local `.rodata` bytes (float/vector constants and PIC jump tables), 16-byte aligned.
+  pub rodata: Bytes,
+  /// Jump-table entries inside `rodata` targeting code labels in this function.
+  pub rodataJumps: List<RodataJumpEntry>,
+  /// Prologue metadata for `.eh_frame` FDE emission.
+  pub unwind: UnwindInfo,
+  /// Pairs of `(codeOffset, line << 24 | column)` for debug line tables.
+  pub locations: List<u64>,
+}
+
+/// One address relocation inside a static data object's image.
+pub struct Pointer {
+  /// Byte offset inside `Object.image`.
+  pub offset: usize,
+  /// Referenced symbol name.
+  pub symbol: Bytes,
+  /// Unsigned byte addend.
+  pub addend: u64,
+  /// Pointer width in bytes (8 on x86-64).
+  pub size: usize,
+}
+
+/// One static data object emitted into `.rodata`, `.data`, `.bss`, `.tdata`, or `silk_frames`.
+pub struct Object {
+  pub symbol: Bytes,
+  pub alignment: u64,
+  pub image: Bytes,
+  pub pointers: List<Pointer>,
+  /// True for trap-frame metadata entries placed in `silk_frames`.
+  pub framed: bool,
+  /// True for thread-local objects placed in `.tdata`.
+  pub local: bool,
+  /// True for immutable objects without relocations placed in `.rodata`.
+  pub readonly: bool,
+}
+
+/// One serialized unit of x86-64 object fragments.
+pub struct Fragment {
+  pub functions: List<Function>,
+  pub objects: List<Object>,
+  /// Weak function symbols (resolved to 0 if undefined).
+  pub weakFunctions: List<Bytes>,
+  /// Weak data symbols (resolved to 0 if undefined).
+  pub weakObjects: List<Bytes>,
+  /// Refusal messages emitted when a function could not be lowered.
+  pub refused: List<Bytes>,
+  /// Foreign C data objects declared without a definition (inspected by semantic checks).
+  pub declaredObjects: List<Bytes>,
+}
+
+fn magic() -> u64 { return 0x36387800 }
+
+fn tagFunction() -> u8 { return 1 }
+fn tagObject() -> u8 { return 2 }
+fn tagWeakFunction() -> u8 { return 3 }
+fn tagWeakObject() -> u8 { return 4 }
+fn tagRefused() -> u8 { return 5 }
+fn tagDeclaredObject() -> u8 { return 6 }
+
+fn relocKindCode(kind: RelocationKind) -> u8 {
+  return match kind {
+    RelocationKind.Pc32 => 0
+    RelocationKind.Plt32 => 1
+    RelocationKind.Abs64 => 2
+    RelocationKind.GotPcRel => 3
+    RelocationKind.GotTpOff => 4
+    RelocationKind.LocalRodataPc32 => 5
+  }
+}
+
+fn relocKindFrom(code: u8) -> RelocationKind {
+  if code == 1 { return RelocationKind.Plt32 }
+  if code == 2 { return RelocationKind.Abs64 }
+  if code == 3 { return RelocationKind.GotPcRel }
+  if code == 4 { return RelocationKind.GotTpOff }
+  if code == 5 { return RelocationKind.LocalRodataPc32 }
+  return RelocationKind.Pc32
+}
+
+impl Fragment {
+  /// An empty x86-64 object fragment.
+  pub fn make() -> Fragment {
+    return Fragment {
+      functions: List<Function>.make(),
+      objects: List<Object>.make(),
+      weakFunctions: List<Bytes>.make(),
+      weakObjects: List<Bytes>.make(),
+      refused: List<Bytes>.make(),
+      declaredObjects: List<Bytes>.make(),
+    }
+  }
+
+  /// Encodes this fragment into its binary wire format.
+  pub effect fn encode(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut out = Bytes.make()
+    run X86Encode.u32Le(&mut out, magic())
+    run X86Encode.u32Le(&mut out, 0)
+    let functions = List<Function>.asSlice(&self.functions)
+    let mut at = usize.ZERO
+    while at < functions.length {
+      run X86Encode.byte(&mut out, tagFunction())
+      run writeFunction(&mut out, &functions[at])
+      at = at + usize.ONE
+    }
+    let objects = List<Object>.asSlice(&self.objects)
+    at = usize.ZERO
+    while at < objects.length {
+      run X86Encode.byte(&mut out, tagObject())
+      run writeObject(&mut out, &objects[at])
+      at = at + usize.ONE
+    }
+    let weakFns = List<Bytes>.asSlice(&self.weakFunctions)
+    at = usize.ZERO
+    while at < weakFns.length {
+      run X86Encode.byte(&mut out, tagWeakFunction())
+      run writeBytes(&mut out, Bytes.asSlice(&weakFns[at]))
+      at = at + usize.ONE
+    }
+    let weakObjs = List<Bytes>.asSlice(&self.weakObjects)
+    at = usize.ZERO
+    while at < weakObjs.length {
+      run X86Encode.byte(&mut out, tagWeakObject())
+      run writeBytes(&mut out, Bytes.asSlice(&weakObjs[at]))
+      at = at + usize.ONE
+    }
+    let refused = List<Bytes>.asSlice(&self.refused)
+    at = usize.ZERO
+    while at < refused.length {
+      run X86Encode.byte(&mut out, tagRefused())
+      run writeBytes(&mut out, Bytes.asSlice(&refused[at]))
+      at = at + usize.ONE
+    }
+    let declared = List<Bytes>.asSlice(&self.declaredObjects)
+    at = usize.ZERO
+    while at < declared.length {
+      run X86Encode.byte(&mut out, tagDeclaredObject())
+      run writeBytes(&mut out, Bytes.asSlice(&declared[at]))
+      at = at + usize.ONE
+    }
+    let size = Bytes.length(&out)
+    X86Encode.patchU32(&mut out, 4, usize.toU64(size))
+    return move out
+  }
+}
+
+/// Decodes back-to-back encoded [`Fragment`]s into one combined [`Fragment`].
+pub effect fn decode(bytes: &[u8]) -> Fragment ! OutOfMemoryError ? &mut Allocator {
+  let mut result = Fragment.make()
+  let mut at = usize.ZERO
+  while at + 8 <= bytes.length {
+    if readU32(bytes, at) != magic() { break }
+    let length = u64.toUsize(readU32(bytes, at + 4))
+    if length < 8 || at + length > bytes.length { break }
+    let end = at + length
+    let mut cursor = at + 8
+    while cursor < end {
+      let tag = bytes[cursor]
+      cursor = cursor + usize.ONE
+      if tag == tagFunction() {
+        run List<Function>.append(&mut result.functions, run readFunction(bytes, &mut cursor))
+      } else if tag == tagObject() {
+        run List<Object>.append(&mut result.objects, run readObject(bytes, &mut cursor))
+      } else if tag == tagWeakFunction() {
+        run List<Bytes>.append(&mut result.weakFunctions, run readBytes(bytes, &mut cursor))
+      } else if tag == tagWeakObject() {
+        run List<Bytes>.append(&mut result.weakObjects, run readBytes(bytes, &mut cursor))
+      } else if tag == tagRefused() {
+        run List<Bytes>.append(&mut result.refused, run readBytes(bytes, &mut cursor))
+      } else if tag == tagDeclaredObject() {
+        run List<Bytes>.append(&mut result.declaredObjects, run readBytes(bytes, &mut cursor))
+      } else {
+        break
+      }
+    }
+    at = end
+  }
+  return move result
+}
+
+/// Whether `bytes` (one or more concatenated x86-64 fragments) declares a C data object named
+/// `symbol`.
+pub effect fn declaresObject(bytes: &[u8], symbol: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let decoded = run decode(bytes)
+  let declared = List<Bytes>.asSlice(&decoded.declaredObjects)
+  let mut at = usize.ZERO
+  while at < declared.length {
+    if same(Bytes.asSlice(&declared[at]), symbol) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Binary serialization helpers.
+
+effect fn writeVar(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  while true {
+    let low = u64.wrappingToU8(rest & 127)
+    rest = u64.shiftRight(rest, 7)
+    if rest == 0 { return run X86Encode.byte(&mut out.*, low) }
+    run X86Encode.byte(&mut out.*, low | 128)
+  }
+}
+
+fn readVar(bytes: &[u8], cursor: &mut usize) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while cursor.* < bytes.length {
+    let b = bytes[cursor.*]
+    cursor.* = cursor.* + usize.ONE
+    value = value | u64.shiftLeft(u8.toU64(b & 127), shift)
+    if (b & 128) == 0 { break }
+    shift = shift + 7
+  }
+  return value
+}
+
+effect fn writeBytes(out: &mut Bytes, data: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeVar(&mut out.*, usize.toU64(data.length))
+  return run Bytes.append(&mut out.*, data)
+}
+
+effect fn readBytes(bytes: &[u8], cursor: &mut usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let len = u64.toUsize(readVar(bytes, &mut cursor.*))
+  let start = cursor.*
+  cursor.* = start + len
+  return run Bytes.copy(Slice.view<u8>(bytes, start, len))
+}
+
+effect fn writeFunction(out: &mut Bytes, f: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeBytes(&mut out.*, Bytes.asSlice(&f.symbol))
+  run writeBytes(&mut out.*, Bytes.asSlice(&f.exported))
+  run writeBytes(&mut out.*, Bytes.asSlice(&f.code))
+  let relocs = List<Relocation>.asSlice(&f.relocations)
+  run writeVar(&mut out.*, usize.toU64(relocs.length))
+  let mut at = usize.ZERO
+  while at < relocs.length {
+    run writeVar(&mut out.*, usize.toU64(relocs[at].offset))
+    run X86Encode.byte(&mut out.*, relocKindCode(relocs[at].kind))
+    run writeVar(&mut out.*, usize.toU64(relocs[at].target))
+    run X86Encode.u64Le(&mut out.*, i64.wrappingToU64(relocs[at].addend))
+    at = at + usize.ONE
+  }
+  let syms = List<Bytes>.asSlice(&f.symbols)
+  run writeVar(&mut out.*, usize.toU64(syms.length))
+  at = usize.ZERO
+  while at < syms.length {
+    run writeBytes(&mut out.*, Bytes.asSlice(&syms[at]))
+    at = at + usize.ONE
+  }
+  run writeBytes(&mut out.*, Bytes.asSlice(&f.rodata))
+  let jumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+  run writeVar(&mut out.*, usize.toU64(jumps.length))
+  at = usize.ZERO
+  while at < jumps.length {
+    run writeVar(&mut out.*, usize.toU64(jumps[at].rodataOffset))
+    run writeVar(&mut out.*, usize.toU64(jumps[at].tableOffset))
+    run writeVar(&mut out.*, usize.toU64(jumps[at].targetCodeOffset))
+    at = at + usize.ONE
+  }
+  run X86Encode.byte(&mut out.*, if f.unwind.hasFramePointer { 1 } else { 0 })
+  run X86Encode.byte(&mut out.*, f.unwind.pushRbpEnd)
+  run X86Encode.byte(&mut out.*, f.unwind.movRbpEnd)
+  run X86Encode.byte(&mut out.*, f.unwind.savesEnd)
+  run writeVar(&mut out.*, f.unwind.savedCalleeMask)
+  let locs = List<u64>.asSlice(&f.locations)
+  run writeVar(&mut out.*, usize.toU64(locs.length))
+  at = usize.ZERO
+  while at < locs.length {
+    run writeVar(&mut out.*, locs[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn readFunction(bytes: &[u8], cursor: &mut usize) -> Function ! OutOfMemoryError ? &mut Allocator {
+  let symbol = run readBytes(bytes, &mut cursor.*)
+  let exported = run readBytes(bytes, &mut cursor.*)
+  let code = run readBytes(bytes, &mut cursor.*)
+  let relocCount = u64.toUsize(readVar(bytes, &mut cursor.*))
+  let mut relocations = run List<Relocation>.makeWithCapacity(relocCount)
+  let mut at = usize.ZERO
+  while at < relocCount {
+    let offset = u64.toUsize(readVar(bytes, &mut cursor.*))
+    let kind = relocKindFrom(bytes[cursor.*])
+    cursor.* = cursor.* + usize.ONE
+    let target = u64.toUsize(readVar(bytes, &mut cursor.*))
+    let addend = u64.wrappingToI64(readU64(bytes, cursor.*))
+    cursor.* = cursor.* + 8
+    run List<Relocation>.append(&mut relocations, Relocation {offset: offset, kind: kind, target: target, addend: addend})
+    at = at + usize.ONE
+  }
+  let symCount = u64.toUsize(readVar(bytes, &mut cursor.*))
+  let mut symbols = run List<Bytes>.makeWithCapacity(symCount)
+  at = usize.ZERO
+  while at < symCount {
+    run List<Bytes>.append(&mut symbols, run readBytes(bytes, &mut cursor.*))
+    at = at + usize.ONE
+  }
+  let rodata = run readBytes(bytes, &mut cursor.*)
+  let jumpCount = u64.toUsize(readVar(bytes, &mut cursor.*))
+  let mut rodataJumps = run List<RodataJumpEntry>.makeWithCapacity(jumpCount)
+  at = usize.ZERO
+  while at < jumpCount {
+    let rodataOffset = u64.toUsize(readVar(bytes, &mut cursor.*))
+    let tableOffset = u64.toUsize(readVar(bytes, &mut cursor.*))
+    let targetCodeOffset = u64.toUsize(readVar(bytes, &mut cursor.*))
+    run List<RodataJumpEntry>.append(&mut rodataJumps, RodataJumpEntry {
+      rodataOffset: rodataOffset, tableOffset: tableOffset, targetCodeOffset: targetCodeOffset,
+    })
+    at = at + usize.ONE
+  }
+  let hasFp = bytes[cursor.*] != 0
+  let pushRbpEnd = bytes[cursor.* + 1]
+  let movRbpEnd = bytes[cursor.* + 2]
+  let savesEnd = bytes[cursor.* + 3]
+  cursor.* = cursor.* + 4
+  let savedCalleeMask = readVar(bytes, &mut cursor.*)
+  let locCount = u64.toUsize(readVar(bytes, &mut cursor.*))
+  let mut locations = run List<u64>.makeWithCapacity(locCount)
+  at = usize.ZERO
+  while at < locCount {
+    run List<u64>.append(&mut locations, readVar(bytes, &mut cursor.*))
+    at = at + usize.ONE
+  }
+  return Function {
+    symbol: move symbol,
+    exported: move exported,
+    code: move code,
+    relocations: move relocations,
+    symbols: move symbols,
+    rodata: move rodata,
+    rodataJumps: move rodataJumps,
+    unwind: UnwindInfo {
+      hasFramePointer: hasFp,
+      pushRbpEnd: pushRbpEnd,
+      movRbpEnd: movRbpEnd,
+      savedCalleeMask: savedCalleeMask,
+      savesEnd: savesEnd,
+    },
+    locations: move locations,
+  }
+}
+
+effect fn writeObject(out: &mut Bytes, obj: &Object) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeBytes(&mut out.*, Bytes.asSlice(&obj.symbol))
+  run writeVar(&mut out.*, obj.alignment)
+  run writeBytes(&mut out.*, Bytes.asSlice(&obj.image))
+  let mut flags: u8 = 0
+  if obj.framed { flags = u8.bitOr(flags, 1) }
+  if obj.local { flags = u8.bitOr(flags, 2) }
+  if obj.readonly { flags = u8.bitOr(flags, 4) }
+  run X86Encode.byte(&mut out.*, flags)
+  let ptrs = List<Pointer>.asSlice(&obj.pointers)
+  run writeVar(&mut out.*, usize.toU64(ptrs.length))
+  let mut at = usize.ZERO
+  while at < ptrs.length {
+    run writeVar(&mut out.*, usize.toU64(ptrs[at].offset))
+    run writeBytes(&mut out.*, Bytes.asSlice(&ptrs[at].symbol))
+    run writeVar(&mut out.*, ptrs[at].addend)
+    run writeVar(&mut out.*, usize.toU64(ptrs[at].size))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn readObject(bytes: &[u8], cursor: &mut usize) -> Object ! OutOfMemoryError ? &mut Allocator {
+  let symbol = run readBytes(bytes, &mut cursor.*)
+  let alignment = readVar(bytes, &mut cursor.*)
+  let image = run readBytes(bytes, &mut cursor.*)
+  let flags = bytes[cursor.*]
+  cursor.* = cursor.* + usize.ONE
+  let ptrCount = u64.toUsize(readVar(bytes, &mut cursor.*))
+  let mut pointers = run List<Pointer>.makeWithCapacity(ptrCount)
+  let mut at = usize.ZERO
+  while at < ptrCount {
+    let offset = u64.toUsize(readVar(bytes, &mut cursor.*))
+    let sym = run readBytes(bytes, &mut cursor.*)
+    let addend = readVar(bytes, &mut cursor.*)
+    let size = u64.toUsize(readVar(bytes, &mut cursor.*))
+    run List<Pointer>.append(&mut pointers, Pointer {offset: offset, symbol: move sym, addend: addend, size: size})
+    at = at + usize.ONE
+  }
+  return Object {
+    symbol: move symbol,
+    alignment: alignment,
+    image: move image,
+    pointers: move pointers,
+    framed: (flags & 1) != 0,
+    local: (flags & 2) != 0,
+    readonly: (flags & 4) != 0,
+  }
+}
+
+fn readU32(bytes: &[u8], at: usize) -> u64 {
+  return u8.toU64(bytes[at])
+    | u64.shiftLeft(u8.toU64(bytes[at + 1]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[at + 3]), 24)
+}
+
+fn readU64(bytes: &[u8], at: usize) -> u64 {
+  return readU32(bytes, at) | u64.shiftLeft(readU32(bytes, at + 4), 32)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}

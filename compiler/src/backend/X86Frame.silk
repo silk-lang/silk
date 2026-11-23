@@ -1,0 +1,568 @@
+//! Stack frame layout and interval-colored slot allocation for x86-64 functions.
+//!
+//! # When to use
+//! Call [`X86Frame.plan`] on a finished [`SsaFunction`] before emitting machine code in
+//! `X86Emit`. The returned [`FramePlan`] assigns every MIR stack slot and every non-constant SSA
+//! value a negative `rbp`-relative byte offset, reserves the 176-byte SysV variadic register-save
+//! area when `Operation.VaStart` is present, and computes the exact 16-byte-aligned stack
+//! subtraction size and callee-saved register mask.
+//!
+//! # Details
+//! - MIR stack slots marked by `StackLifetimes` (`SlotStart`/`SlotEnd`) share frame storage when
+//!   their live intervals (extended over any overlapping CFG back-edges) do not overlap.
+//! - Non-constant SSA values share 8-byte and 16-byte home slots via linear live-interval
+//!   coloring, keeping stack frames small in deeply recursive compiler functions.
+//! - Because `push rbp; mov rbp, rsp` aligns `rsp` to 16 bytes on entry, `8 * savedCount +
+//!   localBytes` is rounded up to a multiple of 16 so every outgoing `call` sees a 16-byte-aligned
+//!   stack pointer.
+
+import backend.SsaFunction {Definition, Edge, InlineAsm, Kind, Operation, SsaFunction, none}
+import backend.X86Asm
+import backend.X86Asm {Constraint, ConstraintKind}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// Complete stack frame layout for one compiled x86-64 function.
+pub struct FramePlan {
+  /// Negative `rbp`-relative byte offset of each MIR stack slot `0 .. slotCount - 1`.
+  pub slotOffsets: List<i32>,
+  /// Negative `rbp`-relative byte offset of each SSA value `0 .. valueCount - 1` (0 for constants
+  /// and unit values).
+  pub valueOffsets: List<i32>,
+  /// Allocated byte size of each SSA value's home slot (0, 8, 16, or rounded multiple of 16).
+  pub valueSizes: List<usize>,
+  /// True when the function contains `Operation.VaStart`.
+  pub hasVaStart: bool,
+  /// Negative `rbp`-relative offset of the 176-byte SysV variadic register-save area when
+  /// `hasVaStart` is true, else 0.
+  pub regSaveOffset: i32,
+  /// Bitmask of callee-saved GPRs (`rbx=3, r12=12, r13=13, r14=14, r15=15`) that prologue must
+  /// push and epilogue must pop.
+  pub savedCalleeMask: u64,
+  /// Number of callee-saved GPRs in `savedCalleeMask`.
+  pub savedCount: usize,
+  /// Byte count subtracted from `rsp` after pushing callee-saved GPRs (`8 * savedCount +
+  /// subRspBytes` is always a multiple of 16).
+  pub subRspBytes: u64,
+  /// True when the function contains `Operation.DynamicSlot` (so `rsp` may move below the fixed
+  /// frame during execution).
+  pub hasDynamicSlot: bool,
+}
+
+struct Interval {
+  start: usize,
+  end: usize,
+  hasStart: bool,
+  hasEnd: bool,
+  unmarked: bool,
+}
+
+impl Copy for Interval {}
+
+struct BackEdge {
+  headerPoint: usize,
+  latchPoint: usize,
+}
+
+impl Copy for BackEdge {}
+
+struct ReusableSlot {
+  rbpOffset: i32,
+  size: u64,
+  align: u64,
+  freeAfter: usize,
+}
+
+impl Copy for ReusableSlot {}
+
+/// Byte size of the home slot for a value of `kind` (`0` for unit, `8` for scalar <= 64-bit, `16`
+/// for `i128` or <= 16-byte vector, or 16-byte-rounded `storeSize` for wider vectors).
+pub fn valueSlotBytes(kind: Kind) -> usize {
+  if kind.isUnit() { return usize.ZERO }
+  if !kind.isVector() {
+    if kind.bits > 64 { return 16 }
+    return 8
+  }
+  let sz = kind.storeSize()
+  if sz <= 16 { return 16 }
+  return ((sz + 15) / 16) * 16
+}
+
+/// Computes the stack frame plan for `function`.
+pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mut Allocator {
+  let blockCount = function.blockCount()
+  let slotCount = function.slotCount()
+  let valueCount = function.valueCount()
+
+  // Compute Reverse Post-Order (RPO) over reachable blocks so dominators always precede dominated
+  // blocks and `rpoRank[target] <= rpoRank[source]` characterizes every CFG back-edge even when
+  // optimization passes (such as inlining) leave raw block indices out of RPO order.
+  let mut visited = run List<u8>.makeWithCapacity(blockCount)
+  let mut rpoOrder = run List<usize>.makeWithCapacity(blockCount)
+  let mut rpoRank = run List<usize>.makeWithCapacity(blockCount)
+  let mut blockStart = run List<usize>.makeWithCapacity(blockCount)
+  let mut blockExit = run List<usize>.makeWithCapacity(blockCount)
+  let mut b = usize.ZERO
+  while b < blockCount {
+    run List<u8>.append(&mut visited, 0)
+    run List<usize>.append(&mut rpoRank, usize.ZERO)
+    run List<usize>.append(&mut blockStart, usize.ZERO)
+    run List<usize>.append(&mut blockExit, usize.ZERO)
+    b = b + usize.ONE
+  }
+  if blockCount > usize.ZERO {
+    let mut dfsBlocks = List<usize>.make()
+    let mut dfsEdges = List<usize>.make()
+    let mut postOrder = run List<usize>.makeWithCapacity(blockCount)
+    let visitedMut = List<u8>.asMutSlice(&mut visited)
+    visitedMut[usize.ZERO] = 1
+    run List<usize>.append(&mut dfsBlocks, usize.ZERO)
+    run List<usize>.append(&mut dfsEdges, usize.ZERO)
+    while List<usize>.length(&dfsBlocks) > usize.ZERO {
+      let top = List<usize>.length(&dfsBlocks) - usize.ONE
+      let u = List<usize>.asSlice(&dfsBlocks)[top]
+      let nextEdge = List<usize>.asSlice(&dfsEdges)[top]
+      let edges = List<Edge>.asSlice(&function.block(u).edges)
+      if nextEdge < edges.length {
+        let edgesMut = List<usize>.asMutSlice(&mut dfsEdges)
+        edgesMut[top] = nextEdge + usize.ONE
+        let target = edges[nextEdge].block
+        if target < blockCount && visitedMut[target] == 0 {
+          visitedMut[target] = 1
+          run List<usize>.append(&mut dfsBlocks, target)
+          run List<usize>.append(&mut dfsEdges, usize.ZERO)
+        }
+      } else {
+        drop List<usize>.remove(&mut dfsBlocks, top)
+        drop List<usize>.remove(&mut dfsEdges, top)
+        run List<usize>.append(&mut postOrder, u)
+      }
+    }
+    let post = List<usize>.asSlice(&postOrder)
+    let mut pIdx = post.length
+    while pIdx > usize.ZERO {
+      pIdx = pIdx - usize.ONE
+      run List<usize>.append(&mut rpoOrder, post[pIdx])
+    }
+  }
+  // Place any unreachable blocks after all reachable blocks so every block has valid points.
+  b = usize.ZERO
+  while b < blockCount {
+    if List<u8>.asSlice(&visited)[b] == 0 {
+      run List<usize>.append(&mut rpoOrder, b)
+    }
+    b = b + usize.ONE
+  }
+
+  // Assign a linear program point to each block entry, instruction, and block exit in RPO order.
+  let orderSlice = List<usize>.asSlice(&rpoOrder)
+  let rankMut = List<usize>.asMutSlice(&mut rpoRank)
+  let startMut = List<usize>.asMutSlice(&mut blockStart)
+  let exitMut = List<usize>.asMutSlice(&mut blockExit)
+  let mut totalPoints = usize.ONE // point 0 is function entry (arguments live here)
+  let mut rank = usize.ZERO
+  while rank < orderSlice.length {
+    let blkIdx = orderSlice[rank]
+    rankMut[blkIdx] = rank
+    startMut[blkIdx] = totalPoints
+    let blk = function.block(blkIdx)
+    let insts = List<usize>.asSlice(&blk.instructions)
+    totalPoints = totalPoints + insts.length + usize.ONE
+    exitMut[blkIdx] = totalPoints - usize.ONE
+    rank = rank + usize.ONE
+  }
+
+  let visitedSlice = List<u8>.asSlice(&visited)
+  let rankSlice = List<usize>.asSlice(&rpoRank)
+  let bStart = List<usize>.asSlice(&blockStart)
+  let bExit = List<usize>.asSlice(&blockExit)
+
+  // Collect CFG back-edges (`rpoRank[target] <= rpoRank[source]`) among reachable blocks so live
+  // intervals spanning a loop stay live across the entire loop body.
+  let mut backEdges = List<BackEdge>.make()
+  b = usize.ZERO
+  while b < blockCount {
+    if visitedSlice[b] != 0 {
+      let blk = function.block(b)
+      let edges = List<Edge>.asSlice(&blk.edges)
+      let mut e = usize.ZERO
+      while e < edges.length {
+        let target = edges[e].block
+        if target < blockCount && rankSlice[target] <= rankSlice[b] {
+          run List<BackEdge>.append(&mut backEdges, BackEdge {headerPoint: bStart[target], latchPoint: bExit[b]})
+        }
+        e = e + usize.ONE
+      }
+    }
+    b = b + usize.ONE
+  }
+  let loops = List<BackEdge>.asSlice(&backEdges)
+
+  // Initialize MIR stack slot intervals and SSA value intervals.
+  let mut slotIv = run List<Interval>.makeWithCapacity(slotCount)
+  let mut s = usize.ZERO
+  while s < slotCount {
+    run List<Interval>.append(&mut slotIv, Interval {start: totalPoints, end: usize.ZERO, hasStart: false, hasEnd: false, unmarked: false})
+    s = s + usize.ONE
+  }
+
+  let mut valIv = run List<Interval>.makeWithCapacity(valueCount)
+  let mut valSizes = run List<usize>.makeWithCapacity(valueCount)
+  let mut v = usize.ZERO
+  while v < valueCount {
+    let info = function.value(usize.toU64(v))
+    let sz = if info.definition == Definition.Constant { usize.ZERO } else { valueSlotBytes(info.kind) }
+    run List<usize>.append(&mut valSizes, sz)
+    let mut start = totalPoints
+    let mut end = usize.ZERO
+    if info.definition == Definition.Argument && sz > usize.ZERO {
+      start = usize.ZERO
+      end = usize.ZERO
+    }
+    run List<Interval>.append(&mut valIv, Interval {start: start, end: end, hasStart: false, hasEnd: false, unmarked: false})
+    v = v + usize.ONE
+  }
+
+  let mut hasVaStart = false
+  let mut hasDynamicSlot = false
+  let mut calleeMask: u64 = 0
+  let calleeBits: u64 = u64.shiftLeft(1, 3) | u64.shiftLeft(1, 12) | u64.shiftLeft(1, 13) | u64.shiftLeft(1, 14) | u64.shiftLeft(1, 15)
+
+  // Walk every block and instruction to populate live ranges and detect special frame needs.
+  let slotIvMut = List<Interval>.asMutSlice(&mut slotIv)
+  b = usize.ZERO
+  while b < blockCount {
+    let blk = function.block(b)
+    let entryPt = bStart[b]
+    let params = List<u64>.asSlice(&blk.parameters)
+    let mut p = usize.ZERO
+    while p < params.length {
+      recordValPoint(&mut valIv, params[p], entryPt)
+      p = p + usize.ONE
+    }
+    let insts = List<usize>.asSlice(&blk.instructions)
+    let mut i = usize.ZERO
+    while i < insts.length {
+      let pt = entryPt + i
+      let inst = function.instruction(insts[i])
+      if !inst.removed {
+        // Record result definitions.
+        let rc = inst.resultCount()
+        if rc >= usize.ONE && inst.result != none() {
+          recordValPoint(&mut valIv, inst.result, pt)
+        }
+        if rc >= 2 && inst.result != none() {
+          recordValPoint(&mut valIv, inst.result + 1, pt)
+        }
+        // Record operand uses.
+        let ops = function.operandsOf(insts[i])
+        let mut opIdx = usize.ZERO
+        while opIdx < ops.length {
+          recordValPoint(&mut valIv, ops[opIdx], pt)
+          opIdx = opIdx + usize.ONE
+        }
+        // Inspect slot lifetime markers & special operations.
+        match inst.operation {
+          Operation.SlotStart {slot} => {
+            if slot < slotCount {
+              slotIvMut[slot].hasStart = true
+              if pt < slotIvMut[slot].start { slotIvMut[slot].start = pt }
+              if pt > slotIvMut[slot].end { slotIvMut[slot].end = pt }
+            }
+          }
+          Operation.SlotEnd {slot} => {
+            if slot < slotCount {
+              slotIvMut[slot].hasEnd = true
+              if pt < slotIvMut[slot].start { slotIvMut[slot].start = pt }
+              if pt > slotIvMut[slot].end { slotIvMut[slot].end = pt }
+            }
+          }
+          Operation.SlotAddress {slot} => {
+            if slot < slotCount {
+              if pt < slotIvMut[slot].start { slotIvMut[slot].start = pt }
+              if pt > slotIvMut[slot].end { slotIvMut[slot].end = pt }
+            }
+          }
+          Operation.VaStart => { hasVaStart = true }
+          Operation.DynamicSlot {..} => { hasDynamicSlot = true }
+          Operation.CompareExchange => {
+            if inst.kind.bits > 64 {
+              // `lock cmpxchg16b` uses `rbx` for the low 64 bits of the replacement value.
+              calleeMask = calleeMask | u64.shiftLeft(1, 3)
+            }
+          }
+          Operation.InlineAsm {index, ..} => {
+            let asm: &InlineAsm = function.asm(index)
+            let clob = X86Asm.parseClobberMask(Bytes.asSlice(&asm.clobbers))
+            calleeMask = calleeMask | (clob & calleeBits)
+            let hasOut = !inst.kind.isUnit()
+            let parsed = run X86Asm.parseConstraints(Bytes.asSlice(&asm.constraints), hasOut)
+            let cs = List<Constraint>.asSlice(&parsed)
+            let mut c = usize.ZERO
+            while c < cs.length {
+              if cs[c].kind == ConstraintKind.FixedReg && cs[c].reg < 16 {
+                calleeMask = calleeMask | (u64.shiftLeft(1, u8.toU64(cs[c].reg)) & calleeBits)
+              }
+              c = c + usize.ONE
+            }
+          }
+          _ => {}
+        }
+      }
+      i = i + usize.ONE
+    }
+    // Block exit values & outgoing edge arguments (also extend target block parameters to this edge).
+    let exitPt = bExit[b]
+    if blk.value != none() { recordValPoint(&mut valIv, blk.value, exitPt) }
+    if blk.secondValue != none() { recordValPoint(&mut valIv, blk.secondValue, exitPt) }
+    let edges = List<Edge>.asSlice(&blk.edges)
+    let mut e = usize.ZERO
+    while e < edges.length {
+      let edgeArgs = List<u64>.asSlice(&edges[e].arguments)
+      let targetParams = List<u64>.asSlice(&function.block(edges[e].block).parameters)
+      let mut a = usize.ZERO
+      while a < edgeArgs.length {
+        recordValPoint(&mut valIv, edgeArgs[a], exitPt)
+        if a < targetParams.length {
+          recordValPoint(&mut valIv, targetParams[a], exitPt)
+        }
+        a = a + usize.ONE
+      }
+      e = e + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+
+  // Extend all intervals across overlapping CFG back-edges to fixpoint.
+  let valIvMut = List<Interval>.asMutSlice(&mut valIv)
+  let mut changed = true
+  while changed {
+    changed = false
+    s = usize.ZERO
+    while s < slotCount {
+      if slotIvMut[s].hasStart && slotIvMut[s].hasEnd && !slotIvMut[s].unmarked {
+        if extendForLoops(&mut slotIvMut[s], loops) { changed = true }
+      }
+      s = s + usize.ONE
+    }
+    v = usize.ZERO
+    while v < valueCount {
+      if valIvMut[v].start <= valIvMut[v].end {
+        if extendForLoops(&mut valIvMut[v], loops) { changed = true }
+      }
+      v = v + usize.ONE
+    }
+  }
+
+  // Count callee-saved GPRs and start allocating negative `rbp`-relative frame bytes below them.
+  let mut savedCount = usize.ZERO
+  let mut r: u8 = 0
+  while r < 16 {
+    if (calleeMask & u64.shiftLeft(1, u8.toU64(r))) != 0 {
+      savedCount = savedCount + usize.ONE
+    }
+    r = r + 1
+  }
+  let savedBytes = usize.toU64(savedCount * 8)
+  let mut usedBytes: u64 = savedBytes
+
+  // 1. Reserve 176-byte SysV variadic register-save area if needed (16-byte aligned).
+  let mut regSaveOffset: i32 = 0
+  if hasVaStart {
+    usedBytes = alignUp(usedBytes + 176, 16)
+    regSaveOffset = 0 - u64.wrappingToI32(usedBytes)
+  }
+
+  // 2. Allocate MIR stack slots with greedy interval coloring for lifetime-marked slots.
+  let mut slotOffsets = run List<i32>.makeWithCapacity(slotCount)
+  s = usize.ZERO
+  while s < slotCount {
+    run List<i32>.append(&mut slotOffsets, 0)
+    s = s + usize.ONE
+  }
+  let slotOffMut = List<i32>.asMutSlice(&mut slotOffsets)
+
+  // Order slots: unmarked (whole-function) first, then marked slots sorted by start point.
+  let mut markedOrder = List<usize>.make()
+  s = usize.ZERO
+  while s < slotCount {
+    let slot = function.slot(s)
+    let sz = if slot.size == 0 { 8 } else { slot.size }
+    let align = maxU64(8, slot.alignment)
+    if !slotIvMut[s].hasStart || !slotIvMut[s].hasEnd || slotIvMut[s].start > slotIvMut[s].end {
+      usedBytes = alignUp(usedBytes + sz, align)
+      slotOffMut[s] = 0 - u64.wrappingToI32(usedBytes)
+    } else {
+      run List<usize>.append(&mut markedOrder, s)
+    }
+    s = s + usize.ONE
+  }
+  // Insertion-sort marked slots by start point (typically small, O(N) when already in order).
+  let orderMut = List<usize>.asMutSlice(&mut markedOrder)
+  let mut k = usize.ONE
+  while k < orderMut.length {
+    let key = orderMut[k]
+    let keyStart = slotIvMut[key].start
+    let mut j = k
+    while j > usize.ZERO && slotIvMut[orderMut[j - usize.ONE]].start > keyStart {
+      orderMut[j] = orderMut[j - usize.ONE]
+      j = j - usize.ONE
+    }
+    orderMut[j] = key
+    k = k + usize.ONE
+  }
+  let mut slotPool = List<ReusableSlot>.make()
+  k = usize.ZERO
+  while k < orderMut.length {
+    let idx = orderMut[k]
+    let slot = function.slot(idx)
+    let sz = if slot.size == 0 { 8 } else { slot.size }
+    let align = maxU64(8, slot.alignment)
+    let iv = slotIvMut[idx]
+    let pool = List<ReusableSlot>.asMutSlice(&mut slotPool)
+    let mut best = usize.MAX
+    let mut bestSize = u64.MAX
+    let mut pIdx = usize.ZERO
+    while pIdx < pool.length {
+      if pool[pIdx].freeAfter < iv.start && pool[pIdx].size >= sz && pool[pIdx].align >= align && pool[pIdx].size < bestSize {
+        best = pIdx
+        bestSize = pool[pIdx].size
+      }
+      pIdx = pIdx + usize.ONE
+    }
+    if best != usize.MAX {
+      slotOffMut[idx] = pool[best].rbpOffset
+      pool[best].freeAfter = iv.end
+    } else {
+      usedBytes = alignUp(usedBytes + sz, align)
+      let off = 0 - u64.wrappingToI32(usedBytes)
+      slotOffMut[idx] = off
+      run List<ReusableSlot>.append(&mut slotPool, ReusableSlot {rbpOffset: off, size: sz, align: align, freeAfter: iv.end})
+    }
+    k = k + usize.ONE
+  }
+
+  // 3. Allocate SSA value home slots with greedy interval coloring (separate pools by byte size).
+  let mut valueOffsets = run List<i32>.makeWithCapacity(valueCount)
+  v = usize.ZERO
+  while v < valueCount {
+    run List<i32>.append(&mut valueOffsets, 0)
+    v = v + usize.ONE
+  }
+  let valOffMut = List<i32>.asMutSlice(&mut valueOffsets)
+  let valSizeSlice = List<usize>.asSlice(&valSizes)
+
+  let mut liveVals = List<usize>.make()
+  v = usize.ZERO
+  while v < valueCount {
+    if valSizeSlice[v] > usize.ZERO && valIvMut[v].start <= valIvMut[v].end {
+      run List<usize>.append(&mut liveVals, v)
+    }
+    v = v + usize.ONE
+  }
+  // Sort non-constant values by interval start point.
+  let lvMut = List<usize>.asMutSlice(&mut liveVals)
+  k = usize.ONE
+  while k < lvMut.length {
+    let key = lvMut[k]
+    let keyStart = valIvMut[key].start
+    let mut j = k
+    while j > usize.ZERO && valIvMut[lvMut[j - usize.ONE]].start > keyStart {
+      lvMut[j] = lvMut[j - usize.ONE]
+      j = j - usize.ONE
+    }
+    lvMut[j] = key
+    k = k + usize.ONE
+  }
+  let mut valPool = List<ReusableSlot>.make()
+  k = usize.ZERO
+  while k < lvMut.length {
+    let idx = lvMut[k]
+    let sz = usize.toU64(valSizeSlice[idx])
+    let align: u64 = if sz >= 16 { 16 } else { 8 }
+    let iv = valIvMut[idx]
+    let pool = List<ReusableSlot>.asMutSlice(&mut valPool)
+    let mut reused = usize.MAX
+    let mut pIdx = usize.ZERO
+    while pIdx < pool.length {
+      if pool[pIdx].freeAfter < iv.start && pool[pIdx].size == sz && pool[pIdx].align >= align {
+        reused = pIdx
+        break
+      }
+      pIdx = pIdx + usize.ONE
+    }
+    if reused != usize.MAX {
+      valOffMut[idx] = pool[reused].rbpOffset
+      pool[reused].freeAfter = iv.end
+    } else {
+      usedBytes = alignUp(usedBytes + sz, align)
+      let off = 0 - u64.wrappingToI32(usedBytes)
+      valOffMut[idx] = off
+      run List<ReusableSlot>.append(&mut valPool, ReusableSlot {rbpOffset: off, size: sz, align: align, freeAfter: iv.end})
+    }
+    k = k + usize.ONE
+  }
+
+  // Round total frame below saved `rbp` up to a multiple of 16 bytes.
+  let totalAligned = alignUp(usedBytes, 16)
+  let subRspBytes = totalAligned - savedBytes
+
+  return FramePlan {
+    slotOffsets: move slotOffsets,
+    valueOffsets: move valueOffsets,
+    valueSizes: move valSizes,
+    hasVaStart: hasVaStart,
+    regSaveOffset: regSaveOffset,
+    savedCalleeMask: calleeMask,
+    savedCount: savedCount,
+    subRspBytes: subRspBytes,
+    hasDynamicSlot: hasDynamicSlot,
+  }
+}
+
+fn recordValPoint(list: &mut List<Interval>, value: u64, pt: usize) -> () {
+  if value == none() { return () }
+  let ivs = List<Interval>.asMutSlice(&mut list.*)
+  let idx = u64.toUsize(value)
+  if idx >= ivs.length { return () }
+  if pt < ivs[idx].start { ivs[idx].start = pt }
+  if pt > ivs[idx].end { ivs[idx].end = pt }
+}
+
+fn extendForLoops(iv: &mut Interval, loops: &[BackEdge]) -> bool {
+  let mut changed = false
+  let mut at = usize.ZERO
+  while at < loops.length {
+    let lp = loops[at]
+    // If interval starts at or before loop latch AND ends at or after loop header, extend across
+    // the entire loop body when it crosses the header or latch.
+    if iv.start <= lp.headerPoint && iv.end >= lp.headerPoint && iv.end < lp.latchPoint {
+      iv.end = lp.latchPoint
+      changed = true
+    }
+    if iv.start > lp.headerPoint && iv.start <= lp.latchPoint && iv.end > lp.latchPoint {
+      iv.start = lp.headerPoint
+      changed = true
+    }
+    at = at + usize.ONE
+  }
+  return changed
+}
+
+fn alignUp(value: u64, align: u64) -> u64 {
+  if align <= 1 { return value }
+  let rem = value % align
+  if rem == 0 { return value }
+  return value + (align - rem)
+}
+
+fn maxU64(a: u64, b: u64) -> u64 {
+  if a >= b { return a }
+  return b
+}
