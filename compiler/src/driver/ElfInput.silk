@@ -1,0 +1,1728 @@
+//! Unified ELF64 x86-64 linker input model and parsers for the Linux direct linker (`ElfLink`).
+//!
+//! # When to use
+//! `ElfLink` consumes Silk [`X86Object.Fragment`] streams directly from memory alongside any
+//! native C/C++ relocatable objects (`.o`), static archives (`.a` / thin archives), shared
+//! libraries (`.so` and GNU linker scripts), and the built-in glibc 2.28 / `libgcc_s.so.1`
+//! virtual DSOs and x86-64 `_start` startup code.
+
+import backend.X86Encode
+import backend.X86Encode {Alu, Mem}
+import backend.X86Object
+import backend.X86Object {Function, Object, Pointer as ObjectPointer, RelocationKind, RodataJumpEntry}
+import backend.X86Unwind
+import driver.LinuxLink
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string {String}
+
+/// A link-time input or resolution error raised by the direct ELF64 linker.
+pub struct LinkError {
+  pub detail: Bytes,
+}
+
+/// Fails with a [`LinkError`] containing `detail`.
+pub effect fn linkError(detail: &[u8]) -> never ! LinkError | OutOfMemoryError ? &mut Allocator {
+  fail LinkError {detail: run Bytes.copy(detail)}
+}
+
+/// Fails with a [`LinkError`] concatenating `prefix` and `suffix`.
+pub effect fn linkError2(prefix: &[u8], suffix: &[u8]) -> never ! LinkError | OutOfMemoryError ? &mut Allocator {
+  let mut msg = run Bytes.copy(prefix)
+  run Bytes.append(&mut msg, suffix)
+  fail LinkError {detail: move msg}
+}
+
+/// Output section classification for one input section.
+pub enum SectionKind {
+  Text,
+  Rodata,
+  Data,
+  Bss,
+  Tdata,
+  Tbss,
+  InitArray,
+  FiniArray,
+  SilkFrames,
+  SilkSeen,
+  EhFrame,
+}
+
+/// `R_X86_64_NONE` (0).
+pub fn rNone() -> u64 { return 0 }
+/// `R_X86_64_64` (1).
+pub fn r64() -> u64 { return 1 }
+/// `R_X86_64_PC32` (2).
+pub fn rPc32() -> u64 { return 2 }
+/// `R_X86_64_GOT32` (3).
+pub fn rGot32() -> u64 { return 3 }
+/// `R_X86_64_PLT32` (4).
+pub fn rPlt32() -> u64 { return 4 }
+/// `R_X86_64_COPY` (5).
+pub fn rCopy() -> u64 { return 5 }
+/// `R_X86_64_GLOB_DAT` (6).
+pub fn rGlobDat() -> u64 { return 6 }
+/// `R_X86_64_JUMP_SLOT` (7).
+pub fn rJumpSlot() -> u64 { return 7 }
+/// `R_X86_64_RELATIVE` (8).
+pub fn rRelative() -> u64 { return 8 }
+/// `R_X86_64_GOTPCREL` (9).
+pub fn rGotPcRel() -> u64 { return 9 }
+/// `R_X86_64_32` (10).
+pub fn r32() -> u64 { return 10 }
+/// `R_X86_64_32S` (11).
+pub fn r32S() -> u64 { return 11 }
+/// `R_X86_64_TPOFF64` (18).
+pub fn rTpoff64() -> u64 { return 18 }
+/// `R_X86_64_TLSGD` (19).
+pub fn rTlsGd() -> u64 { return 19 }
+/// `R_X86_64_TLSLD` (20).
+pub fn rTlsLd() -> u64 { return 20 }
+/// `R_X86_64_DTPOFF32` (21).
+pub fn rDtpoff32() -> u64 { return 21 }
+/// `R_X86_64_GOTTPOFF` (22).
+pub fn rGotTpOff() -> u64 { return 22 }
+/// `R_X86_64_TPOFF32` (23).
+pub fn rTpoff32() -> u64 { return 23 }
+/// `R_X86_64_PC64` (24).
+pub fn rPc64() -> u64 { return 24 }
+/// `R_X86_64_GOTOFF64` (25).
+pub fn rGotOff64() -> u64 { return 25 }
+/// `R_X86_64_GOTPC32` (26).
+pub fn rGotPc32() -> u64 { return 26 }
+/// `R_X86_64_GOT64` (27).
+pub fn rGot64() -> u64 { return 27 }
+/// `R_X86_64_GOTPC64` (29).
+pub fn rGotPc64() -> u64 { return 29 }
+/// `R_X86_64_SIZE32` (32).
+pub fn rSize32() -> u64 { return 32 }
+/// `R_X86_64_SIZE64` (33).
+pub fn rSize64() -> u64 { return 33 }
+/// `R_X86_64_GOTPCRELX` (41).
+pub fn rGotPcRelX() -> u64 { return 41 }
+/// `R_X86_64_REX_GOTPCRELX` (42).
+pub fn rRexGotPcRelX() -> u64 { return 42 }
+
+/// One relocation inside an [`InputSection`].
+pub struct InputReloc {
+  pub offset: u64,
+  pub relType: u64,
+  pub addend: i64,
+  /// When true, targets `(localSection, localOffset)` inside the same [`InputUnit`].
+  pub targetLocal: bool,
+  pub localSection: usize,
+  pub localOffset: u64,
+  /// Global symbol name when `!targetLocal`.
+  pub symbol: Bytes,
+}
+
+/// One loadable or unwind section contributed by an [`InputUnit`].
+pub struct InputSection {
+  pub kind: SectionKind,
+  pub alignment: u64,
+  pub data: Bytes,
+  pub memSize: u64,
+  pub relocs: List<InputReloc>,
+  /// Non-empty when this section belongs to an ELF COMDAT group (`SHT_GROUP`).
+  pub comdatGroup: Bytes,
+}
+
+/// One defined or common symbol exported by an [`InputUnit`].
+pub struct InputSymbol {
+  pub name: Bytes,
+  /// Index in `InputUnit.sections`, or `usize.MAX` for `SHN_COMMON` tentative definitions.
+  pub section: usize,
+  pub offset: u64,
+  pub size: u64,
+  pub alignment: u64,
+  pub isFunc: bool,
+  pub isTls: bool,
+  pub weak: bool,
+  pub hidden: bool,
+  pub common: bool,
+}
+
+/// One linkable unit (Silk fragment batch, C/C++ `.o`, archive member, or synthetic startup).
+pub struct InputUnit {
+  pub name: Bytes,
+  pub sections: List<InputSection>,
+  pub symbols: List<InputSymbol>,
+  pub undefinedSymbols: List<Bytes>,
+}
+
+/// One member inside a static archive (`.a`).
+pub struct ArchiveMember {
+  pub name: Bytes,
+  pub offset: usize,
+  pub size: usize,
+  pub isThin: bool,
+}
+
+/// Parsed static archive with O(1) symbol-to-member lookup for lazy extraction.
+pub struct ArchiveIndex {
+  pub path: Bytes,
+  pub dir: Bytes,
+  pub raw: Bytes,
+  pub isThin: bool,
+  pub members: List<ArchiveMember>,
+  pub symNames: List<Bytes>,
+  pub symMemberIdx: List<usize>,
+  pub symIndex: InternIndex,
+}
+
+/// One exported symbol of a shared library (real `.so` or virtual glibc DSO).
+pub struct DynamicExport {
+  pub name: Bytes,
+  pub version: Bytes,
+  pub size: u64,
+  pub isObject: bool,
+}
+
+/// Parsed shared library (`ET_DYN` or virtual glibc DSO) with O(1) export lookup.
+pub struct SharedLib {
+  pub soname: Bytes,
+  pub asNeeded: bool,
+  pub exports: List<DynamicExport>,
+  pub exportIndex: InternIndex,
+}
+
+/// One input directive parsed from a GNU linker script (`GROUP`, `INPUT`, `AS_NEEDED`).
+pub struct ScriptEntry {
+  pub path: Bytes,
+  pub asNeeded: bool,
+}
+
+/// Result of parsing a `.so` file, which may be an ELF shared object or a GNU linker script.
+pub union SharedFile {
+  Library {pub lib: SharedLib},
+  Script {pub entries: List<ScriptEntry>},
+}
+
+// ---- Byte Reading Helpers ----
+
+fn readU16Le(data: &[u8], at: usize) -> u64 {
+  return u8.toU64(data[at]) | u64.shiftLeft(u8.toU64(data[at + 1]), 8)
+}
+
+fn readU32Le(data: &[u8], at: usize) -> u64 {
+  return u8.toU64(data[at])
+    | u64.shiftLeft(u8.toU64(data[at + 1]), 8)
+    | u64.shiftLeft(u8.toU64(data[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(data[at + 3]), 24)
+}
+
+fn readU32Be(data: &[u8], at: usize) -> u64 {
+  return u64.shiftLeft(u8.toU64(data[at]), 24)
+    | u64.shiftLeft(u8.toU64(data[at + 1]), 16)
+    | u64.shiftLeft(u8.toU64(data[at + 2]), 8)
+    | u8.toU64(data[at + 3])
+}
+
+fn readU64Le(data: &[u8], at: usize) -> u64 {
+  return readU32Le(data, at) | u64.shiftLeft(readU32Le(data, at + 4), 32)
+}
+
+fn readU64Be(data: &[u8], at: usize) -> u64 {
+  return u64.shiftLeft(readU32Be(data, at), 32) | readU32Be(data, at + 4)
+}
+
+fn readI64Le(data: &[u8], at: usize) -> i64 {
+  return u64.wrappingToI64(readU64Le(data, at))
+}
+
+fn cstrAt(table: &[u8], off: usize) -> &[u8] {
+  if off >= table.length { return b"" }
+  let mut end = off
+  while end < table.length && table[end] != 0 {
+    end = end + usize.ONE
+  }
+  return Slice.view<u8>(table, off, end - off)
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(s: &[u8], prefix: &[u8]) -> bool {
+  if s.length < prefix.length { return false }
+  return sameBytes(Slice.view<u8>(s, usize.ZERO, prefix.length), prefix)
+}
+
+fn alignUpU64(v: u64, align: u64) -> u64 {
+  if align <= 1 { return v }
+  let rem = v % align
+  if rem == 0 { return v }
+  return v + (align - rem)
+}
+
+effect fn padZero(out: &mut Bytes, align: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= 1 { return () }
+  let a = u64.toUsize(align)
+  let rem = Bytes.length(&out.*) % a
+  if rem == usize.ZERO { return () }
+  let mut pad = a - rem
+  while pad > usize.ZERO {
+    run X86Encode.byte(&mut out.*, 0)
+    pad = pad - usize.ONE
+  }
+  return ()
+}
+
+effect fn padNop(out: &mut Bytes, align: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= 1 { return () }
+  let a = u64.toUsize(align)
+  let rem = Bytes.length(&out.*) % a
+  if rem == usize.ZERO { return () }
+  let mut pad = a - rem
+  while pad > usize.ZERO {
+    run X86Encode.byte(&mut out.*, 0x90)
+    pad = pad - usize.ONE
+  }
+  return ()
+}
+
+// ---- 1. Direct X86Object.Fragment Ingestion (Zero .o Round-Trip) ----
+
+struct NameSet {
+  names: List<Bytes>,
+  index: InternIndex,
+}
+
+effect fn nameSetInsert(set: &mut NameSet, name: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let hash = InternIndex.hashBytes(0, name)
+  let existing = List<Bytes>.asSlice(&set.names)
+  let mut at = InternIndex.first(&set.index, hash)
+  while at != usize.MAX {
+    if sameBytes(Bytes.asSlice(&existing[at]), name) { return false }
+    at = InternIndex.after(&set.index, at)
+  }
+  run InternIndex.record(&mut set.index, hash)
+  run List<Bytes>.append(&mut set.names, run Bytes.copy(name))
+  return true
+}
+
+fn nameSetContains(set: &NameSet, name: &[u8]) -> bool {
+  let hash = InternIndex.hashBytes(0, name)
+  let existing = List<Bytes>.asSlice(&set.names)
+  let mut at = InternIndex.first(&set.index, hash)
+  while at != usize.MAX {
+    if sameBytes(Bytes.asSlice(&existing[at]), name) { return true }
+    at = InternIndex.after(&set.index, at)
+  }
+  return false
+}
+
+/// Decodes concatenated Silk [`X86Object.Fragment`] records directly into an [`InputUnit`],
+/// deduplicating content-addressed functions and objects and emitting standard `.eh_frame`
+/// CIE/FDE records without round-tripping through an intermediate `.o` file.
+pub effect fn ingestFragments(fragments: &[u8]) -> InputUnit ! LinkError | OutOfMemoryError ? &mut Allocator {
+  let decoded = run X86Object.decode(fragments)
+  if List<Bytes>.length(&decoded.refused) > usize.ZERO {
+    let first = &List<Bytes>.asSlice(&decoded.refused)[usize.ZERO]
+    return run linkError2(b"direct x86-64 backend unsupported: ", Bytes.asSlice(first))
+  }
+
+  let mut weakFuncs = NameSet {names: List<Bytes>.make(), index: InternIndex.make()}
+  let wfSlice = List<Bytes>.asSlice(&decoded.weakFunctions)
+  let mut at = usize.ZERO
+  while at < wfSlice.length {
+    drop run nameSetInsert(&mut weakFuncs, Bytes.asSlice(&wfSlice[at]))
+    at = at + usize.ONE
+  }
+  let mut weakObjs = NameSet {names: List<Bytes>.make(), index: InternIndex.make()}
+  let woSlice = List<Bytes>.asSlice(&decoded.weakObjects)
+  at = usize.ZERO
+  while at < woSlice.length {
+    drop run nameSetInsert(&mut weakObjs, Bytes.asSlice(&woSlice[at]))
+    at = at + usize.ONE
+  }
+
+  // Fixed section slots inside the Silk InputUnit:
+  //   0: .text
+  //   1: .rodata
+  //   2: .data
+  //   3: .tdata
+  //   4: silk_frames
+  //   5: .eh_frame
+  //   6: silk_seen
+  let secText: usize = 0
+  let secRodata: usize = 1
+  let secData: usize = 2
+  let secTdata: usize = 3
+  let secFrames: usize = 4
+
+  let mut textData = Bytes.make()
+  let mut textRelocs = List<InputReloc>.make()
+  let mut rodataData = Bytes.make()
+  let mut rodataRelocs = List<InputReloc>.make()
+  let mut dataData = Bytes.make()
+  let mut dataRelocs = List<InputReloc>.make()
+  let mut tdataData = Bytes.make()
+  let mut tdataRelocs = List<InputReloc>.make()
+  let mut framesData = Bytes.make()
+  let mut framesRelocs = List<InputReloc>.make()
+  let mut ehData = Bytes.make()
+  let mut ehRelocs = List<InputReloc>.make()
+  let mut symbols = List<InputSymbol>.make()
+  let mut seenDefs = NameSet {names: List<Bytes>.make(), index: InternIndex.make()}
+
+  let funcs = List<Function>.asSlice(&decoded.functions)
+  if funcs.length > usize.ZERO {
+    run X86Unwind.appendCie(&mut ehData)
+  }
+
+  at = usize.ZERO
+  while at < funcs.length {
+    let f = &funcs[at]
+    let fName = Bytes.asSlice(&f.symbol)
+    if run nameSetInsert(&mut seenDefs, fName) {
+      run padNop(&mut textData, 16)
+      let fnOff = usize.toU64(Bytes.length(&textData))
+      let codeSlice = Bytes.asSlice(&f.code)
+      let fnSize = usize.toU64(codeSlice.length)
+      run Bytes.append(&mut textData, codeSlice)
+
+      // Append function-local `.rodata` constants (16-byte aligned).
+      let mut localRoBase: u64 = 0
+      let roSlice = Bytes.asSlice(&f.rodata)
+      if roSlice.length > usize.ZERO {
+        run padZero(&mut rodataData, 16)
+        localRoBase = usize.toU64(Bytes.length(&rodataData))
+        run Bytes.append(&mut rodataData, roSlice)
+      }
+
+      let isWeak = nameSetContains(&weakFuncs, fName)
+      run List<InputSymbol>.append(&mut symbols, InputSymbol {
+        name: run Bytes.copy(fName),
+        section: secText,
+        offset: fnOff,
+        size: fnSize,
+        alignment: 16,
+        isFunc: true,
+        isTls: false,
+        weak: isWeak,
+        hidden: false,
+        common: false,
+      })
+      let expName = Bytes.asSlice(&f.exported)
+      if expName.length > usize.ZERO && !sameBytes(expName, fName) {
+        if run nameSetInsert(&mut seenDefs, expName) {
+          run List<InputSymbol>.append(&mut symbols, InputSymbol {
+            name: run Bytes.copy(expName),
+            section: secText,
+            offset: fnOff,
+            size: fnSize,
+            alignment: 16,
+            isFunc: true,
+            isTls: false,
+            weak: isWeak,
+            hidden: false,
+            common: false,
+          })
+        }
+      }
+
+      // Translate function relocations.
+      let fSyms = List<Bytes>.asSlice(&f.symbols)
+      let rels = List<X86Object.Relocation>.asSlice(&f.relocations)
+      let mut r = usize.ZERO
+      while r < rels.length {
+        let rel = &rels[r]
+        let rOff = fnOff + usize.toU64(rel.offset)
+        match rel.kind {
+          RelocationKind.LocalRodataPc32 => {
+            run List<InputReloc>.append(&mut textRelocs, InputReloc {
+              offset: rOff,
+              relType: rPc32(),
+              addend: rel.addend - 4,
+              targetLocal: true,
+              localSection: secRodata,
+              localOffset: localRoBase,
+              symbol: Bytes.make(),
+            })
+          }
+          _ => {
+            let rType = match rel.kind {
+              RelocationKind.Pc32 => rPc32()
+              RelocationKind.Plt32 => rPlt32()
+              RelocationKind.Abs64 => r64()
+              RelocationKind.GotPcRel => rGotPcRel()
+              RelocationKind.GotTpOff => rGotTpOff()
+              RelocationKind.LocalRodataPc32 => rPc32()
+            }
+            run List<InputReloc>.append(&mut textRelocs, InputReloc {
+              offset: rOff,
+              relType: rType,
+              addend: rel.addend,
+              targetLocal: false,
+              localSection: usize.ZERO,
+              localOffset: 0,
+              symbol: run Bytes.copy(Bytes.asSlice(&fSyms[rel.target])),
+            })
+          }
+        }
+        r = r + usize.ONE
+      }
+
+      // Translate function-local `.rodata` PIC jump-table entries.
+      let fJumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+      let mut j = usize.ZERO
+      while j < fJumps.length {
+        let je = fJumps[j]
+        let addend = usize.toI64(je.rodataOffset) - usize.toI64(je.tableOffset)
+        run List<InputReloc>.append(&mut rodataRelocs, InputReloc {
+          offset: localRoBase + usize.toU64(je.rodataOffset),
+          relType: rPc32(),
+          addend: addend,
+          targetLocal: true,
+          localSection: secText,
+          localOffset: fnOff + usize.toU64(je.targetCodeOffset),
+          symbol: Bytes.make(),
+        })
+        j = j + usize.ONE
+      }
+
+      // Emit `.eh_frame` FDE targeting `(secText, fnOff)`.
+      let fdeInitOff = run X86Unwind.appendFde(&mut ehData, fnSize, f.unwind)
+      run List<InputReloc>.append(&mut ehRelocs, InputReloc {
+        offset: usize.toU64(fdeInitOff),
+        relType: rPc32(),
+        addend: 0,
+        targetLocal: true,
+        localSection: secText,
+        localOffset: fnOff,
+        symbol: Bytes.make(),
+      })
+    }
+    at = at + usize.ONE
+  }
+
+  let objs = List<Object>.asSlice(&decoded.objects)
+  at = usize.ZERO
+  while at < objs.length {
+    let o = &objs[at]
+    let oName = Bytes.asSlice(&o.symbol)
+    if run nameSetInsert(&mut seenDefs, oName) {
+      let align = if o.alignment == 0 { 1 } else { o.alignment }
+      let img = Bytes.asSlice(&o.image)
+      let mut secIdx = secData
+      let mut objOff: u64 = 0
+      if o.framed {
+        secIdx = secFrames
+        run padZero(&mut framesData, align)
+        objOff = usize.toU64(Bytes.length(&framesData))
+        run Bytes.append(&mut framesData, img)
+      } else if o.local {
+        secIdx = secTdata
+        run padZero(&mut tdataData, align)
+        objOff = usize.toU64(Bytes.length(&tdataData))
+        run Bytes.append(&mut tdataData, img)
+      } else if o.readonly {
+        secIdx = secRodata
+        run padZero(&mut rodataData, align)
+        objOff = usize.toU64(Bytes.length(&rodataData))
+        run Bytes.append(&mut rodataData, img)
+      } else {
+        secIdx = secData
+        run padZero(&mut dataData, align)
+        objOff = usize.toU64(Bytes.length(&dataData))
+        run Bytes.append(&mut dataData, img)
+      }
+      run List<InputSymbol>.append(&mut symbols, InputSymbol {
+        name: run Bytes.copy(oName),
+        section: secIdx,
+        offset: objOff,
+        size: usize.toU64(img.length),
+        alignment: align,
+        isFunc: false,
+        isTls: o.local,
+        weak: nameSetContains(&weakObjs, oName),
+        hidden: false,
+        common: false,
+      })
+
+      let ptrs = List<ObjectPointer>.asSlice(&o.pointers)
+      let mut p = usize.ZERO
+      while p < ptrs.length {
+        let ptr = &ptrs[p]
+        let rel = InputReloc {
+          offset: objOff + usize.toU64(ptr.offset),
+          relType: r64(),
+          addend: u64.wrappingToI64(ptr.addend),
+          targetLocal: false,
+          localSection: usize.ZERO,
+          localOffset: 0,
+          symbol: run Bytes.copy(Bytes.asSlice(&ptr.symbol)),
+        }
+        if secIdx == secFrames { run List<InputReloc>.append(&mut framesRelocs, move rel) }
+        else if secIdx == secTdata { run List<InputReloc>.append(&mut tdataRelocs, move rel) }
+        else if secIdx == secRodata { run List<InputReloc>.append(&mut rodataRelocs, move rel) }
+        else { run List<InputReloc>.append(&mut dataRelocs, move rel) }
+        p = p + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+
+  let mut sections = run List<InputSection>.makeWithCapacity(7)
+  let textSz = usize.toU64(Bytes.length(&textData))
+  let roSz = usize.toU64(Bytes.length(&rodataData))
+  let dataSz = usize.toU64(Bytes.length(&dataData))
+  let tdataSz = usize.toU64(Bytes.length(&tdataData))
+  let framesSz = usize.toU64(Bytes.length(&framesData))
+  let ehSz = usize.toU64(Bytes.length(&ehData))
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Text, alignment: 16, data: move textData, memSize: textSz, relocs: move textRelocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Rodata, alignment: 16, data: move rodataData, memSize: roSz, relocs: move rodataRelocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Data, alignment: 16, data: move dataData, memSize: dataSz, relocs: move dataRelocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Tdata, alignment: 16, data: move tdataData, memSize: tdataSz, relocs: move tdataRelocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.SilkFrames, alignment: 8, data: move framesData, memSize: framesSz, relocs: move framesRelocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.EhFrame, alignment: 8, data: move ehData, memSize: ehSz, relocs: move ehRelocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.SilkSeen, alignment: 1, data: Bytes.make(), memSize: 0, relocs: List<InputReloc>.make(), comdatGroup: Bytes.make(),
+  })
+
+  return InputUnit {
+    name: run Bytes.copy(b"<silk>"),
+    sections: move sections,
+    symbols: move symbols,
+    undefinedSymbols: List<Bytes>.make(),
+  }
+}
+
+// ---- 2. Relocatable ELF64 `.o` Parser (C / C++ Native Inputs) ----
+
+fn classifyElfSection(name: &[u8], shType: u64, flags: u64) -> Option<SectionKind> {
+  // SHF_ALLOC = 0x2, SHF_WRITE = 0x1, SHF_EXECINSTR = 0x4, SHF_TLS = 0x400
+  if (flags & 0x2) == 0 { return Option<SectionKind>.none() }
+  if sameBytes(name, b".eh_frame") { return Option<SectionKind>.some(SectionKind.EhFrame) }
+  if sameBytes(name, b"silk_frames") { return Option<SectionKind>.some(SectionKind.SilkFrames) }
+  if sameBytes(name, b"silk_seen") { return Option<SectionKind>.some(SectionKind.SilkSeen) }
+  // SHT_INIT_ARRAY = 14, SHT_FINI_ARRAY = 15
+  if shType == 14 || startsWith(name, b".init_array") || startsWith(name, b".ctors") {
+    return Option<SectionKind>.some(SectionKind.InitArray)
+  }
+  if shType == 15 || startsWith(name, b".fini_array") || startsWith(name, b".dtors") {
+    return Option<SectionKind>.some(SectionKind.FiniArray)
+  }
+  // SHT_NOBITS = 8
+  if (flags & 0x400) != 0 {
+    if shType == 8 { return Option<SectionKind>.some(SectionKind.Tbss) }
+    return Option<SectionKind>.some(SectionKind.Tdata)
+  }
+  if shType == 8 { return Option<SectionKind>.some(SectionKind.Bss) }
+  if (flags & 0x4) != 0 { return Option<SectionKind>.some(SectionKind.Text) }
+  if (flags & 0x1) != 0 { return Option<SectionKind>.some(SectionKind.Data) }
+  return Option<SectionKind>.some(SectionKind.Rodata)
+}
+
+/// Parses a standard Linux x86-64 relocatable ELF64 object file (`.o`) into an [`InputUnit`].
+/// Handles COMDAT groups (`SHT_GROUP`), `SHN_COMMON` tentative definitions, `.init_array`,
+/// `.fini_array`, `.eh_frame`, TLS sections, and all `SHT_RELA` relocations.
+pub effect fn parseRelocatable(bytes: &[u8], unitName: &[u8]) -> InputUnit ! LinkError | OutOfMemoryError ? &mut Allocator {
+  if bytes.length < 64 || bytes[0] != 0x7F || bytes[1] != 0x45 || bytes[2] != 0x4C || bytes[3] != 0x46 {
+    return run linkError2(b"not an ELF file: ", unitName)
+  }
+  if bytes[4] != 2 || bytes[5] != 1 {
+    return run linkError2(b"unsupported ELF class/endianness (need ELF64 little-endian): ", unitName)
+  }
+  let eType = readU16Le(bytes, 16)
+  let eMachine = readU16Le(bytes, 18)
+  if eType != 1 || eMachine != 62 {
+    return run linkError2(b"expected relocatable x86-64 ELF64 object: ", unitName)
+  }
+  let shoff = u64.toUsize(readU64Le(bytes, 40))
+  let shentsize = u64.toUsize(readU16Le(bytes, 58))
+  let mut shnum = u64.toUsize(readU16Le(bytes, 60))
+  let mut shstrndx = u64.toUsize(readU16Le(bytes, 62))
+  if shentsize < 64 || shoff + 64 > bytes.length {
+    return run linkError2(b"invalid ELF section header table: ", unitName)
+  }
+  // Handle extended section numbering (SHN_XINDEX / shnum == 0).
+  if shnum == usize.ZERO {
+    shnum = u64.toUsize(readU64Le(bytes, shoff + 32))
+  }
+  if shstrndx == 0xFFFF {
+    shstrndx = u64.toUsize(readU32Le(bytes, shoff + 40))
+  }
+  if shoff + shnum * shentsize > bytes.length {
+    return run linkError2(b"truncated ELF section headers: ", unitName)
+  }
+
+  let shstrHdr = shoff + shstrndx * shentsize
+  let shstrOff = u64.toUsize(readU64Le(bytes, shstrHdr + 24))
+  let shstrSz = u64.toUsize(readU64Le(bytes, shstrHdr + 32))
+  let shstrtab = if shstrOff + shstrSz <= bytes.length {
+    Slice.view<u8>(bytes, shstrOff, shstrSz)
+  } else {
+    b""
+  }
+
+  // Locate `.symtab` and its `.strtab` (and optional `SHT_SYMTAB_SHNDX`).
+  let mut symtabSh = usize.MAX
+  let mut symShndxSh = usize.MAX
+  let mut s = usize.ZERO
+  while s < shnum {
+    let hdr = shoff + s * shentsize
+    let shType = readU32Le(bytes, hdr + 4)
+    if shType == 2 { symtabSh = s }
+    else if shType == 18 { symShndxSh = s }
+    s = s + usize.ONE
+  }
+
+  let mut symtabOff = usize.ZERO
+  let mut symtabSz = usize.ZERO
+  let mut symEntSz: usize = 24
+  let mut symCount = usize.ZERO
+  let mut strtab = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+  let mut symShndxOff = usize.ZERO
+  if symtabSh != usize.MAX {
+    let hdr = shoff + symtabSh * shentsize
+    symtabOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+    symtabSz = u64.toUsize(readU64Le(bytes, hdr + 32))
+    let strSh = u64.toUsize(readU32Le(bytes, hdr + 40))
+    symEntSz = u64.toUsize(readU64Le(bytes, hdr + 56))
+    if symEntSz < 24 { symEntSz = 24 }
+    symCount = symtabSz / symEntSz
+    if strSh < shnum {
+      let sHdr = shoff + strSh * shentsize
+      let sOff = u64.toUsize(readU64Le(bytes, sHdr + 24))
+      let sSz = u64.toUsize(readU64Le(bytes, sHdr + 32))
+      if sOff + sSz <= bytes.length {
+        strtab = Slice.view<u8>(bytes, sOff, sSz)
+      }
+    }
+  }
+  if symShndxSh != usize.MAX {
+    symShndxOff = u64.toUsize(readU64Le(bytes, shoff + symShndxSh * shentsize + 24))
+  }
+
+  // Collect COMDAT group names per member section index (`SHT_GROUP = 17`).
+  let mut comdatForSec = run List<Bytes>.makeWithCapacity(shnum)
+  s = usize.ZERO
+  while s < shnum {
+    run List<Bytes>.append(&mut comdatForSec, Bytes.make())
+    s = s + usize.ONE
+  }
+  s = usize.ZERO
+  while s < shnum {
+    let hdr = shoff + s * shentsize
+    let shType = readU32Le(bytes, hdr + 4)
+    if shType == 17 {
+      let gOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+      let gSz = u64.toUsize(readU64Le(bytes, hdr + 32))
+      let sigSym = u64.toUsize(readU32Le(bytes, hdr + 44))
+      if gOff + 4 <= bytes.length && gSz >= 4 && (readU32Le(bytes, gOff) & 1) != 0 {
+        // GRP_COMDAT = 1; group signature is the name of symbol `sigSym`.
+        let mut groupName = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+        if sigSym < symCount {
+          let symOff = symtabOff + sigSym * symEntSz
+          let nameOff = u64.toUsize(readU32Le(bytes, symOff))
+          groupName = cstrAt(strtab, nameOff)
+        }
+        if groupName.length > usize.ZERO {
+          let mut gAt: usize = 4
+          while gAt + 4 <= gSz && gOff + gAt + 4 <= bytes.length {
+            let member = u64.toUsize(readU32Le(bytes, gOff + gAt))
+            if member < shnum {
+              let mut copied = run Bytes.copy(groupName)
+              let mutComdat = List<Bytes>.asMutSlice(&mut comdatForSec)
+              mutComdat[member] = move copied
+            }
+            gAt = gAt + 4
+          }
+        }
+      }
+    }
+    s = s + usize.ONE
+  }
+
+  // Create InputSections for all kept allocatable sections and build `elfSecToUnitSec`.
+  let mut sections = List<InputSection>.make()
+  let mut secMap = run List<usize>.makeWithCapacity(shnum)
+  s = usize.ZERO
+  while s < shnum {
+    let hdr = shoff + s * shentsize
+    let nameOff = u64.toUsize(readU32Le(bytes, hdr))
+    let shType = readU32Le(bytes, hdr + 4)
+    let flags = readU64Le(bytes, hdr + 8)
+    let shFileOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+    let shSize = readU64Le(bytes, hdr + 32)
+    let shAlign = readU64Le(bytes, hdr + 48)
+    let secName = cstrAt(shstrtab, nameOff)
+    match classifyElfSection(secName, shType, flags) {
+      Option<SectionKind>.Some {value: kind} => {
+        let idx = List<InputSection>.length(&sections)
+        run List<usize>.append(&mut secMap, idx)
+        let mut payload = Bytes.make()
+        if shType != 8 && shSize > 0 {
+          let sz = u64.toUsize(shSize)
+          if shFileOff + sz <= bytes.length {
+            payload = run Bytes.copy(Slice.view<u8>(bytes, shFileOff, sz))
+          }
+        }
+        let comdatSlice = List<Bytes>.asSlice(&comdatForSec)
+        let groupCopy = run Bytes.copy(Bytes.asSlice(&comdatSlice[s]))
+        run List<InputSection>.append(&mut sections, InputSection {
+          kind: kind,
+          alignment: if shAlign == 0 { 1 } else { shAlign },
+          data: move payload,
+          memSize: shSize,
+          relocs: List<InputReloc>.make(),
+          comdatGroup: move groupCopy,
+        })
+      }
+      Option<SectionKind>.None => {
+        run List<usize>.append(&mut secMap, usize.MAX)
+      }
+    }
+    s = s + usize.ONE
+  }
+  let secMapSlice = List<usize>.asSlice(&secMap)
+
+  // Parse ELF symbols: export defined Global/Weak/Common symbols, track Undefined symbols.
+  let mut symbols = List<InputSymbol>.make()
+  let mut undefinedSymbols = List<Bytes>.make()
+  let mut sym = usize.ONE
+  while sym < symCount {
+    let off = symtabOff + sym * symEntSz
+    if off + 24 > bytes.length { break }
+    let nameOff = u64.toUsize(readU32Le(bytes, off))
+    let info = bytes[off + 4]
+    let other = bytes[off + 5]
+    let rawShndx = readU16Le(bytes, off + 6)
+    let stValue = readU64Le(bytes, off + 8)
+    let stSize = readU64Le(bytes, off + 16)
+    let bind = u8.shiftRight(info, 4)
+    let symType = u8.bitAnd(info, 15)
+    let vis = u8.bitAnd(other, 3)
+    let mut shndx = u64.toUsize(rawShndx)
+    if rawShndx == 0xFFFF && symShndxSh != usize.MAX {
+      let xOff = symShndxOff + sym * 4
+      if xOff + 4 <= bytes.length { shndx = u64.toUsize(readU32Le(bytes, xOff)) }
+    }
+    let name = cstrAt(strtab, nameOff)
+    if bind == 1 || bind == 2 {
+      // STB_GLOBAL (1) or STB_WEAK (2)
+      if rawShndx == 0 {
+        if name.length > usize.ZERO {
+          run List<Bytes>.append(&mut undefinedSymbols, run Bytes.copy(name))
+        }
+      } else if rawShndx == 0xFFF2 {
+        // SHN_COMMON tentative BSS definition
+        if name.length > usize.ZERO {
+          run List<InputSymbol>.append(&mut symbols, InputSymbol {
+            name: run Bytes.copy(name),
+            section: usize.MAX,
+            offset: 0,
+            size: stSize,
+            alignment: if stValue == 0 { 1 } else { stValue },
+            isFunc: false,
+            isTls: false,
+            weak: bind == 2,
+            hidden: vis == 2,
+            common: true,
+          })
+        }
+      } else if rawShndx < 0xFF00 && shndx < shnum && secMapSlice[shndx] != usize.MAX {
+        if name.length > usize.ZERO {
+          run List<InputSymbol>.append(&mut symbols, InputSymbol {
+            name: run Bytes.copy(name),
+            section: secMapSlice[shndx],
+            offset: stValue,
+            size: stSize,
+            alignment: 1,
+            isFunc: symType == 2,
+            isTls: symType == 6,
+            weak: bind == 2,
+            hidden: vis == 2,
+            common: false,
+          })
+        }
+      }
+    }
+    sym = sym + usize.ONE
+  }
+
+  // Parse all `SHT_RELA` (4) sections targeting our kept sections.
+  s = usize.ZERO
+  while s < shnum {
+    let hdr = shoff + s * shentsize
+    let shType = readU32Le(bytes, hdr + 4)
+    if shType == 4 {
+      let targetSh = u64.toUsize(readU32Le(bytes, hdr + 44))
+      if targetSh < shnum && secMapSlice[targetSh] != usize.MAX {
+        let dstSecIdx = secMapSlice[targetSh]
+        let rOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+        let rSz = u64.toUsize(readU64Le(bytes, hdr + 32))
+        let mut rEnt = u64.toUsize(readU64Le(bytes, hdr + 56))
+        if rEnt < 24 { rEnt = 24 }
+        let rCount = rSz / rEnt
+        let mut ri = usize.ZERO
+        while ri < rCount {
+          let eOff = rOff + ri * rEnt
+          if eOff + 24 > bytes.length { break }
+          let relOffset = readU64Le(bytes, eOff)
+          let rInfo = readU64Le(bytes, eOff + 8)
+          let rAddend = readI64Le(bytes, eOff + 16)
+          let rType = rInfo & 0xFFFFFFFF
+          let symIdx = u64.toUsize(u64.shiftRight(rInfo, 32))
+          if rType != rNone() && symIdx < symCount {
+            let sOff = symtabOff + symIdx * symEntSz
+            let sNameOff = u64.toUsize(readU32Le(bytes, sOff))
+            let sInfo = bytes[sOff + 4]
+            let sRawSh = readU16Le(bytes, sOff + 6)
+            let sVal = readU64Le(bytes, sOff + 8)
+            let sBind = u8.shiftRight(sInfo, 4)
+            let mut sSh = u64.toUsize(sRawSh)
+            if sRawSh == 0xFFFF && symShndxSh != usize.MAX {
+              let xOff = symShndxOff + symIdx * 4
+              if xOff + 4 <= bytes.length { sSh = u64.toUsize(readU32Le(bytes, xOff)) }
+            }
+            if sBind == 0 {
+              // STB_LOCAL: resolve directly to `(secMap[sSh], sVal)`.
+              if sRawSh < 0xFF00 && sSh < shnum && secMapSlice[sSh] != usize.MAX {
+                let rel = InputReloc {
+                  offset: relOffset,
+                  relType: rType,
+                  addend: rAddend,
+                  targetLocal: true,
+                  localSection: secMapSlice[sSh],
+                  localOffset: sVal,
+                  symbol: Bytes.make(),
+                }
+                let secMut = List<InputSection>.asMutSlice(&mut sections)
+                run List<InputReloc>.append(&mut secMut[dstSecIdx].relocs, move rel)
+              }
+            } else {
+              let symName = cstrAt(strtab, sNameOff)
+              let rel = InputReloc {
+                offset: relOffset,
+                relType: rType,
+                addend: rAddend,
+                targetLocal: false,
+                localSection: usize.ZERO,
+                localOffset: 0,
+                symbol: run Bytes.copy(symName),
+              }
+              let secMut = List<InputSection>.asMutSlice(&mut sections)
+              run List<InputReloc>.append(&mut secMut[dstSecIdx].relocs, move rel)
+            }
+          }
+          ri = ri + usize.ONE
+        }
+      }
+    }
+    s = s + usize.ONE
+  }
+
+  return InputUnit {
+    name: run Bytes.copy(unitName),
+    sections: move sections,
+    symbols: move symbols,
+    undefinedSymbols: move undefinedSymbols,
+  }
+}
+
+// ---- 3. Static Archive (`.a` / thin archive) Parser ----
+
+fn parseArDecimal(field: &[u8]) -> usize {
+  let mut val = usize.ZERO
+  let mut i = usize.ZERO
+  while i < field.length && field[i] == 32 { i = i + usize.ONE }
+  while i < field.length && field[i] >= 48 && field[i] <= 57 {
+    val = val * 10 + u8.toUsize(field[i] - 48)
+    i = i + usize.ONE
+  }
+  return val
+}
+
+fn trimArName(raw: &[u8]) -> &[u8] {
+  let mut end = raw.length
+  while end > usize.ZERO && raw[end - usize.ONE] == 32 { end = end - usize.ONE }
+  if end > usize.ZERO && raw[end - usize.ONE] == 47 { end = end - usize.ONE }
+  return Slice.view<u8>(raw, usize.ZERO, end)
+}
+
+/// Parses a GNU or thin static archive (`.a`) into an [`ArchiveIndex`] for lazy member extraction.
+pub effect fn parseArchive(bytes: &[u8], path: &[u8], dir: &[u8]) -> ArchiveIndex ! LinkError | OutOfMemoryError ? &mut Allocator {
+  let isRegular = startsWith(bytes, b"!<arch>\n")
+  let isThin = startsWith(bytes, b"!<thin>\n")
+  if !isRegular && !isThin {
+    return run linkError2(b"not a valid static archive: ", path)
+  }
+  let mut members = List<ArchiveMember>.make()
+  let mut memberHdrOffsets = List<usize>.make()
+  let mut symNames = List<Bytes>.make()
+  let mut symMemberIdx = List<usize>.make()
+  let mut symIndex = InternIndex.make()
+
+  let mut symtabData = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+  let mut symtabIs64 = false
+  let mut extNames = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+
+  // First pass: walk archive member headers to capture `/`, `/SYM64/`, `//`, and object members.
+  let mut pos: usize = 8
+  while pos + 60 <= bytes.length {
+    if bytes[pos + 58] != 96 || bytes[pos + 59] != 10 { break }
+    let rawName = Slice.view<u8>(bytes, pos, 16)
+    let memberSz = parseArDecimal(Slice.view<u8>(bytes, pos + 48, 10))
+    let payloadPos = pos + 60
+    let trimmed = trimArName(rawName)
+    let isSym32 = rawName[0] == 47 && rawName[1] == 32
+    let isSym64 = sameBytes(trimmed, b"/SYM64")
+    let isExt = rawName[0] == 47 && rawName[1] == 47 && rawName[2] == 32
+    if isSym32 {
+      if payloadPos + memberSz <= bytes.length {
+        symtabData = Slice.view<u8>(bytes, payloadPos, memberSz)
+        symtabIs64 = false
+      }
+    } else if isSym64 {
+      if payloadPos + memberSz <= bytes.length {
+        symtabData = Slice.view<u8>(bytes, payloadPos, memberSz)
+        symtabIs64 = true
+      }
+    } else if isExt {
+      if payloadPos + memberSz <= bytes.length {
+        extNames = Slice.view<u8>(bytes, payloadPos, memberSz)
+      }
+    } else {
+      // Regular or thin archive object member.
+      let mut mName = Bytes.make()
+      if rawName[0] == 47 && rawName[1] >= 48 && rawName[1] <= 57 {
+        let nameOff = parseArDecimal(Slice.view<u8>(rawName, usize.ONE, 15))
+        if nameOff < extNames.length {
+          let mut end = nameOff
+          while end < extNames.length && extNames[end] != 10 && extNames[end] != 47 && extNames[end] != 0 {
+            end = end + usize.ONE
+          }
+          mName = run Bytes.copy(Slice.view<u8>(extNames, nameOff, end - nameOff))
+        }
+      } else {
+        mName = run Bytes.copy(trimmed)
+      }
+      run List<usize>.append(&mut memberHdrOffsets, pos)
+      run List<ArchiveMember>.append(&mut members, ArchiveMember {
+        name: move mName,
+        offset: if isThin { usize.ZERO } else { payloadPos },
+        size: memberSz,
+        isThin: isThin,
+      })
+    }
+    if isThin && !isSym32 && !isSym64 && !isExt {
+      pos = payloadPos
+    } else {
+      pos = payloadPos + memberSz
+      if (pos & usize.ONE) != usize.ZERO { pos = pos + usize.ONE }
+    }
+  }
+
+  // Second pass: index the archive symbol table (`/` or `/SYM64/`) mapping symbol -> member index.
+  let hdrOffs = List<usize>.asSlice(&memberHdrOffsets)
+  if symtabData.length >= 4 {
+    let entrySize: usize = if symtabIs64 { 8 } else { 4 }
+    let count = if symtabIs64 {
+      if symtabData.length >= 8 { u64.toUsize(readU64Be(symtabData, usize.ZERO)) } else { usize.ZERO }
+    } else {
+      u64.toUsize(readU32Be(symtabData, usize.ZERO))
+    }
+    let namesStart = entrySize + count * entrySize
+    if namesStart <= symtabData.length {
+      let mut nameAt = namesStart
+      let mut i = usize.ZERO
+      while i < count && nameAt < symtabData.length {
+        let targetHdr = if symtabIs64 {
+          u64.toUsize(readU64Be(symtabData, entrySize + i * 8))
+        } else {
+          u64.toUsize(readU32Be(symtabData, entrySize + i * 4))
+        }
+        let sName = cstrAt(symtabData, nameAt)
+        nameAt = nameAt + sName.length + usize.ONE
+        // Binary search `hdrOffs` (strictly ascending) for `targetHdr`.
+        let mut lo = usize.ZERO
+        let mut hi = hdrOffs.length
+        while lo < hi {
+          let mid = lo + (hi - lo) / 2
+          if hdrOffs[mid] < targetHdr { lo = mid + usize.ONE } else { hi = mid }
+        }
+        if lo < hdrOffs.length && hdrOffs[lo] == targetHdr && sName.length > usize.ZERO {
+          let hash = InternIndex.hashBytes(0, sName)
+          run InternIndex.record(&mut symIndex, hash)
+          run List<Bytes>.append(&mut symNames, run Bytes.copy(sName))
+          run List<usize>.append(&mut symMemberIdx, lo)
+        }
+        i = i + usize.ONE
+      }
+    }
+  }
+
+  return ArchiveIndex {
+    path: run Bytes.copy(path),
+    dir: run Bytes.copy(dir),
+    raw: if isThin { Bytes.make() } else { run Bytes.copy(bytes) },
+    isThin: isThin,
+    members: move members,
+    symNames: move symNames,
+    symMemberIdx: move symMemberIdx,
+    symIndex: move symIndex,
+  }
+}
+
+/// Looks up `symbol` in `archive` and returns the defining member index if present.
+pub fn archiveLookup(archive: &ArchiveIndex, symbol: &[u8]) -> Option<usize> {
+  let hash = InternIndex.hashBytes(0, symbol)
+  let names = List<Bytes>.asSlice(&archive.symNames)
+  let idxs = List<usize>.asSlice(&archive.symMemberIdx)
+  let mut at = InternIndex.first(&archive.symIndex, hash)
+  while at != usize.MAX {
+    if sameBytes(Bytes.asSlice(&names[at]), symbol) {
+      return Option<usize>.some(idxs[at])
+    }
+    at = InternIndex.after(&archive.symIndex, at)
+  }
+  return Option<usize>.none()
+}
+
+// ---- 4. Shared Object (`.so`) & GNU Linker Script Parser ----
+
+/// Looks up `symbol` in a [`SharedLib`] in O(1) amortized time.
+pub fn sharedLibLookup(lib: &SharedLib, symbol: &[u8]) -> Option<usize> {
+  let hash = InternIndex.hashBytes(0, symbol)
+  let exports = List<DynamicExport>.asSlice(&lib.exports)
+  let mut at = InternIndex.first(&lib.exportIndex, hash)
+  while at != usize.MAX {
+    if sameBytes(Bytes.asSlice(&exports[at].name), symbol) {
+      return Option<usize>.some(at)
+    }
+    at = InternIndex.after(&lib.exportIndex, at)
+  }
+  return Option<usize>.none()
+}
+
+fn isScriptSpace(b: u8) -> bool {
+  return b == 32 || b == 9 || b == 10 || b == 13
+}
+
+fn isScriptDelim(b: u8) -> bool {
+  return isScriptSpace(b) || b == 40 || b == 41 || b == 44 || b == 59
+}
+
+effect fn parseLinkerScript(bytes: &[u8], defaultAsNeeded: bool) -> List<ScriptEntry> ! OutOfMemoryError ? &mut Allocator {
+  let mut entries = List<ScriptEntry>.make()
+  let mut at = usize.ZERO
+  let mut inGroupDepth = usize.ZERO
+  let mut asNeededDepth = usize.ZERO
+  let mut expectAsNeededParen = false
+  let mut expectGroupParen = false
+  let mut skipParen = false
+  let mut skipDepth = usize.ZERO
+  while at < bytes.length {
+    // Skip whitespace and `/* ... */` or `# ...` comments.
+    if isScriptSpace(bytes[at]) {
+      at = at + usize.ONE
+      continue
+    }
+    if at + usize.ONE < bytes.length && bytes[at] == 47 && bytes[at + usize.ONE] == 42 {
+      at = at + 2
+      while at + usize.ONE < bytes.length && !(bytes[at] == 42 && bytes[at + usize.ONE] == 47) {
+        at = at + usize.ONE
+      }
+      if at + usize.ONE < bytes.length { at = at + 2 }
+      continue
+    }
+    if bytes[at] == 35 {
+      while at < bytes.length && bytes[at] != 10 { at = at + usize.ONE }
+      continue
+    }
+    if bytes[at] == 40 {
+      if skipParen {
+        skipDepth = skipDepth + usize.ONE
+        skipParen = false
+      } else if expectAsNeededParen {
+        asNeededDepth = asNeededDepth + usize.ONE
+        expectAsNeededParen = false
+      } else if expectGroupParen {
+        inGroupDepth = inGroupDepth + usize.ONE
+        expectGroupParen = false
+      }
+      at = at + usize.ONE
+      continue
+    }
+    if bytes[at] == 41 {
+      if skipDepth > usize.ZERO {
+        skipDepth = skipDepth - usize.ONE
+      } else if asNeededDepth > usize.ZERO {
+        asNeededDepth = asNeededDepth - usize.ONE
+      } else if inGroupDepth > usize.ZERO {
+        inGroupDepth = inGroupDepth - usize.ONE
+      }
+      at = at + usize.ONE
+      continue
+    }
+    if bytes[at] == 44 || bytes[at] == 59 {
+      at = at + usize.ONE
+      continue
+    }
+    // Read quoted or bare token.
+    let mut tokStart = at
+    let mut tokEnd = at
+    if bytes[at] == 34 {
+      tokStart = at + usize.ONE
+      at = tokStart
+      while at < bytes.length && bytes[at] != 34 { at = at + usize.ONE }
+      tokEnd = at
+      if at < bytes.length { at = at + usize.ONE }
+    } else {
+      while at < bytes.length && !isScriptDelim(bytes[at]) { at = at + usize.ONE }
+      tokEnd = at
+    }
+    let tok = Slice.view<u8>(bytes, tokStart, tokEnd - tokStart)
+    if skipDepth > usize.ZERO { continue }
+    if sameBytes(tok, b"OUTPUT_FORMAT") || sameBytes(tok, b"EXTERN") {
+      skipParen = true
+    } else if sameBytes(tok, b"GROUP") || sameBytes(tok, b"INPUT") {
+      expectGroupParen = true
+    } else if sameBytes(tok, b"AS_NEEDED") {
+      expectAsNeededParen = true
+    } else if inGroupDepth > usize.ZERO && tok.length > usize.ZERO {
+      run List<ScriptEntry>.append(&mut entries, ScriptEntry {
+        path: run Bytes.copy(tok),
+        asNeeded: defaultAsNeeded || asNeededDepth > usize.ZERO,
+      })
+    }
+  }
+  return move entries
+}
+
+/// Parses either a real ELF64 shared library (`.so`, extracting `DT_SONAME`, `.dynsym`,
+/// `.gnu.version`, and `.gnu.version_d`) or a GNU linker script (`GROUP`/`INPUT`/`AS_NEEDED`).
+pub effect fn parseSharedObject(bytes: &[u8], fallbackName: &[u8], asNeeded: bool) -> SharedFile
+! LinkError | OutOfMemoryError ? &mut Allocator {
+  if bytes.length < 64 || bytes[0] != 0x7F || bytes[1] != 0x45 || bytes[2] != 0x4C || bytes[3] != 0x46 {
+    let entries = run parseLinkerScript(bytes, asNeeded)
+    if List<ScriptEntry>.length(&entries) > usize.ZERO {
+      return SharedFile.Script {entries: move entries}
+    }
+    return run linkError2(b"unrecognized shared library or linker script: ", fallbackName)
+  }
+  if bytes[4] != 2 || bytes[5] != 1 || readU16Le(bytes, 16) != 3 || readU16Le(bytes, 18) != 62 {
+    return run linkError2(b"expected x86-64 ELF64 shared object: ", fallbackName)
+  }
+  let shoff = u64.toUsize(readU64Le(bytes, 40))
+  let shentsize = u64.toUsize(readU16Le(bytes, 58))
+  let shnum = u64.toUsize(readU16Le(bytes, 60))
+  if shentsize < 64 || shoff + shnum * shentsize > bytes.length {
+    return run linkError2(b"invalid section headers in shared object: ", fallbackName)
+  }
+
+  let mut dynsymSh = usize.MAX
+  let mut dynamicSh = usize.MAX
+  let mut versymSh = usize.MAX
+  let mut verdefSh = usize.MAX
+  let mut s = usize.ZERO
+  while s < shnum {
+    let hdr = shoff + s * shentsize
+    let shType = readU32Le(bytes, hdr + 4)
+    if shType == 11 { dynsymSh = s }           // SHT_DYNSYM
+    else if shType == 6 { dynamicSh = s }      // SHT_DYNAMIC
+    else if shType == 0x6FFFFFFF { versymSh = s } // SHT_GNU_versym
+    else if shType == 0x6FFFFFFD { verdefSh = s } // SHT_GNU_verdef
+    s = s + usize.ONE
+  }
+
+  let mut dynstr = Slice.view<u8>(bytes, usize.ZERO, usize.ZERO)
+  let mut dynsymOff = usize.ZERO
+  let mut dynsymEnt: usize = 24
+  let mut dynsymCount = usize.ZERO
+  if dynsymSh != usize.MAX {
+    let hdr = shoff + dynsymSh * shentsize
+    dynsymOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+    let sz = u64.toUsize(readU64Le(bytes, hdr + 32))
+    let strSh = u64.toUsize(readU32Le(bytes, hdr + 40))
+    dynsymEnt = u64.toUsize(readU64Le(bytes, hdr + 56))
+    if dynsymEnt < 24 { dynsymEnt = 24 }
+    dynsymCount = sz / dynsymEnt
+    if strSh < shnum {
+      let sHdr = shoff + strSh * shentsize
+      let sOff = u64.toUsize(readU64Le(bytes, sHdr + 24))
+      let sSz = u64.toUsize(readU64Le(bytes, sHdr + 32))
+      if sOff + sSz <= bytes.length { dynstr = Slice.view<u8>(bytes, sOff, sSz) }
+    }
+  }
+
+  // Extract `DT_SONAME` (14) from `SHT_DYNAMIC`.
+  let mut soname = run Bytes.copy(fallbackName)
+  if dynamicSh != usize.MAX {
+    let hdr = shoff + dynamicSh * shentsize
+    let dOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+    let dSz = u64.toUsize(readU64Le(bytes, hdr + 32))
+    let mut dAt = usize.ZERO
+    while dAt + 16 <= dSz && dOff + dAt + 16 <= bytes.length {
+      let tag = readU64Le(bytes, dOff + dAt)
+      let val = readU64Le(bytes, dOff + dAt + 8)
+      if tag == 0 { break }
+      if tag == 14 {
+        let name = cstrAt(dynstr, u64.toUsize(val))
+        if name.length > usize.ZERO { soname = run Bytes.copy(name) }
+      }
+      dAt = dAt + 16
+    }
+  }
+
+  // Parse `SHT_GNU_verdef` mapping version index (`vd_ndx`) -> version string.
+  let mut verNames = List<Bytes>.make()
+  if verdefSh != usize.MAX {
+    let hdr = shoff + verdefSh * shentsize
+    let vOff = u64.toUsize(readU64Le(bytes, hdr + 24))
+    let vSz = u64.toUsize(readU64Le(bytes, hdr + 32))
+    let mut vAt = usize.ZERO
+    while vAt + 20 <= vSz && vOff + vAt + 20 <= bytes.length {
+      let vdNdx = u64.toUsize(readU16Le(bytes, vOff + vAt + 4))
+      let vdAux = u64.toUsize(readU32Le(bytes, vOff + vAt + 12))
+      let vdNext = u64.toUsize(readU32Le(bytes, vOff + vAt + 16))
+      if vAt + vdAux + 8 <= vSz && vOff + vAt + vdAux + 8 <= bytes.length {
+        let vdaName = u64.toUsize(readU32Le(bytes, vOff + vAt + vdAux))
+        let name = cstrAt(dynstr, vdaName)
+        while List<Bytes>.length(&verNames) <= vdNdx {
+          run List<Bytes>.append(&mut verNames, Bytes.make())
+        }
+        let mut copy = run Bytes.copy(name)
+        let vm = List<Bytes>.asMutSlice(&mut verNames)
+        vm[vdNdx] = move copy
+      }
+      if vdNext == usize.ZERO { break }
+      vAt = vAt + vdNext
+    }
+  }
+  let verNameSlice = List<Bytes>.asSlice(&verNames)
+
+  let mut versymOff = usize.ZERO
+  let mut hasVersym = false
+  if versymSh != usize.MAX {
+    versymOff = u64.toUsize(readU64Le(bytes, shoff + versymSh * shentsize + 24))
+    hasVersym = true
+  }
+
+  let mut exports = List<DynamicExport>.make()
+  let mut exportIndex = InternIndex.make()
+  let mut i = usize.ONE
+  while i < dynsymCount {
+    let off = dynsymOff + i * dynsymEnt
+    if off + 24 > bytes.length { break }
+    let nameOff = u64.toUsize(readU32Le(bytes, off))
+    let info = bytes[off + 4]
+    let shndx = readU16Le(bytes, off + 6)
+    let stSize = readU64Le(bytes, off + 16)
+    let bind = u8.shiftRight(info, 4)
+    let symType = u8.bitAnd(info, 15)
+    if shndx != 0 && (bind == 1 || bind == 2) {
+      let name = cstrAt(dynstr, nameOff)
+      if name.length > usize.ZERO {
+        let mut skipHidden = false
+        let mut ver = Bytes.make()
+        if hasVersym && versymOff + i * 2 + 2 <= bytes.length {
+          let rawVer = readU16Le(bytes, versymOff + i * 2)
+          if (rawVer & 0x8000) != 0 {
+            // Non-default hidden historical version (`foo@GLIBC_2.2.5`, not `@@`); skip for unversioned binding.
+            skipHidden = true
+          } else {
+            let vIdx = u64.toUsize(rawVer & 0x7FFF)
+            if vIdx >= 2 && vIdx < verNameSlice.length {
+              ver = run Bytes.copy(Bytes.asSlice(&verNameSlice[vIdx]))
+            }
+          }
+        }
+        if !skipHidden {
+          let hash = InternIndex.hashBytes(0, name)
+          run InternIndex.record(&mut exportIndex, hash)
+          run List<DynamicExport>.append(&mut exports, DynamicExport {
+            name: run Bytes.copy(name),
+            version: move ver,
+            size: stSize,
+            isObject: symType == 1,
+          })
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  return SharedFile.Library {
+    lib: SharedLib {
+      soname: move soname,
+      asNeeded: asNeeded,
+      exports: move exports,
+      exportIndex: move exportIndex,
+    },
+  }
+}
+
+// ---- 5. Built-In Virtual glibc 2.28 + libgcc_s.so.1 DSOs & Native x86-64 Startup ----
+
+fn nextSpace(line: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < line.length && line[at] != 32 { at = at + usize.ONE }
+  return at
+}
+
+/// Builds the 5 virtual Linux x86-64 system shared libraries (`libc.so.6`, `libpthread.so.0`,
+/// `libm.so.6`, `libdl.so.2`, `libgcc_s.so.1`) directly in memory from [`LinuxLink.symbols`],
+/// eliminating Clang stub compilation completely.
+pub effect fn virtualGlibcLibraries() -> List<SharedLib> ! OutOfMemoryError ? &mut Allocator {
+  let libNames = LinuxLink.libraries()
+  let mut libs = run List<SharedLib>.makeWithCapacity(libNames.length)
+  let mut li = usize.ZERO
+  while li < libNames.length {
+    run List<SharedLib>.append(&mut libs, SharedLib {
+      soname: run Bytes.copy(libNames[li]),
+      asNeeded: true,
+      exports: List<DynamicExport>.make(),
+      exportIndex: InternIndex.make(),
+    })
+    li = li + usize.ONE
+  }
+
+  let table = String.utf8Bytes(LinuxLink.symbols())
+  let mut start = usize.ZERO
+  while start < table.length {
+    let mut end = start
+    while end < table.length && table[end] != 10 { end = end + usize.ONE }
+    let line = Slice.view<u8>(table, start, end - start)
+    start = end + usize.ONE
+
+    let mut pos = usize.ZERO
+    while pos < line.length && line[pos] == 32 { pos = pos + usize.ONE }
+    if pos >= line.length { continue }
+    let mut tokEnd = nextSpace(line, pos)
+    let first = Slice.view<u8>(line, pos, tokEnd - pos)
+    if sameBytes(first, b"aarch64") { continue }
+    if sameBytes(first, b"x86_64") {
+      pos = tokEnd + usize.ONE
+      while pos < line.length && line[pos] == 32 { pos = pos + usize.ONE }
+      tokEnd = nextSpace(line, pos)
+    }
+    let libName = Slice.view<u8>(line, pos, tokEnd - pos)
+    pos = tokEnd + usize.ONE
+    while pos < line.length && line[pos] == 32 { pos = pos + usize.ONE }
+    let verEnd = nextSpace(line, pos)
+    if verEnd <= pos + usize.ONE { continue }
+    // Strip trailing `:` from version token.
+    let ver = Slice.view<u8>(line, pos, verEnd - pos - usize.ONE)
+
+    // Find matching library slot.
+    let mut targetLib = usize.MAX
+    li = usize.ZERO
+    while li < libNames.length {
+      if sameBytes(libNames[li], libName) {
+        targetLib = li
+        break
+      }
+      li = li + usize.ONE
+    }
+    if targetLib == usize.MAX { continue }
+
+    let mut symPos = verEnd + usize.ONE
+    while symPos < line.length {
+      while symPos < line.length && line[symPos] == 32 { symPos = symPos + usize.ONE }
+      if symPos >= line.length { break }
+      let symEnd = nextSpace(line, symPos)
+      let tok = Slice.view<u8>(line, symPos, symEnd - symPos)
+      symPos = symEnd + usize.ONE
+
+      let mut eq = usize.ZERO
+      while eq < tok.length && tok[eq] != 61 { eq = eq + usize.ONE }
+      let sName = Slice.view<u8>(tok, usize.ZERO, eq)
+      let mut objSz: u64 = 0
+      if eq < tok.length {
+        let mut d = eq + usize.ONE
+        while d < tok.length {
+          objSz = objSz * 10 + u8.toU64(tok[d] - 48)
+          d = d + usize.ONE
+        }
+      }
+      let hash = InternIndex.hashBytes(0, sName)
+      let libsMut = List<SharedLib>.asMutSlice(&mut libs)
+      run InternIndex.record(&mut libsMut[targetLib].exportIndex, hash)
+      run List<DynamicExport>.append(&mut libsMut[targetLib].exports, DynamicExport {
+        name: run Bytes.copy(sName),
+        version: run Bytes.copy(ver),
+        size: objSz,
+        isObject: objSz > 0,
+      })
+    }
+  }
+  return move libs
+}
+
+/// Emits the native x86-64 Linux startup [`InputUnit`] defining `_start`, `silk_gnu_initialize`,
+/// and `__dso_handle` (matching [`LinuxLink.startSource`]) without invoking Clang.
+pub effect fn startupUnit(includeEntry: bool) -> InputUnit ! OutOfMemoryError ? &mut Allocator {
+  let mut code = Bytes.make()
+  let mut relocs = List<InputReloc>.make()
+  let mut data = Bytes.make()
+  let mut dataRelocs = List<InputReloc>.make()
+  let mut symbols = List<InputSymbol>.make()
+
+  // Weak hidden `__dso_handle` in `.data` (8 bytes holding its own address).
+  run Bytes.append(&mut data, &[0, 0, 0, 0, 0, 0, 0, 0])
+  run List<InputSymbol>.append(&mut symbols, InputSymbol {
+    name: run Bytes.copy(b"__dso_handle"),
+    section: 1,
+    offset: 0,
+    size: 8,
+    alignment: 8,
+    isFunc: false,
+    isTls: false,
+    weak: true,
+    hidden: true,
+    common: false,
+  })
+  run List<InputReloc>.append(&mut dataRelocs, InputReloc {
+    offset: 0,
+    relType: r64(),
+    addend: 0,
+    targetLocal: false,
+    localSection: usize.ZERO,
+    localOffset: 0,
+    symbol: run Bytes.copy(b"__dso_handle"),
+  })
+
+  if includeEntry {
+    // 1. `silk_gnu_initialize(int argc, char **argv, char **envp)`:
+    //    Runs every initializer pointer in `[__init_array_start, __init_array_end)`.
+    let initOff = usize.toU64(Bytes.length(&code))
+    run X86Encode.push(&mut code, X86Encode.rbp())
+    run X86Encode.movRr64(&mut code, X86Encode.rbp(), X86Encode.rsp())
+    run X86Encode.push(&mut code, X86Encode.rbx())
+    run X86Encode.push(&mut code, X86Encode.r12())
+    run X86Encode.push(&mut code, X86Encode.r13())
+    run X86Encode.push(&mut code, X86Encode.r14())
+    run X86Encode.push(&mut code, X86Encode.r15())
+    run X86Encode.aluRi64(&mut code, Alu.Sub, X86Encode.rsp(), 8)
+    run X86Encode.movRr32(&mut code, X86Encode.r12(), X86Encode.rdi())
+    run X86Encode.movRr64(&mut code, X86Encode.r13(), X86Encode.rsi())
+    run X86Encode.movRr64(&mut code, X86Encode.r14(), X86Encode.rdx())
+    let startDisp = run X86Encode.lea64(&mut code, X86Encode.rbx(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(startDisp),
+      relType: rPc32(),
+      addend: -4,
+      targetLocal: false,
+      localSection: usize.ZERO,
+      localOffset: 0,
+      symbol: run Bytes.copy(b"__init_array_start"),
+    })
+    let endDisp = run X86Encode.lea64(&mut code, X86Encode.r15(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(endDisp),
+      relType: rPc32(),
+      addend: -4,
+      targetLocal: false,
+      localSection: usize.ZERO,
+      localOffset: 0,
+      symbol: run Bytes.copy(b"__init_array_end"),
+    })
+    let loopHead = Bytes.length(&code)
+    run X86Encode.aluRr64(&mut code, Alu.Cmp, X86Encode.rbx(), X86Encode.r15())
+    let doneJcc = run X86Encode.jccRel32(&mut code, X86Encode.ccAe())
+    run X86Encode.movRr32(&mut code, X86Encode.rdi(), X86Encode.r12())
+    run X86Encode.movRr64(&mut code, X86Encode.rsi(), X86Encode.r13())
+    run X86Encode.movRr64(&mut code, X86Encode.rdx(), X86Encode.r14())
+    drop run X86Encode.movRm64(&mut code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbx(), 0))
+    run X86Encode.callReg(&mut code, X86Encode.rax())
+    run X86Encode.aluRi64(&mut code, Alu.Add, X86Encode.rbx(), 8)
+    let backJmp = run X86Encode.jmpRel32(&mut code)
+    X86Encode.patchRel32(&mut code, backJmp, loopHead)
+    let afterLoop = Bytes.length(&code)
+    X86Encode.patchRel32(&mut code, doneJcc, afterLoop)
+    run X86Encode.aluRi64(&mut code, Alu.Add, X86Encode.rsp(), 8)
+    run X86Encode.pop(&mut code, X86Encode.r15())
+    run X86Encode.pop(&mut code, X86Encode.r14())
+    run X86Encode.pop(&mut code, X86Encode.r13())
+    run X86Encode.pop(&mut code, X86Encode.r12())
+    run X86Encode.pop(&mut code, X86Encode.rbx())
+    run X86Encode.pop(&mut code, X86Encode.rbp())
+    run X86Encode.ret(&mut code)
+    let initSize = usize.toU64(Bytes.length(&code)) - initOff
+    run List<InputSymbol>.append(&mut symbols, InputSymbol {
+      name: run Bytes.copy(b"silk_gnu_initialize"),
+      section: 0,
+      offset: initOff,
+      size: initSize,
+      alignment: 16,
+      isFunc: true,
+      isTls: false,
+      weak: false,
+      hidden: true,
+      common: false,
+    })
+
+    // 2. `_start`: standard Linux x86-64 glibc entry calling `__libc_start_main`.
+    run padNop(&mut code, 16)
+    let startOff = usize.toU64(Bytes.length(&code))
+    // xor ebp, ebp
+    run X86Encode.aluRr32(&mut code, Alu.Xor, X86Encode.rbp(), X86Encode.rbp())
+    // mov r9, rdx
+    run X86Encode.movRr64(&mut code, X86Encode.r9(), X86Encode.rdx())
+    // pop rsi (argc)
+    run X86Encode.pop(&mut code, X86Encode.rsi())
+    // mov rdx, rsp (argv)
+    run X86Encode.movRr64(&mut code, X86Encode.rdx(), X86Encode.rsp())
+    // and rsp, -16
+    run X86Encode.aluRi64(&mut code, Alu.And, X86Encode.rsp(), -16)
+    // push rax; push rsp (stack_end)
+    run X86Encode.push(&mut code, X86Encode.rax())
+    run X86Encode.push(&mut code, X86Encode.rsp())
+    // xor r8d, r8d (fini = NULL)
+    run X86Encode.aluRr32(&mut code, Alu.Xor, X86Encode.r8(), X86Encode.r8())
+    // lea rcx, [rip + silk_gnu_initialize]
+    let initRef = run X86Encode.lea64(&mut code, X86Encode.rcx(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(initRef),
+      relType: rPc32(),
+      addend: -4,
+      targetLocal: true,
+      localSection: 0,
+      localOffset: initOff,
+      symbol: Bytes.make(),
+    })
+    // lea rdi, [rip + main]
+    let mainRef = run X86Encode.lea64(&mut code, X86Encode.rdi(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(mainRef),
+      relType: rPc32(),
+      addend: -4,
+      targetLocal: false,
+      localSection: usize.ZERO,
+      localOffset: 0,
+      symbol: run Bytes.copy(b"main"),
+    })
+    // call qword ptr [rip + __libc_start_main@GOTPCREL]: FF 15 <disp32>
+    run X86Encode.byte(&mut code, 0xFF)
+    run X86Encode.byte(&mut code, 0x15)
+    let callRef = Bytes.length(&code)
+    run X86Encode.u32Le(&mut code, 0)
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(callRef),
+      relType: rGotPcRel(),
+      addend: -4,
+      targetLocal: false,
+      localSection: usize.ZERO,
+      localOffset: 0,
+      symbol: run Bytes.copy(b"__libc_start_main"),
+    })
+    // hlt (0xF4)
+    run X86Encode.byte(&mut code, 0xF4)
+    let startSize = usize.toU64(Bytes.length(&code)) - startOff
+    run List<InputSymbol>.append(&mut symbols, InputSymbol {
+      name: run Bytes.copy(b"_start"),
+      section: 0,
+      offset: startOff,
+      size: startSize,
+      alignment: 16,
+      isFunc: true,
+      isTls: false,
+      weak: false,
+      hidden: false,
+      common: false,
+    })
+  }
+
+  let mut sections = run List<InputSection>.makeWithCapacity(2)
+  let codeSz = usize.toU64(Bytes.length(&code))
+  let dataSz = usize.toU64(Bytes.length(&data))
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Text, alignment: 16, data: move code, memSize: codeSz, relocs: move relocs, comdatGroup: Bytes.make(),
+  })
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Data, alignment: 8, data: move data, memSize: dataSz, relocs: move dataRelocs, comdatGroup: Bytes.make(),
+  })
+  return InputUnit {
+    name: run Bytes.copy(b"<silk-start>"),
+    sections: move sections,
+    symbols: move symbols,
+    undefinedSymbols: List<Bytes>.make(),
+  }
+}
+
+/// Emits an on-demand glibc nonshared helper unit (`atexit`, `at_quick_exit`, or `pthread_atfork`)
+/// when referenced by linked C/C++ objects.
+pub effect fn nonsharedHelperUnit(name: &[u8]) -> Option<InputUnit> ! OutOfMemoryError ? &mut Allocator {
+  let mut code = Bytes.make()
+  let mut relocs = List<InputReloc>.make()
+  let mut target: &[u8] = b""
+  if sameBytes(name, b"atexit") {
+    // xor esi, esi; lea rdx, [rip + __dso_handle]; jmp __cxa_atexit
+    run X86Encode.aluRr32(&mut code, Alu.Xor, X86Encode.rsi(), X86Encode.rsi())
+    let dsoRef = run X86Encode.lea64(&mut code, X86Encode.rdx(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(dsoRef), relType: rPc32(), addend: -4,
+      targetLocal: false, localSection: usize.ZERO, localOffset: 0, symbol: run Bytes.copy(b"__dso_handle"),
+    })
+    target = b"__cxa_atexit"
+  } else if sameBytes(name, b"at_quick_exit") {
+    // lea rsi, [rip + __dso_handle]; jmp __cxa_at_quick_exit
+    let dsoRef = run X86Encode.lea64(&mut code, X86Encode.rsi(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(dsoRef), relType: rPc32(), addend: -4,
+      targetLocal: false, localSection: usize.ZERO, localOffset: 0, symbol: run Bytes.copy(b"__dso_handle"),
+    })
+    target = b"__cxa_at_quick_exit"
+  } else if sameBytes(name, b"pthread_atfork") {
+    // lea rcx, [rip + __dso_handle]; jmp __register_atfork
+    let dsoRef = run X86Encode.lea64(&mut code, X86Encode.rcx(), Mem.ripRel(0))
+    run List<InputReloc>.append(&mut relocs, InputReloc {
+      offset: usize.toU64(dsoRef), relType: rPc32(), addend: -4,
+      targetLocal: false, localSection: usize.ZERO, localOffset: 0, symbol: run Bytes.copy(b"__dso_handle"),
+    })
+    target = b"__register_atfork"
+  } else {
+    return Option<InputUnit>.none()
+  }
+  let jmpRef = run X86Encode.jmpRel32(&mut code)
+  run List<InputReloc>.append(&mut relocs, InputReloc {
+    offset: usize.toU64(jmpRef), relType: rPlt32(), addend: -4,
+    targetLocal: false, localSection: usize.ZERO, localOffset: 0, symbol: run Bytes.copy(target),
+  })
+  let sz = usize.toU64(Bytes.length(&code))
+  let mut sections = List<InputSection>.make()
+  run List<InputSection>.append(&mut sections, InputSection {
+    kind: SectionKind.Text, alignment: 16, data: move code, memSize: sz, relocs: move relocs, comdatGroup: Bytes.make(),
+  })
+  let mut symbols = List<InputSymbol>.make()
+  run List<InputSymbol>.append(&mut symbols, InputSymbol {
+    name: run Bytes.copy(name), section: 0, offset: 0, size: sz, alignment: 16,
+    isFunc: true, isTls: false, weak: true, hidden: true, common: false,
+  })
+  return Option<InputUnit>.some(InputUnit {
+    name: run Bytes.copy(b"<silk-nonshared>"),
+    sections: move sections,
+    symbols: move symbols,
+    undefinedSymbols: List<Bytes>.make(),
+  })
+}

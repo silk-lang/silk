@@ -1,0 +1,157 @@
+//! Unit checks for `ElfInput` and `ElfLink` (in-process Linux x86-64 ELF64 direct linker).
+
+import backend.SsaFunction {Binary, Kind, SsaFunction}
+import backend.X86ElfObject
+import backend.X86Emit
+import backend.X86Object {Fragment, Function, Object, Pointer as ObjectPointer, Unsupported as X86Unsupported}
+import driver.ElfInput
+import driver.ElfInput {ArchiveIndex, InputUnit, LinkError, ScriptEntry, SharedFile, SharedLib}
+import driver.ElfLink
+import driver.WasmNames {FunctionNames}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {FileError, FileSystem}
+import silk.system.filesystem_native {OsFileSystem}
+import silk.testing.testing {AssertionError, Testing}
+
+fn readU16(b: &[u8], at: usize) -> u64 {
+  return u8.toU64(b[at]) | u64.shiftLeft(u8.toU64(b[at + 1]), 8)
+}
+
+fn readU32(b: &[u8], at: usize) -> u64 {
+  return u8.toU64(b[at])
+    | u64.shiftLeft(u8.toU64(b[at + 1]), 8)
+    | u64.shiftLeft(u8.toU64(b[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(b[at + 3]), 24)
+}
+
+fn readU64(b: &[u8], at: usize) -> u64 {
+  return readU32(b, at) | u64.shiftLeft(readU32(b, at + 4), 32)
+}
+
+test effect fn parsesVirtualGlibcScriptsArchivesAndLinksElf64Outputs() -> ()
+! LinkError | X86Unsupported | FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run linkClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn linkClaims() -> () ! LinkError | X86Unsupported | FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut fs = run OsFileSystem.make("/")
+  return run linkClaimsWithFs() |> Effect.provideMut<FileSystem>(&mut fs)
+}
+
+effect fn linkClaimsWithFs() -> ()
+! LinkError | X86Unsupported | FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  // 1. Virtual glibc 2.28 + libgcc_s.so.1 DSO table parsing.
+  let vLibs = run ElfInput.virtualGlibcLibraries()
+  let vSlice = List<SharedLib>.asSlice(&vLibs)
+  run Testing.expect(vSlice.length == 5, "virtual glibc exposes 5 system DSOs")
+  let startMain = ElfInput.sharedLibLookup(&vSlice[0], b"__libc_start_main")
+  let hasStartMain = match startMain {
+    Option<usize>.Some {..} => true
+    Option<usize>.None => false
+  }
+  run Testing.expect(hasStartMain, "libc.so.6 exports __libc_start_main")
+  let unwindBt = ElfInput.sharedLibLookup(&vSlice[4], b"_Unwind_Backtrace")
+  let hasUnwind = match unwindBt {
+    Option<usize>.Some {..} => true
+    Option<usize>.None => false
+  }
+  run Testing.expect(hasUnwind, "libgcc_s.so.1 exports _Unwind_Backtrace")
+
+  // 2. GNU linker script parsing (`GROUP` / `AS_NEEDED`).
+  let script = b"/* GNU ld script */\nOUTPUT_FORMAT(elf64-x86-64)\nGROUP ( /lib/x86_64-linux-gnu/libc.so.6 AS_NEEDED ( /lib64/ld-linux-x86-64.so.2 ) )\n"
+  let parsedScript = run ElfInput.parseSharedObject(script, b"libc.so", false)
+  let scriptOk = match &parsedScript {
+    SharedFile.Script {entries} => List<ScriptEntry>.length(&entries) == 2
+      && !List<ScriptEntry>.asSlice(&entries)[0].asNeeded
+      && List<ScriptEntry>.asSlice(&entries)[1].asNeeded
+    SharedFile.Library {..} => false
+  }
+  run Testing.expect(scriptOk, "GNU linker script parser extracts GROUP and AS_NEEDED entries")
+
+  // 3. Build a real Silk SSA `main` + TLS object, encode as Fragment, round-trip `.o`, and link!
+  let i32K = Kind.integer(32)
+  let mut fnMain = run SsaFunction.make(b"silk_main_sym", 64)
+  fnMain.setResult(i32K)
+  let b0 = run fnMain.newBlock()
+  fnMain.startBlock(b0)
+  let c40 = run fnMain.integer(32, 40)
+  let c2 = run fnMain.integer(32, 2)
+  let sum = run fnMain.binary(Binary.Add, c40, c2)
+  run fnMain.ret(sum)
+  run fnMain.finish()
+
+  let emittedMain = run X86Emit.emit(&fnMain, b"silk_main_sym", b"main")
+  let mut frag = Fragment.make()
+  run List<Function>.append(&mut frag.functions, move emittedMain)
+  // Add a TLS object so `PT_TLS` emission is exercised too.
+  run List<Object>.append(&mut frag.objects, Object {
+    symbol: run Bytes.copy(b"silk_tls_word"),
+    alignment: 8,
+    image: run Bytes.zeroed(8),
+    pointers: List<ObjectPointer>.make(),
+    framed: false,
+    local: true,
+    readonly: false,
+  })
+  let encodedFrag = run frag.encode()
+
+  // 3a. Round-trip an ELF64 `.o` through `X86ElfObject.pack` -> `ElfInput.parseRelocatable`.
+  let relocObj = run X86ElfObject.pack(Bytes.asSlice(&encodedFrag))
+  let parsedObj = run ElfInput.parseRelocatable(Bytes.asSlice(&relocObj), b"test.o")
+  run Testing.expect(List<ElfInput.InputSymbol>.length(&parsedObj.symbols) >= 2,
+    "ELF64 .o parser extracts defined symbols from relocatable object")
+
+  // 3b. Link into a complete PIE executable via `ElfLink.linkUnits`.
+  let silkUnit = run ElfInput.ingestFragments(Bytes.asSlice(&encodedFrag))
+  let startUnit = run ElfInput.startupUnit(true)
+  let mut units = List<InputUnit>.make()
+  run List<InputUnit>.append(&mut units, move silkUnit)
+  run List<InputUnit>.append(&mut units, move startUnit)
+  let mut fnames = FunctionNames.make()
+  run FunctionNames.add(&mut fnames, b"silk_main_sym", b"app:main.silk::main")
+  let emptyRpaths: [Bytes; 0] = []
+  let pie = run ElfLink.linkUnits(
+    move units,
+    List<ArchiveIndex>.make(),
+    move vLibs,
+    false,
+    &emptyRpaths,
+    b"",
+    &fnames,
+  )
+  let pieBytes = Bytes.asSlice(&pie)
+  run Testing.expect(pieBytes.length > 0x3000, "linked PIE executable has full 4-segment layout")
+  run Testing.expect(pieBytes[0] == 0x7F && pieBytes[1] == 0x45 && pieBytes[2] == 0x4C && pieBytes[3] == 0x46, "ELF magic")
+  run Testing.expect(readU16(pieBytes, 16) == 3, "e_type is ET_DYN (PIE)")
+  run Testing.expect(readU16(pieBytes, 18) == 62, "e_machine is EM_X86_64")
+  run Testing.expect(readU64(pieBytes, 24) != 0, "e_entry points to _start")
+  run Testing.expect(readU16(pieBytes, 56) == 11, "11 program headers including PT_TLS")
+  run Testing.expect(readU16(pieBytes, 60) == 23, "23 section headers including .symtab and .eh_frame_hdr")
+
+  // 4. Link a shared library (`shared = true`) and verify `ET_DYN` without `PT_INTERP` and `e_entry == 0`.
+  let mut soUnits = List<InputUnit>.make()
+  run List<InputUnit>.append(&mut soUnits, move parsedObj)
+  run List<InputUnit>.append(&mut soUnits, run ElfInput.startupUnit(false))
+  let vLibs2 = run ElfInput.virtualGlibcLibraries()
+  let so = run ElfLink.linkUnits(
+    move soUnits,
+    List<ArchiveIndex>.make(),
+    move vLibs2,
+    true,
+    &emptyRpaths,
+    b"libtest.so",
+    &fnames,
+  )
+  let soBytes = Bytes.asSlice(&so)
+  run Testing.expect(readU16(soBytes, 16) == 3, "shared library e_type is ET_DYN")
+  run Testing.expect(readU64(soBytes, 24) == 0, "shared library e_entry is 0")
+  run Testing.expect(readU16(soBytes, 56) == 9, "shared library has 9 program headers (no PT_PHDR/PT_INTERP, with PT_TLS)")
+}
