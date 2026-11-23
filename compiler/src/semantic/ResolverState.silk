@@ -1,0 +1,2149 @@
+//! Internal resolver state, lookup caches, memo tables, and check state.
+
+import semantic.ErasedRecursion
+import semantic.ErasureIndex {ErasureIndex}
+import semantic.ErasureRound {ErasureRound}
+import backend.Mir {ErasureFact}
+import semantic.Types {Types}
+import Tracing
+import Progress {Progress, QueryClock}
+import hir.Hir {
+  CallableContract as HirContract,
+  HirId,
+  HirRef,
+  LinkageDirection,
+  Module,
+  Node,
+  Range,
+  RangeRef,
+}
+import backend.Gap {Code as GapCode, Gap as BackendGap, Source as GapSource}
+import backend.InstanceKey {InstanceKey}
+import backend.PackageSettings {PackageSettings}
+import backend.InstanceText {InstanceText as InstanceDefinition}
+import backend.Layout {Layout as BackendLayout}
+import backend.LlvmCode
+import semantic.Specialization {Application, ScopeBinding, StaticSlot}
+import backend.Mir {MirFunction}
+import hir.Intern {StringTable}
+import lexer.Span {Span}
+import semantic.CallSelection {CallSelection}
+import semantic.DeclarationId {DeclarationId}
+import semantic.SourceInputs {SourceInputs}
+import semantic.DeclarationTable
+import semantic.StableKey
+import semantic.CacheImage
+import semantic.BuildRecord
+import semantic.CostLedger {Ledger as CostTable}
+import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile}
+import semantic.InitialProfile {InitialProfile}
+import semantic.Intrinsic as CheckedIntrinsic
+import semantic.Intrinsic {Member as IntrinsicMember}
+import semantic.Lifetime {Lifetime}
+import semantic.TraceDirective {TraceDirective}
+import semantic.ExecutionStorage {ExecutionStorage}
+import semantic.Retention {Root as RetentionRoot}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.PackageGraph {PackageGraph}
+import semantic.ModuleIndex {IndexedDeclaration, ModuleIndex}
+import semantic.CallableOrigin
+import semantic.InternIndex {InternIndex}
+import semantic.ContentHash {ContentHash}
+import semantic.Query {Cycle, Query}
+import semantic.DependencyGraph {Counters as GraphCounters, DependencyGraph, Dependee}
+import semantic.Rejection {
+  make as makeRejection,
+  MessageArgument,
+  Rejection,
+  RejectionCode,
+  RelatedSite,
+}
+import semantic.Origins {Origins}
+import semantic.SourceIndex {
+  AuthoredCursor,
+  NoRejection,
+  RevisionMismatch,
+  SourceIndex,
+  SourceResult,
+}
+import semantic.SourceRevision {Observation}
+import semantic.StorageOperation {StorageOperation}
+import semantic.StaticExecution
+import semantic.StaticExecution {PrefixWork as StaticPrefixWork, Binding as StaticBinding}
+import semantic.StaticValue {Value as StaticData}
+import semantic.Target {Target as MachineTarget}
+import semantic.Type {
+  ErasedTypeMemo,
+  Argument,
+  Composition,
+  Row,
+  RowParameter,
+  Type,
+}
+import semantic.TypedBody {
+  StaticIteration,
+  Local as BodyLocal,
+  NodeId as BodyNodeId,
+  ReceiverPass as BodyReceiverPass,
+  BorrowStatus as BodyBorrowStatus,
+  uncheckedReason,
+  TypedBody,
+}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Word}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.mem.shared {Shared}
+import silk.mem.interned {Interned}
+import silk.num.usize
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import semantic.SemanticModel {
+  Answer,
+  BackendBuild,
+  ConformanceProof,
+  Constraint,
+  DeclarationCheckResult,
+  DeferredStaticTemplate,
+  Dependency,
+  Event,
+  ImplementationHead,
+  ImplementationKind,
+  Key,
+  Member,
+  Outcome,
+  ScopedKey,
+  StaleCause,
+  StaticRootBinder,
+  Sweep,
+  UncheckedBody,
+  UncheckedDeclaration,
+  Value,
+}
+import semantic.SemanticInputs {
+  BackendInstance,
+  ErasedHandle,
+  internApplication,
+  reject,
+  same,
+  sameAllocation,
+}
+import semantic.QueryEngine {
+  declarationAt,
+  header,
+  recordProfileRead,
+  resolvedModule,
+  scopedHeader,
+}
+import semantic.CacheAdoption {CarriedInputs}
+import semantic.NameResolution {genericOwnerPublic, ownedArguments, templateBinders}
+import semantic.Implementations {
+  completeApplicationBinders,
+  headOf,
+  ordinalOfIdentity,
+  sameDeclarationShared,
+}
+import semantic.SignatureCheck {answerBackendGap, reportedDiagnostics}
+import semantic.ConformanceProve {Discovery, ModuleScan, RegionProof, proveAppliedBounds}
+import semantic.PatternAndLambda {ActiveLambda, RowFieldSite}
+import semantic.BodyDriver {BodyFacts, StaticCallHint, StaticReads}
+import semantic.MirLowering {
+  CheckScope,
+  CheckedDispatch,
+  DiscoveryDispatch,
+  ProofMir,
+  featureEnabled,
+  foreignHeader,
+}
+import semantic.EmissionAndAssembly {
+  BuildRoot,
+  CapturedBuild,
+  EmissionInputs,
+  HeaderFingerprint,
+  HeldPack,
+  LlvmInput,
+  ReplayState,
+  digestHash,
+}
+import semantic.CheckAndEscapes {ExportedObject, sameSpan}
+
+pub struct HeaderSyntax {
+  pub header: Node,
+  pub span: Span,
+}
+
+// A method remains a template when its owner has unsupplied type/row arguments, even if a
+// signature trims an owner binder it does not mention. A named empty application cannot provide
+// the missing owner environment for the analysis-only MIR closure.
+pub fn declarationOpen(hir: &Module, declarations: &[IndexedDeclaration], ordinal: usize) -> bool {
+  let mut current = Option<usize>.some(ordinal)
+  while true {
+    let at = match move current {
+      Option<usize>.Some { value } => value
+      _ => {
+        return false
+      }
+    }
+    let mut generics = Range.empty()
+    match Module.node(hir, declarations[at].header) {
+      Node.ImplHeader { generics: written, .. } => {
+        generics = written
+      }
+      Node.FunctionHeader { contract, .. } => {
+        if let Option<HirContract>.Some {value: HirContract {generics: written, ..}} = Module.contractOf(hir, contract) {
+          generics = written
+        }
+      }
+      Node.OperationHeader { contract, .. } => {
+        if let Option<HirContract>.Some {value: HirContract {generics: written, ..}} = Module.contractOf(hir, contract) {
+          generics = written
+        }
+      }
+      Node.StructHeader { generics: written, .. } => { generics = written }
+      Node.TupleHeader { generics: written, .. } => { generics = written }
+      Node.UnionHeader { generics: written, .. } => { generics = written }
+      Node.ServiceHeader { generics: written, .. } => { generics = written }
+      // An interface operation's default body is open over the interface's implicit `Self`.
+      Node.InterfaceHeader { .. } => {
+        return true
+      }
+      Node.AliasHeader { generics: written, .. } => { generics = written }
+      _ => ()
+    }
+    let mut parameter = usize.ZERO
+    while parameter < generics.length {
+      match Module.node(hir, Module.child(hir, generics, parameter)) {
+        Node.TypeParameter { .. } => {
+          return true
+        }
+        Node.RowParameter { .. } => {
+          return true
+        }
+        _ => ()
+      }
+      parameter = parameter + usize.ONE
+    }
+    current = match &declarations[at].parent {
+      Option<usize>.Some { value } => Option<usize>.some(value)
+      _ => Option<usize>.none()
+    }
+  }
+  return false
+}
+
+// The borrow status of a checked body answer, or `Checked` when the answer holds no body.
+pub fn bodyAnswerBorrowStatus(answer: &Result<Answer, NoRejection>) -> BodyBorrowStatus {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success { value } => match &value.outcome {
+      Outcome.Success { value: Value.Body { body } } => Shared<TypedBody>.with<BodyBorrowStatus>(&body, TypedBody.borrowStatus)
+      _ => BodyBorrowStatus.Checked
+    }
+    _ => BodyBorrowStatus.Checked
+  }
+}
+
+pub fn bodyAnswerPresent(answer: &Result<Answer, NoRejection>) -> bool {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success { value } => match &value.outcome {
+      Outcome.Success { value: Value.Body { .. } } => true
+      _ => false
+    }
+    _ => false
+  }
+}
+
+// A Body answer's `uncheckedReason`, `usize.MAX` for a borrow-checked body or any other answer.
+pub fn bodyUnchecked(answer: &Result<Answer, NoRejection>) -> usize {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success { value } => match &value.outcome {
+      Outcome.Success { value: Value.Body { body, .. } } => Shared<TypedBody>.with<usize>(&body, |checked: &TypedBody| -> usize {
+        return uncheckedReason(TypedBody.borrowStatus(checked))
+      })
+      _ => usize.MAX
+    }
+    _ => usize.MAX
+  }
+}
+
+// Records the body block at `block` of `module` under `reason`, unless it is borrow-checked.
+pub effect fn recordUnchecked(bodies: &mut List<UncheckedBody>, module: &ModuleId, block: Span, reason: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if reason == usize.MAX { return () }
+  run List<UncheckedBody>.append(&mut bodies.*, UncheckedBody {module: ModuleId.copy(module), block: block, reason: reason})
+}
+
+pub fn declarationMemberCount(answer: &Result<Answer, NoRejection>) -> usize {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success { value } => match &value.outcome {
+      Outcome.Success { value: Value.Members { members, .. } } => List<Member>.length(&members)
+      _ => usize.ZERO
+    }
+    _ => usize.ZERO
+  }
+}
+
+pub fn checkedConformanceHead(answer: &Result<Answer, NoRejection>) -> bool {
+  let head = headOf(answer)
+  return match move head {
+    Option<Shared<ImplementationHead>>.Some {
+      value
+    } => Shared<ImplementationHead>.with<bool>(
+      &value,
+      |checked: &ImplementationHead| -> bool {
+        return match &checked.kind {
+          ImplementationKind.Conformance => true
+          _ => false
+        }
+      }
+    )
+    _ => false
+  }
+}
+
+// Whether each declaration one escape walk reached is an imported C declaration
+// (`foreignDeclaration`). The walk reaches a declaration at every call of it, and reads its header
+// once: a repeat would record the same reads against the same unit.
+pub struct ForeignDeclarations {
+  pub seen: List<ForeignDeclaration>,
+  pub lookup: InternIndex,
+}
+
+pub struct ForeignDeclaration {
+  pub identity: Interned<DeclarationId>,
+  pub foreign: bool,
+}
+
+// `foreignDeclaration`, read once per declaration of one walk.
+pub effect fn walkedForeign(resolver: &mut Resolver, walked: &mut ForeignDeclarations, instance: &InstanceKey) -> bool
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+  match &instance.* {
+    InstanceKey.DropGlue {..} => { return false }
+    InstanceKey.Helper {..} => { return false }
+    _ => ()
+  }
+  let identity = InstanceKey.identity(instance)
+  let hashed = Interned<DeclarationId>.with<u64>(&identity, DeclarationId.hash)
+  let seen = List<ForeignDeclaration>.asSlice(&walked.seen)
+  let mut at = InternIndex.first(&walked.lookup, hashed)
+  while at != usize.MAX {
+    if sameDeclarationShared(&seen[at].identity, &identity) { return seen[at].foreign }
+    at = InternIndex.after(&walked.lookup, at)
+  }
+  let foreign = run foreignDeclaration(&mut resolver.*, instance)
+  run List<ForeignDeclaration>.append(&mut walked.seen, ForeignDeclaration {identity: move identity, foreign: foreign})
+  run InternIndex.record(&mut walked.lookup, hashed)
+  return foreign
+}
+
+pub effect fn foreignDeclaration(resolver: &mut Resolver, instance: &InstanceKey) -> bool
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+  // Generated glue/helpers have no source function header. A sealed core's glue must never
+  // request its compiler-owned identity from the source resolver.
+  match &instance.* {
+    InstanceKey.DropGlue { .. } => {
+      return false
+    }
+    InstanceKey.Helper { .. } => {
+      return false
+    }
+    _ => ()
+  }
+  let shared = InstanceKey.identity(instance)
+  let declaration = DeclarationId.copyShared(&shared)
+  let module = DeclarationId.moduleId(&declaration)
+  let ordinal = match move run ordinalOfIdentity(&mut resolver.*, module, &shared) {
+    Option<usize>.Some { value } => value
+    _ => {
+      return false
+    }
+  }
+  let written = run header(&mut resolver.*, module, ordinal)
+  if let Option<HeaderSyntax>.Some { value } = move written {
+    if let Node.FunctionHeader { linkage, .. } = value.header {
+      if linkage.present {
+        let foreign = run foreignHeader(&mut resolver.*, module, ordinal)
+        return !foreign.exported
+      }
+    }
+  }
+  return false
+}
+
+pub effect fn checkedAggregateApplication(
+  resolver: &mut Resolver,
+  query: &mut Query<Answer, NoRejection>,
+  moduleOrdinal: usize,
+  declaration: usize,
+  span: Span
+) -> Result<usize, Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let module = resolvedModule(&resolver.*, moduleOrdinal)
+  let template = run templateBinders(&mut resolver.*, &module, declaration)
+  let mut binders = match move template {
+    Result<List<Binder>, Shared<Rejection>>.Success { value } => move value
+    Result<List<Binder>, Shared<Rejection>>.Failure { error } => {
+      return Result<usize, Shared<Rejection>>.failResult(move error)
+    }
+  }
+  let mut dependencies = List<Dependency>.make()
+  let incomplete = run completeApplicationBinders(
+    &mut resolver.*,
+    &mut query.*,
+    &mut dependencies,
+    moduleOrdinal,
+    &module,
+    declaration,
+    span,
+    &mut binders
+  )
+  if let Option<Shared<Rejection>>.Some { value } = move incomplete {
+    return Result<usize, Shared<Rejection>>.failResult(move value)
+  }
+  let identity = match move run declarationAt(&mut resolver.*, &module, declaration) {
+    Option<DeclarationId>.Some { value } => move value
+    _ => {
+      return Result<
+        usize,
+        Shared<Rejection>
+      >.failResult(run reject(&resolver.*, &module, RejectionCode.UnknownName, span))
+    }
+  }
+  let arguments = run ownedArguments(
+    &identity,
+    List<Binder>.asSlice(&binders),
+    List<Interned<Lifetime>>.asSlice(&List<Interned<Lifetime>>.make())
+  )
+  let written = run scopedHeader(&mut resolver.*, &module, declaration)
+  let isPublic = match move written {
+    Option<HeaderSyntax>.Some { value } => genericOwnerPublic(value.header)
+    _ => false
+  }
+  let application = run Types.intern(
+    Type.Nominal { declaration: move identity, isPublic: isPublic, arguments: move arguments }
+  )
+  return Result<
+    usize,
+    Shared<Rejection>
+  >.succeed(run internApplication(&mut resolver.*, &application))
+}
+
+pub effect fn appendCheckedModule(modules: &mut List<usize>, ordinal: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let listed = List<usize>.asSlice(&modules.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at] == ordinal {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  return run List<usize>.append(&mut modules.*, ordinal)
+}
+
+pub struct DeclarationRejectionSite {
+  pub code: RejectionCode,
+  pub module: ModuleId,
+  pub span: Span,
+  pub related: Option<RelatedSite>,
+}
+
+pub fn declarationRejectionSite(rejection: &Rejection) -> DeclarationRejectionSite {
+  let related = match &rejection.related {
+    Option<RelatedSite>.Some { value } => Option<RelatedSite>.some(RelatedSite {
+      module: ModuleId.copy(&value.module), span: value.span
+    })
+    _ => Option<RelatedSite>.none()
+  }
+  return DeclarationRejectionSite {
+    code: rejection.code, module: ModuleId.copy(&rejection.module), span: rejection.span,
+    related: move related
+  }
+}
+
+fn sameDeclarationRejection(left: &DeclarationRejectionSite, right: &DeclarationRejectionSite) -> bool {
+  if left.code != right.code || !sameSpan(left.span, right.span)
+    || !ModuleId.equals(&left.module, &right.module) {
+    return false
+  }
+  return match &left.related {
+    Option<RelatedSite>.None => match &right.related {
+      Option<RelatedSite>.None => true
+      _ => false
+    }
+    Option<RelatedSite>.Some { value: earlier } => match &right.related {
+      Option<RelatedSite>.Some {
+        value: compared
+      } => sameSpan(earlier.span, compared.span)
+        && ModuleId.equals(&earlier.module, &compared.module)
+      _ => false
+    }
+  }
+}
+
+// Whether `moved` is a refusal of another package's body moved to the call that requested it
+// (`requestedRejection`) while `own` reports that same refusal at its own site: the other package's
+// body is wrong whatever the call, so the refusal is reported once, where it is.
+fn relocatedCopy(moved: &DeclarationRejectionSite, own: &DeclarationRejectionSite) -> bool {
+  if moved.code != own.code { return false }
+  if let Option<RelatedSite>.Some {..} = &own.related { return false }
+  return match &moved.related {
+    Option<RelatedSite>.Some {value: site} => sameSpan(site.span, own.span) && ModuleId.equals(&site.module, &own.module)
+      && !ModuleId.samePackage(&moved.module, &site.module)
+    Option<RelatedSite>.None => false
+  }
+}
+
+pub effect fn appendDeclarationRejection(
+  found: &mut List<Shared<Rejection>>,
+  rejection: Shared<Rejection>
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let candidate = Shared<Rejection>.with<DeclarationRejectionSite>(&rejection, declarationRejectionSite)
+  let mut scan = usize.ZERO
+  while scan < List<Shared<Rejection>>.length(&found.*) {
+    let known = Shared<Rejection>.with<DeclarationRejectionSite>(&List<Shared<Rejection>>.asSlice(&found.*)[scan],
+      declarationRejectionSite)
+    if relocatedCopy(&candidate, &known) { return () }
+    if relocatedCopy(&known, &candidate) {
+      drop List<Shared<Rejection>>.remove(&mut found.*, scan)
+    } else {
+      scan = scan + usize.ONE
+    }
+  }
+  let listed = List<Shared<Rejection>>.asSlice(&found.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    // Unavailable answers that share an owner report that owner's same allocations, and keys that
+    // re-derive a diagnostic at one site report equal ones; each is listed once. Shared.with
+    // access is exclusive even for inspection, so recognize aliases before nesting payloads.
+    if sameAllocation<Rejection>(&rejection, &listed[at]) {
+      return ()
+    }
+    let known = Shared<Rejection>.with<DeclarationRejectionSite>(&listed[at], declarationRejectionSite)
+    if sameDeclarationRejection(&candidate, &known) {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  return run List<Shared<Rejection>>.append(&mut found.*, move rejection)
+}
+
+pub effect fn appendDeclarationAnswer(
+  found: &mut List<Shared<Rejection>>,
+  store: &mut Query<Answer, NoRejection>,
+  answer: &Shared<Result<Answer, NoRejection>>
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let reported = run reportedDiagnostics(&mut store.*, answer)
+  let listed = List<Shared<Rejection>>.asSlice(&reported)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run appendDeclarationRejection(&mut found.*, Shared<Rejection>.clone(&listed[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+struct CheckedGapSite {
+  code: GapCode,
+  module: ModuleId,
+  span: Span,
+  kind: usize,
+  declaration: Option<DeclarationId>,
+}
+
+fn checkedGapSite(gap: &BackendGap) -> CheckedGapSite {
+  return match &gap.source {
+    GapSource.Declaration { declaration, span } => {
+      let identity = DeclarationId.copyShared(&declaration)
+      return CheckedGapSite {code: gap.code, module: ModuleId.copy(DeclarationId.moduleId(&identity)),
+        span: span, kind: usize.ZERO, declaration: Option<DeclarationId>.none()}
+    }
+    GapSource.Diagnostic { diagnostic } => {
+      let module = Shared<Rejection>.with<ModuleId>(&diagnostic,
+        |value: &Rejection| -> ModuleId { return ModuleId.copy(&value.module) })
+      return CheckedGapSite {code: gap.code, module: move module, span: BackendGap.span(gap),
+        kind: usize.ZERO, declaration: Option<DeclarationId>.none()}
+    }
+    GapSource.Generated { declaration } => {
+      let identity = DeclarationId.copyShared(&declaration)
+      return CheckedGapSite {code: gap.code, module: ModuleId.copy(DeclarationId.moduleId(&identity)),
+        span: Span.make(usize.ZERO, usize.ZERO), kind: usize.ONE,
+        declaration: Option<DeclarationId>.some(move identity)}
+    }
+    GapSource.Relative { declaration, location } => {
+      let identity = DeclarationId.copyShared(&declaration)
+      return CheckedGapSite {code: gap.code, module: ModuleId.copy(DeclarationId.moduleId(&identity)),
+        span: Span.make(location.start, location.end), kind: 2,
+        declaration: Option<DeclarationId>.some(move identity)}
+    }
+  }
+}
+
+// A body and its MIR/callers can forward one coverage failure. Copy its primary site before
+// inspecting another gap: their source diagnostic handles can alias the same Shared allocation.
+pub effect fn appendDeclarationGap(
+  found: &mut List<Shared<BackendGap>>,
+  gap: Shared<BackendGap>
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let site = Shared<BackendGap>.with<CheckedGapSite>(&gap, checkedGapSite)
+  let listed = List<Shared<BackendGap>>.asSlice(&found.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let same = Shared<BackendGap>.with<bool>(
+      &listed[at],
+      |known: &BackendGap| -> bool {
+        let earlier = checkedGapSite(known)
+        if earlier.code != site.code || earlier.kind != site.kind
+          || !sameSpan(earlier.span, site.span) || !ModuleId.equals(&earlier.module, &site.module) {
+          return false
+        }
+        if earlier.kind == usize.ZERO { return true }
+        return match &earlier.declaration {
+          Option<DeclarationId>.Some { value: left } => match &site.declaration {
+            Option<DeclarationId>.Some { value: right } => DeclarationId.equals(&left, &right)
+            _ => false
+          }
+          _ => false
+        }
+      }
+    )
+    if same {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  return run List<Shared<BackendGap>>.append(&mut found.*, move gap)
+}
+
+// Typed Body and MIR refusals preserve the existing named backend-gap classification. Every
+// other diagnostic remains a source rejection; no failed query is treated as a checked body.
+pub effect fn appendCheckedAnswer(
+  found: &mut List<Shared<Rejection>>,
+  gaps: &mut List<Shared<BackendGap>>,
+  store: &mut Query<Answer, NoRejection>,
+  declaration: &DeclarationId,
+  answer: &Shared<Result<Answer, NoRejection>>
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let reported = run reportedDiagnostics(&mut store.*, answer)
+  let listed = List<Shared<Rejection>>.asSlice(&reported)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run appendCheckedRejection(&mut found.*, &mut gaps.*, declaration, Shared<Rejection>.clone(&listed[at]))
+    at = at + usize.ONE
+  }
+  if listed.length > usize.ZERO {
+    return ()
+  }
+  let gap = Shared<
+    Result<Answer, NoRejection>
+  >.with<Option<Shared<BackendGap>>>(answer, answerBackendGap)
+  if let Option<Shared<BackendGap>>.Some { value } = move gap {
+    return run appendDeclarationGap(&mut gaps.*, move value)
+  }
+  return ()
+}
+
+// A typed Body or MIR refusal keeps its named backend-gap classification; every other diagnostic
+// stays a source rejection.
+effect fn appendCheckedRejection(
+  found: &mut List<Shared<Rejection>>,
+  gaps: &mut List<Shared<BackendGap>>,
+  declaration: &DeclarationId,
+  value: Shared<Rejection>
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let code = Shared<
+    Rejection
+  >.with<RejectionCode>(
+    &value,
+    |diagnostic: &Rejection| -> RejectionCode {
+      return diagnostic.code
+    }
+  )
+  let gap = BackendGap.forRejection(code)
+  if let Option<GapCode>.Some { value: reason } = move gap {
+    return run appendDeclarationGap(
+      &mut gaps.*,
+      run Shared<
+        BackendGap
+      >.make(
+        BackendGap.fromRejection(
+          reason,
+          &run Types.internDeclaration(DeclarationId.copy(declaration)),
+          &value
+        )
+      )
+    )
+  }
+  return run appendDeclarationRejection(&mut found.*, move value)
+}
+
+impl Copy for HeaderSyntax {}
+
+pub struct PathSyntax {
+  pub segments: List<Bytes>,
+  pub span: Span,
+  pub valid: bool,
+}
+
+pub struct WrittenSignature {
+  pub foreign: bool,
+  pub isVariadic: bool,
+  pub generics: Range,
+  pub parameters: List<HirId>,
+  // The whole authored `name: Type` span of each accepted parameter, parallel to `parameters`.
+  pub parameterSpans: List<Span>,
+  // The authored parameter named `self`; only its outer borrow supplies a result default.
+  pub receiver: Option<usize>,
+  pub result: Option<HirId>,
+  pub failures: HirRef,
+  pub requirements: HirRef,
+  pub environment: RangeRef,
+  // The written `where` clauses; only `provides` clauses are supported.
+  pub constraints: Range,
+  pub isEffect: bool,
+  /// Whether the function is written `test fn` or `bench fn`.
+  pub isTest: bool,
+  /// Whether the function is written `bench fn`, so failure advice names `bench effect fn`.
+  pub isBench: bool,
+  pub isUnsafe: bool,
+  pub isStatic: bool,
+  pub isPublic: bool,
+  pub supported: bool,
+  pub span: Span,
+  // The original indices of `static` parameters of a runtime function.
+  pub staticSlots: List<usize>,
+  // The first rejected header form: an invalid `test` entry (TEST-001) or a `mut` parameter of an
+  // interface or service operation (OWN-005).
+  pub headerConflict: Option<HeaderConflict>,
+}
+
+pub struct HeaderConflict {
+  pub code: RejectionCode,
+  pub span: Span,
+  // The catalog template's filled holes, when the conflict names a value.
+  pub arguments: List<MessageArgument>,
+}
+
+// The diagnostic that reports `conflict` in `module`.
+pub effect fn headerRejection(module: &ModuleId, conflict: &HeaderConflict) -> Shared<Rejection> ! OutOfMemoryError ? &mut Allocator {
+  let mut diagnostic = run makeRejection(conflict.code, module, conflict.span)
+  let filled = List<MessageArgument>.asSlice(&conflict.arguments)
+  let mut hole = usize.ZERO
+  while hole < filled.length {
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(Bytes.asSlice(&filled[hole].name)),
+      value: run Bytes.copy(Bytes.asSlice(&filled[hole].value))})
+    hole = hole + usize.ONE
+  }
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// A header conflict that fills no template hole.
+pub fn conflictAt(code: RejectionCode, span: Span) -> Option<HeaderConflict> {
+  return Option<HeaderConflict>.some(HeaderConflict {code: code, span: span, arguments: List<MessageArgument>.make()})
+}
+
+// A header conflict that fills one template hole.
+pub effect fn namedHeaderConflict(code: RejectionCode, span: Span, hole: &[u8], value: &[u8]) -> Option<HeaderConflict>
+! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = List<MessageArgument>.make()
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(hole), value: run Bytes.copy(value)})
+  return Option<HeaderConflict>.some(HeaderConflict {code: code, span: span, arguments: move arguments})
+}
+
+// A `static fn` header that also asks for runtime work, `restriction` (SEM0176): static evaluation
+// runs no Effect, unsafe operation, typed failure or service (STATIC-001).
+pub effect fn staticRestriction(span: Span, restriction: &[u8]) -> Option<HeaderConflict> ! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = List<MessageArgument>.make()
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"8")})
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"restriction"), value: run Bytes.copy(restriction)})
+  return Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.StaticPhaseViolation, span: span, arguments: move arguments})
+}
+
+// A C-linked function header that retains Silk-only `restriction` syntax (SEM0188), worded for an
+// imported foreign declaration or an `export "C"` definition.
+pub effect fn linkageRestriction(span: Span, imported: bool, restriction: &[u8]) -> Option<HeaderConflict>
+! OutOfMemoryError ? &mut Allocator {
+  let mut declaration = b"A foreign function declaration"
+  if !imported { declaration = b"An `export \"C\"` function" }
+  let mut arguments = List<MessageArgument>.make()
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"declaration"), value: run Bytes.copy(declaration)})
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"restriction"), value: run Bytes.copy(restriction)})
+  return Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.ForeignDeclarationRestriction, span: span, arguments: move arguments})
+}
+
+// Why a generic export cannot be variadic: each instantiation has its own C thunk, and a thunk
+// passes fixed lanes only.
+pub fn variadicGenericRestriction() -> &'static [u8] {
+  return b"`...` beside type parameters; a variadic export has one C entry"
+}
+
+// Whether a written generic list declares a type parameter. An `export "C"` function that does is
+// a generic export: it publishes no symbol, and each instantiation whose address is taken has its
+// own C thunk (FFI-012).
+pub fn declaresTypeParameter(hir: &Module, generics: Range) -> bool {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    if let Node.TypeParameter {..} = Module.node(hir, Module.child(hir, generics, at)) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The first lifetime or row parameter of a written generic list, which no linked function admits.
+pub fn proofOnlyParameter(hir: &Module, generics: Range) -> Option<HirId> {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    let parameter = Module.child(hir, generics, at)
+    let typed = match Module.node(hir, parameter) { Node.TypeParameter {..} => true _ => false }
+    if !typed { return Option<HirId>.some(parameter) }
+    at = at + usize.ONE
+  }
+  return Option<HirId>.none()
+}
+
+// Whether the function header at `header` is a generic export.
+pub fn genericExportHeader(hir: &Module, header: HirId) -> bool {
+  if let Node.FunctionHeader {contract, linkage, ..} = Module.node(hir, header) {
+    if !linkage.present { return false }
+    if let Node.Linkage {direction, ..} = Module.node(hir, linkage.id) {
+      if direction != LinkageDirection.Export { return false }
+      if let Option<HirContract>.Some {value: HirContract {generics, ..}} = Module.contractOf(hir, contract) {
+        return declaresTypeParameter(hir, generics)
+      }
+    }
+  }
+  return false
+}
+
+// A variadic Silk function, which has no C caller to pass a variadic tail (SEM0188).
+pub effect fn variadicRestriction(span: Span) -> Option<HeaderConflict> ! OutOfMemoryError ? &mut Allocator {
+  let mut arguments = List<MessageArgument>.make()
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"declaration"), value: run Bytes.copy(b"A Silk function")})
+  run List<MessageArgument>.append(&mut arguments, MessageArgument {name: run Bytes.copy(b"restriction"),
+    value: run Bytes.copy(b"`...`; only an `unsafe extern \"C\"` declaration or an `export \"C\"` function takes C variadic arguments")})
+  return Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.ForeignDeclarationRestriction, span: span, arguments: move arguments})
+}
+
+pub union Binder {
+  Type {pub name: Bytes, pub value: Interned<Type>},
+  Lifetime {pub name: Bytes, pub value: Interned<Lifetime>},
+  // `bound` is the row supplied by an application; an unapplied binder stays a row parameter.
+  Row {pub name: Bytes, pub value: RowParameter, pub bound: Option<Interned<Row>>},
+}
+
+pub struct LifetimeElision {
+  pub owner: Option<DeclarationId>,
+  pub nextOrdinal: usize,
+  pub output: bool,
+  pub resultDefault: Option<Interned<Lifetime>>,
+  pub generated: List<Interned<Lifetime>>,
+  // Inside a callable contract, an omitted input lifetime is a fresh invocation binder.
+  pub invocation: bool,
+  // Inside an invocation-quantified contract, a further quantifier is outside the language.
+  pub nested: bool,
+  // Maps a provisional invocation ordinal to its canonical first-occurrence ordinal; empty when
+  // the provisional numbering is already canonical.
+  pub renumber: List<usize>,
+  // Set only while resolving the `Effect` result of a function with no parameters, whose omitted
+  // environment is `'static`. The first environment elided under it consumes it.
+  pub staticEnvironment: bool,
+  // Arguments for declaration-owned elided lifetimes in an instantiated signature.
+  pub supplied: Option<List<Argument>>,
+  // Bounds already declared by the enclosing generic declaration while resolving its body.
+  pub assumptions: Option<List<Constraint>>,
+  // Set only while a declaration resolves its own bounds: the bounds of a declaration applied
+  // there wait for all of its premises, inline or in its `where` clause, in any order.
+  pub deferred: Option<List<DeferredBounds>>,
+  // Nonzero where an omitted lifetime is an error that must be written (SEM0210, this template):
+  // a declaration's field or header bound, an alias target, or an implementation head and its
+  // bounds (LIFE-003).
+  pub required: u8,
+  // Set while a named function's signature resolves (LIFE-003): a nominal type that holds borrows
+  // shows each lifetime, written or `'_` (SEM0210 template 9).
+  pub paths: bool,
+}
+
+// An applied declaration's bounds, proved once the enclosing declaration's premises are complete.
+pub struct DeferredBounds {
+  pub bounds: List<Constraint>,
+  pub module: ModuleId,
+  pub span: Span,
+}
+
+// Proves the applied bounds deferred while a declaration resolved its own bounds, under all of them.
+pub effect fn proveDeferredBounds(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  elision: &mut LifetimeElision,
+  constraints: &List<Constraint>,
+) -> Option<Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if let Option<List<DeferredBounds>>.Some {value: pending} = &elision.deferred {
+    let waiting = List<DeferredBounds>.asSlice(&pending)
+    let mut at = usize.ZERO
+    while at < waiting.length {
+      let failure = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, constraints,
+        List<Constraint>.asSlice(&waiting[at].bounds), &waiting[at].module, waiting[at].span, RegionProof.Typing)
+      if let Option<Shared<Rejection>>.Some {value} = move failure { return Option<Shared<Rejection>>.some(move value) }
+      at = at + usize.ONE
+    }
+  }
+  elision.deferred = Option<List<DeferredBounds>>.none()
+  return Option<Shared<Rejection>>.none()
+}
+
+pub struct Channels {
+  pub failure: Interned<Type>,
+  pub requirements: Interned<Row>,
+}
+
+pub struct TypeSelection {
+  pub resolved: Option<Interned<Type>>,
+  pub rejected: Option<Shared<Rejection>>,
+}
+
+pub struct ResolvedAnnotation {
+  pub id: HirId,
+  pub result: Result<Interned<Type>, Shared<Rejection>>,
+}
+
+pub struct ImportSelection {
+  pub module: Option<usize>,
+  pub declaration: Option<usize>,
+  pub rejected: Option<Shared<Rejection>>,
+}
+
+pub struct SelectedDeclaration {
+  pub module: usize,
+  pub ordinal: usize,
+}
+
+// Written slots retain their authentic owner when a member opens enclosing binders.
+pub union CallPrefixSlot {
+  Type {pub value: Interned<Type>},
+  Lifetime {pub value: Interned<Lifetime>},
+  Row {pub value: RowParameter},
+}
+
+pub struct CallTarget {
+  pub foreign: bool,
+  pub declaration: DeclarationId,
+  pub isPublic: bool,
+  pub signature: Shared<Result<Answer, NoRejection>>,
+  pub explicit: List<Argument>,
+  // The authentic binder each argument fixes; unwritten leading lifetimes are inferred.
+  pub explicitSlots: List<CallPrefixSlot>,
+  pub prefixOwner: Option<Interned<DeclarationId>>,
+  pub prefixLifetimes: usize,
+  pub scopeArguments: List<Argument>,
+  pub inferOwner: bool,
+  pub explicitSyntax: bool,
+}
+
+// A receiver call's adapted receiver, supplied as argument zero of its selected declaration. A
+// bound method value supplies only the receiver and leaves the other parameters open (CALL-003).
+pub struct CallReceiver {
+  pub node: BodyNodeId,
+  pub pass: BodyReceiverPass,
+  pub subject: HirId,
+  pub memberSpan: Span,
+  pub bound: bool,
+  // The receiver supplies the owner's binders by inference, matched as the explicit argument it
+  // stands for: the `&place` loan of an implicit borrow, or the value it takes.
+  pub open: bool,
+}
+
+// A written call prefix and its private templates for omitted body regions.
+pub struct CallPrefix {
+  pub arguments: List<Argument>,
+  pub slots: List<CallPrefixSlot>,
+  pub owner: Option<Interned<DeclarationId>>,
+  pub lifetimes: usize,
+}
+
+pub fn emptyCallPrefix() -> CallPrefix {
+  return CallPrefix {arguments: List<Argument>.make(), slots: List<CallPrefixSlot>.make(),
+    owner: Option<Interned<DeclarationId>>.none(), lifetimes: usize.ZERO}
+}
+
+// Advisory positions for selecting a named callable, separate from a concrete expected type.
+// The pending owner is the consumer call's private inference identity, never the target's.
+pub struct NamedCallableEvidence {
+  pub contract: Interned<Type>,
+  pub pending: Option<DeclarationId>,
+  /// The enclosing call, when the contract depends on binders that call infers rather than writes.
+  /// An invocation region escaping such a contract is the call's unsatisfied lifetime relation.
+  pub call: Option<Span>,
+}
+
+// A selected body's static result for one authored syntax node. The checker consumes these
+// facts; it never evaluates static work itself.
+pub union SelectionFact {
+  // A static value used at runtime at its exact type: a `let static` read or static-helper call.
+  Embedded {pub value: Interned<StaticData>, pub ty: Interned<Type>},
+  // The evaluated condition of one static conditional.
+  Condition {pub selected: bool},
+  // A `let static` statement and its value, which has no runtime local.
+  StaticBinding {pub value: Interned<StaticData>},
+  // A call to a runtime function with `static` parameters: the values the selection pass
+  // evaluated for them, at the callee's original parameter indices.
+  StaticArguments {pub slots: Shared<List<StaticSlot>>},
+  StaticFor {pub iterations: Shared<List<IterationFacts>>},
+}
+
+pub struct IterationFacts {
+  pub ordinal: usize,
+  pub calls: List<ResolvedCall>,
+}
+
+// An authored name resolves to a source function, a constant, a sealed primitive, or a selected
+// body's static fact.
+pub union ResolvedTarget {
+  Function {pub target: CallTarget},
+  Constant {pub declaration: DeclarationId, pub ty: Interned<Type>},
+  /// The constant written as the receiver of `C.m()`: the call is `m` on the constant's value.
+  ConstantReceiver {pub declaration: DeclarationId, pub ty: Interned<Type>},
+  /// An imported C static read by value, with its admitted scalar or pointer type.
+  ForeignStatic {pub declaration: DeclarationId, pub ty: Interned<Type>},
+  Intrinsic {pub member: IntrinsicMember, pub typeArguments: List<Interned<Type>>},
+  /// A sealed Effect composition intrinsic and its written type and row arguments.
+  Composition {pub operation: Composition, pub written: List<Argument>},
+  /// A sealed core storage primitive and its written type arguments.
+  Storage {pub operation: StorageOperation, pub typeArguments: List<Interned<Type>>},
+  Tuple {pub ty: Interned<Type>, pub elements: List<Interned<Type>>},
+  Selected {pub fact: SelectionFact},
+}
+
+// A selected static operation. The caller uses the contract signature, while `implementation`
+// names the concrete body required at runtime; a declared bound has no concrete body yet, and a
+// scalar intrinsic witness runs in place without one.
+pub struct OperationCall {
+  pub operation: DeclarationId,
+  pub implementation: Option<Interned<DeclarationId>>,
+  pub signature: Shared<Result<Answer, NoRejection>>,
+  pub proof: ConformanceProof,
+  pub receiver: Option<ReceiverPosition>,
+}
+
+pub struct OperatorCandidate {
+  pub contract: Interned<Type>,
+  pub provider: Interned<Type>,
+  pub operationModule: usize,
+  pub operationOrdinal: usize,
+}
+
+pub struct SelectedOperator {
+  pub contract: Interned<Type>,
+  pub provider: Interned<Type>,
+  pub call: OperationCall,
+}
+
+// Duplicate bound spellings or the same head observed from two permitted owner buckets still
+// name one supplier. Coherence of that exact goal is checked by the common proof after selection.
+pub effect fn addOperatorCandidate(
+  suppliers: &mut List<OperatorCandidate>,
+  choice: &mut CallSelection,
+  contract: &Interned<Type>,
+  provider: &Interned<Type>,
+  operationModule: usize,
+  operationOrdinal: usize,
+) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = List<OperatorCandidate>.asSlice(&suppliers.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].operationModule == operationModule && listed[at].operationOrdinal == operationOrdinal {
+      let sameContract = run Type.equalsShared(&listed[at].contract, contract)
+      let sameProvider = run Type.equalsShared(&listed[at].provider, provider)
+      if sameContract && sameProvider {
+        return ()
+      }
+    }
+    at = at + usize.ONE
+  }
+  let ordinal = List<OperatorCandidate>.length(&suppliers.*)
+  run List<OperatorCandidate>.append(
+    &mut suppliers.*,
+    OperatorCandidate {
+      contract: Interned<Type>.clone(contract),
+      provider: Interned<Type>.clone(provider),
+      operationModule: operationModule,
+      operationOrdinal: operationOrdinal,
+    },
+  )
+  CallSelection.add(&mut choice.*, ordinal)
+  return ()
+}
+
+pub struct ReceiverPosition {
+  pub ordinal: usize,
+  pub mode: BodyReceiverPass,
+}
+
+pub struct MethodSupplier {
+  pub contract: Interned<Type>,
+  pub operationModule: usize,
+  pub operationOrdinal: usize,
+  pub receiver: ReceiverPosition,
+}
+
+pub struct SelectedReceiverOperation {
+  pub contract: Interned<Type>,
+  pub call: OperationCall,
+}
+
+pub union ReceiverCallChoice {
+  Inherent {pub target: CallTarget, pub receiver: ReceiverPosition},
+  Interface {pub selected: SelectedReceiverOperation},
+}
+
+pub struct VisibleName {
+  pub module: usize,
+  pub name: Bytes,
+  pub external: bool,
+}
+
+pub struct VisibleInterface {
+  pub module: usize,
+  pub ordinal: usize,
+}
+
+pub union InherentCallChoice {
+  Missing,
+  Claimed,
+  Selected {pub target: CallTarget, pub receiver: Option<ReceiverPosition>},
+}
+
+impl Copy for ReceiverPosition {}
+
+pub union CallReference {
+  Named {pub name: Bytes},
+  // A value read with no local binding. Functions construct exact environments; constants
+  // remain available only to static bodies.
+  Unbound {pub name: Bytes},
+  Qualified {pub namespace: Bytes, pub member: Bytes, pub subjectSpan: Span, pub memberSpan: Span, pub application: HirRef},
+  NonCallable,
+  CallableValue,
+  Unsupported,
+}
+
+pub struct CallSyntax {
+  pub exactItem: bool,
+  // Value reads preserve foreign/constant admission even when qualified by a namespace or type.
+  pub value: bool,
+  pub pipeline: bool,
+  pub id: HirId,
+  pub span: Span,
+  pub reference: CallReference,
+  pub generics: HirRef,
+}
+
+pub struct ResolvedCall {
+  pub id: HirId,
+  pub result: Result<ResolvedTarget, Shared<Rejection>>,
+}
+
+pub struct PreparedBody {
+  pub block: HirId,
+  pub identity: DeclarationId,
+  pub locals: List<BodyLocal>,
+  pub contractBody: bool,
+  pub staticBody: bool,
+}
+
+pub struct QualifiedBodyName {
+  // Whether the applied qualifier names a public declaration of Intrinsic.
+  pub intrinsic: bool,
+  pub namespace: Bytes,
+  pub member: Bytes,
+  pub subjectSpan: Span,
+  pub application: Option<HirId>,
+}
+
+// The enclosing statement context an expression needs to check a block-bodied match arm: arm
+// locals join the body's locals, and return, break and continue keep their enclosing targets.
+pub struct StatementScope<'scope> {
+  pub locals: &'scope mut List<BodyLocal>,
+  pub annotations: &'scope [ResolvedAnnotation],
+  pub resultType: &'scope Interned<Type>,
+  pub loopDepth: usize,
+  pub staticBinders: &'scope [StaticRootBinder],
+  pub staticValues: &'scope [StaticBinding],
+  // Whether the expressions checked in this scope run during static evaluation, so nested match
+  // arms and value blocks keep the static body's phase rules.
+  pub staticBody: bool,
+  // The expression whose value its statement discards, if the statement is an expression
+  // statement: a `match` there is a statement whose arm blocks yield nothing.
+  pub discarded: HirRef,
+}
+
+pub struct CheckedControl {
+  pub node: BodyNodeId,
+  pub canComplete: bool,
+}
+
+// Effective bindings and exact registration for one unpublished defaults graph.
+pub struct ParameterAssembly {
+  pub parameters: List<DeclarationId>,
+  pub bindings: List<ProfileEntry>,
+}
+
+pub fn replaceAssemblyValues(assembly: &mut ParameterAssembly, values: List<ProfileEntry>) -> () {
+  assembly.*.bindings = move values
+  return ()
+}
+
+// Deferred identity transitions keep source loading at its demand boundary. Each intermediate
+// observation matters: deleting and reintroducing a declaration cannot revive its old handle.
+pub struct DeclarationChange {
+  pub module: ModuleId,
+  pub ordinal: usize,
+  pub previous: Option<ModuleIndex>,
+  pub observations: List<Observation>,
+}
+
+// A body's source dependency already consumed by the current provider. The interval is
+// authenticated by SourceSyntax, not inferred from the provider's own declaration.
+pub struct BodySourceSnapshot {
+  pub module: ModuleId,
+  pub first: usize,
+  pub last: usize,
+  pub answer: Shared<Result<SourceResult, NoRejection>>,
+}
+
+pub struct Resolver {
+  pub erasures: ErasureIndex,
+  pub erasureDispatchers: List<DiscoveryDispatch>,
+  pub checkedDispatchers: List<CheckedDispatch>,
+  pub checkScopes: List<CheckScope>,
+  pub activeCheckScope: usize,
+  pub checkingMembers: bool,
+  pub recordingDiscovery: bool,
+  pub proofMirs: List<ProofMir>,
+  pub proofMirUnits: InternIndex,
+  pub checkMemberSets: List<List<ErasureFact>>,
+  pub effectDispatchers: List<ErasedRecursion.Operation>,
+  pub erasureRound: ErasureRound,
+  pub membershipInputs: List<usize>,
+  pub ambientConsumers: InternIndex,
+  pub ambientQueries: List<Word>,
+  pub writtenErasure: bool,
+  // Modules with a NonParking obligation on an Effect that still needs a provider.
+  pub nonParkingCallers: List<usize>,
+  pub checkImageScope: ContentHash,
+  // Whether a module the store's load read writes an erased type (`Semantic.offerErasure`).
+  pub loadedErasure: bool,
+  pub typeErasure: ErasedTypeMemo,
+  pub closedErasures: bool,
+  // The lambdas whose enclosing body is checking them, with the signatures that check resolved,
+  // innermost last (ANON-CALLABLE-002).
+  pub lambdas: List<ActiveLambda>,
+  pub staticDemandDepth: usize,
+  pub staticDemandLimit: usize,
+  // The static results being evaluated, outermost first, as module ordinal, declaration ordinal
+  // and selected application. A call that reaches one of them again runs in its caller's machine,
+  // which reports the cycle.
+  pub staticResultsInFlight: List<usize>,
+  // The receiver call whose static arguments the body being checked found no selection for: its
+  // Body query selects again with it (`resolveBody`).
+  pub discoveredStaticCall: Option<StaticCallHint>,
+  // The field read whose subject is the index expression being checked next, which an
+  // `Intrinsic.Rows` subject answers as one place (INDEX-002), and whether that subject did.
+  pub rowFieldSite: Option<RowFieldSite>,
+  pub rowFieldPlaced: bool,
+  pub source: SourceIndex,
+  // Whether this process will revise sources, independently of disk-cache recording.
+  pub revisable: bool,
+  pub baseTarget: MachineTarget,
+  pub target: MachineTarget,
+  pub initialProfile: Option<FinalProfile>,
+  pub assemblyFacts: Option<InitialProfile>,
+  pub parameterAssembly: Option<ParameterAssembly>,
+  pub nextAssembly: usize,
+  /// The composition's execution-storage component, which suspendable frames use (SUSP-005).
+  pub executionStorage: Option<ExecutionStorage>,
+  pub traceDirective: Option<TraceDirective>,
+  /// The composition's explicit retention roots (ARTIFACT-003), in manifest order.
+  pub retention: List<RetentionRoot>,
+  /// The target's support modules, whose C exports root every executable (see `selectSupport`).
+  pub support: List<ModuleId>,
+  /// The support modules whose C exports are link symbols only, not host exports.
+  pub linkOnlySupport: List<ModuleId>,
+  /// Whether checked bodies keep the names they resolve for an editor (`selectEditorTables`).
+  pub editorTables: bool,
+  /// The literal ranges static evaluations linked to fields while the current constant is
+  /// evaluated; filled only with `editorTables`.
+  pub staticLinks: Option<List<StaticExecution.EditorLink>>,
+  /// The discovery root of a test build and its package-relative module directory (TEST-003).
+  pub discovery: Option<Discovery>,
+  /// The dependency names of every package in the build, which turn import paths into modules.
+  pub packages: PackageGraph,
+  pub profiles: List<FinalProfile>,
+  pub profileSlot: usize,
+  pub mirValues: List<MirFunction>,
+  // The `mirValues` index of each function the last whole-program walk emitted, in walk order.
+  pub emittedMir: List<usize>,
+  // What each call in the root package asked the build walk to generate (`selectCosts`), and the
+  // static evaluation steps the process ran.
+  pub costs: CostTable,
+  // Which lowered functions `releaseStaleMir` emptied, by index, and how many.
+  pub mirReleased: List<bool>,
+  pub mirReleasedCount: usize,
+  // Whether a direct build's walk keeps of each spliced copy it emitted only its residue
+  // (`MirInline.residue`), and which `mirValues` are such copies, by index.
+  pub trimsEmitted: bool,
+  pub splicedCopies: List<bool>,
+  // The coalesced copy of each un-inlined function a caller read for inlining (`coalescedMir`):
+  // its position in `coalescedValues` by `mirValues` index, or `usize.MAX`. Every caller that
+  // inlines a function reads the same copy, so it is made once.
+  pub coalescedIndex: List<usize>,
+  pub coalescedValues: List<MirFunction>,
+  pub layoutValues: List<Shared<BackendLayout>>,
+  // The instance-text content of each layout value, encoded on first supply; empty until then.
+  pub layoutContents: List<Bytes>,
+  // The C objects the current artifact build defines for its exported statics (FFI-005).
+  pub exportedObjects: List<ExportedObject>,
+  // The C declaration each exported function root would print as an import of its own symbol.
+  pub exportedFunctions: List<LlvmCode.Declaration>,
+  pub emissionInputs: List<EmissionInputs>,
+  pub llvmInputs: List<LlvmInput>,
+  pub llvmValues: List<InstanceDefinition>,
+  // Whether an assembled module is also split into codegen units.
+  pub codegenUnits: bool,
+  pub packageCodegen: List<PackageSettings>,
+  pub programDebug: bool,
+  // Whether LLVM text is shaped for an unoptimized compile (`LlvmCode.Writer.fastPath`).
+  pub fastPathIr: bool,
+  // Whether each emitted function marks its record in the table of executed functions as it
+  // starts, which a test runner reads to learn what each test ran (`selectCoverage`).
+  pub coverage: bool,
+  // Whether lowering inlines callees into their callers (`inlineCalls`, by `inlineRule`): an
+  // optimized build without line tables (`selectInlining`).
+  pub inlining: bool,
+  // Whether instances lower to wasm fragments for the direct backend (`WasmLower`) instead of
+  // LLVM text, whether its memory is shared between threads, and whether an optimized build
+  // optimizes them for size rather than speed.
+  pub direct: bool,
+  pub threads: bool,
+  pub directSize: bool,
+  // Whether lowered functions carry their source lines (`MirFunction.lines`) for line tables.
+  pub lineTables: bool,
+  // Where each declaration of the modules such a build emits starts (`collectedOrigins`), by
+  // module: the tables a cache offered (`Semantic.offerOrigins`) and those made since.
+  pub declarationOrigins: Origins,
+  // Whether an assembled module is split into packs for a cache to store beside its image
+  // (`Semantic.offerPacks`), the bodies offered, and the packs of the image an adoption read that
+  // claimed one.
+  pub packing: bool,
+  pub offeredBodies: List<BuildRecord.PackBody>,
+  pub packs: List<HeldPack>,
+  // Each interned table below keeps its lookup beside it, so interning never scans the table.
+  pub modules: List<ModuleId>,
+  pub moduleLookup: InternIndex,
+  pub declarations: DeclarationTable.DeclarationTable,
+  pub sourceInputs: SourceInputs,
+  // The inputs of an adopted image's unchanged files that adoption left unplaced
+  // (`unplacedInput`), by stable key, so a check that runs again reads their recorded values
+  // instead of capturing them (`carriedInput`).
+  pub carried: CarriedInputs,
+  pub declarationChanges: List<DeclarationChange>,
+  pub names: StringTable,
+  pub applications: List<Interned<Type>>,
+  pub applicationLookup: InternIndex,
+  // Types interned up to lifetime erasure. Layout and PhaseOnly keys name a type by its position
+  // here, since neither answer depends on a region.
+  pub erasedTypes: List<Interned<Type>>,
+  pub erasedTypeLookup: InternIndex,
+  // Every handle already interned there, by allocation address. Each entry holds its handle, so
+  // an address names one live allocation for as long as the resolver.
+  pub erasedHandles: List<ErasedHandle>,
+  pub erasedHandleLookup: InternIndex,
+  // Header fingerprints of signature content, by module, declaration and source revision.
+  pub headerFingerprints: List<HeaderFingerprint>,
+  pub headerFingerprintLookup: InternIndex,
+  // Whether each static function's body reads its argument values, by module, declaration and
+  // source revision.
+  pub staticReads: List<StaticReads>,
+  pub staticReadsLookup: InternIndex,
+  // Per module, family selector and source revision: declaration ordinals or names a whole-module
+  // scan found, so a query asked once per type or per call does not rescan the module.
+  pub moduleScans: List<ModuleScan>,
+  pub moduleScanLookup: InternIndex,
+  pub backendInstances: List<BackendInstance>,
+  // The modules, by ordinal, whose source the loader read and found to declare no foreign claim
+  // (`claimsForeignSymbols`), so `foreignClaims` need not read them. Cleared on a new revision.
+  pub claimFree: List<bool>,
+  pub backendInstanceLookup: InternIndex,
+  // Semantic applications of selected bodies; a Body key's member is one plus this index.
+  pub originEvidence: List<CallableOrigin.Producer>,
+  pub originPlans: List<CallableOrigin.Plan>,
+  pub selectedApplications: List<Application>,
+  pub selectedApplicationLookup: InternIndex,
+  pub llvmInputLookup: InternIndex,
+  pub keys: List<ScopedKey>,
+  pub keyLookup: InternIndex,
+  // The origin keys scoped keys name by `OriginContext.slot`, interned.
+  pub origins: List<Key>,
+  pub originLookup: InternIndex,
+  // The request-selected application module ordinal, or MAX when no binding was supplied.
+  pub currentApplication: usize,
+  pub active: List<Word>,
+  // What the units of a revisable store consumed. A one-shot store records nothing into it.
+  pub graph: DependencyGraph,
+  // Demands, memo hits among them, and units run, counted in every store.
+  pub demands: usize,
+  pub hits: usize,
+  pub runs: usize,
+  // Query lifecycle events, recorded only by a traced store; every demand, hit included, adds one.
+  pub tracing: bool,
+  pub events: List<Event>,
+  // Why each outdated unit failed verification while the store is traced: the unit, then the
+  // dependee that changed.
+  pub staleCauses: List<StaleCause>,
+  // Never published; separates nested inference transactions within this resolver.
+  pub nextInferenceId: usize,
+  // Set while a section's arguments are checked: the region check does not relate a section's bound
+  // regions to its captured loans, so caller-local invariant regions stay exact there.
+  pub exactLocalRegions: bool,
+  // The checking frame of each body being checked, innermost last.
+  pub bodies: List<BodyFrame>,
+  // Where a command-line build reports how far checking and emission have come; off otherwise.
+  pub progress: Progress,
+  // Whether lowered MIR is checked for uses after drop before it is stored. Only tests and CI
+  // turn it on: a defect it finds is a compiler bug, never a verdict on the program.
+  pub verifyMir: bool,
+  // The module check unit whose root demands and reads are recorded while no provider runs, or
+  // `usize.MAX`. A provider's own unit records its demands as usual.
+  pub rootRecorder: usize,
+  // The unit run in progress, numbered by `runs` when it began; zero while no unit runs.
+  pub currentRun: usize,
+  pub bodySource: Option<BodySourceSnapshot>,
+  // Each function body's resolved annotations and calls (`Family.BodyFacts`), until its checking
+  // takes them, and its slot here by dense declaration handle, or `usize.MAX`. A rerun refills its
+  // declaration's slot.
+  pub bodyFacts: List<Option<BodyFacts>>,
+  pub bodyFactsSlots: List<usize>,
+  // The implied-bound walks shared by every unit of this revision (`signatureImpliedBounds`), by
+  // signature address, owing and request scope, and the revision they belong to. An update drops
+  // them with the answers they read.
+  pub impliedWalks: List<ImpliedWalk>,
+  pub impliedLookup: InternIndex,
+  pub impliedRevision: u32,
+  // Each declaration's successful `templateBinders`, kept only while the store is never revised and
+  // no unit records its reads, when building them again reads nothing a later unit could observe.
+  pub templateBinderSets: List<TemplateBinders>,
+  pub templateBinderLookup: InternIndex,
+  // The walks of the unit runs in progress whose demand path a walk may read, innermost last. Each
+  // run reads only its own and drops them when it ends.
+  pub runWalks: List<ImpliedWalk>,
+  // How many running units' answers depend on more of the demand path than their own scoped key:
+  // static-if conditions, callable origins and their transactions, and applied bodies.
+  pub pathFrames: usize,
+  // How many answers read the demand path itself (cycle answers, active producer checks); a walk
+  // that met one is not shared.
+  pub pathReads: usize,
+}
+
+// One implied-bound walk: the run that made it (zero when shared), the request scope it ran under,
+// the signature it read, retained so its address names that signature while the walk is kept,
+// whether a call owes the bounds, what the walk found, and the answer edges and graph records its
+// unit made, which a unit reusing the walk makes again.
+// The binders `templateBinders` built for one declaration, by module ordinal and position: its
+// owner and, per binder, its kind (0 row, 1 type, 2 lifetime), name and parameter ordinal.
+pub struct TemplateBinders {
+  pub module: usize,
+  pub ordinal: usize,
+  pub owner: Option<DeclarationId>,
+  pub kinds: List<u8>,
+  pub names: List<Bytes>,
+  pub ordinals: List<usize>,
+}
+
+pub struct ImpliedWalk {
+  pub unitRun: usize,
+  pub application: usize,
+  pub profile: usize,
+  pub signature: Shared<Result<Answer, NoRejection>>,
+  pub owed: bool,
+  pub bounds: List<Constraint>,
+  pub dependencies: List<Dependency>,
+  pub recorded: List<Dependee>,
+}
+
+// One body being checked. Its channels are what a `run` or `fail` in the body may use (EFF-006,
+// FAIL-003); an `effect {}` block without an expected contract derives them from its body instead
+// (EFF-002, EFF-011).
+pub struct BodyFrame {
+  /// Whether the body is an `effect fn`; only such a body may `fail` (FAIL-002).
+  pub isEffect: bool,
+  /// Whether the body is a `test fn`, so failure advice names `test effect fn`.
+  pub isTest: bool,
+  pub failure: Interned<Type>,
+  pub requirements: Interned<Row>,
+  pub derived: Option<DerivedChannels>,
+  pub occurrences: List<StaticIteration>,
+  pub staticApplication: Option<Application>,
+  pub staticPrefixes: List<List<StaticPrefixWork>>,
+  /// Diagnostics a recovering construct reported before checking went on. Every one belongs to a
+  /// body that fails: the construct that recorded it still fails its own check.
+  pub recovered: List<Shared<Rejection>>,
+  /// The statements of this body that failed and were recovered past. A binder inside one has no
+  /// local, and a read of it fails as `UnavailableBinding` instead of reporting a cascade.
+  pub failedStatements: List<FailedStatement>,
+  /// The calls of this body whose result-only binder shortened to its outlives bound
+  /// (`outlivesShortenedBinders`). Their binding is admitted only when the borrow check proves the
+  /// whole body; otherwise each call keeps its unshortened bound refusal (SEM0212).
+  pub shortened: List<Span>,
+  /// A declaration body's own signature, whose implied bounds the region checks of its anonymous
+  /// bodies assume (`rootBodySignature`); none for every other frame.
+  pub signature: Option<Shared<Result<Answer, NoRejection>>>,
+  /// Whether this frame begins a body of its own: a declaration's body or a static root. A frame
+  /// nested in it (a callable literal, an Effect block) reads its failed statements; a frame of
+  /// another body pushed above it never does.
+  pub root: bool,
+  /// The operand of the `run` being checked in this frame, if any: a call at it is consumed in
+  /// place, so its Effect never outlives the call (`runsInPlace`).
+  pub runOperand: Option<HirId>,
+  /// A declaration body's own source, where a diagnostic finds the spelling of a type parameter
+  /// (`spellParameters`); none for every other frame.
+  pub naming: Option<AuthoredCursor>,
+}
+
+// A recovered statement's module and source span.
+pub struct FailedStatement {
+  pub module: ModuleId,
+  pub span: Span,
+}
+
+// What one deriving `effect {}` body returns, fails with and runs.
+pub struct DerivedChannels {
+  pub returns: List<Interned<Type>>,
+  // The type of each `fail` operand, as written.
+  pub failed: List<Interned<Type>>,
+  // Every failure member from `fail` and `run` sites.
+  pub failures: List<Interned<Type>>,
+  pub requirements: Row,
+}
+
+// Whether the selected target and profile admit an architecture operation (SIMD-007), read for a
+// check of `module`. Without a selected profile only the architecture is checked; the backend
+// never runs without one.
+pub effect fn archAdmitted(resolver: &mut Resolver, module: &ModuleId, signature: CheckedIntrinsic.ArchSignature, listed: &[Bytes]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if !same(resolver.target.architecture(), signature.architecture) { return false }
+  if featureEnabled(&resolver.target, listed, signature.feature) { return true }
+  return run profileFeature(&mut resolver.*, module, signature.feature)
+}
+
+// Whether the selected profile enables `feature`, read for a check of `module`; true when no
+// profile is selected.
+pub effect fn profileFeature(resolver: &mut Resolver, module: &ModuleId, feature: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  run recordProfileRead(&mut resolver.*, module, b"set:", b"cpu-features")
+  let mut facts = Option<&InitialProfile>.none()
+  if let Option<&FinalProfile>.Some {value} = move selectedProfile(&resolver.*) {
+    facts = Option<&InitialProfile>.some(FinalProfile.facts(value))
+  } else if let Option<InitialProfile>.Some {value} = &resolver.assemblyFacts {
+    facts = Option<&InitialProfile>.some(&value)
+  }
+  return match move facts {
+    Option<&InitialProfile>.Some {value} => match move InitialProfile.contains(value, b"cpu-features", feature) {
+      Option<bool>.Some {value: enabled} => enabled
+      Option<bool>.None => false
+    }
+    Option<&InitialProfile>.None => true
+  }
+}
+
+pub fn selectedProfile<'a>(resolver: &'a Resolver) -> Option<&'a FinalProfile> {
+  if resolver.profileSlot == usize.ZERO || resolver.profileSlot == usize.MAX {
+    return Option<&FinalProfile>.none()
+  }
+  if resolver.profileSlot == usize.ONE {
+    return match &resolver.initialProfile {
+      Option<FinalProfile>.Some {value} => Option<&FinalProfile>.some(&value)
+      Option<FinalProfile>.None => Option<&FinalProfile>.none()
+    }
+  }
+  let profiles = List<FinalProfile>.asSlice(&resolver.profiles)
+  let index = resolver.profileSlot - 2
+  if index < profiles.length {
+    return Option<&FinalProfile>.some(&profiles[index])
+  }
+  return Option<&FinalProfile>.none()
+}
+
+pub effect fn sameStoredProfile(resolver: &Resolver, candidate: &FinalProfile, slot: usize) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if slot == usize.ONE {
+    if let Option<FinalProfile>.Some {value: initial} = &resolver.initialProfile {
+      return run FinalProfile.sameIdentity(&initial, candidate)
+    }
+    return false
+  }
+  let known = List<FinalProfile>.asSlice(&resolver.profiles)
+  let index = slot - 2
+  if index < known.length {
+    return run FinalProfile.sameIdentity(&known[index], candidate)
+  }
+  return false
+}
+
+pub struct Running<'a, 'b> {
+  pub resolver: &'a mut Resolver,
+  pub query: &'b mut Query<Answer, NoRejection>,
+  pub key: Word,
+  pub base: usize,
+  /// The open body frames when this query began; any failed exit restores them.
+  pub bodies: usize,
+  /// The enclosing unit run, and how many implied-bound walks it held, restored on any exit.
+  pub outerRun: usize,
+  pub walks: usize,
+  /// Whether this unit counts in `pathFrames`.
+  pub pathFrame: bool,
+  pub clock: QueryClock,
+  pub traced: Tracing.QueryMark,
+  pub bodySource: Option<BodySourceSnapshot>,
+}
+
+/// The demand counters of one store, and its graph's counters when it records a graph.
+pub struct Statistics {
+  /// Every demand of a unit, memo hits included.
+  pub demands: usize,
+  /// The demands a completed answer served.
+  pub hits: usize,
+  /// The units run.
+  pub runs: usize,
+  /// The completed answers the store holds.
+  pub answers: usize,
+  /// The lowered MIR functions the store holds and has not released.
+  pub mirFunctions: usize,
+  /// The graph recorded for persistent caching or source revisions; a transient store has none.
+  pub graph: Option<GraphCounters>,
+}
+
+// A build whose walk copies of the process shared, as `buildFrom` takes it.
+pub struct UnrecordedBuild {
+  pub module: ModuleId,
+  pub runtimeSelected: bool,
+  pub roots: List<BuildRoot>,
+  pub entrySpan: Span,
+  pub closureNodes: usize,
+}
+
+// How a build walk is shared between copies of the process (`WalkShared`), and what it found.
+pub struct SharedWalk {
+  // How many copies walk, the process that starts them among them; fewer than two shares nothing.
+  pub workers: usize,
+  // How many instances the walk enters before it starts the copies, so each starts with those
+  // instances' pending references and what the walk has lowered so far.
+  pub frontier: usize,
+  pub started: bool,
+  // What each copy lowered (`sharedPart`), the starting process's first.
+  pub parts: List<Bytes>,
+  // Whether a copy failed or the walk read a growth guard, so the parts are not the whole walk.
+  pub failed: bool,
+}
+
+// What a build walk that may be shared gave: the build, when it ended before any copy started;
+// else what the copies lowered, or neither when that is not the whole walk.
+pub struct SharedBuild {
+  pub built: Option<BackendBuild>,
+  pub state: Option<ReplayState>,
+}
+
+// A walk no copy of the process shares.
+pub fn unshared() -> SharedWalk {
+  return SharedWalk {workers: usize.ZERO, frontier: usize.ZERO, started: false, parts: List<Bytes>.make(), failed: false}
+}
+
+// The leaf a shared walk's record holds for the instance `exact` names when no copy entered it.
+pub fn absentEntry(exact: ContentHash) -> BuildRecord.Entry {
+  return BuildRecord.Entry {exact: exact, hash: 0, family: 0, declaration: Bytes.make(), parent: usize.MAX, position: usize.ZERO,
+    requested: false, alias: usize.MAX, leaf: BuildRecord.ABSENT, references: List<BuildRecord.Reference>.make(),
+    summary: ContentHash {high: 0, low: 0}, facts: BuildRecord.unknownFacts()}
+}
+
+// What one module's sweep found, kept until its unit is no longer current.
+pub struct ModuleCheckMemo {
+  pub unit: usize,
+  pub sweep: Sweep,
+  pub deferred: List<DeferredStaticTemplate>,
+  pub unchecked: List<UncheckedBody>,
+}
+
+// The check of one declaration of a module sweep that found nothing to report, kept until its
+// unit is no longer current, so a sweep of its module after an edit elsewhere reuses it.
+pub struct DeclarationMemo {
+  // `usize.MAX` once the check is outdated.
+  pub unit: usize,
+  pub identity: DeclarationId,
+  // Whether the declaration is a concrete body the module's escape check walks.
+  pub concrete: bool,
+  // Whether an unlinked `adoptCache` reused it, so the image written carries it.
+  pub carried: bool,
+}
+
+// The escape check of one list of concrete bodies, kept until its unit is no longer current.
+pub struct EscapeMemo {
+  pub unit: usize,
+  // The raw MIR and source dependencies that established this check's dispatch members.
+  pub discovery: usize,
+  pub concrete: List<DeclarationId>,
+  pub result: DeclarationCheckResult,
+  // The record of the walk that found nothing to report, which `cacheImage` writes.
+  pub captured: Option<CapturedBuild>,
+  // For a replay, the unit that holds what it demanded, which the root of a replay that reports
+  // rests on (`imageReplayedChecks`); `usize.MAX` otherwise.
+  pub reads: usize,
+}
+
+// One escape walk record an adoption read: its root in the adopted image, whose key holds its
+// check's stable unit key at `unit` and whose answer holds the record.
+pub struct EscapeRecordRoot {
+  pub unit: Span,
+  pub root: usize,
+}
+
+// The escape walk records an image holds whose guard reads are green, and its green escape
+// entries by exact identity, each with its root in the image.
+// Which entries of a replayed record name each entry among their references, built when a
+// replay first needs another way to an entry than its parent (`replayOrphan`).
+pub struct RecordReferrers {
+  pub built: bool,
+  // The referrers of entry `e` are `from[starts[e]..starts[e + 1]]`, each naming it at its
+  // reference `positions` holds.
+  pub starts: List<usize>,
+  pub from: List<usize>,
+  pub positions: List<usize>,
+}
+
+pub effect fn recordReferrers(entries: &[BuildRecord.Entry]) -> RecordReferrers ! OutOfMemoryError ? &mut Allocator {
+  let mut starts = List<usize>.make()
+  while List<usize>.length(&starts) <= entries.length { run List<usize>.append(&mut starts, usize.ZERO) }
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let references = List<BuildRecord.Reference>.asSlice(&entries[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = references[reference].target
+      if target < entries.length {
+        let counted = List<usize>.get(&starts, target + usize.ONE) + usize.ONE
+        List<usize>.set(&mut starts, target + usize.ONE, counted)
+      }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ONE
+  while at <= entries.length {
+    let summed = List<usize>.get(&starts, at) + List<usize>.get(&starts, at - usize.ONE)
+    List<usize>.set(&mut starts, at, summed)
+    at = at + usize.ONE
+  }
+  let total = List<usize>.get(&starts, entries.length)
+  let mut from = List<usize>.make()
+  let mut positions = List<usize>.make()
+  let mut next = List<usize>.make()
+  while List<usize>.length(&from) < total {
+    run List<usize>.append(&mut from, usize.ZERO)
+    run List<usize>.append(&mut positions, usize.ZERO)
+  }
+  at = usize.ZERO
+  while at < entries.length {
+    run List<usize>.append(&mut next, List<usize>.get(&starts, at))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < entries.length {
+    let references = List<BuildRecord.Reference>.asSlice(&entries[at].references)
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      let target = references[reference].target
+      if target < entries.length {
+        let slot = List<usize>.get(&next, target)
+        List<usize>.set(&mut from, slot, at)
+        List<usize>.set(&mut positions, slot, reference)
+        List<usize>.set(&mut next, target, slot + usize.ONE)
+      }
+      reference = reference + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return RecordReferrers {built: true, starts: move starts, from: move from, positions: move positions}
+}
+
+// Whether `instance` applies generic, static or scope arguments, which a walk admits by the path
+// it reaches the instance along.
+pub fn specializedInstance(instance: &InstanceKey) -> bool {
+  if let Option<Interned<Application>>.Some {value} = move InstanceKey.application(instance) {
+    return Interned<Application>.with<bool>(&value, |applied: &Application| -> bool {
+      return List<Argument>.length(&applied.arguments) > usize.ZERO || Application.hasStatics(applied)
+        || List<ScopeBinding>.length(&applied.scopes) > usize.ZERO
+    })
+  }
+  return false
+}
+
+// The key of entry `index` of a replayed record when it is the entry of a root the walk still
+// starts from; `entryRoots` names each entry's root.
+pub fn replayRootKey(roots: &[Option<InstanceKey>], entryRoots: &[usize], index: usize) -> Option<InstanceKey> {
+  let root = entryRoots[index]
+  if root >= roots.length { return Option<InstanceKey>.none() }
+  if let Option<InstanceKey>.Some {value} = &roots[root] { return Option<InstanceKey>.some(InstanceKey.copy(&value)) }
+  return Option<InstanceKey>.none()
+}
+
+pub struct EscapeImage {
+  pub records: List<EscapeRecordRoot>,
+  pub entries: DigestSet,
+  pub roots: List<usize>,
+}
+
+impl EscapeImage {
+  pub fn make() -> EscapeImage {
+    return EscapeImage {records: List<EscapeRecordRoot>.make(), entries: DigestSet.make(), roots: List<usize>.make()}
+  }
+
+  // The image root of the green entry named `exact`, or `usize.MAX`.
+  pub fn entryRoot(self: &Self, exact: ContentHash) -> usize {
+    let found = DigestSet.find(&self.entries, exact)
+    if found == usize.MAX { return usize.MAX }
+    return List<usize>.get(&self.roots, found)
+  }
+
+  // Takes the record of the check whose stable unit key is `unit`, if the image holds one.
+  pub fn take(self: &mut Self, image: &Option<CacheImage.Image>, unit: &[u8]) -> Option<EscapeRecordRoot> {
+    let mut found = usize.MAX
+    if let Option<CacheImage.Image>.Some {value: adopted} = &image.* {
+      let roots = List<CacheImage.Root>.asSlice(&adopted.roots)
+      let held = List<EscapeRecordRoot>.asSlice(&self.records)
+      let mut at = usize.ZERO
+      while at < held.length && found == usize.MAX {
+        if same(StableKey.view(Bytes.asSlice(&roots[held[at].root].key), held[at].unit), unit) { found = at }
+        at = at + usize.ONE
+      }
+    }
+    if found == usize.MAX { return Option<EscapeRecordRoot>.none() }
+    return Option<EscapeRecordRoot>.some(List<EscapeRecordRoot>.remove(&mut self.records, found))
+  }
+}
+
+// The module a record's stable unit key `key` names when the record is a sibling's of the check
+// whose key is `unit`: the same check of a module whose source this store does not hold, as the walk another
+// program made of its own module. None for any other record, such as a dependency module's.
+effect fn siblingModule(resolver: &Resolver, key: &[u8], unit: &[u8], own: &ModuleId) -> Option<ModuleId> ! OutOfMemoryError ? &mut Allocator {
+  // A unit key is its family and profile words, its module, and the rest (`stableUnit`).
+  let mut reader = StableKey.reader()
+  drop StableKey.readWord(key, &mut reader)
+  drop StableKey.readWord(key, &mut reader)
+  let module = match move run StableKey.readModule(key, &mut reader) {
+    Option<ModuleId>.Some {value} => move value
+    Option<ModuleId>.None => { return Option<ModuleId>.none() }
+  }
+  if StableKey.failed(&reader) || SourceIndex.presents(&resolver.source, &module) { return Option<ModuleId>.none() }
+  let mut named = Bytes.make()
+  run StableKey.module(&mut named, own)
+  let rest = 16 + Bytes.length(&named)
+  if unit.length < rest { return Option<ModuleId>.none() }
+  let mut expected = run Bytes.copy(Slice.view<u8>(unit, usize.ZERO, 16))
+  run StableKey.module(&mut expected, &module)
+  run Bytes.append(&mut expected, Slice.view<u8>(unit, rest, unit.length - rest))
+  if !same(Bytes.asSlice(&expected), key) { return Option<ModuleId>.none() }
+  return Option<ModuleId>.some(move module)
+}
+
+// The image root of the longest record `escapes` holds for a sibling of the check whose stable
+// unit key is `unit` (`siblingModule`), or `usize.MAX` when it holds none. The longest walk
+// reached the most, so a walk started from it lowers the least again.
+pub effect fn siblingRecord(resolver: &Resolver, escapes: &EscapeImage, image: &Option<CacheImage.Image>, unit: &[u8], own: &ModuleId) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let mut best = usize.MAX
+  let mut length = usize.ZERO
+  if let Option<CacheImage.Image>.Some {value: adopted} = &image.* {
+    let roots = List<CacheImage.Root>.asSlice(&adopted.roots)
+    let held = List<EscapeRecordRoot>.asSlice(&escapes.records)
+    let mut at = usize.ZERO
+    while at < held.length {
+      let size = Bytes.length(&roots[held[at].root].answer)
+      if size > length {
+        let key = StableKey.view(Bytes.asSlice(&roots[held[at].root].key), held[at].unit)
+        if let Option<ModuleId>.Some {..} = move run siblingModule(resolver, key, unit, own) {
+          length = size
+          best = held[at].root
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return best
+}
+
+// Byte strings by position, found through their hashes.
+pub struct ExactSet {
+  pub values: List<Bytes>,
+  pub lookup: InternIndex,
+}
+
+impl ExactSet {
+  pub fn make() -> ExactSet {
+    return ExactSet {values: List<Bytes>.make(), lookup: InternIndex.make()}
+  }
+
+  // The position of `value`, or `usize.MAX`.
+  pub fn find(self: &Self, value: &[u8]) -> usize {
+    let values = List<Bytes>.asSlice(&self.values)
+    let mut at = InternIndex.first(&self.lookup, InternIndex.hashBytes(0, value))
+    while at != usize.MAX {
+      if same(Bytes.asSlice(&values[at]), value) { return at }
+      at = InternIndex.after(&self.lookup, at)
+    }
+    return usize.MAX
+  }
+
+  // Adds `value` unless it is held already; whether it was added.
+  pub effect fn add(self: &mut Self, value: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if ExactSet.find(&self.*, value) != usize.MAX { return false }
+    run InternIndex.record(&mut self.lookup, InternIndex.hashBytes(0, value))
+    run List<Bytes>.append(&mut self.values, run Bytes.copy(value))
+    return true
+  }
+}
+
+// Digests by position, found through their hashes.
+pub struct DigestSet {
+  pub values: List<ContentHash>,
+  pub lookup: InternIndex,
+}
+
+impl DigestSet {
+  pub fn make() -> DigestSet {
+    return DigestSet {values: List<ContentHash>.make(), lookup: InternIndex.make()}
+  }
+
+  // The position of `value`, or `usize.MAX`.
+  pub fn find(self: &Self, value: ContentHash) -> usize {
+    let values = List<ContentHash>.asSlice(&self.values)
+    let mut at = InternIndex.first(&self.lookup, digestHash(value))
+    while at != usize.MAX {
+      if ContentHash.equals(values[at], value) { return at }
+      at = InternIndex.after(&self.lookup, at)
+    }
+    return usize.MAX
+  }
+
+  // Adds `value` unless it is held already; whether it was added.
+  pub effect fn add(self: &mut Self, value: ContentHash) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if DigestSet.find(&self.*, value) != usize.MAX { return false }
+    run InternIndex.record(&mut self.lookup, digestHash(value))
+    run List<ContentHash>.append(&mut self.values, value)
+    return true
+  }
+}
+
+pub fn escapeMemoOf(memos: &[EscapeMemo], unit: usize) -> usize {
+  let mut at = usize.ZERO
+  while at < memos.length {
+    if memos[at].unit == unit { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+pub fn sameDeclarations(left: &[DeclarationId], right: &[DeclarationId]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if !DeclarationId.equals(&left[at], &right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+pub effect fn copyDeclarations(declarations: &[DeclarationId]) -> List<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = run List<DeclarationId>.makeWithCapacity(declarations.length)
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    run List<DeclarationId>.append(&mut copied, DeclarationId.copy(&declarations[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+pub effect fn copyRejections(rejections: &[Shared<Rejection>]) -> List<Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = run List<Shared<Rejection>>.makeWithCapacity(rejections.length)
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    run List<Shared<Rejection>>.append(&mut copied, Shared<Rejection>.clone(&rejections[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+pub effect fn mergeRejections(into: &mut List<Shared<Rejection>>, rejections: &[Shared<Rejection>]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    run appendDeclarationRejection(&mut into.*, Shared<Rejection>.clone(&rejections[at]))
+    at = at + usize.ONE
+  }
+}
+
+// Appends each of `rejections` to `outside`, or to `inside` when it is located in the selected
+// `runtime`: those are the runtime's refusals of the application's `main`, which the driver
+// reports at the entry instead.
+pub effect fn splitRuntimeRejections(outside: &mut List<Shared<Rejection>>, inside: &mut List<Shared<Rejection>>,
+  rejections: &[Shared<Rejection>], runtime: &Option<ModuleId>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    let within = match &runtime.* {
+      Option<ModuleId>.Some {value: selected} => Shared<Rejection>.with<bool>(&rejections[at], |value: &Rejection| -> bool {
+        return ModuleId.equals(&value.module, &selected)
+      })
+      Option<ModuleId>.None => false
+    }
+    if within { run appendDeclarationRejection(&mut inside.*, Shared<Rejection>.clone(&rejections[at])) }
+    else { run appendDeclarationRejection(&mut outside.*, Shared<Rejection>.clone(&rejections[at])) }
+    at = at + usize.ONE
+  }
+}
+
+pub effect fn mergeGaps(into: &mut List<Shared<BackendGap>>, gaps: &[Shared<BackendGap>]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < gaps.length {
+    run appendDeclarationGap(&mut into.*, Shared<BackendGap>.clone(&gaps[at]))
+    at = at + usize.ONE
+  }
+}
+
+// Adds a kept sweep's findings to `result` and its concrete bodies to `concrete`.
+pub effect fn mergeSweep(result: &mut DeclarationCheckResult, concrete: &mut List<DeclarationId>, sweep: &Sweep) -> () ! OutOfMemoryError ? &mut Allocator {
+  run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&sweep.rejections))
+  run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&sweep.gaps))
+  let unchecked = List<UncheckedDeclaration>.asSlice(&sweep.unchecked)
+  let mut at = usize.ZERO
+  while at < unchecked.length {
+    run List<UncheckedDeclaration>.append(&mut result.unchecked,
+      UncheckedDeclaration {identity: DeclarationId.copy(&unchecked[at].identity), borrow: unchecked[at].borrow})
+    at = at + usize.ONE
+  }
+  let bodies = List<DeclarationId>.asSlice(&sweep.concrete)
+  at = usize.ZERO
+  while at < bodies.length {
+    run List<DeclarationId>.append(&mut concrete.*, DeclarationId.copy(&bodies[at]))
+    at = at + usize.ONE
+  }
+}
+
+pub effect fn copyCheckResult(result: &DeclarationCheckResult) -> DeclarationCheckResult ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+    unchecked: List<UncheckedDeclaration>.make()}
+  let rejections = List<Shared<Rejection>>.asSlice(&result.rejections)
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    run List<Shared<Rejection>>.append(&mut copied.rejections, Shared<Rejection>.clone(&rejections[at]))
+    at = at + usize.ONE
+  }
+  let gaps = List<Shared<BackendGap>>.asSlice(&result.gaps)
+  at = usize.ZERO
+  while at < gaps.length {
+    run List<Shared<BackendGap>>.append(&mut copied.gaps, Shared<BackendGap>.clone(&gaps[at]))
+    at = at + usize.ONE
+  }
+  let unchecked = List<UncheckedDeclaration>.asSlice(&result.unchecked)
+  at = usize.ZERO
+  while at < unchecked.length {
+    run List<UncheckedDeclaration>.append(&mut copied.unchecked,
+      UncheckedDeclaration {identity: DeclarationId.copy(&unchecked[at].identity), borrow: unchecked[at].borrow})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+pub effect fn copyDeferred(deferred: &[DeferredStaticTemplate]) -> List<DeferredStaticTemplate> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<DeferredStaticTemplate>.make()
+  run appendDeferred(&mut copied, deferred)
+  return move copied
+}
+
+pub effect fn appendDeferred(into: &mut List<DeferredStaticTemplate>, deferred: &[DeferredStaticTemplate]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < deferred.length {
+    run List<DeferredStaticTemplate>.append(&mut into.*,
+      DeferredStaticTemplate {declaration: DeclarationId.copy(&deferred[at].declaration), reason: deferred[at].reason})
+    at = at + usize.ONE
+  }
+}
+
+pub effect fn copyUnchecked(unchecked: &[UncheckedBody]) -> List<UncheckedBody> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<UncheckedBody>.make()
+  run appendUnchecked(&mut copied, unchecked)
+  return move copied
+}
+
+pub effect fn appendUnchecked(into: &mut List<UncheckedBody>, unchecked: &[UncheckedBody]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < unchecked.length {
+    run List<UncheckedBody>.append(&mut into.*,
+      UncheckedBody {module: ModuleId.copy(&unchecked[at].module), block: unchecked[at].block, reason: unchecked[at].reason})
+    at = at + usize.ONE
+  }
+}
+
+// The position of `unit`'s memo, or `usize.MAX`.
+pub fn declarationMemoOf(slots: &[usize], unit: usize) -> usize {
+  if unit < slots.length { return slots[unit] }
+  return usize.MAX
+}
+
+pub fn memoOf(memos: &[ModuleCheckMemo], unit: usize) -> usize {
+  let mut at = usize.ZERO
+  while at < memos.length {
+    if memos[at].unit == unit { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+/// The target facts of one closed type that static evaluation reads: its size and alignment, and
+/// the byte offset of each record field in declaration order (`usize.MAX` for a field without
+/// one).
+pub struct StaticLayout {
+  pub bytes: usize,
+  pub alignment: usize,
+  pub offsets: List<usize>,
+}
+
+/// An owned snapshot of one checked direct call's canonical selection.
+pub struct StaticCall {
+  pub application: Application,
+  // Whether the call's receiver, the subject of its callee, is its first argument.
+  pub receiver: bool,
+}
+
+/// What static evaluation makes of an expression that the checker gave a function value form.
+pub union StaticCallable {
+  /// A named function, or a partial application of one: the checked section type and how many
+  /// leading parameters stay open. The expression's written operands are the captures.
+  Section {pub ty: Interned<Type>, pub first: usize},
+  /// A call through a function value, or a partial application of one: the callee expression
+  /// holds the value, and the written operands follow its open parameters.
+  Through,
+}
