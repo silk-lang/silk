@@ -16,7 +16,7 @@
 //!   localBytes` is rounded up to a multiple of 16 so every outgoing `call` sees a 16-byte-aligned
 //!   stack pointer.
 
-import backend.SsaFunction {Definition, Edge, InlineAsm, Kind, Operation, SsaFunction, none}
+import backend.SsaFunction {Cast, Definition, Edge, Exit, InlineAsm, Kind, Operation, SsaFunction, none}
 import backend.X86Asm
 import backend.X86Asm {Constraint, ConstraintKind}
 import silk.collections.bytes {Bytes}
@@ -24,19 +24,31 @@ import silk.collections.list {List}
 import silk.core.ownership {Copy}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.num.i32
+import silk.num.i64
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 
-/// Complete stack frame layout for one compiled x86-64 function.
+/// Sentinel register index indicating an SSA value is homed in memory (or is a constant/unit).
+pub fn regNone() -> u8 { return 255 }
+
+/// Complete stack frame layout and callee-saved register assignment for one compiled x86-64 function.
 pub struct FramePlan {
   /// Negative `rbp`-relative byte offset of each MIR stack slot `0 .. slotCount - 1`.
   pub slotOffsets: List<i32>,
-  /// Negative `rbp`-relative byte offset of each SSA value `0 .. valueCount - 1` (0 for constants
-  /// and unit values).
+  /// Negative `rbp`-relative byte offset of each SSA value `0 .. valueCount - 1` (0 for constants,
+  /// unit values, rematerialized slot addresses, and values homed in callee-saved GPRs).
   pub valueOffsets: List<i32>,
   /// Allocated byte size of each SSA value's home slot (0, 8, 16, or rounded multiple of 16).
   pub valueSizes: List<usize>,
+  /// Assigned callee-saved GPR (`rbx=3, r12=12, r13=13, r14=14, r15=15`) for each SSA value
+  /// `0 .. valueCount - 1`, or [`regNone`] (`255`) when homed in `valueOffsets`.
+  pub valueRegs: List<u8>,
+  /// Negative `rbp`-relative byte offset for SSA values known to equal `rbp + disp` (from
+  /// `SlotAddress` and constant `Offset` chains), or 0 otherwise.
+  pub valueSlotBase: List<i32>,
+  /// Total non-removed use count of each SSA value `0 .. valueCount - 1`.
+  pub valueUses: List<usize>,
   /// True when the function contains `Operation.VaStart`.
   pub hasVaStart: bool,
   /// Negative `rbp`-relative offset of the 176-byte SysV variadic register-save area when
@@ -53,6 +65,8 @@ pub struct FramePlan {
   /// True when the function contains `Operation.DynamicSlot` (so `rsp` may move below the fixed
   /// frame during execution).
   pub hasDynamicSlot: bool,
+  /// True when the function contains any non-removed `Operation.InlineAsm`.
+  pub hasInlineAsm: bool,
 }
 
 struct Interval {
@@ -64,6 +78,13 @@ struct Interval {
 }
 
 impl Copy for Interval {}
+
+struct Range {
+  start: usize,
+  end: usize,
+}
+
+impl Copy for Range {}
 
 struct BackEdge {
   headerPoint: usize,
@@ -204,7 +225,26 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   }
   let loops = List<BackEdge>.asSlice(&backEdges)
 
-  // Initialize MIR stack slot intervals and SSA value intervals.
+  // Mark which blocks fall inside any CFG loop body so loop definitions and uses receive higher
+  // register-allocation priority.
+  let mut inLoopBlock = run List<u8>.makeWithCapacity(blockCount)
+  b = usize.ZERO
+  while b < blockCount {
+    let mut inLp: u8 = 0
+    let mut lIdx = usize.ZERO
+    while lIdx < loops.length {
+      if bStart[b] >= loops[lIdx].headerPoint && bStart[b] <= loops[lIdx].latchPoint {
+        inLp = 1
+        break
+      }
+      lIdx = lIdx + usize.ONE
+    }
+    run List<u8>.append(&mut inLoopBlock, inLp)
+    b = b + usize.ONE
+  }
+  let inLoop = List<u8>.asSlice(&inLoopBlock)
+
+  // Initialize MIR stack slot intervals and SSA value intervals, use counts, and weights.
   let mut slotIv = run List<Interval>.makeWithCapacity(slotCount)
   let mut s = usize.ZERO
   while s < slotCount {
@@ -214,36 +254,56 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
 
   let mut valIv = run List<Interval>.makeWithCapacity(valueCount)
   let mut valSizes = run List<usize>.makeWithCapacity(valueCount)
+  let mut valUses = run List<usize>.makeWithCapacity(valueCount)
+  let mut valWeights = run List<u64>.makeWithCapacity(valueCount)
+  let mut valNoReg = run List<u8>.makeWithCapacity(valueCount)
+  let mut valSlotIdx = run List<usize>.makeWithCapacity(valueCount)
+  let mut valSlotDisp = run List<i64>.makeWithCapacity(valueCount)
   let mut v = usize.ZERO
   while v < valueCount {
     let info = function.value(usize.toU64(v))
     let sz = if info.definition == Definition.Constant { usize.ZERO } else { valueSlotBytes(info.kind) }
     run List<usize>.append(&mut valSizes, sz)
+    run List<usize>.append(&mut valUses, usize.ZERO)
     let mut start = totalPoints
     let mut end = usize.ZERO
+    let mut initW: u64 = 0
     if info.definition == Definition.Argument && sz > usize.ZERO {
       start = usize.ZERO
       end = usize.ZERO
+      initW = 1
     }
+    run List<u64>.append(&mut valWeights, initW)
+    run List<u8>.append(&mut valNoReg, 0)
+    run List<usize>.append(&mut valSlotIdx, usize.MAX)
+    run List<i64>.append(&mut valSlotDisp, 0)
     run List<Interval>.append(&mut valIv, Interval {start: start, end: end, hasStart: false, hasEnd: false, unmarked: false})
     v = v + usize.ONE
   }
 
   let mut hasVaStart = false
   let mut hasDynamicSlot = false
-  let mut calleeMask: u64 = 0
+  let mut hasInlineAsm = false
+  let mut reservedCalleeMask: u64 = 0
   let calleeBits: u64 = u64.shiftLeft(1, 3) | u64.shiftLeft(1, 12) | u64.shiftLeft(1, 13) | u64.shiftLeft(1, 14) | u64.shiftLeft(1, 15)
 
-  // Walk every block and instruction to populate live ranges and detect special frame needs.
+  // Walk every block in RPO order to populate live ranges, use counts, SlotAddress/Offset chains,
+  // and special frame needs. RPO order guarantees every dominating `SlotAddress` precedes any
+  // dominated `Offset`.
   let slotIvMut = List<Interval>.asMutSlice(&mut slotIv)
-  b = usize.ZERO
-  while b < blockCount {
+  let slotIdxMut = List<usize>.asMutSlice(&mut valSlotIdx)
+  let slotDispMut = List<i64>.asMutSlice(&mut valSlotDisp)
+  let mut rpoIdx = usize.ZERO
+  while rpoIdx < orderSlice.length {
+    b = orderSlice[rpoIdx]
     let blk = function.block(b)
     let entryPt = bStart[b]
+    let blkWeight: u64 = if inLoop[b] != 0 { 16 } else { 1 }
+    let paramWeight: u64 = if inLoop[b] != 0 { 32 } else { 2 }
     let params = List<u64>.asSlice(&blk.parameters)
     let mut p = usize.ZERO
     while p < params.length {
-      recordValPoint(&mut valIv, params[p], entryPt)
+      recordValDef(&mut valIv, &mut valWeights, params[p], entryPt, paramWeight)
       p = p + usize.ONE
     }
     let insts = List<usize>.asSlice(&blk.instructions)
@@ -255,16 +315,16 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         // Record result definitions.
         let rc = inst.resultCount()
         if rc >= usize.ONE && inst.result != none() {
-          recordValPoint(&mut valIv, inst.result, pt)
+          recordValDef(&mut valIv, &mut valWeights, inst.result, pt, blkWeight)
         }
         if rc >= 2 && inst.result != none() {
-          recordValPoint(&mut valIv, inst.result + 1, pt)
+          recordValDef(&mut valIv, &mut valWeights, inst.result + 1, pt, blkWeight)
         }
         // Record operand uses.
         let ops = function.operandsOf(insts[i])
         let mut opIdx = usize.ZERO
         while opIdx < ops.length {
-          recordValPoint(&mut valIv, ops[opIdx], pt)
+          recordValUse(&mut valIv, &mut valUses, &mut valWeights, ops[opIdx], pt, blkWeight)
           opIdx = opIdx + usize.ONE
         }
         // Inspect slot lifetime markers & special operations.
@@ -287,6 +347,40 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
             if slot < slotCount {
               if pt < slotIvMut[slot].start { slotIvMut[slot].start = pt }
               if pt > slotIvMut[slot].end { slotIvMut[slot].end = pt }
+              if inst.result != none() {
+                let rIdx = u64.toUsize(inst.result)
+                if rIdx < valueCount {
+                  slotIdxMut[rIdx] = slot
+                  slotDispMut[rIdx] = 0
+                  let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                  noRegMut[rIdx] = 1
+                }
+              }
+            }
+          }
+          Operation.Offset {offset} => {
+            if ops.length >= usize.ONE && inst.result != none() {
+              let baseIdx = u64.toUsize(ops[0])
+              let rIdx = u64.toUsize(inst.result)
+              if baseIdx < valueCount && rIdx < valueCount && slotIdxMut[baseIdx] != usize.MAX {
+                let d = slotDispMut[baseIdx] + u64.wrappingToI64(offset)
+                if d >= -1073741824 && d <= 1073741824 {
+                  slotIdxMut[rIdx] = slotIdxMut[baseIdx]
+                  slotDispMut[rIdx] = d
+                  let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                  noRegMut[rIdx] = 1
+                }
+              }
+            }
+          }
+          Operation.Cast {operation} => {
+            // Vector-to-scalar bitcast copies bytes into `result`'s memory slot.
+            if operation == Cast.Bitcast && ops.length >= usize.ONE && inst.result != none() {
+              if function.value(ops[0]).kind.isVector() {
+                let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                let rIdx = u64.toUsize(inst.result)
+                if rIdx < noRegMut.length { noRegMut[rIdx] = 1 }
+              }
             }
           }
           Operation.VaStart => { hasVaStart = true }
@@ -294,20 +388,21 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
           Operation.CompareExchange => {
             if inst.kind.bits > 64 {
               // `lock cmpxchg16b` uses `rbx` for the low 64 bits of the replacement value.
-              calleeMask = calleeMask | u64.shiftLeft(1, 3)
+              reservedCalleeMask = reservedCalleeMask | u64.shiftLeft(1, 3)
             }
           }
           Operation.InlineAsm {index, ..} => {
+            hasInlineAsm = true
             let asm: &InlineAsm = function.asm(index)
             let clob = X86Asm.parseClobberMask(Bytes.asSlice(&asm.clobbers))
-            calleeMask = calleeMask | (clob & calleeBits)
+            reservedCalleeMask = reservedCalleeMask | (clob & calleeBits)
             let hasOut = !inst.kind.isUnit()
             let parsed = run X86Asm.parseConstraints(Bytes.asSlice(&asm.constraints), hasOut)
             let cs = List<Constraint>.asSlice(&parsed)
             let mut c = usize.ZERO
             while c < cs.length {
               if cs[c].kind == ConstraintKind.FixedReg && cs[c].reg < 16 {
-                calleeMask = calleeMask | (u64.shiftLeft(1, u8.toU64(cs[c].reg)) & calleeBits)
+                reservedCalleeMask = reservedCalleeMask | (u64.shiftLeft(1, u8.toU64(cs[c].reg)) & calleeBits)
               }
               c = c + usize.ONE
             }
@@ -319,8 +414,8 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     }
     // Block exit values & outgoing edge arguments (also extend target block parameters to this edge).
     let exitPt = bExit[b]
-    if blk.value != none() { recordValPoint(&mut valIv, blk.value, exitPt) }
-    if blk.secondValue != none() { recordValPoint(&mut valIv, blk.secondValue, exitPt) }
+    if blk.value != none() { recordValUse(&mut valIv, &mut valUses, &mut valWeights, blk.value, exitPt, blkWeight) }
+    if blk.secondValue != none() { recordValUse(&mut valIv, &mut valUses, &mut valWeights, blk.secondValue, exitPt, blkWeight) }
     let edges = List<Edge>.asSlice(&blk.edges)
     let mut e = usize.ZERO
     while e < edges.length {
@@ -328,15 +423,15 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
       let targetParams = List<u64>.asSlice(&function.block(edges[e].block).parameters)
       let mut a = usize.ZERO
       while a < edgeArgs.length {
-        recordValPoint(&mut valIv, edgeArgs[a], exitPt)
+        recordValUse(&mut valIv, &mut valUses, &mut valWeights, edgeArgs[a], exitPt, blkWeight)
         if a < targetParams.length {
-          recordValPoint(&mut valIv, targetParams[a], exitPt)
+          recordValDef(&mut valIv, &mut valWeights, targetParams[a], exitPt, blkWeight)
         }
         a = a + usize.ONE
       }
       e = e + usize.ONE
     }
-    b = b + usize.ONE
+    rpoIdx = rpoIdx + usize.ONE
   }
 
   // Extend all intervals across overlapping CFG back-edges to fixpoint.
@@ -355,6 +450,157 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     while v < valueCount {
       if valIvMut[v].start <= valIvMut[v].end {
         if extendForLoops(&mut valIvMut[v], loops) { changed = true }
+      }
+      v = v + usize.ONE
+    }
+  }
+
+  // Priority-weighted linear-scan register allocation onto the 5 callee-saved GPRs
+  // (`rbx=3, r12=12, r13=13, r14=14, r15=15`), excluding any registers reserved by `InlineAsm`
+  // or 128-bit `CompareExchange`.
+  let mut valueRegs = run List<u8>.makeWithCapacity(valueCount)
+  v = usize.ZERO
+  while v < valueCount {
+    run List<u8>.append(&mut valueRegs, regNone())
+    v = v + usize.ONE
+  }
+  let valIvSlice = List<Interval>.asSlice(&valIv)
+  let valSizeSlice = List<usize>.asSlice(&valSizes)
+  let valUsesSlice = List<usize>.asSlice(&valUses)
+  let valWeightSlice = List<u64>.asSlice(&valWeights)
+
+  // Do not waste a callee-saved register on a single-use scalar integer compare immediately
+  // consumed by its block's `Exit.Branch`, since `X86Emit` fuses it into `cmp + jcc`.
+  b = usize.ZERO
+  while b < blockCount {
+    let blk = function.block(b)
+    if blk.exit == Exit.Branch && blk.value != none() {
+      let condIdx = u64.toUsize(blk.value)
+      if condIdx < valueCount && valUsesSlice[condIdx] == usize.ONE {
+        let insts = List<usize>.asSlice(&blk.instructions)
+        let mut last = insts.length
+        while last > usize.ZERO {
+          last = last - usize.ONE
+          let inst = function.instruction(insts[last])
+          if !inst.removed {
+            if inst.result == blk.value {
+              if let Operation.Compare {..} = inst.operation {
+                let ops = function.operandsOf(insts[last])
+                if ops.length >= 2 {
+                  let opKind = function.value(ops[0]).kind
+                  if !opKind.isVector() && !opKind.isFloat() && opKind.bits <= 64 {
+                    let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                    noRegMut[condIdx] = 1
+                  }
+                }
+              }
+            }
+            break
+          }
+        }
+      }
+    }
+    b = b + usize.ONE
+  }
+
+  let valNoRegSlice = List<u8>.asSlice(&valNoReg)
+
+  let mut regCands = List<usize>.make()
+  v = usize.ZERO
+  while v < valueCount {
+    if valSizeSlice[v] == 8 && valNoRegSlice[v] == 0 && valUsesSlice[v] > usize.ZERO && valWeightSlice[v] >= 2 && valIvSlice[v].start <= valIvSlice[v].end {
+      let kind = function.value(usize.toU64(v)).kind
+      if !kind.isFloat() && !kind.isVector() && !kind.isUnit() && kind.bits <= 64 {
+        run List<usize>.append(&mut regCands, v)
+      }
+    }
+    v = v + usize.ONE
+  }
+  heapSortCandidates(&mut regCands, valWeightSlice, List<Interval>.asSlice(&valIv))
+  let candMut = List<usize>.asSlice(&regCands)
+
+  let poolRegs: [u8; 5] = [3, 12, 13, 14, 15]
+  let mut ranges0 = List<Range>.make()
+  let mut ranges1 = List<Range>.make()
+  let mut ranges2 = List<Range>.make()
+  let mut ranges3 = List<Range>.make()
+  let mut ranges4 = List<Range>.make()
+  let mut slotWeights: [u64; 5] = [0, 0, 0, 0, 0]
+  let mut slotCountAssigned: [usize; 5] = [0, 0, 0, 0, 0]
+  let valRegsMut = List<u8>.asMutSlice(&mut valueRegs)
+
+  let mut cIdx = usize.ZERO
+  while cIdx < candMut.length {
+    let idx = candMut[cIdx]
+    let iv = valIvSlice[idx]
+    let mut assigned = false
+    if !assigned && (reservedCalleeMask & u64.shiftLeft(1, 3)) == 0 {
+      if run tryAssignReg(&mut ranges0, iv.start, iv.end) {
+        valRegsMut[idx] = poolRegs[0]
+        slotWeights[0] = slotWeights[0] + valWeightSlice[idx]
+        slotCountAssigned[0] = slotCountAssigned[0] + usize.ONE
+        assigned = true
+      }
+    }
+    if !assigned && (reservedCalleeMask & u64.shiftLeft(1, 12)) == 0 {
+      if run tryAssignReg(&mut ranges1, iv.start, iv.end) {
+        valRegsMut[idx] = poolRegs[1]
+        slotWeights[1] = slotWeights[1] + valWeightSlice[idx]
+        slotCountAssigned[1] = slotCountAssigned[1] + usize.ONE
+        assigned = true
+      }
+    }
+    if !assigned && (reservedCalleeMask & u64.shiftLeft(1, 13)) == 0 {
+      if run tryAssignReg(&mut ranges2, iv.start, iv.end) {
+        valRegsMut[idx] = poolRegs[2]
+        slotWeights[2] = slotWeights[2] + valWeightSlice[idx]
+        slotCountAssigned[2] = slotCountAssigned[2] + usize.ONE
+        assigned = true
+      }
+    }
+    if !assigned && (reservedCalleeMask & u64.shiftLeft(1, 14)) == 0 {
+      if run tryAssignReg(&mut ranges3, iv.start, iv.end) {
+        valRegsMut[idx] = poolRegs[3]
+        slotWeights[3] = slotWeights[3] + valWeightSlice[idx]
+        slotCountAssigned[3] = slotCountAssigned[3] + usize.ONE
+        assigned = true
+      }
+    }
+    if !assigned && (reservedCalleeMask & u64.shiftLeft(1, 15)) == 0 {
+      if run tryAssignReg(&mut ranges4, iv.start, iv.end) {
+        valRegsMut[idx] = poolRegs[4]
+        slotWeights[4] = slotWeights[4] + valWeightSlice[idx]
+        slotCountAssigned[4] = slotCountAssigned[4] + usize.ONE
+        assigned = true
+      }
+    }
+    cIdx = cIdx + usize.ONE
+  }
+
+  // Profitability gate: only commit a callee-saved register when its total weighted benefit pays
+  // for the prologue push and epilogue pop (avoiding bloat in tiny leaf functions).
+  let mut calleeMask: u64 = reservedCalleeMask
+  let mut anySaved = reservedCalleeMask != 0
+  let mut rejectMask: u64 = 0
+  let mut regSlot = usize.ZERO
+  while regSlot < 5 {
+    if slotCountAssigned[regSlot] > usize.ZERO {
+      let minW: u64 = if anySaved { 3 } else if regSlot == usize.ZERO { 4 } else { 5 }
+      if slotWeights[regSlot] >= minW {
+        calleeMask = calleeMask | u64.shiftLeft(1, u8.toU64(poolRegs[regSlot]))
+        anySaved = true
+      } else {
+        rejectMask = rejectMask | u64.shiftLeft(1, u8.toU64(poolRegs[regSlot]))
+      }
+    }
+    regSlot = regSlot + usize.ONE
+  }
+  if rejectMask != 0 {
+    v = usize.ZERO
+    while v < valueCount {
+      let reg = valRegsMut[v]
+      if reg != regNone() && (rejectMask & u64.shiftLeft(1, u8.toU64(reg))) != 0 {
+        valRegsMut[v] = regNone()
       }
       v = v + usize.ONE
     }
@@ -448,7 +694,25 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     k = k + usize.ONE
   }
 
-  // 3. Allocate SSA value home slots with greedy interval coloring (separate pools by byte size).
+  // Resolve folded `rbp`-relative offsets for `SlotAddress` and constant `Offset` chains.
+  let mut valueSlotBase = run List<i32>.makeWithCapacity(valueCount)
+  v = usize.ZERO
+  while v < valueCount {
+    let mut sb: i32 = 0
+    let si = slotIdxMut[v]
+    if si != usize.MAX && si < slotCount && slotOffMut[si] < 0 {
+      let total = i32.toI64(slotOffMut[si]) + slotDispMut[v]
+      if total < 0 && total >= -2147483648 {
+        sb = i64.wrappingToI32(total)
+      }
+    }
+    run List<i32>.append(&mut valueSlotBase, sb)
+    v = v + usize.ONE
+  }
+  let valSlotBaseSlice = List<i32>.asSlice(&valueSlotBase)
+
+  // 3. Allocate stack home slots only for live SSA values that were neither assigned a callee-saved
+  //    GPR nor folded into a constant `rbp`-relative slot base.
   let mut valueOffsets = run List<i32>.makeWithCapacity(valueCount)
   v = usize.ZERO
   while v < valueCount {
@@ -456,24 +720,23 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     v = v + usize.ONE
   }
   let valOffMut = List<i32>.asMutSlice(&mut valueOffsets)
-  let valSizeSlice = List<usize>.asSlice(&valSizes)
 
   let mut liveVals = List<usize>.make()
   v = usize.ZERO
   while v < valueCount {
-    if valSizeSlice[v] > usize.ZERO && valIvMut[v].start <= valIvMut[v].end {
+    if valSizeSlice[v] > usize.ZERO && valRegsMut[v] == regNone() && valSlotBaseSlice[v] == 0 && valIvSlice[v].start <= valIvSlice[v].end {
       run List<usize>.append(&mut liveVals, v)
     }
     v = v + usize.ONE
   }
-  // Sort non-constant values by interval start point.
+  // Sort non-constant spilled values by interval start point.
   let lvMut = List<usize>.asMutSlice(&mut liveVals)
   k = usize.ONE
   while k < lvMut.length {
     let key = lvMut[k]
-    let keyStart = valIvMut[key].start
+    let keyStart = valIvSlice[key].start
     let mut j = k
-    while j > usize.ZERO && valIvMut[lvMut[j - usize.ONE]].start > keyStart {
+    while j > usize.ZERO && valIvSlice[lvMut[j - usize.ONE]].start > keyStart {
       lvMut[j] = lvMut[j - usize.ONE]
       j = j - usize.ONE
     }
@@ -486,7 +749,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     let idx = lvMut[k]
     let sz = usize.toU64(valSizeSlice[idx])
     let align: u64 = if sz >= 16 { 16 } else { 8 }
-    let iv = valIvMut[idx]
+    let iv = valIvSlice[idx]
     let pool = List<ReusableSlot>.asMutSlice(&mut valPool)
     let mut reused = usize.MAX
     let mut pIdx = usize.ZERO
@@ -517,22 +780,127 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     slotOffsets: move slotOffsets,
     valueOffsets: move valueOffsets,
     valueSizes: move valSizes,
+    valueRegs: move valueRegs,
+    valueSlotBase: move valueSlotBase,
+    valueUses: move valUses,
     hasVaStart: hasVaStart,
     regSaveOffset: regSaveOffset,
     savedCalleeMask: calleeMask,
     savedCount: savedCount,
     subRspBytes: subRspBytes,
     hasDynamicSlot: hasDynamicSlot,
+    hasInlineAsm: hasInlineAsm,
   }
 }
 
-fn recordValPoint(list: &mut List<Interval>, value: u64, pt: usize) -> () {
+fn recordValDef(list: &mut List<Interval>, weights: &mut List<u64>, value: u64, pt: usize, weight: u64) -> () {
   if value == none() { return () }
   let ivs = List<Interval>.asMutSlice(&mut list.*)
+  let ws = List<u64>.asMutSlice(&mut weights.*)
   let idx = u64.toUsize(value)
   if idx >= ivs.length { return () }
   if pt < ivs[idx].start { ivs[idx].start = pt }
   if pt > ivs[idx].end { ivs[idx].end = pt }
+  ws[idx] = ws[idx] + weight
+}
+
+fn recordValUse(
+  list: &mut List<Interval>,
+  uses: &mut List<usize>,
+  weights: &mut List<u64>,
+  value: u64,
+  pt: usize,
+  weight: u64,
+) -> () {
+  if value == none() { return () }
+  let ivs = List<Interval>.asMutSlice(&mut list.*)
+  let us = List<usize>.asMutSlice(&mut uses.*)
+  let ws = List<u64>.asMutSlice(&mut weights.*)
+  let idx = u64.toUsize(value)
+  if idx >= ivs.length { return () }
+  if pt < ivs[idx].start { ivs[idx].start = pt }
+  if pt > ivs[idx].end { ivs[idx].end = pt }
+  us[idx] = us[idx] + usize.ONE
+  ws[idx] = ws[idx] + weight
+}
+
+// Returns true when candidate `a` has strictly lower priority than candidate `b` (for max-heap
+// extraction that produces descending-priority order).
+fn candLess(a: usize, b: usize, weights: &[u64], ivs: &[Interval]) -> bool {
+  if weights[a] != weights[b] { return weights[a] < weights[b] }
+  let spanA = ivs[a].end - ivs[a].start
+  let spanB = ivs[b].end - ivs[b].start
+  if spanA != spanB { return spanA > spanB }
+  return a > b
+}
+
+// In-place O(N log N) heapsort placing highest-priority candidates first.
+fn heapSortCandidates(list: &mut List<usize>, weights: &[u64], ivs: &[Interval]) -> () {
+  let n = List<usize>.length(&list.*)
+  if n < 2 { return () }
+  // Build min-heap (smallest priority at root) so popping into the back leaves highest priority first.
+  let mut start = n / 2
+  while start > usize.ZERO {
+    start = start - usize.ONE
+    siftDownMin(&mut list.*, start, n, weights, ivs)
+  }
+  let mut end = n
+  while end > usize.ONE {
+    end = end - usize.ONE
+    let cands = List<usize>.asMutSlice(&mut list.*)
+    let tmp = cands[usize.ZERO]
+    cands[usize.ZERO] = cands[end]
+    cands[end] = tmp
+    siftDownMin(&mut list.*, usize.ZERO, end, weights, ivs)
+  }
+}
+
+fn siftDownMin(list: &mut List<usize>, rootStart: usize, end: usize, weights: &[u64], ivs: &[Interval]) -> () {
+  let cands = List<usize>.asMutSlice(&mut list.*)
+  let mut root = rootStart
+  while root * 2 + usize.ONE < end {
+    let left = root * 2 + usize.ONE
+    let right = left + usize.ONE
+    let mut smallest = root
+    if candLess(cands[left], cands[smallest], weights, ivs) {
+      smallest = left
+    }
+    if right < end && candLess(cands[right], cands[smallest], weights, ivs) {
+      smallest = right
+    }
+    if smallest == root { return () }
+    let tmp = cands[root]
+    cands[root] = cands[smallest]
+    cands[smallest] = tmp
+    root = smallest
+  }
+}
+
+effect fn tryAssignReg(ranges: &mut List<Range>, start: usize, end: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let slice = List<Range>.asSlice(&ranges.*)
+  let mut lo = usize.ZERO
+  let mut hi = slice.length
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if slice[mid].end < start {
+      lo = mid + usize.ONE
+    } else {
+      hi = mid
+    }
+  }
+  if lo < slice.length && slice[lo].start <= end {
+    return false
+  }
+  let insertAt = lo
+  run List<Range>.append(&mut ranges.*, Range {start: start, end: end})
+  let mutSlice = List<Range>.asMutSlice(&mut ranges.*)
+  let mut k = mutSlice.length - usize.ONE
+  while k > insertAt {
+    mutSlice[k] = mutSlice[k - usize.ONE]
+    k = k - usize.ONE
+  }
+  mutSlice[insertAt] = Range {start: start, end: end}
+  return true
 }
 
 fn extendForLoops(iv: &mut Interval, loops: &[BackEdge]) -> bool {
