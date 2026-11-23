@@ -231,7 +231,7 @@ effect fn demandSource(
   number: usize,
   key: Word,
   fingerprinted: bool,
-  parsed: &mut List<SourceUnit>,
+  parsed: &mut OfferedParsed,
 ) -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   return run Query.demand(
     move query,
@@ -246,13 +246,11 @@ effect fn demandSource(
       run record(&mut events.*, EventKind.SourceRead, id, number, present)
       let content = run Observation.copyContent(&observed)
       if let Option<Bytes>.Some {value} = move content {
-        let mut unit = match move takeParsed(&mut parsed.*, id, number, Bytes.asSlice(&value)) {
+        let unit = match move takeParsed(&mut parsed.*, id, number, Bytes.asSlice(&value)) {
           Option<SourceUnit>.Some {value: taken} => move taken
           Option<SourceUnit>.None => run SourceUnit.parse(id, number, move value)
         }
         let index = run ModuleIndex.build(&unit, fingerprinted)
-        // The index holds everything later readers take from the tokens.
-        SourceUnit.releaseTokens(&mut unit)
         let headers = run placeHeaders(&unit.authored, &index)
         let source = IndexedSource {
           observation: run Observation.copy(&observed),
@@ -289,16 +287,34 @@ fn sameBytes(left: &[u8], right: &[u8]) -> bool {
 
 // The unit a driver parsed from exactly `content` of module `id`, if any, as a unit of revision
 // `number`: a parse depends only on the bytes, and the driver's revision numbers count its loads.
-fn takeParsed(parsed: &mut List<SourceUnit>, id: &ModuleId, number: usize, content: &[u8]) -> Option<SourceUnit> {
-  let units = List<SourceUnit>.asSlice(&parsed.*)
-  let mut at = usize.ZERO
-  while at < units.length {
-    if ModuleId.equals(&units[at].id, id) && sameBytes(SourceUnit.bytes(&units[at]), content) {
-      let mut unit = List<SourceUnit>.remove(&mut parsed.*, at)
-      unit.revision = number
-      return Option<SourceUnit>.some(move unit)
+fn takeParsed(parsed: &mut OfferedParsed, id: &ModuleId, number: usize, content: &[u8]) -> Option<SourceUnit> {
+  if parsed.remaining == usize.ZERO {
+    return Option<SourceUnit>.none()
+  }
+  let hashed = ModuleId.hash(id)
+  let mut at = InternIndex.first(&parsed.lookup, hashed)
+  while at != usize.MAX {
+    let matched = match &List<Option<SourceUnit>>.asSlice(&parsed.units)[at] {
+      Option<SourceUnit>.Some {value} => ModuleId.equals(&value.id, id) && sameBytes(SourceUnit.bytes(&value), content)
+      Option<SourceUnit>.None => false
     }
-    at = at + usize.ONE
+    if matched {
+      let taken = Intrinsic.replace(
+        List<Option<SourceUnit>>.asMutSlice(&mut parsed.units)[at],
+        Option<SourceUnit>.none(),
+      )
+      parsed.remaining = parsed.remaining - usize.ONE
+      if parsed.remaining == usize.ZERO {
+        parsed.units = List<Option<SourceUnit>>.make()
+        parsed.lookup = InternIndex.make()
+      }
+      if let Option<SourceUnit>.Some {value} = move taken {
+        let mut unit = move value
+        unit.revision = number
+        return Option<SourceUnit>.some(move unit)
+      }
+    }
+    at = InternIndex.after(&parsed.lookup, at)
   }
   return Option<SourceUnit>.none()
 }
@@ -312,7 +328,7 @@ effect fn withPublication<'a, 'b, 'c, 'd, 'e, 'f>(
   number: usize,
   key: Word,
   fingerprinted: bool,
-  parsed: &'f mut List<SourceUnit>,
+  parsed: &'f mut OfferedParsed,
 ) -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let base = List<SourceSlot>.length(&sources.*)
   let publication = SourcePublication {
@@ -394,6 +410,20 @@ pub enum Environment {
   Final,
 }
 
+struct OfferedParsed {
+  units: List<Option<SourceUnit>>,
+  lookup: InternIndex,
+  remaining: usize,
+}
+
+fn emptyOffered() -> OfferedParsed {
+  return OfferedParsed {
+    units: List<Option<SourceUnit>>.make(),
+    lookup: InternIndex.make(),
+    remaining: usize.ZERO,
+  }
+}
+
 /// A serial source-query store bound to one immutable Final environment and revision.
 ///
 /// # Details
@@ -414,8 +444,8 @@ pub struct SourceIndex {
   events: List<Event>,
   // Whether this store can be revised; `revise` traps on a one-shot store.
   revisions: bool,
-  // Units a driver parsed already, each taken by the first demand of the same module and bytes.
-  parsed: List<SourceUnit>,
+  // Units a driver parsed already, indexed by module hash and taken on first matching demand.
+  parsed: OfferedParsed,
 }
 
 effect fn record(
@@ -680,7 +710,7 @@ fn openIndex(revision: Revision, revisions: bool) -> SourceIndex {
     query: Query<SourceResult, NoRejection>.make(),
     events: List<Event>.make(),
     revisions: revisions,
-    parsed: List<SourceUnit>.make(),
+    parsed: emptyOffered(),
   }
 }
 
@@ -843,6 +873,46 @@ impl SourceIndex {
   ? &mut Allocator {
     return run Revision.observe(&self.revision, id)
   }
+  /// Hands the store units a driver already parsed. The first demand of a module whose bytes in
+  /// this revision equal a unit's takes that unit instead of parsing again.
+  pub effect fn offerParsed(self: &mut Self, units: List<SourceUnit>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let count = List<SourceUnit>.length(&units)
+    if count == usize.ZERO {
+      self.parsed = emptyOffered()
+      return ()
+    }
+    let mut offered = OfferedParsed {
+      units: run List<Option<SourceUnit>>.makeWithCapacity(count),
+      lookup: run InternIndex.withCapacity(count),
+      remaining: count,
+    }
+    let mut slot = usize.ZERO
+    while slot < count {
+      run List<Option<SourceUnit>>.append(&mut offered.units, Option<SourceUnit>.none())
+      slot = slot + usize.ONE
+    }
+    let mut incoming = move units
+    let mut at = count
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      if let Option<SourceUnit>.Some {value} = move List<SourceUnit>.pop(&mut incoming) {
+        let mut writable = List<Option<SourceUnit>>.asMutSlice(&mut offered.units)
+        writable[at] = Option<SourceUnit>.some(move value)
+      }
+    }
+    let mut index = usize.ZERO
+    while index < count {
+      let hashed = match &List<Option<SourceUnit>>.asSlice(&offered.units)[index] {
+        Option<SourceUnit>.Some {value} => ModuleId.hash(&value.id)
+        Option<SourceUnit>.None => 0
+      }
+      run InternIndex.record(&mut offered.lookup, hashed)
+      index = index + usize.ONE
+    }
+    self.parsed = move offered
+    return ()
+  }
   /// Requests one source and its complete syntax index through the typed query store.
   ///
   /// # Details
@@ -851,11 +921,6 @@ impl SourceIndex {
   /// returns the completed answer without another source read or event. Source absence also
   /// completes.
   /// Provider or publication failure removes the active reservation and any unpublished source.
-  /// Hands the store units a driver already parsed. The first demand of a module whose bytes in
-  /// this revision equal a unit's takes that unit instead of parsing again.
-  pub fn offerParsed(self: &mut Self, units: List<SourceUnit>) -> () {
-    self.parsed = move units
-  }
   pub effect fn demand(self: &mut Self, id: &ModuleId) -> Shared<Result<SourceResult, NoRejection>>
   ! Cycle | OutOfMemoryError
   ? &mut Allocator {
