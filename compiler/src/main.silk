@@ -144,8 +144,10 @@ import backend.WasmText { Printed }
 import backend.WasmObject { Unsupported }
 import backend.X86ElfObject
 import backend.X86Object { Unsupported as X86Unsupported }
+import driver.ElfDebug { DebugLineMap }
+import driver.ElfIncremental
+import driver.ElfIncremental { IncrementalResult as ElfIncrementalResult, LinkMode as ElfLinkMode }
 import driver.ElfInput { LinkError as ElfLinkError }
-import driver.ElfLink
 import driver.ElfLink { LinkOptions as ElfLinkOptions }
 import driver.WasmLink as WasmLink { Linked }
 import backend.Bitcode {
@@ -5134,6 +5136,50 @@ effect fn directSourceMap(
   return run WasmDebug.sourceMap(&table, List<Option<Bytes>>.asSlice(&contents))
 }
 
+// Builds the DWARF `.debug_line` file and declaration-origin map for a Linux x86-64 direct link.
+effect fn buildElfDebugLines(
+  plan: &EmissionPlan,
+  sources: &ModuleSources,
+) -> DebugLineMap
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut map = DebugLineMap.make()
+  let mut modules = List<ModuleId>.make()
+  let mut fileIndices = List<usize>.make()
+  let count = EmissionPlan.symbolCount(plan)
+  let mut at = usize.ZERO
+  while at < count {
+    let origin = EmissionPlan.identityOrigin(plan, at)
+    let owner = DeclarationId.moduleId(EmissionPlan.identityDeclaration(plan, at))
+    let known = List<ModuleId>.asSlice(&modules)
+    let mut fi = usize.ZERO
+    while fi < known.length && !ModuleId.equals(&known[fi], owner) {
+      fi = fi + usize.ONE
+    }
+    if fi == known.length {
+      let location = run ModuleSourceFiles.sourceLocation(sources, owner)
+      let mut path = Bytes.make()
+      if let Option<Path>.Some { value: found } = &location.path {
+        path = run Bytes.copy(Path.rawBytes(&found))
+      }
+      run List<ModuleId>.append(&mut modules, ModuleId.copy(owner))
+      run List<usize>.append(
+        &mut fileIndices,
+        run DebugLineMap.addFile(&mut map, Bytes.asSlice(&path)),
+      )
+    }
+    let dwarfFile = List<usize>.get(&fileIndices, fi)
+    run DebugLineMap.addSymbol(
+      &mut map,
+      EmissionPlan.identitySymbol(plan, at),
+      dwarfFile,
+      origin,
+    )
+    at = at + usize.ONE
+  }
+  return move map
+}
+
 // Gives up `value` without dropping it, for a process about to exit: what it owns is left for the
 // exit to return.
 effect fn abandonValue<T>(value: T) -> ()
@@ -6002,13 +6048,14 @@ effect fn build(
           }
           return Compiled.Finished { status: 0 }
         }
-        // Check whether all native link inputs can be linked directly in-process by `ElfLink`
-        // (zero `clang`/`ld.lld` invocation for pure Silk + prebuilt `.o`/`.a`/`-l`/`-L`/`-rpath`).
+        // Check whether all native link inputs can be linked directly in-process by `ElfIncremental` /
+        // `ElfLink` (zero `clang`/`ld.lld` invocation for pure Silk + prebuilt `.o`/`.a`/`-l`/`-L`/`-rpath`).
         let linkInputs = ModuleSourceFiles.nativeLinkInputs(&sources)
         let mut canDirectLink = form == Form.Executable || form == Form.SharedLibrary
         let mut elfOpts = ElfLinkOptions.executable()
         elfOpts.shared = form == Form.SharedLibrary
         elfOpts.includeStart = form == Form.Executable
+        elfOpts.incremental = form == Form.Executable && same(Bytes.asSlice(&optimization), b"none")
         let mut li = usize.ZERO
         while li < linkInputs.length && canDirectLink {
           match &linkInputs[li] {
@@ -6038,10 +6085,23 @@ effect fn build(
           let _traced = Trace.span("link.elf")
           run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
           run Progress.show(&mut progress.*, b"elf-link")
-          let linkedElf = run Effect.result(ElfLink.link(Bytes.asSlice(&text), &elfOpts, &functionNames))
-          let elfBytes = match move linkedElf {
-            Result<Bytes, ElfLinkError | FileError | OutOfMemoryError>.Success { value } => move value
-            Result<Bytes, ElfLinkError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+          let elfDebug = if debug {
+            run buildElfDebugLines(&plan, &sources)
+          } else {
+            DebugLineMap.make()
+          }
+          let linkedElf = run Effect.result(
+            ElfIncremental.linkOrPatch(
+              output,
+              Bytes.asSlice(&text),
+              &elfOpts,
+              &functionNames,
+              &elfDebug,
+            ),
+          )
+          let linkResult = match move linkedElf {
+            Result<ElfIncrementalResult, ElfLinkError | FileError | OutOfMemoryError>.Success { value } => value
+            Result<ElfIncrementalResult, ElfLinkError | FileError | OutOfMemoryError>.Failure { error } => match move error {
               ElfLinkError failed => {
                 run Progress.refuse(&mut progress.*, usize.ZERO)
                 let mut message = run Bytes.copy(b"silk: direct elf link failed: ")
@@ -6058,26 +6118,17 @@ effect fn build(
               }
             }
           }
-          if let Option<Path>.Some { value: parent } = move run Path.parent(output) {
-            run FileSystem.createDirectoriesRecursively(&parent)
-          }
-          let mut pendingBytes = run Bytes.copy(Path.rawBytes(output))
-          run Bytes.append(&mut pendingBytes, b".elf-partial")
-          let pendingPath = run Path.fromBytes(Bytes.asSlice(&pendingBytes))
-          run FileSystem.writeFile(&pendingPath, Bytes.asSlice(&elfBytes))
-          if form == Form.Executable || form == Form.SharedLibrary {
-            drop run HostRename.makeExecutable(&pendingPath)
-          }
-          if !run HostRename.replaceFile(&pendingPath, output) {
-            run FileSystem.writeFile(output, Bytes.asSlice(&elfBytes))
-            drop run HostRename.makeExecutable(output)
-          }
           let symbolMap = run EmissionPlan.symbolMap(&plan)
           let mapFile = run symbolMapFor(output)
           if !run holds(&mapFile, Bytes.asSlice(&symbolMap)) {
             run FileSystem.writeFile(&mapFile, Bytes.asSlice(&symbolMap))
           }
-          run Progress.end(&mut progress.*, b"elf-link")
+          let linkLabel = match linkResult.mode {
+            ElfLinkMode.Skipped => b"elf-cached"
+            ElfLinkMode.Patched => b"elf-patch"
+            ElfLinkMode.Full => b"elf-link"
+          }
+          run Progress.end(&mut progress.*, linkLabel)
           if receipts {
             run reportCompiled(
               display,
