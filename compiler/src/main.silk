@@ -144,6 +144,9 @@ import backend.WasmText { Printed }
 import backend.WasmObject { Unsupported }
 import backend.X86ElfObject
 import backend.X86Object { Unsupported as X86Unsupported }
+import driver.ElfInput { LinkError as ElfLinkError }
+import driver.ElfLink
+import driver.ElfLink { LinkOptions as ElfLinkOptions }
 import driver.WasmLink as WasmLink { Linked }
 import backend.Bitcode {
   DebugFunction,
@@ -5969,23 +5972,23 @@ effect fn build(
           )
           return Compiled.Finished { status: 2 }
         }
-        let packed = run Effect.result(X86ElfObject.pack(Bytes.asSlice(&text)))
-        let objectBytes = match move packed {
-          Result<Bytes, X86Unsupported | OutOfMemoryError>.Success { value } => move value
-          Result<Bytes, X86Unsupported | OutOfMemoryError>.Failure { error } => match move error {
-            X86Unsupported failed => {
-              let mut message = run Bytes.copy(b"silk: direct x86-64 backend unsupported: ")
-              run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
-              run Bytes.append(&mut message, b"\n")
-              run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
-              return Compiled.Finished { status: 2 }
-            }
-            OutOfMemoryError exhausted => {
-              fail move exhausted
+        if stage == Stage.Object {
+          let packed = run Effect.result(X86ElfObject.pack(Bytes.asSlice(&text)))
+          let objectBytes = match move packed {
+            Result<Bytes, X86Unsupported | OutOfMemoryError>.Success { value } => move value
+            Result<Bytes, X86Unsupported | OutOfMemoryError>.Failure { error } => match move error {
+              X86Unsupported failed => {
+                let mut message = run Bytes.copy(b"silk: direct x86-64 backend unsupported: ")
+                run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
+                run Bytes.append(&mut message, b"\n")
+                run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+                return Compiled.Finished { status: 2 }
+              }
+              OutOfMemoryError exhausted => {
+                fail move exhausted
+              }
             }
           }
-        }
-        if stage == Stage.Object {
           run FileSystem.writeFile(output, Bytes.asSlice(&objectBytes))
           if receipts {
             run reportCompiled(
@@ -5999,9 +6002,119 @@ effect fn build(
           }
           return Compiled.Finished { status: 0 }
         }
-        directObject = Option<Bytes>.some(move objectBytes)
+        // Check whether all native link inputs can be linked directly in-process by `ElfLink`
+        // (zero `clang`/`ld.lld` invocation for pure Silk + prebuilt `.o`/`.a`/`-l`/`-L`/`-rpath`).
+        let linkInputs = ModuleSourceFiles.nativeLinkInputs(&sources)
+        let mut canDirectLink = form == Form.Executable || form == Form.SharedLibrary
+        let mut elfOpts = ElfLinkOptions.executable()
+        elfOpts.shared = form == Form.SharedLibrary
+        elfOpts.includeStart = form == Form.Executable
+        let mut li = usize.ZERO
+        while li < linkInputs.length && canDirectLink {
+          match &linkInputs[li] {
+            NativeLinkInput.Object { path } => {
+              run List<Path>.append(&mut elfOpts.objects, run Path.fromBytes(Path.rawBytes(&path)))
+            }
+            NativeLinkInput.StaticArchive { path } => {
+              run List<Path>.append(&mut elfOpts.archives, run Path.fromBytes(Path.rawBytes(&path)))
+            }
+            NativeLinkInput.SearchPath { path } => {
+              run List<Path>.append(&mut elfOpts.searchPaths, run Path.fromBytes(Path.rawBytes(&path)))
+            }
+            NativeLinkInput.RPath { value } => {
+              run List<Bytes>.append(&mut elfOpts.rpaths, run Bytes.copy(Bytes.asSlice(&value)))
+            }
+            NativeLinkInput.Library { name, .. } => {
+              run List<Bytes>.append(&mut elfOpts.libraries, run Bytes.copy(Bytes.asSlice(&name)))
+            }
+            NativeLinkInput.FrameworkSearchPath { .. } => {}
+            NativeLinkInput.Framework { .. } => {}
+            NativeLinkInput.Sources { .. } => { canDirectLink = false }
+            NativeLinkInput.LinkerScript { .. } => { canDirectLink = false }
+          }
+          li = li + usize.ONE
+        }
+        if canDirectLink {
+          let _traced = Trace.span("link.elf")
+          run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
+          run Progress.show(&mut progress.*, b"elf-link")
+          let linkedElf = run Effect.result(ElfLink.link(Bytes.asSlice(&text), &elfOpts, &functionNames))
+          let elfBytes = match move linkedElf {
+            Result<Bytes, ElfLinkError | FileError | OutOfMemoryError>.Success { value } => move value
+            Result<Bytes, ElfLinkError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+              ElfLinkError failed => {
+                run Progress.refuse(&mut progress.*, usize.ZERO)
+                let mut message = run Bytes.copy(b"silk: direct elf link failed: ")
+                run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
+                run Bytes.append(&mut message, b"\n")
+                run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+                return Compiled.Finished { status: 1 }
+              }
+              FileError failed => {
+                fail move failed
+              }
+              OutOfMemoryError exhausted => {
+                fail move exhausted
+              }
+            }
+          }
+          if let Option<Path>.Some { value: parent } = move run Path.parent(output) {
+            run FileSystem.createDirectoriesRecursively(&parent)
+          }
+          let mut pendingBytes = run Bytes.copy(Path.rawBytes(output))
+          run Bytes.append(&mut pendingBytes, b".elf-partial")
+          let pendingPath = run Path.fromBytes(Bytes.asSlice(&pendingBytes))
+          run FileSystem.writeFile(&pendingPath, Bytes.asSlice(&elfBytes))
+          if form == Form.Executable || form == Form.SharedLibrary {
+            drop run HostRename.makeExecutable(&pendingPath)
+          }
+          if !run HostRename.replaceFile(&pendingPath, output) {
+            run FileSystem.writeFile(output, Bytes.asSlice(&elfBytes))
+            drop run HostRename.makeExecutable(output)
+          }
+          let symbolMap = run EmissionPlan.symbolMap(&plan)
+          let mapFile = run symbolMapFor(output)
+          if !run holds(&mapFile, Bytes.asSlice(&symbolMap)) {
+            run FileSystem.writeFile(&mapFile, Bytes.asSlice(&symbolMap))
+          }
+          run Progress.end(&mut progress.*, b"elf-link")
+          if receipts {
+            run reportCompiled(
+              display,
+              sourcePath,
+              output,
+              &target,
+              EmissionPlan.symbolCount(&plan),
+              b"direct",
+            )
+          }
+          status = 0
+        } else {
+          // Fallback when `[native].sources` or a custom `LinkerScript` requires Clang/lld.
+          let packed = run Effect.result(X86ElfObject.pack(Bytes.asSlice(&text)))
+          let objectBytes = match move packed {
+            Result<Bytes, X86Unsupported | OutOfMemoryError>.Success { value } => move value
+            Result<Bytes, X86Unsupported | OutOfMemoryError>.Failure { error } => match move error {
+              X86Unsupported failed => {
+                let mut message = run Bytes.copy(b"silk: direct x86-64 backend unsupported: ")
+                run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
+                run Bytes.append(&mut message, b"\n")
+                run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+                return Compiled.Finished { status: 2 }
+              }
+              OutOfMemoryError exhausted => {
+                fail move exhausted
+              }
+            }
+          }
+          directObject = Option<Bytes>.some(move objectBytes)
+        }
       }
-      if stage == Stage.LlvmIr && !packageCodegen {
+      let skipClangLink = direct && match &directObject {
+        Option<Bytes>.Some { .. } => false
+        Option<Bytes>.None => true
+      }
+      if !skipClangLink && stage == Stage.LlvmIr && !packageCodegen {
         let mut printed = Bytes.make()
         if debug {
           // A debug build's IR shows the line tables its objects carry.
@@ -6030,82 +6143,181 @@ effect fn build(
         return Compiled.Finished { status: 0 }
       }
 
-      // Units that only the cache asked for are not compiled apart.
-      if !split {
-        units = List<CodegenUnit>.make()
-      }
-
-      // An optimized executable stays one module unless its profile's `codegen-units` asks for
-      // more. Then it splits by its call graph (`ReleaseUnits`), so Clang optimizes the units on
-      // several threads and a ThinLTO link joins them. One module is the default because the
-      // split costs run time: silkjs ran 10% slower in 16 units (regexp 26%, startup 16%) and
-      // grew from 25 to 33 MB, while the compiler built 3x faster. A build with line tables stays
-      // one module, whose tables `debugInfo` holds.
-      if !direct && !split && form == Form.Executable && stage == Stage.Final
-        && same(Bytes.asSlice(&optimization), b"speed")
-        && !debug {
-        let requested = u64.toUsize(InitialProfile.unitCount(&profile))
-        if requested > usize.ONE {
-          let partitioning = Trace.span("codegen.partition")
-          // The source edited with the program: the root package's and its path dependencies'.
-          let mut edited = run ModuleSourceFiles.loadedRootModules(&sources)
-          let mut local = run ModuleSourceFiles.loadedLocalDependencyModules(&sources)
-          while List<ModuleId>.length(&local) > usize.ZERO {
-            run List<ModuleId>.append(&mut edited, List<ModuleId>.remove(&mut local, usize.ZERO))
-          }
-          units = run ReleaseUnits.partition(Bytes.asSlice(&text), requested, &plan, List<ModuleId>.asSlice(&edited))
-          drop partitioning
+      if !skipClangLink {
+        // Units that only the cache asked for are not compiled apart.
+        if !split {
+          units = List<CodegenUnit>.make()
         }
-      }
-      if !direct && form == Form.Executable && stage == Stage.Final && !started
-        && !same(Target.objectFormat(&target), b"wasm")
-        && ModuleSourceFiles.nativeLinkInputs(&sources).length == usize.ZERO
-        && !definesMain(Bytes.asSlice(&text))
-        && !unitsDefineMain(
-          List<CodegenUnit>.asSlice(&units),
-          List<BuildRecord.PackBody>.asSlice(&packs),
-        ) {
-        run writeHeaded(
-          heading,
-          &mut headed,
-          b"silk: an executable built with runtime = { kind = \"none\" } has no `main`; export one, as `export \"C\" fn start() -> i32 as \"main\"` does, or select a runtime\n",
-          &mut progress.*,
-        )
-        return Compiled.Finished { status: 2 }
-      }
 
-      // Only a link consumes a platform supply; compiling to an object or an intermediate stage
-      // needs no SDK, so a cross-target object never runs discovery.
-      let mut supply = Option<Supply>.none()
-      if (form == Form.Executable || form == Form.SharedLibrary) && stage == Stage.Final {
-        let resolved = run Effect.result(
-          PlatformSupplies.resolve(
-            &target,
-            &hostTarget(),
+        // An optimized executable stays one module unless its profile's `codegen-units` asks for
+        // more. Then it splits by its call graph (`ReleaseUnits`), so Clang optimizes the units on
+        // several threads and a ThinLTO link joins them. One module is the default because the
+        // split costs run time: silkjs ran 10% slower in 16 units (regexp 26%, startup 16%) and
+        // grew from 25 to 33 MB, while the compiler built 3x faster. A build with line tables stays
+        // one module, whose tables `debugInfo` holds.
+        if !direct && !split && form == Form.Executable && stage == Stage.Final
+          && same(Bytes.asSlice(&optimization), b"speed")
+          && !debug {
+          let requested = u64.toUsize(InitialProfile.unitCount(&profile))
+          if requested > usize.ONE {
+            let partitioning = Trace.span("codegen.partition")
+            // The source edited with the program: the root package's and its path dependencies'.
+            let mut edited = run ModuleSourceFiles.loadedRootModules(&sources)
+            let mut local = run ModuleSourceFiles.loadedLocalDependencyModules(&sources)
+            while List<ModuleId>.length(&local) > usize.ZERO {
+              run List<ModuleId>.append(&mut edited, List<ModuleId>.remove(&mut local, usize.ZERO))
+            }
+            units = run ReleaseUnits.partition(Bytes.asSlice(&text), requested, &plan, List<ModuleId>.asSlice(&edited))
+            drop partitioning
+          }
+        }
+        if !direct && form == Form.Executable && stage == Stage.Final && !started
+          && !same(Target.objectFormat(&target), b"wasm")
+          && ModuleSourceFiles.nativeLinkInputs(&sources).length == usize.ZERO
+          && !definesMain(Bytes.asSlice(&text))
+          && !unitsDefineMain(
+            List<CodegenUnit>.asSlice(&units),
+            List<BuildRecord.PackBody>.asSlice(&packs),
+          ) {
+          run writeHeaded(
+            heading,
+            &mut headed,
+            b"silk: an executable built with runtime = { kind = \"none\" } has no `main`; export one, as `export \"C\" fn start() -> i32 as \"main\"` does, or select a runtime\n",
+            &mut progress.*,
+          )
+          return Compiled.Finished { status: 2 }
+        }
+
+        // Only a link consumes a platform supply; compiling to an object or an intermediate stage
+        // needs no SDK, so a cross-target object never runs discovery.
+        let mut supply = Option<Supply>.none()
+        if (form == Form.Executable || form == Form.SharedLibrary) && stage == Stage.Final {
+          let resolved = run Effect.result(
+            PlatformSupplies.resolve(
+              &target,
+              &hostTarget(),
+              Bytes.asSlice(&libc),
+              Bytes.asSlice(&deployment),
+              ModuleSourceFiles.nativeLinkInputs(&sources).length > usize.ZERO,
+              &capturedSupply,
+            ),
+          )
+          supply = match move resolved {
+            Result<
+              Option<Supply>,
+              SupplyError | FileError | HostInputError | OutOfMemoryError
+            >.Success {
+              value
+            } => move value
+            Result<
+              Option<Supply>,
+              SupplyError | FileError | HostInputError | OutOfMemoryError
+            >.Failure {
+              error
+            } => match move error {
+              SupplyError unavailable => {
+                run reportSupply(&unavailable)
+                return Compiled.Finished { status: 2 }
+              }
+              FileError failed => {
+                fail move failed
+              }
+              HostInputError failed => {
+                fail move failed
+              }
+              OutOfMemoryError exhausted => {
+                fail move exhausted
+              }
+            }
+          }
+        }
+        // An optimized build spends most of its time in clang, which reads only the units, so the
+        // store's memory goes back to the system first.
+        if abandon && !testing && !same(Bytes.asSlice(&optimization), b"none") {
+          Semantic.release(&mut store)
+          HeapRelease.release()
+        }
+        run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
+        run Progress.show(&mut progress.*, b"clang")
+
+        // A link input the target cannot link fails this package's link, like a linker error.
+        // A split debug build makes each compiled unit's line tables from its own text.
+        let mut unitLines = Option<&EmissionPlan>.none()
+        if lineTables && split {
+          unitLines = Option<&EmissionPlan>.some(&plan)
+        }
+        let precompiled = match &directObject {
+          Option<Bytes>.Some { value } => Option<&Bytes>.some(&value)
+          Option<Bytes>.None => Option<&Bytes>.none()
+        }
+        let symbolMap = run EmissionPlan.symbolMap(&plan)
+        let linked = run Effect.result(
+          compileIr(
+            &text,
+            precompiled,
+            Bytes.asSlice(&debugInfo),
+            unitLines,
+            &sources,
+            &functionNames,
+            List<CodegenUnit>.asSlice(&units),
+            List<BuildRecord.PackBody>.asSlice(&packs),
+            output,
+            form,
+            stage,
+            Bytes.asSlice(&optimization),
+            lineTables,
+            Bytes.asSlice(&relocation),
             Bytes.asSlice(&libc),
-            Bytes.asSlice(&deployment),
-            ModuleSourceFiles.nativeLinkInputs(&sources).length > usize.ZERO,
-            &capturedSupply,
+            List<Bytes>.asSlice(&profileFlags),
+            &target,
+            &supply,
+            ModuleSourceFiles.nativeLinkInputs(&sources),
+            ModuleSourceFiles.functionOrder(&sources),
+            Bytes.asSlice(&symbolMap),
+            clang,
+            &world,
+            started,
+            printed,
+            explicit,
+            &mut progress.*,
           ),
         )
-        supply = match move resolved {
+        match move linked {
           Result<
-            Option<Supply>,
-            SupplyError | FileError | HostInputError | OutOfMemoryError
+            i32,
+            FileError
+              | ProcessError
+              | HostInputError
+              | InvalidNativeLinkInput
+              | OutOfMemoryError
+              | WriterError
           >.Success {
             value
-          } => move value
+          } => {
+            status = value
+          }
           Result<
-            Option<Supply>,
-            SupplyError | FileError | HostInputError | OutOfMemoryError
+            i32,
+            FileError
+              | ProcessError
+              | HostInputError
+              | InvalidNativeLinkInput
+              | OutOfMemoryError
+              | WriterError
           >.Failure {
             error
           } => match move error {
-            SupplyError unavailable => {
-              run reportSupply(&unavailable)
-              return Compiled.Finished { status: 2 }
+            InvalidNativeLinkInput invalid => {
+              let mut message = run Bytes.copy(b"silk: invalid native link input: ")
+              run Bytes.append(&mut message, Bytes.asSlice(&invalid.detail))
+              run Bytes.append(&mut message, b"\n")
+              run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+              status = 1
             }
             FileError failed => {
+              fail move failed
+            }
+            ProcessError failed => {
               fail move failed
             }
             HostInputError failed => {
@@ -6114,140 +6326,43 @@ effect fn build(
             OutOfMemoryError exhausted => {
               fail move exhausted
             }
+            WriterError failed => {
+              fail move failed
+            }
           }
         }
-      }
-      // An optimized build spends most of its time in clang, which reads only the units, so the
-      // store's memory goes back to the system first.
-      if abandon && !testing && !same(Bytes.asSlice(&optimization), b"none") {
-        Semantic.release(&mut store)
-        HeapRelease.release()
-      }
-      run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
-      run Progress.show(&mut progress.*, b"clang")
 
-      // A link input the target cannot link fails this package's link, like a linker error.
-      // A split debug build makes each compiled unit's line tables from its own text.
-      let mut unitLines = Option<&EmissionPlan>.none()
-      if lineTables && split {
-        unitLines = Option<&EmissionPlan>.some(&plan)
-      }
-      let precompiled = match &directObject {
-        Option<Bytes>.Some { value } => Option<&Bytes>.some(&value)
-        Option<Bytes>.None => Option<&Bytes>.none()
-      }
-      let symbolMap = run EmissionPlan.symbolMap(&plan)
-      let linked = run Effect.result(
-        compileIr(
-          &text,
-          precompiled,
-          Bytes.asSlice(&debugInfo),
-          unitLines,
-          &sources,
-          &functionNames,
-          List<CodegenUnit>.asSlice(&units),
-          List<BuildRecord.PackBody>.asSlice(&packs),
-          output,
-          form,
-          stage,
-          Bytes.asSlice(&optimization),
-          lineTables,
-          Bytes.asSlice(&relocation),
-          Bytes.asSlice(&libc),
-          List<Bytes>.asSlice(&profileFlags),
-          &target,
-          &supply,
-          ModuleSourceFiles.nativeLinkInputs(&sources),
-          ModuleSourceFiles.functionOrder(&sources),
-          Bytes.asSlice(&symbolMap),
-          clang,
-          &world,
-          started,
-          printed,
-          explicit,
-          &mut progress.*,
-        ),
-      )
-      match move linked {
-        Result<
-          i32,
-          FileError
-            | ProcessError
-            | HostInputError
-            | InvalidNativeLinkInput
-            | OutOfMemoryError
-            | WriterError
-        >.Success {
-          value
-        } => {
-          status = value
+        // Every published artifact has its content-derived symbols named beside it, so a frame an
+        // optimized program's backtrace or a profiler shows by symbol leads to its declaration. An
+        // unchanged map is left alone, so a build that changes nothing writes nothing.
+        if status == 0 {
+          let mapFile = run symbolMapFor(output)
+          if !run holds(&mapFile, Bytes.asSlice(&symbolMap)) { run FileSystem.writeFile(&mapFile, Bytes.asSlice(&symbolMap)) }
         }
-        Result<
-          i32,
-          FileError
-            | ProcessError
-            | HostInputError
-            | InvalidNativeLinkInput
-            | OutOfMemoryError
-            | WriterError
-        >.Failure {
-          error
-        } => match move error {
-          InvalidNativeLinkInput invalid => {
-            let mut message = run Bytes.copy(b"silk: invalid native link input: ")
-            run Bytes.append(&mut message, Bytes.asSlice(&invalid.detail))
-            run Bytes.append(&mut message, b"\n")
-            run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
-            status = 1
-          }
-          FileError failed => {
-            fail move failed
-          }
-          ProcessError failed => {
-            fail move failed
-          }
-          HostInputError failed => {
-            fail move failed
-          }
-          OutOfMemoryError exhausted => {
-            fail move exhausted
-          }
-          WriterError failed => {
-            fail move failed
+        if status == 0 {
+          run Progress.end(&mut progress.*, b"clang")
+        } else {
+          run Progress.refuse(&mut progress.*, usize.ZERO)
+        }
+        if status == 0 {
+          if receipts {
+            run reportCompiled(
+              display,
+              sourcePath,
+              output,
+              &target,
+              EmissionPlan.symbolCount(&plan),
+              if direct { b"direct" } else { b"llvm" },
+            )
           }
         }
-      }
 
-      // Every published artifact has its content-derived symbols named beside it, so a frame an
-      // optimized program's backtrace or a profiler shows by symbol leads to its declaration. An
-      // unchanged map is left alone, so a build that changes nothing writes nothing.
-      if status == 0 {
-        let mapFile = run symbolMapFor(output)
-        if !run holds(&mapFile, Bytes.asSlice(&symbolMap)) { run FileSystem.writeFile(&mapFile, Bytes.asSlice(&symbolMap)) }
-      }
-      if status == 0 {
-        run Progress.end(&mut progress.*, b"clang")
-      } else {
-        run Progress.refuse(&mut progress.*, usize.ZERO)
-      }
-      if status == 0 {
-        if receipts {
-          run reportCompiled(
-            display,
-            sourcePath,
-            output,
-            &target,
-            EmissionPlan.symbolCount(&plan),
-            if direct { b"direct" } else { b"llvm" },
-          )
+        // A process about to exit leaves the program's text and plan to the exit, as the store below.
+        if abandon {
+          run abandonValue(move plan)
+          run abandonValue(move text)
+          run abandonValue(move units)
         }
-      }
-
-      // A process about to exit leaves the program's text and plan to the exit, as the store below.
-      if abandon {
-        run abandonValue(move plan)
-        run abandonValue(move text)
-        run abandonValue(move units)
       }
     }
     BackendBuild.Unsupported { gaps } => {

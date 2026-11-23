@@ -1,0 +1,2339 @@
+//! In-process Linux x86-64 ELF64 direct linker.
+//!
+//! # When to use
+//! Links Silk [`X86Object.Fragment`] streams together with any C/C++ relocatable objects (`.o`),
+//! static archives (`.a`), shared libraries (`.so` / GNU linker scripts), and the built-in
+//! glibc 2.28 / `libgcc_s.so.1` virtual DSOs into a directly runnable Linux x86-64 PIE
+//! executable (`ET_DYN` with `PT_INTERP`) or shared library (`ET_DYN`) — with zero `clang` or
+//! `ld.lld` invocation for pure Silk builds.
+
+import backend.X86Encode
+import driver.ElfInput
+import driver.ElfInput {
+  ArchiveIndex,
+  ArchiveMember,
+  DynamicExport,
+  InputReloc,
+  InputSection,
+  InputSymbol,
+  InputUnit,
+  LinkError,
+  ScriptEntry,
+  SectionKind,
+  SharedFile,
+  SharedLib,
+}
+import driver.WasmNames {FunctionNames}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {FileError, FileSystem, Path}
+
+/// Configuration and native inputs passed to [`link`].
+pub struct LinkOptions {
+  /// Emit a shared library (`ET_DYN` without `PT_INTERP`) instead of a PIE executable.
+  pub shared: bool,
+  /// Include the built-in glibc `_start` / `silk_gnu_initialize` startup code (true for normal
+  /// Silk executables with a runtime or exporting `main`).
+  pub includeStart: bool,
+  /// Precompiled `.o` object files (from `[native].sources` or `NativeLinkInput.Object`).
+  pub objects: List<Path>,
+  /// Static archives (`.a`).
+  pub archives: List<Path>,
+  /// Library search paths (`-L`).
+  pub searchPaths: List<Path>,
+  /// Requested shared/static library names (`-l<name>`).
+  pub libraries: List<Bytes>,
+  /// Dynamic `DT_RUNPATH` entries (`-Wl,-rpath,...`).
+  pub rpaths: List<Bytes>,
+  /// Optional explicit `DT_SONAME` for shared libraries.
+  pub soname: Bytes,
+}
+
+impl LinkOptions {
+  /// An empty default configuration for a pure Silk Linux x86-64 PIE executable.
+  pub fn executable() -> LinkOptions {
+    return LinkOptions {
+      shared: false,
+      includeStart: true,
+      objects: List<Path>.make(),
+      archives: List<Path>.make(),
+      searchPaths: List<Path>.make(),
+      libraries: List<Bytes>.make(),
+      rpaths: List<Bytes>.make(),
+      soname: Bytes.make(),
+    }
+  }
+}
+
+// ---- Internal Linker Data Structures ----
+
+enum SymState {
+  Undefined,
+  Defined,
+  Common,
+  Dynamic,
+  Synthetic,
+}
+
+// Which synthetic symbol an entry represents.
+enum SynthKind {
+  None,
+  StartSilkFrames,
+  StopSilkFrames,
+  StartSilkSeen,
+  StopSilkSeen,
+  InitArrayStart,
+  InitArrayEnd,
+  FiniArrayStart,
+  FiniArrayEnd,
+  GotBase,
+  DynamicBase,
+  BssStart,
+  Edata,
+  End,
+}
+
+struct GlobalSym {
+  name: Bytes,
+  state: SymState,
+  synth: SynthKind,
+  unitIdx: usize,
+  secIdx: usize,
+  offset: u64,
+  size: u64,
+  alignment: u64,
+  isFunc: bool,
+  isTls: bool,
+  weak: bool,
+  hidden: bool,
+  // Dynamic import metadata (when state == Dynamic)
+  libIdx: usize,
+  version: Bytes,
+  isObject: bool,
+  // Assigned synthetic slots (usize.MAX = not allocated)
+  gotSlot: usize,
+  gotTpOffSlot: usize,
+  pltSlot: usize,
+  copyBssOff: u64,
+  hasCopy: bool,
+  dynsymIdx: usize,
+  // Resolved runtime virtual address (or TLS offset if `isTls`)
+  vaddr: u64,
+}
+
+// Per-(unit, section) placement in the merged output image.
+struct SecPlacement {
+  kept: bool,
+  kind: SectionKind,
+  outOffset: u64, // offset inside its merged output section
+  vaddr: u64,
+  size: u64,
+}
+
+struct DynRela {
+  offset: u64,
+  dynsym: usize, // 0 for R_X86_64_RELATIVE
+  relType: u64,
+  addend: i64,
+}
+
+impl Copy for DynRela {}
+
+struct FdeEntry {
+  funcVaddr: u64,
+  fdeVaddr: u64,
+}
+
+impl Copy for FdeEntry {}
+
+struct EhCieMap {
+  unitIdx: usize,
+  secIdx: usize,
+  inOff: u64,
+  outOff: u64,
+}
+
+impl Copy for EhCieMap {}
+
+struct EhFdePlace {
+  unitIdx: usize,
+  secIdx: usize,
+  inInitLocOff: u64,
+  outInitLocOff: u64,
+  outFdeOff: u64,
+}
+
+impl Copy for EhFdePlace {}
+
+struct VerNeedEntry {
+  libIdx: usize,
+  version: Bytes,
+  verNdx: u64,
+}
+
+// ---- Small Utilities ----
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn alignUp(v: u64, align: u64) -> u64 {
+  if align <= 1 { return v }
+  let rem = v % align
+  if rem == 0 { return v }
+  return v + (align - rem)
+}
+
+fn maxU64(a: u64, b: u64) -> u64 {
+  if a >= b { return a }
+  return b
+}
+
+fn putU16Le(out: &mut Bytes, at: usize, v: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  buf[at] = u64.wrappingToU8(v & 255)
+  buf[at + 1] = u64.wrappingToU8(u64.shiftRight(v, 8) & 255)
+}
+
+fn putU32Le(out: &mut Bytes, at: usize, v: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  buf[at] = u64.wrappingToU8(v & 255)
+  buf[at + 1] = u64.wrappingToU8(u64.shiftRight(v, 8) & 255)
+  buf[at + 2] = u64.wrappingToU8(u64.shiftRight(v, 16) & 255)
+  buf[at + 3] = u64.wrappingToU8(u64.shiftRight(v, 24) & 255)
+}
+
+fn putU64Le(out: &mut Bytes, at: usize, v: u64) -> () {
+  putU32Le(&mut out.*, at, v)
+  putU32Le(&mut out.*, at + 4, u64.shiftRight(v, 32))
+}
+
+fn readU32Le(data: &[u8], at: usize) -> u64 {
+  return u8.toU64(data[at])
+    | u64.shiftLeft(u8.toU64(data[at + 1]), 8)
+    | u64.shiftLeft(u8.toU64(data[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(data[at + 3]), 24)
+}
+
+effect fn appendPad(out: &mut Bytes, count: usize, fill: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i = usize.ZERO
+  while i < count {
+    run X86Encode.byte(&mut out.*, fill)
+    i = i + usize.ONE
+  }
+  return ()
+}
+
+effect fn padToOffset(out: &mut Bytes, target: usize, fill: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let cur = Bytes.length(&out.*)
+  if target > cur {
+    run appendPad(&mut out.*, target - cur, fill)
+  }
+  return ()
+}
+
+effect fn appendCstr(table: &mut Bytes, s: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let off = usize.toU64(Bytes.length(&table.*))
+  run Bytes.append(&mut table.*, s)
+  run X86Encode.byte(&mut table.*, 0)
+  return off
+}
+
+fn elfSysVHash(name: &[u8]) -> u64 {
+  let mut h: u64 = 0
+  let mut i = usize.ZERO
+  while i < name.length {
+    h = (u64.shiftLeft(h, 4) + u8.toU64(name[i])) & 0xFFFFFFFF
+    let g = h & 0xF0000000
+    if g != 0 { h = h ^ u64.shiftRight(g, 24) }
+    h = h & (0xFFFFFFFF ^ g)
+    i = i + usize.ONE
+  }
+  return h
+}
+
+fn gnuHash(name: &[u8]) -> u64 {
+  let mut h: u64 = 5381
+  let mut i = usize.ZERO
+  while i < name.length {
+    h = (h * 33 + u8.toU64(name[i])) & 0xFFFFFFFF
+    i = i + usize.ONE
+  }
+  return h
+}
+
+// ---- Global Symbol Table Helpers ----
+
+struct SymTab {
+  entries: List<GlobalSym>,
+  index: InternIndex,
+}
+
+fn symLookupIn(entries: &[GlobalSym], index: &InternIndex, name: &[u8]) -> usize {
+  let hash = InternIndex.hashBytes(0, name)
+  let mut at = InternIndex.first(index, hash)
+  while at != usize.MAX {
+    if sameBytes(Bytes.asSlice(&entries[at].name), name) { return at }
+    at = InternIndex.after(index, at)
+  }
+  return usize.MAX
+}
+
+fn symLookup(tab: &SymTab, name: &[u8]) -> usize {
+  return symLookupIn(List<GlobalSym>.asSlice(&tab.entries), &tab.index, name)
+}
+
+effect fn symIntern(tab: &mut SymTab, name: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let found = symLookup(&tab.*, name)
+  if found != usize.MAX { return found }
+  let hash = InternIndex.hashBytes(0, name)
+  let idx = List<GlobalSym>.length(&tab.entries)
+  run InternIndex.record(&mut tab.index, hash)
+  run List<GlobalSym>.append(&mut tab.entries, GlobalSym {
+    name: run Bytes.copy(name),
+    state: SymState.Undefined,
+    synth: SynthKind.None,
+    unitIdx: usize.MAX,
+    secIdx: usize.MAX,
+    offset: 0,
+    size: 0,
+    alignment: 1,
+    isFunc: false,
+    isTls: false,
+    weak: false,
+    hidden: false,
+    libIdx: usize.MAX,
+    version: Bytes.make(),
+    isObject: false,
+    gotSlot: usize.MAX,
+    gotTpOffSlot: usize.MAX,
+    pltSlot: usize.MAX,
+    copyBssOff: 0,
+    hasCopy: false,
+    dynsymIdx: usize.MAX,
+    vaddr: 0,
+  })
+  return idx
+}
+
+effect fn registerSynthetic(tab: &mut SymTab, name: &[u8], kind: SynthKind) -> () ! OutOfMemoryError ? &mut Allocator {
+  let idx = run symIntern(&mut tab.*, name)
+  let entries = List<GlobalSym>.asMutSlice(&mut tab.entries)
+  if entries[idx].state == SymState.Undefined {
+    entries[idx].state = SymState.Synthetic
+    entries[idx].synth = kind
+    entries[idx].hidden = true
+  }
+}
+
+effect fn registerUnitSymbols(
+  tab: &mut SymTab,
+  unitIdx: usize,
+  unit: &InputUnit,
+  secKept: &[bool],
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let syms = List<InputSymbol>.asSlice(&unit.symbols)
+  let mut i = usize.ZERO
+  while i < syms.length {
+    let s = &syms[i]
+    let validSec = s.common || (s.section < secKept.length && secKept[s.section])
+    if validSec && Bytes.length(&s.name) > usize.ZERO {
+      let idx = run symIntern(&mut tab.*, Bytes.asSlice(&s.name))
+      let entries = List<GlobalSym>.asMutSlice(&mut tab.entries)
+      let cur = entries[idx].state
+      let take = if s.common {
+        cur == SymState.Undefined || (cur == SymState.Common && s.size > entries[idx].size)
+      } else if s.weak {
+        cur == SymState.Undefined || cur == SymState.Common
+      } else {
+        cur == SymState.Undefined || cur == SymState.Common || cur == SymState.Synthetic || entries[idx].weak
+      }
+      if take {
+        entries[idx].state = if s.common { SymState.Common } else { SymState.Defined }
+        entries[idx].synth = SynthKind.None
+        entries[idx].unitIdx = unitIdx
+        entries[idx].secIdx = s.section
+        entries[idx].offset = s.offset
+        entries[idx].size = s.size
+        entries[idx].alignment = maxU64(entries[idx].alignment, s.alignment)
+        entries[idx].isFunc = s.isFunc
+        entries[idx].isTls = s.isTls
+        entries[idx].weak = s.weak
+        entries[idx].hidden = s.hidden
+      }
+    }
+    i = i + usize.ONE
+  }
+  // Intern all relocation targets & explicit undefined symbols so archives/DSOs resolve them.
+  let undefs = List<Bytes>.asSlice(&unit.undefinedSymbols)
+  i = usize.ZERO
+  while i < undefs.length {
+    if Bytes.length(&undefs[i]) > usize.ZERO {
+      drop run symIntern(&mut tab.*, Bytes.asSlice(&undefs[i]))
+    }
+    i = i + usize.ONE
+  }
+  let secs = List<InputSection>.asSlice(&unit.sections)
+  let mut sc = usize.ZERO
+  while sc < secs.length {
+    if sc < secKept.length && secKept[sc] {
+      let rels = List<InputReloc>.asSlice(&secs[sc].relocs)
+      let mut r = usize.ZERO
+      while r < rels.length {
+        if !rels[r].targetLocal && Bytes.length(&rels[r].symbol) > usize.ZERO {
+          drop run symIntern(&mut tab.*, Bytes.asSlice(&rels[r].symbol))
+        }
+        r = r + usize.ONE
+      }
+    }
+    sc = sc + usize.ONE
+  }
+}
+
+// ---- External Library Search & File Loading ----
+
+effect fn resolveLibraryFile(
+  name: &[u8],
+  searchPaths: &[Path],
+) -> Option<Path> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  // Build candidate filenames: `lib<name>.so`, `lib<name>.a`, or literal `<name>` (when `:foo`).
+  let mut soName = Bytes.make()
+  let mut aName = Bytes.make()
+  if name.length > usize.ZERO && name[0] == 58 {
+    soName = run Bytes.copy(Slice.view<u8>(name, usize.ONE, name.length - usize.ONE))
+  } else {
+    soName = run Bytes.copy(b"lib")
+    run Bytes.append(&mut soName, name)
+    run Bytes.append(&mut soName, b".so")
+    aName = run Bytes.copy(b"lib")
+    run Bytes.append(&mut aName, name)
+    run Bytes.append(&mut aName, b".a")
+  }
+
+  // Search explicit `-L` paths first, then standard Linux x86-64 system library directories.
+  let mut dirs = List<Path>.make()
+  let mut i = usize.ZERO
+  while i < searchPaths.length {
+    run List<Path>.append(&mut dirs, run Path.fromBytes(Path.rawBytes(&searchPaths[i])))
+    i = i + usize.ONE
+  }
+  let defaults = [
+    b"/usr/lib/x86_64-linux-gnu",
+    b"/lib/x86_64-linux-gnu",
+    b"/usr/lib64",
+    b"/lib64",
+    b"/usr/lib",
+    b"/usr/local/lib",
+  ]
+  i = usize.ZERO
+  while i < defaults.length {
+    run List<Path>.append(&mut dirs, run Path.fromBytes(defaults[i]))
+    i = i + usize.ONE
+  }
+
+  let dirSlice = List<Path>.asSlice(&dirs)
+  i = usize.ZERO
+  while i < dirSlice.length {
+    let candSo = run Path.joinBytes(&dirSlice[i], Bytes.asSlice(&soName))
+    if run FileSystem.exists(&candSo) { return Option<Path>.some(move candSo) }
+    if Bytes.length(&aName) > usize.ZERO {
+      let candA = run Path.joinBytes(&dirSlice[i], Bytes.asSlice(&aName))
+      if run FileSystem.exists(&candA) { return Option<Path>.some(move candA) }
+    }
+    i = i + usize.ONE
+  }
+  return Option<Path>.none()
+}
+
+fn isVirtualGlibcLibrary(name: &[u8]) -> bool {
+  return sameBytes(name, b"c")
+    || sameBytes(name, b"m")
+    || sameBytes(name, b"pthread")
+    || sameBytes(name, b"dl")
+    || sameBytes(name, b"rt")
+    || sameBytes(name, b"gcc_s")
+}
+
+fn basenameOf(path: &[u8]) -> &[u8] {
+  let mut last = usize.ZERO
+  let mut i = usize.ZERO
+  while i < path.length {
+    if path[i] == 47 { last = i + usize.ONE }
+    i = i + usize.ONE
+  }
+  return Slice.view<u8>(path, last, path.length - last)
+}
+
+fn dirnameOf(path: &[u8]) -> &[u8] {
+  let mut last = usize.ZERO
+  let mut found = false
+  let mut i = usize.ZERO
+  while i < path.length {
+    if path[i] == 47 {
+      last = i
+      found = true
+    }
+    i = i + usize.ONE
+  }
+  if !found { return b"." }
+  if last == usize.ZERO { return b"/" }
+  return Slice.view<u8>(path, usize.ZERO, last)
+}
+
+effect fn loadSharedOrArchivePath(
+  pathBytes: &[u8],
+  asNeeded: bool,
+  units: &mut List<InputUnit>,
+  archives: &mut List<ArchiveIndex>,
+  sharedLibs: &mut List<SharedLib>,
+  depth: usize,
+) -> () ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if depth > 8 { return () }
+  let path = run Path.fromBytes(pathBytes)
+  let raw = run FileSystem.readFile(&path)
+  let data = Bytes.asSlice(&raw)
+  // Check archive magic `!<arch>\n` or `!<thin>\n`.
+  if data.length >= 8 && data[0] == 33 && data[1] == 60 {
+    let arch = run ElfInput.parseArchive(data, pathBytes, dirnameOf(pathBytes))
+    return run List<ArchiveIndex>.append(&mut archives.*, move arch)
+  }
+  // Check ELF64 relocatable `.o` (`e_type == 1`).
+  if data.length >= 20 && data[0] == 0x7F && data[1] == 69 && data[2] == 76 && data[3] == 70
+    && data[16] == 1 && data[17] == 0 {
+    let unit = run ElfInput.parseRelocatable(data, pathBytes)
+    return run List<InputUnit>.append(&mut units.*, move unit)
+  }
+  // Otherwise parse as `.so` or GNU linker script.
+  let parsed = run ElfInput.parseSharedObject(data, basenameOf(pathBytes), asNeeded)
+  match move parsed {
+    SharedFile.Library {lib} => {
+      return run List<SharedLib>.append(&mut sharedLibs.*, move lib)
+    }
+    SharedFile.Script {entries} => {
+      let list = List<ScriptEntry>.asSlice(&entries)
+      let baseDir = dirnameOf(pathBytes)
+      let mut i = usize.ZERO
+      while i < list.length {
+        let entryPath = Bytes.asSlice(&list[i].path)
+        let mut resolved = Bytes.make()
+        if entryPath.length > usize.ZERO && entryPath[0] == 47 {
+          resolved = run Bytes.copy(entryPath)
+        } else {
+          resolved = run Bytes.copy(baseDir)
+          run Bytes.append(&mut resolved, b"/")
+          run Bytes.append(&mut resolved, entryPath)
+        }
+        let checkP = run Path.fromBytes(Bytes.asSlice(&resolved))
+        if run FileSystem.exists(&checkP) {
+          run loadSharedOrArchivePath(Bytes.asSlice(&resolved), list[i].asNeeded, &mut units.*, &mut archives.*, &mut sharedLibs.*, depth + usize.ONE)
+        }
+        i = i + usize.ONE
+      }
+    }
+  }
+}
+
+// ---- Core Pure In-Memory ELF64 Linker ----
+
+/// Links `units`, optional `archives`, and `sharedLibs` purely in memory into a complete Linux
+/// x86-64 PIE executable (`!shared`) or shared library (`shared`) ELF64 binary image.
+///
+/// Exposed directly so unit tests (`ElfLinkCases`) can exercise the linker without disk I/O.
+pub effect fn linkUnits(
+  unitsIn: List<InputUnit>,
+  archivesIn: List<ArchiveIndex>,
+  sharedLibsIn: List<SharedLib>,
+  shared: bool,
+  rpaths: &[Bytes],
+  soname: &[u8],
+  functionNames: &FunctionNames,
+) -> Bytes ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut units = move unitsIn
+  let archives = move archivesIn
+  let sharedLibs = move sharedLibsIn
+
+  // Track COMDAT group deduplication across all input units.
+  let mut seenComdats = List<Bytes>.make()
+  let mut comdatIdx = InternIndex.make()
+
+  // Track which sections of each unit are kept (non-duplicate COMDAT).
+  let mut unitSecKept = List<List<bool>>.make()
+  let mut symtab = SymTab {entries: List<GlobalSym>.make(), index: InternIndex.make()}
+
+  // Register built-in linker synthetic symbols.
+  run registerSynthetic(&mut symtab, b"__start_silk_frames", SynthKind.StartSilkFrames)
+  run registerSynthetic(&mut symtab, b"__stop_silk_frames", SynthKind.StopSilkFrames)
+  run registerSynthetic(&mut symtab, b"__start_silk_seen", SynthKind.StartSilkSeen)
+  run registerSynthetic(&mut symtab, b"__stop_silk_seen", SynthKind.StopSilkSeen)
+  run registerSynthetic(&mut symtab, b"__init_array_start", SynthKind.InitArrayStart)
+  run registerSynthetic(&mut symtab, b"__init_array_end", SynthKind.InitArrayEnd)
+  run registerSynthetic(&mut symtab, b"__fini_array_start", SynthKind.FiniArrayStart)
+  run registerSynthetic(&mut symtab, b"__fini_array_end", SynthKind.FiniArrayEnd)
+  run registerSynthetic(&mut symtab, b"_GLOBAL_OFFSET_TABLE_", SynthKind.GotBase)
+  run registerSynthetic(&mut symtab, b"_DYNAMIC", SynthKind.DynamicBase)
+  run registerSynthetic(&mut symtab, b"__bss_start", SynthKind.BssStart)
+  run registerSynthetic(&mut symtab, b"_edata", SynthKind.Edata)
+  run registerSynthetic(&mut symtab, b"_end", SynthKind.End)
+
+  // Process initial units.
+  let mut nextUnit = usize.ZERO
+  // Track which archive members `(archIdx, memberIdx)` have already been extracted.
+  let archCount = List<ArchiveIndex>.length(&archives)
+  let mut archPulled = run List<List<u8>>.makeWithCapacity(archCount)
+  let mut ai = usize.ZERO
+  while ai < archCount {
+    let mCount = List<ArchiveMember>.length(&List<ArchiveIndex>.asSlice(&archives)[ai].members)
+    let mut flags = run List<u8>.makeWithCapacity(mCount)
+    let mut mi = usize.ZERO
+    while mi < mCount {
+      run List<u8>.append(&mut flags, 0)
+      mi = mi + usize.ONE
+    }
+    run List<List<u8>>.append(&mut archPulled, move flags)
+    ai = ai + usize.ONE
+  }
+
+  let mut nonsharedAdded = false
+  let mut resolveLoop = true
+  while resolveLoop {
+    // Register symbols from any newly added units.
+    while nextUnit < List<InputUnit>.length(&units) {
+      let u = &List<InputUnit>.asSlice(&units)[nextUnit]
+      let secs = List<InputSection>.asSlice(&u.sections)
+      let mut kept = run List<bool>.makeWithCapacity(secs.length)
+      // Within one unit, multiple sections can belong to the same COMDAT group; accept all of
+      // them if the group was not seen in an EARLIER unit.
+      let mut unitNewGroups = List<Bytes>.make()
+      let mut si = usize.ZERO
+      while si < secs.length {
+        let g = Bytes.asSlice(&secs[si].comdatGroup)
+        if g.length == usize.ZERO {
+          run List<bool>.append(&mut kept, true)
+        } else {
+          let hash = InternIndex.hashBytes(0, g)
+          let prev = List<Bytes>.asSlice(&seenComdats)
+          let mut foundOld = false
+          let mut at = InternIndex.first(&comdatIdx, hash)
+          while at != usize.MAX {
+            if sameBytes(Bytes.asSlice(&prev[at]), g) {
+              foundOld = true
+              break
+            }
+            at = InternIndex.after(&comdatIdx, at)
+          }
+          if foundOld {
+            run List<bool>.append(&mut kept, false)
+          } else {
+            run List<bool>.append(&mut kept, true)
+            run List<Bytes>.append(&mut unitNewGroups, run Bytes.copy(g))
+          }
+        }
+        si = si + usize.ONE
+      }
+      let newGs = List<Bytes>.asSlice(&unitNewGroups)
+      let mut gi = usize.ZERO
+      while gi < newGs.length {
+        let g = Bytes.asSlice(&newGs[gi])
+        let hash = InternIndex.hashBytes(0, g)
+        run InternIndex.record(&mut comdatIdx, hash)
+        run List<Bytes>.append(&mut seenComdats, run Bytes.copy(g))
+        gi = gi + usize.ONE
+      }
+      run registerUnitSymbols(&mut symtab, nextUnit, u, List<bool>.asSlice(&kept))
+      run List<List<bool>>.append(&mut unitSecKept, move kept)
+      nextUnit = nextUnit + usize.ONE
+    }
+
+    // Lazily pull matching archive members (and glibc nonshared helpers) for undefined symbols.
+    let mut pulledAny = false
+    let symCount = List<GlobalSym>.length(&symtab.entries)
+    let mut si = usize.ZERO
+    while si < symCount {
+      let isUndef = List<GlobalSym>.asSlice(&symtab.entries)[si].state == SymState.Undefined
+      if isUndef {
+        let sName = run Bytes.copy(Bytes.asSlice(&List<GlobalSym>.asSlice(&symtab.entries)[si].name))
+        // Check on-demand glibc nonshared helpers (`atexit`, `at_quick_exit`, `pthread_atfork`).
+        if !nonsharedAdded || true {
+          if let Option<InputUnit>.Some {value: helper} = move run ElfInput.nonsharedHelperUnit(Bytes.asSlice(&sName)) {
+            run List<InputUnit>.append(&mut units, move helper)
+            nonsharedAdded = true
+            pulledAny = true
+            si = si + usize.ONE
+            continue
+          }
+        }
+        // Search static archives in order.
+        let archSlice = List<ArchiveIndex>.asSlice(&archives)
+        let mut aIdx = usize.ZERO
+        while aIdx < archSlice.length {
+          if let Option<usize>.Some {value: mIdx} = ElfInput.archiveLookup(&archSlice[aIdx], Bytes.asSlice(&sName)) {
+            let pulledMut = List<List<u8>>.asMutSlice(&mut archPulled)
+            let flags = List<u8>.asMutSlice(&mut pulledMut[aIdx])
+            if flags[mIdx] == 0 {
+              flags[mIdx] = 1
+              let mem = &List<ArchiveMember>.asSlice(&archSlice[aIdx].members)[mIdx]
+              let memUnit = if mem.isThin {
+                let mut fullPath = Bytes.make()
+                let mName = Bytes.asSlice(&mem.name)
+                if mName.length > usize.ZERO && mName[0] == 47 {
+                  fullPath = run Bytes.copy(mName)
+                } else {
+                  fullPath = run Bytes.copy(Bytes.asSlice(&archSlice[aIdx].dir))
+                  run Bytes.append(&mut fullPath, b"/")
+                  run Bytes.append(&mut fullPath, mName)
+                }
+                let p = run Path.fromBytes(Bytes.asSlice(&fullPath))
+                let objBytes = run FileSystem.readFile(&p)
+                run ElfInput.parseRelocatable(Bytes.asSlice(&objBytes), Bytes.asSlice(&fullPath))
+              } else {
+                let rawAll = Bytes.asSlice(&archSlice[aIdx].raw)
+                let slice = Slice.view<u8>(rawAll, mem.offset, mem.size)
+                run ElfInput.parseRelocatable(slice, Bytes.asSlice(&mem.name))
+              }
+              run List<InputUnit>.append(&mut units, move memUnit)
+              pulledAny = true
+            }
+            break
+          }
+          aIdx = aIdx + usize.ONE
+        }
+      }
+      si = si + usize.ONE
+    }
+    resolveLoop = pulledAny
+  }
+
+  // Resolve remaining Undefined symbols against shared libraries (in order, respecting `--as-needed`).
+  let libSlice = List<SharedLib>.asSlice(&sharedLibs)
+  let mut libUsed = run List<bool>.makeWithCapacity(libSlice.length)
+  let mut li = usize.ZERO
+  while li < libSlice.length {
+    run List<bool>.append(&mut libUsed, !libSlice[li].asNeeded)
+    li = li + usize.ONE
+  }
+  let libUsedMut = List<bool>.asMutSlice(&mut libUsed)
+
+  let symCount = List<GlobalSym>.length(&symtab.entries)
+  let entriesMut = List<GlobalSym>.asMutSlice(&mut symtab.entries)
+  let mut si = usize.ZERO
+  while si < symCount {
+    if entriesMut[si].state == SymState.Undefined {
+      let sName = Bytes.asSlice(&entriesMut[si].name)
+      li = usize.ZERO
+      while li < libSlice.length {
+        if let Option<usize>.Some {value: expIdx} = ElfInput.sharedLibLookup(&libSlice[li], sName) {
+          let exp = &List<DynamicExport>.asSlice(&libSlice[li].exports)[expIdx]
+          entriesMut[si].state = SymState.Dynamic
+          entriesMut[si].libIdx = li
+          entriesMut[si].version = run Bytes.copy(Bytes.asSlice(&exp.version))
+          entriesMut[si].size = exp.size
+          entriesMut[si].isObject = exp.isObject
+          entriesMut[si].isFunc = !exp.isObject
+          libUsedMut[li] = true
+          break
+        }
+        li = li + usize.ONE
+      }
+    }
+    si = si + usize.ONE
+  }
+
+  // Check for unresolved strong undefined symbols (shared libraries may leave undefined symbols
+  // to be resolved by the host executable/dlopen at load time).
+  if !shared {
+    si = usize.ZERO
+    while si < symCount {
+      if entriesMut[si].state == SymState.Undefined && !entriesMut[si].weak {
+        let name = Bytes.asSlice(&entriesMut[si].name)
+        // Standard optional CRT/sanitizer hooks that may be weak-referenced in C objects.
+        let optional = sameBytes(name, b"__gmon_start__")
+          || sameBytes(name, b"_ITM_registerTMCloneTable")
+          || sameBytes(name, b"_ITM_deregisterTMCloneTable")
+          || sameBytes(name, b"__cxa_finalize")
+        if !optional {
+          return run ElfInput.linkError2(b"undefined symbol: ", name)
+        }
+      }
+      si = si + usize.ONE
+    }
+  } else {
+    // In shared libraries, unresolved symbols become unversioned dynamic imports.
+    si = usize.ZERO
+    while si < symCount {
+      if entriesMut[si].state == SymState.Undefined {
+        entriesMut[si].state = SymState.Dynamic
+        entriesMut[si].libIdx = usize.MAX
+        entriesMut[si].isFunc = true
+      }
+      si = si + usize.ONE
+    }
+  }
+
+  // ---- Relocation Scanning: Allocate GOT, GOTTPOFF, PLT, and COPY Slots ----
+
+  let mut gotSyms = List<usize>.make()        // symIdx for each `.got` regular entry
+  let mut gotTpOffSyms = List<usize>.make()   // symIdx for each `.got` GOTTPOFF entry
+  let mut pltSyms = List<usize>.make()        // symIdx for each `.plt` stub (uses same GOT slot!)
+  let mut copySyms = List<usize>.make()       // symIdx for each COPY-relocated external object
+  let mut localGotTargets = List<u64>.make()  // packed (unitIdx << 32 | secIdx) for local GOT entries
+  let mut localGotOffs = List<u64>.make()
+  let mut relaDynCount = usize.ZERO
+
+  let unitSlice = List<InputUnit>.asSlice(&units)
+  let keptAll = List<List<bool>>.asSlice(&unitSecKept)
+  let mut ui = usize.ZERO
+  while ui < unitSlice.length {
+    let secs = List<InputSection>.asSlice(&unitSlice[ui].sections)
+    let kSlice = List<bool>.asSlice(&keptAll[ui])
+    let mut sc = usize.ZERO
+    while sc < secs.length {
+      if kSlice[sc] {
+        let rels = List<InputReloc>.asSlice(&secs[sc].relocs)
+        let mut ri = usize.ZERO
+        while ri < rels.length {
+          let r = &rels[ri]
+          let rt = r.relType
+          if r.targetLocal {
+            if rt == ElfInput.r64() {
+              relaDynCount = relaDynCount + usize.ONE
+            } else if rt == ElfInput.rGotPcRel() || rt == ElfInput.rGotPcRelX() || rt == ElfInput.rRexGotPcRelX() {
+              let key = u64.shiftLeft(usize.toU64(ui), 32) | usize.toU64(r.localSection)
+              run List<u64>.append(&mut localGotTargets, key)
+              run List<u64>.append(&mut localGotOffs, r.localOffset)
+              relaDynCount = relaDynCount + usize.ONE
+            }
+          } else {
+            let symName = Bytes.asSlice(&r.symbol)
+            let mut sIdx = InternIndex.first(&symtab.index, InternIndex.hashBytes(0, symName))
+            while sIdx != usize.MAX && !sameBytes(Bytes.asSlice(&entriesMut[sIdx].name), symName) {
+              sIdx = InternIndex.after(&symtab.index, sIdx)
+            }
+            if sIdx != usize.MAX {
+              let st = entriesMut[sIdx].state
+              if rt == ElfInput.rGotPcRel() || rt == ElfInput.rGotPcRelX() || rt == ElfInput.rRexGotPcRelX() {
+                if entriesMut[sIdx].gotSlot == usize.MAX {
+                  entriesMut[sIdx].gotSlot = List<usize>.length(&gotSyms)
+                  run List<usize>.append(&mut gotSyms, sIdx)
+                  if st == SymState.Dynamic || st == SymState.Defined || st == SymState.Common || st == SymState.Synthetic {
+                    relaDynCount = relaDynCount + usize.ONE
+                  }
+                }
+              } else if rt == ElfInput.rGotTpOff() {
+                if entriesMut[sIdx].gotTpOffSlot == usize.MAX {
+                  entriesMut[sIdx].gotTpOffSlot = List<usize>.length(&gotTpOffSyms)
+                  run List<usize>.append(&mut gotTpOffSyms, sIdx)
+                  if shared || st == SymState.Dynamic {
+                    relaDynCount = relaDynCount + usize.ONE
+                  }
+                }
+              } else if rt == ElfInput.rPlt32() || rt == ElfInput.rPc32() {
+                if st == SymState.Dynamic {
+                  if entriesMut[sIdx].isObject && !shared {
+                    // Non-PIC PC32 access to external data object -> COPY relocation in `.bss`.
+                    if !entriesMut[sIdx].hasCopy {
+                      entriesMut[sIdx].hasCopy = true
+                      run List<usize>.append(&mut copySyms, sIdx)
+                      relaDynCount = relaDynCount + usize.ONE
+                    }
+                  } else {
+                    // External function call -> 8-byte `.plt` thunk jumping through `.got`.
+                    if entriesMut[sIdx].gotSlot == usize.MAX {
+                      entriesMut[sIdx].gotSlot = List<usize>.length(&gotSyms)
+                      run List<usize>.append(&mut gotSyms, sIdx)
+                      relaDynCount = relaDynCount + usize.ONE
+                    }
+                    if entriesMut[sIdx].pltSlot == usize.MAX {
+                      entriesMut[sIdx].pltSlot = List<usize>.length(&pltSyms)
+                      run List<usize>.append(&mut pltSyms, sIdx)
+                    }
+                  }
+                }
+              } else if rt == ElfInput.r64() {
+                if st == SymState.Dynamic || st == SymState.Defined || st == SymState.Common || st == SymState.Synthetic {
+                  relaDynCount = relaDynCount + usize.ONE
+                }
+              } else if rt == ElfInput.r32() || rt == ElfInput.r32S() {
+                if st == SymState.Dynamic && entriesMut[sIdx].isObject && !shared {
+                  if !entriesMut[sIdx].hasCopy {
+                    entriesMut[sIdx].hasCopy = true
+                    run List<usize>.append(&mut copySyms, sIdx)
+                    relaDynCount = relaDynCount + usize.ONE
+                  }
+                }
+              }
+            }
+          }
+          ri = ri + usize.ONE
+        }
+      }
+      sc = sc + usize.ONE
+    }
+    ui = ui + usize.ONE
+  }
+
+  // ---- Merge Input Sections & Count `.eh_frame` FDEs ----
+
+  let mut placements = run List<List<SecPlacement>>.makeWithCapacity(unitSlice.length)
+  let mut textSize: u64 = 0
+  let mut rodataSize: u64 = 0
+  let mut dataSize: u64 = 0
+  let mut bssSize: u64 = 0
+  let mut tdataSize: u64 = 0
+  let mut tbssSize: u64 = 0
+  let mut tlsAlign: u64 = 16
+  let mut initArraySize: u64 = 0
+  let mut finiArraySize: u64 = 0
+  let mut framesSize: u64 = 0
+  let mut seenSize: u64 = 0
+
+  // Merged `.eh_frame` bytes & FDE placement table.
+  let mut ehMerged = Bytes.make()
+  let mut ehCies = List<EhCieMap>.make()
+  let mut ehFdes = List<EhFdePlace>.make()
+
+  ui = usize.ZERO
+  while ui < unitSlice.length {
+    let secs = List<InputSection>.asSlice(&unitSlice[ui].sections)
+    let kSlice = List<bool>.asSlice(&keptAll[ui])
+    let mut uPlace = run List<SecPlacement>.makeWithCapacity(secs.length)
+    let mut sc = usize.ZERO
+    while sc < secs.length {
+      if !kSlice[sc] {
+        run List<SecPlacement>.append(&mut uPlace, SecPlacement {
+          kept: false, kind: secs[sc].kind, outOffset: 0, vaddr: 0, size: 0,
+        })
+      } else {
+        let align = maxU64(1, secs[sc].alignment)
+        let sz = secs[sc].memSize
+        let mut off: u64 = 0
+        match secs[sc].kind {
+          SectionKind.Text => {
+            off = alignUp(textSize, align)
+            textSize = off + sz
+          }
+          SectionKind.Rodata => {
+            off = alignUp(rodataSize, align)
+            rodataSize = off + sz
+          }
+          SectionKind.Data => {
+            off = alignUp(dataSize, align)
+            dataSize = off + sz
+          }
+          SectionKind.Bss => {
+            off = alignUp(bssSize, align)
+            bssSize = off + sz
+          }
+          SectionKind.Tdata => {
+            tlsAlign = maxU64(tlsAlign, align)
+            off = alignUp(tdataSize, align)
+            tdataSize = off + sz
+          }
+          SectionKind.Tbss => {
+            tlsAlign = maxU64(tlsAlign, align)
+            off = alignUp(tbssSize, align)
+            tbssSize = off + sz
+          }
+          SectionKind.InitArray => {
+            off = alignUp(initArraySize, maxU64(8, align))
+            initArraySize = off + sz
+          }
+          SectionKind.FiniArray => {
+            off = alignUp(finiArraySize, maxU64(8, align))
+            finiArraySize = off + sz
+          }
+          SectionKind.SilkFrames => {
+            off = alignUp(framesSize, maxU64(8, align))
+            framesSize = off + sz
+          }
+          SectionKind.SilkSeen => {
+            off = alignUp(seenSize, align)
+            seenSize = off + sz
+          }
+          SectionKind.EhFrame => {
+            off = usize.toU64(Bytes.length(&ehMerged))
+            // Walk CIE and FDE records inside this input `.eh_frame` section.
+            let rawEh = Bytes.asSlice(&secs[sc].data)
+            let mut pos = usize.ZERO
+            while pos + 4 <= rawEh.length {
+              let recLen = u64.toUsize(readU32Le(rawEh, pos))
+              if recLen == usize.ZERO {
+                pos = pos + 4
+                continue
+              }
+              if pos + 4 + recLen > rawEh.length { break }
+              let cieId = readU32Le(rawEh, pos + 4)
+              let outPos = usize.toU64(Bytes.length(&ehMerged))
+              run Bytes.append(&mut ehMerged, Slice.view<u8>(rawEh, pos, 4 + recLen))
+              if cieId == 0 {
+                run List<EhCieMap>.append(&mut ehCies, EhCieMap {
+                  unitIdx: ui, secIdx: sc, inOff: usize.toU64(pos), outOff: outPos,
+                })
+              } else {
+                // Patch FDE's CIE pointer relative to `outPos + 4`.
+                let inCiePos = usize.toU64(pos + 4) - cieId
+                let cies = List<EhCieMap>.asSlice(&ehCies)
+                let mut cieOut: u64 = 0
+                let mut ci = cies.length
+                while ci > usize.ZERO {
+                  ci = ci - usize.ONE
+                  if cies[ci].unitIdx == ui && cies[ci].secIdx == sc && cies[ci].inOff == inCiePos {
+                    cieOut = cies[ci].outOff
+                    break
+                  }
+                }
+                let newCiePtr = (outPos + 4) - cieOut
+                putU32Le(&mut ehMerged, u64.toUsize(outPos) + 4, newCiePtr)
+                run List<EhFdePlace>.append(&mut ehFdes, EhFdePlace {
+                  unitIdx: ui,
+                  secIdx: sc,
+                  inInitLocOff: usize.toU64(pos + 8),
+                  outInitLocOff: outPos + 8,
+                  outFdeOff: outPos,
+                })
+              }
+              pos = pos + 4 + recLen
+            }
+          }
+        }
+        run List<SecPlacement>.append(&mut uPlace, SecPlacement {
+          kept: true, kind: secs[sc].kind, outOffset: off, vaddr: 0, size: sz,
+        })
+      }
+      sc = sc + usize.ONE
+    }
+    run List<List<SecPlacement>>.append(&mut placements, move uPlace)
+    ui = ui + usize.ONE
+  }
+
+  // Append 4-byte zero terminator to merged `.eh_frame`.
+  run X86Encode.u32Le(&mut ehMerged, 0)
+  let ehFrameSize = usize.toU64(Bytes.length(&ehMerged))
+  let fdeCount = List<EhFdePlace>.length(&ehFdes)
+  let ehFrameHdrSize: u64 = 12 + usize.toU64(fdeCount) * 8
+
+  // Place `SHN_COMMON` and COPY-relocated objects at the end of `.bss`.
+  si = usize.ZERO
+  while si < symCount {
+    if entriesMut[si].state == SymState.Common {
+      let align = maxU64(1, entriesMut[si].alignment)
+      let off = alignUp(bssSize, align)
+      entriesMut[si].offset = off
+      bssSize = off + entriesMut[si].size
+    }
+    si = si + usize.ONE
+  }
+  let copySlice = List<usize>.asSlice(&copySyms)
+  let mut ci = usize.ZERO
+  while ci < copySlice.length {
+    let sIdx = copySlice[ci]
+    let sz = if entriesMut[sIdx].size == 0 { 8 } else { entriesMut[sIdx].size }
+    let off = alignUp(bssSize, 16)
+    entriesMut[sIdx].copyBssOff = off
+    bssSize = off + sz
+    ci = ci + usize.ONE
+  }
+
+  // ---- Build `.dynstr`, `.dynsym`, `.gnu.version`, `.gnu.version_r`, `.gnu.hash` ----
+
+  let mut dynstr = Bytes.make()
+  run X86Encode.byte(&mut dynstr, 0)
+
+  // Collect `DT_NEEDED` sonames for all used shared libraries.
+  let mut neededLibs = List<usize>.make()
+  let mut neededStrOffs = List<u64>.make()
+  li = usize.ZERO
+  while li < libSlice.length {
+    if libUsedMut[li] {
+      run List<usize>.append(&mut neededLibs, li)
+      let off = run appendCstr(&mut dynstr, Bytes.asSlice(&libSlice[li].soname))
+      run List<u64>.append(&mut neededStrOffs, off)
+    }
+    li = li + usize.ONE
+  }
+  let mut sonameOff: u64 = 0
+  if shared && soname.length > usize.ZERO {
+    sonameOff = run appendCstr(&mut dynstr, soname)
+  }
+  let mut runpathOff: u64 = 0
+  if rpaths.length > usize.ZERO {
+    let mut joined = Bytes.make()
+    let mut ri = usize.ZERO
+    while ri < rpaths.length {
+      if ri > usize.ZERO { run X86Encode.byte(&mut joined, 58) }
+      run Bytes.append(&mut joined, Bytes.asSlice(&rpaths[ri]))
+      ri = ri + usize.ONE
+    }
+    runpathOff = run appendCstr(&mut dynstr, Bytes.asSlice(&joined))
+  }
+
+  // Partition dynamic symbols:
+  //   0: STN_UNDEF
+  //   1..symoffset-1: referenced Dynamic imports
+  //   symoffset..: exported Defined global symbols (for shared libraries)
+  let mut dynImportSyms = List<usize>.make()
+  let mut dynExportSyms = List<usize>.make()
+  si = usize.ZERO
+  while si < symCount {
+    if entriesMut[si].state == SymState.Dynamic {
+      if entriesMut[si].gotSlot != usize.MAX
+        || entriesMut[si].gotTpOffSlot != usize.MAX
+        || entriesMut[si].pltSlot != usize.MAX
+        || entriesMut[si].hasCopy {
+        run List<usize>.append(&mut dynImportSyms, si)
+      } else {
+        // Also check if referenced via R_X86_64_64 (we include all Dynamic symbols resolved).
+        run List<usize>.append(&mut dynImportSyms, si)
+      }
+    } else if shared && entriesMut[si].state == SymState.Defined && !entriesMut[si].hidden {
+      run List<usize>.append(&mut dynExportSyms, si)
+    }
+    si = si + usize.ONE
+  }
+
+  // Sort exported dynamic symbols by `gnuHash(name) % nbuckets` for `.gnu.hash`.
+  let exportCount = List<usize>.length(&dynExportSyms)
+  let nbuckets: u64 = if exportCount == usize.ZERO { 1 } else { maxU64(1, usize.toU64(exportCount)) }
+  let bloomSize: u64 = 1
+  let bloomShift: u64 = 6
+  if exportCount > usize.ONE {
+    let expMut = List<usize>.asMutSlice(&mut dynExportSyms)
+    let mut k = usize.ONE
+    while k < expMut.length {
+      let key = expMut[k]
+      let keyB = gnuHash(Bytes.asSlice(&entriesMut[key].name)) % nbuckets
+      let mut j = k
+      while j > usize.ZERO && (gnuHash(Bytes.asSlice(&entriesMut[expMut[j - usize.ONE]].name)) % nbuckets) > keyB {
+        expMut[j] = expMut[j - usize.ONE]
+        j = j - usize.ONE
+      }
+      expMut[j] = key
+      k = k + usize.ONE
+    }
+  }
+
+  let symoffset = usize.ONE + List<usize>.length(&dynImportSyms)
+  let dynsymCount = symoffset + exportCount
+
+  // Assign `dynsymIdx` and intern dynamic symbol names + version requirements.
+  let mut verNeeds = List<VerNeedEntry>.make()
+  let mut nextVerNdx: u64 = 2
+  let mut dynSymNameOffs = run List<u64>.makeWithCapacity(dynsymCount)
+  let mut dynSymVerNdxs = run List<u64>.makeWithCapacity(dynsymCount)
+  run List<u64>.append(&mut dynSymNameOffs, 0)
+  run List<u64>.append(&mut dynSymVerNdxs, 0)
+
+  let impSlice = List<usize>.asSlice(&dynImportSyms)
+  let mut di = usize.ZERO
+  while di < impSlice.length {
+    let sIdx = impSlice[di]
+    entriesMut[sIdx].dynsymIdx = usize.ONE + di
+    let nameOff = run appendCstr(&mut dynstr, Bytes.asSlice(&entriesMut[sIdx].name))
+    run List<u64>.append(&mut dynSymNameOffs, nameOff)
+    let verBytes = Bytes.asSlice(&entriesMut[sIdx].version)
+    if verBytes.length > usize.ZERO && entriesMut[sIdx].libIdx != usize.MAX {
+      let vSlice = List<VerNeedEntry>.asSlice(&verNeeds)
+      let mut foundVer: u64 = 0
+      let mut vi = usize.ZERO
+      while vi < vSlice.length {
+        if vSlice[vi].libIdx == entriesMut[sIdx].libIdx && sameBytes(Bytes.asSlice(&vSlice[vi].version), verBytes) {
+          foundVer = vSlice[vi].verNdx
+          break
+        }
+        vi = vi + usize.ONE
+      }
+      if foundVer == 0 {
+        foundVer = nextVerNdx
+        nextVerNdx = nextVerNdx + 1
+        run List<VerNeedEntry>.append(&mut verNeeds, VerNeedEntry {
+          libIdx: entriesMut[sIdx].libIdx,
+          version: run Bytes.copy(verBytes),
+          verNdx: foundVer,
+        })
+      }
+      run List<u64>.append(&mut dynSymVerNdxs, foundVer)
+    } else {
+      run List<u64>.append(&mut dynSymVerNdxs, 1)
+    }
+    di = di + usize.ONE
+  }
+
+  let expSlice = List<usize>.asSlice(&dynExportSyms)
+  di = usize.ZERO
+  while di < expSlice.length {
+    let sIdx = expSlice[di]
+    entriesMut[sIdx].dynsymIdx = symoffset + di
+    let nameOff = run appendCstr(&mut dynstr, Bytes.asSlice(&entriesMut[sIdx].name))
+    run List<u64>.append(&mut dynSymNameOffs, nameOff)
+    run List<u64>.append(&mut dynSymVerNdxs, 1)
+    di = di + usize.ONE
+  }
+
+  // Build `.gnu.version` (2 bytes per dynsym) and `.gnu.version_r` (grouped by library).
+  let mut versymBytes = Bytes.make()
+  let verNdxSlice = List<u64>.asSlice(&dynSymVerNdxs)
+  di = usize.ZERO
+  while di < verNdxSlice.length {
+    run X86Encode.u16Le(&mut versymBytes, verNdxSlice[di])
+    di = di + usize.ONE
+  }
+
+  let mut verneedBytes = Bytes.make()
+  let mut verneedLibCount: u64 = 0
+  let vNeedSlice = List<VerNeedEntry>.asSlice(&verNeeds)
+  let neededSlice = List<usize>.asSlice(&neededLibs)
+  let neededOffSlice = List<u64>.asSlice(&neededStrOffs)
+  // First count how many libraries actually have versioned imports so `vn_next` is exact.
+  let mut verLibs = List<usize>.make()
+  let mut verLibNameOffs = List<u64>.make()
+  let mut ni = usize.ZERO
+  while ni < neededSlice.length {
+    let lIdx = neededSlice[ni]
+    let mut cnt = usize.ZERO
+    let mut vi = usize.ZERO
+    while vi < vNeedSlice.length {
+      if vNeedSlice[vi].libIdx == lIdx { cnt = cnt + usize.ONE }
+      vi = vi + usize.ONE
+    }
+    if cnt > usize.ZERO {
+      run List<usize>.append(&mut verLibs, lIdx)
+      run List<u64>.append(&mut verLibNameOffs, neededOffSlice[ni])
+    }
+    ni = ni + usize.ONE
+  }
+  let vLibSlice = List<usize>.asSlice(&verLibs)
+  let vLibOffSlice = List<u64>.asSlice(&verLibNameOffs)
+  verneedLibCount = usize.toU64(vLibSlice.length)
+  ni = usize.ZERO
+  while ni < vLibSlice.length {
+    let lIdx = vLibSlice[ni]
+    let mut auxList = List<usize>.make()
+    let mut vi = usize.ZERO
+    while vi < vNeedSlice.length {
+      if vNeedSlice[vi].libIdx == lIdx { run List<usize>.append(&mut auxList, vi) }
+      vi = vi + usize.ONE
+    }
+    let auxs = List<usize>.asSlice(&auxList)
+    let hasNextLib = ni + usize.ONE < vLibSlice.length
+    let nextLibDelta: u64 = if hasNextLib { 16 + usize.toU64(auxs.length) * 16 } else { 0 }
+    // Elf64_Verneed (16 bytes)
+    run X86Encode.u16Le(&mut verneedBytes, 1) // vn_version = VER_NEED_CURRENT
+    run X86Encode.u16Le(&mut verneedBytes, usize.toU64(auxs.length))
+    run X86Encode.u32Le(&mut verneedBytes, vLibOffSlice[ni])
+    run X86Encode.u32Le(&mut verneedBytes, 16) // vn_aux
+    run X86Encode.u32Le(&mut verneedBytes, nextLibDelta)
+    let mut ai2 = usize.ZERO
+    while ai2 < auxs.length {
+      let vn = &vNeedSlice[auxs[ai2]]
+      let verStr = Bytes.asSlice(&vn.version)
+      let verStrOff = run appendCstr(&mut dynstr, verStr)
+      let nextAux: u64 = if ai2 + usize.ONE < auxs.length { 16 } else { 0 }
+      // Elf64_Vernaux (16 bytes)
+      run X86Encode.u32Le(&mut verneedBytes, elfSysVHash(verStr))
+      run X86Encode.u16Le(&mut verneedBytes, 0) // vna_flags
+      run X86Encode.u16Le(&mut verneedBytes, vn.verNdx)
+      run X86Encode.u32Le(&mut verneedBytes, verStrOff)
+      run X86Encode.u32Le(&mut verneedBytes, nextAux)
+      ai2 = ai2 + usize.ONE
+    }
+    ni = ni + usize.ONE
+  }
+
+  // Build `.gnu.hash`.
+  let mut gnuHashBytes = Bytes.make()
+  run X86Encode.u32Le(&mut gnuHashBytes, nbuckets)
+  run X86Encode.u32Le(&mut gnuHashBytes, usize.toU64(symoffset))
+  run X86Encode.u32Le(&mut gnuHashBytes, bloomSize)
+  run X86Encode.u32Le(&mut gnuHashBytes, bloomShift)
+  let mut bloomWord: u64 = 0
+  let mut buckets = run List<u64>.makeWithCapacity(u64.toUsize(nbuckets))
+  let mut bi: u64 = 0
+  while bi < nbuckets {
+    run List<u64>.append(&mut buckets, 0)
+    bi = bi + 1
+  }
+  let bucketsMut = List<u64>.asMutSlice(&mut buckets)
+  let mut chains = run List<u64>.makeWithCapacity(exportCount)
+  di = usize.ZERO
+  while di < expSlice.length {
+    let h = gnuHash(Bytes.asSlice(&entriesMut[expSlice[di]].name))
+    bloomWord = bloomWord | u64.shiftLeft(1, h & 63) | u64.shiftLeft(1, u64.shiftRight(h, bloomShift) & 63)
+    let bIdx = u64.toUsize(h % nbuckets)
+    if bucketsMut[bIdx] == 0 {
+      bucketsMut[bIdx] = usize.toU64(symoffset + di)
+    }
+    let isLast = if di + usize.ONE >= expSlice.length {
+      true
+    } else {
+      let nextH = gnuHash(Bytes.asSlice(&entriesMut[expSlice[di + usize.ONE]].name))
+      u64.toUsize(nextH % nbuckets) != bIdx
+    }
+    let lastBit: u64 = if isLast { 1 } else { 0 }
+    let chainVal = (h & 0xFFFFFFFE) | lastBit
+    run List<u64>.append(&mut chains, chainVal)
+    di = di + usize.ONE
+  }
+  run X86Encode.u64Le(&mut gnuHashBytes, bloomWord)
+  let bSlice = List<u64>.asSlice(&buckets)
+  di = usize.ZERO
+  while di < bSlice.length {
+    run X86Encode.u32Le(&mut gnuHashBytes, bSlice[di])
+    di = di + usize.ONE
+  }
+  let cSlice = List<u64>.asSlice(&chains)
+  di = usize.ZERO
+  while di < cSlice.length {
+    run X86Encode.u32Le(&mut gnuHashBytes, cSlice[di])
+    di = di + usize.ONE
+  }
+
+  // ---- Compute Exact 4-Segment Page-Aligned ELF64 Layout ----
+
+  let hasTls = tdataSize > 0 || tbssSize > 0
+  let tlsMemSize = tdataSize + tbssSize
+  let tlsBlockSize = alignUp(tlsMemSize, tlsAlign)
+  let interpBytes: &[u8] = b"/lib64/ld-linux-x86-64.so.2\x00"
+
+  // Program header count:
+  // Executable: PHDR, INTERP, 4x LOAD, DYNAMIC, GNU_EH_FRAME, GNU_STACK, GNU_RELRO, (+ TLS if hasTls)
+  // Shared lib: 4x LOAD, DYNAMIC, GNU_EH_FRAME, GNU_STACK, GNU_RELRO, (+ TLS if hasTls)
+  let basePhnum: u64 = if shared { 8 } else { 10 }
+  let tlsPh: u64 = if hasTls { 1 } else { 0 }
+  let phnum: u64 = basePhnum + tlsPh
+
+  // Dynamic table entry count (reserve exact space).
+  let mut dynEntries: u64 = usize.toU64(neededSlice.length)
+  if sonameOff != 0 { dynEntries = dynEntries + 1 }
+  if runpathOff != 0 { dynEntries = dynEntries + 1 }
+  if initArraySize > 0 { dynEntries = dynEntries + 2 }
+  if finiArraySize > 0 { dynEntries = dynEntries + 2 }
+  // DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_FLAGS, DT_FLAGS_1, DT_NULL
+  dynEntries = dynEntries + 8
+  if relaDynCount > 0 { dynEntries = dynEntries + 3 } // DT_RELA, DT_RELASZ, DT_RELAENT
+  if verneedLibCount > 0 { dynEntries = dynEntries + 3 } // DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM
+  let dynamicSize: u64 = dynEntries * 16
+
+  let gotRegularCount = List<usize>.length(&gotSyms)
+  let gotLocalCount = List<u64>.length(&localGotTargets)
+  let gotTpCount = List<usize>.length(&gotTpOffSyms)
+  let gotTotalEntries = gotRegularCount + gotLocalCount + gotTpCount
+  let gotSize: u64 = usize.toU64(gotTotalEntries) * 8
+  let pltCount = List<usize>.length(&pltSyms)
+  let pltSize: u64 = usize.toU64(pltCount) * 8
+
+  // Segment 1 (PF_R, vaddr = 0x0, fileOff = 0x0):
+  let mut cur: u64 = 64 + phnum * 56
+  let interpOff = cur
+  if !shared { cur = cur + usize.toU64(interpBytes.length) }
+  cur = alignUp(cur, 8)
+  let gnuHashOff = cur
+  cur = cur + usize.toU64(Bytes.length(&gnuHashBytes))
+  cur = alignUp(cur, 8)
+  let dynsymOff = cur
+  let dynsymSize: u64 = usize.toU64(dynsymCount) * 24
+  cur = cur + dynsymSize
+  let dynstrOff = cur
+  let dynstrSize = usize.toU64(Bytes.length(&dynstr))
+  cur = cur + dynstrSize
+  cur = alignUp(cur, 2)
+  let versymOff = cur
+  let versymSize = usize.toU64(Bytes.length(&versymBytes))
+  cur = cur + versymSize
+  cur = alignUp(cur, 8)
+  let verneedOff = cur
+  let verneedSize = usize.toU64(Bytes.length(&verneedBytes))
+  cur = cur + verneedSize
+  cur = alignUp(cur, 8)
+  let relaDynOff = cur
+  let relaDynSize: u64 = usize.toU64(relaDynCount) * 24
+  cur = cur + relaDynSize
+  cur = alignUp(cur, 16)
+  let rodataVaddr = cur
+  cur = cur + rodataSize
+  cur = alignUp(cur, 4)
+  let ehFrameHdrVaddr = cur
+  cur = cur + ehFrameHdrSize
+  cur = alignUp(cur, 8)
+  let ehFrameVaddr = cur
+  cur = cur + ehFrameSize
+  let seg1FileSz = cur
+
+  // Segment 2 (PF_R | PF_X, page-aligned):
+  let seg2Off = alignUp(cur, 0x1000)
+  let seg2Vaddr = seg2Off
+  cur = seg2Off
+  let pltVaddr = cur
+  cur = cur + pltSize
+  cur = alignUp(cur, 16)
+  let textVaddr = cur
+  cur = cur + textSize
+  let seg2FileSz = cur - seg2Off
+
+  // Segment 3 (PF_R | PF_W -> PT_GNU_RELRO, page-aligned):
+  let seg3Off = alignUp(cur, 0x1000)
+  let seg3Vaddr = seg3Off
+  cur = seg3Off
+  let initArrayVaddr = cur
+  cur = cur + initArraySize
+  cur = alignUp(cur, 8)
+  let finiArrayVaddr = cur
+  cur = cur + finiArraySize
+  cur = alignUp(cur, 8)
+  let dynamicVaddr = cur
+  cur = cur + dynamicSize
+  cur = alignUp(cur, 8)
+  let gotVaddr = cur
+  cur = cur + gotSize
+  let seg3FileSz = cur - seg3Off
+  let seg3RelroMemSz = alignUp(seg3FileSz, 0x1000)
+
+  // Segment 4 (PF_R | PF_W, page-aligned AFTER RELRO page!):
+  let seg4Off = alignUp(cur, 0x1000)
+  let seg4Vaddr = seg3Vaddr + seg3RelroMemSz
+  // Ensure `seg4Off % 0x1000 == seg4Vaddr % 0x1000` (both are multiples of 0x1000!).
+  let mut rwPos: u64 = 0
+  let tdataOffInSeg4 = alignUp(rwPos, tlsAlign)
+  let tdataVaddr = seg4Vaddr + tdataOffInSeg4
+  let tdataFileOff = seg4Off + tdataOffInSeg4
+  rwPos = tdataOffInSeg4 + tdataSize
+  let dataOffInSeg4 = alignUp(rwPos, 16)
+  let dataVaddr = seg4Vaddr + dataOffInSeg4
+  rwPos = dataOffInSeg4 + dataSize
+  let framesOffInSeg4 = alignUp(rwPos, 8)
+  let framesVaddr = seg4Vaddr + framesOffInSeg4
+  rwPos = framesOffInSeg4 + framesSize
+  let seenOffInSeg4 = rwPos
+  let seenVaddr = seg4Vaddr + seenOffInSeg4
+  rwPos = seenOffInSeg4 + seenSize
+  let seg4FileSz = rwPos
+  let bssOffInSeg4 = alignUp(rwPos, 16)
+  let bssVaddr = seg4Vaddr + bssOffInSeg4
+  let seg4MemSz = bssOffInSeg4 + bssSize
+
+  // ---- Assign Final Virtual Addresses to Every Input Section & Global Symbol ----
+
+  let placeMut = List<List<SecPlacement>>.asMutSlice(&mut placements)
+  ui = usize.ZERO
+  while ui < placeMut.length {
+    let secP = List<SecPlacement>.asMutSlice(&mut placeMut[ui])
+    let mut sc = usize.ZERO
+    while sc < secP.length {
+      if secP[sc].kept {
+        let base: u64 = match secP[sc].kind {
+          SectionKind.Text => textVaddr
+          SectionKind.Rodata => rodataVaddr
+          SectionKind.Data => dataVaddr
+          SectionKind.Bss => bssVaddr
+          SectionKind.Tdata => 0 // TLS symbols carry offset inside TLS block!
+          SectionKind.Tbss => tdataSize
+          SectionKind.InitArray => initArrayVaddr
+          SectionKind.FiniArray => finiArrayVaddr
+          SectionKind.SilkFrames => framesVaddr
+          SectionKind.SilkSeen => seenVaddr
+          SectionKind.EhFrame => ehFrameVaddr
+        }
+        secP[sc].vaddr = base + secP[sc].outOffset
+      }
+      sc = sc + usize.ONE
+    }
+    ui = ui + usize.ONE
+  }
+
+  si = usize.ZERO
+  while si < symCount {
+    match entriesMut[si].state {
+      SymState.Defined => {
+        let secP = List<SecPlacement>.asSlice(&placeMut[entriesMut[si].unitIdx])
+        entriesMut[si].vaddr = secP[entriesMut[si].secIdx].vaddr + entriesMut[si].offset
+      }
+      SymState.Common => {
+        entriesMut[si].vaddr = bssVaddr + entriesMut[si].offset
+      }
+      SymState.Synthetic => {
+        entriesMut[si].vaddr = match entriesMut[si].synth {
+          SynthKind.StartSilkFrames => framesVaddr
+          SynthKind.StopSilkFrames => framesVaddr + framesSize
+          SynthKind.StartSilkSeen => seenVaddr
+          SynthKind.StopSilkSeen => seenVaddr + seenSize
+          SynthKind.InitArrayStart => initArrayVaddr
+          SynthKind.InitArrayEnd => initArrayVaddr + initArraySize
+          SynthKind.FiniArrayStart => finiArrayVaddr
+          SynthKind.FiniArrayEnd => finiArrayVaddr + finiArraySize
+          SynthKind.GotBase => gotVaddr
+          SynthKind.DynamicBase => dynamicVaddr
+          SynthKind.BssStart => seg4Vaddr + seg4FileSz
+          SynthKind.Edata => seg4Vaddr + seg4FileSz
+          SynthKind.End => seg4Vaddr + seg4MemSz
+          SynthKind.None => 0
+        }
+      }
+      SymState.Dynamic => {
+        if entriesMut[si].hasCopy {
+          entriesMut[si].vaddr = bssVaddr + entriesMut[si].copyBssOff
+        } else {
+          entriesMut[si].vaddr = 0
+        }
+      }
+      SymState.Undefined => {
+        entriesMut[si].vaddr = 0
+      }
+    }
+    si = si + usize.ONE
+  }
+
+  // Entry point `_start` (or `main` if `_start` not included) for executables.
+  let mut entryVaddr: u64 = 0
+  if !shared {
+    let mut startIdx = InternIndex.first(&symtab.index, InternIndex.hashBytes(0, b"_start"))
+    while startIdx != usize.MAX && !sameBytes(Bytes.asSlice(&entriesMut[startIdx].name), b"_start") {
+      startIdx = InternIndex.after(&symtab.index, startIdx)
+    }
+    if startIdx != usize.MAX && entriesMut[startIdx].state == SymState.Defined {
+      entryVaddr = entriesMut[startIdx].vaddr
+    } else {
+      let mut mainIdx = InternIndex.first(&symtab.index, InternIndex.hashBytes(0, b"main"))
+      while mainIdx != usize.MAX && !sameBytes(Bytes.asSlice(&entriesMut[mainIdx].name), b"main") {
+        mainIdx = InternIndex.after(&symtab.index, mainIdx)
+      }
+      if mainIdx != usize.MAX && entriesMut[mainIdx].state == SymState.Defined {
+        entryVaddr = entriesMut[mainIdx].vaddr
+      }
+    }
+  }
+
+  // ---- Build Merged Section Buffers & Apply All Relocations ----
+
+  let mut textBuf = run Bytes.zeroed(u64.toUsize(textSize))
+  let mut rodataBuf = run Bytes.zeroed(u64.toUsize(rodataSize))
+  let mut dataBuf = run Bytes.zeroed(u64.toUsize(dataSize))
+  let mut tdataBuf = run Bytes.zeroed(u64.toUsize(tdataSize))
+  let mut initArrBuf = run Bytes.zeroed(u64.toUsize(initArraySize))
+  let mut finiArrBuf = run Bytes.zeroed(u64.toUsize(finiArraySize))
+  let mut framesBuf = run Bytes.zeroed(u64.toUsize(framesSize))
+  let mut seenBuf = run Bytes.zeroed(u64.toUsize(seenSize))
+
+  // Copy raw input section bytes into merged buffers.
+  ui = usize.ZERO
+  while ui < unitSlice.length {
+    let secs = List<InputSection>.asSlice(&unitSlice[ui].sections)
+    let secP = List<SecPlacement>.asSlice(&placeMut[ui])
+    let mut sc = usize.ZERO
+    while sc < secs.length {
+      if secP[sc].kept {
+        let src = Bytes.asSlice(&secs[sc].data)
+        if src.length > usize.ZERO {
+          let dstOff = u64.toUsize(secP[sc].outOffset)
+          match secP[sc].kind {
+            SectionKind.Text => { copyInto(&mut textBuf, dstOff, src) }
+            SectionKind.Rodata => { copyInto(&mut rodataBuf, dstOff, src) }
+            SectionKind.Data => { copyInto(&mut dataBuf, dstOff, src) }
+            SectionKind.Tdata => { copyInto(&mut tdataBuf, dstOff, src) }
+            SectionKind.InitArray => { copyInto(&mut initArrBuf, dstOff, src) }
+            SectionKind.FiniArray => { copyInto(&mut finiArrBuf, dstOff, src) }
+            SectionKind.SilkFrames => { copyInto(&mut framesBuf, dstOff, src) }
+            SectionKind.SilkSeen => { copyInto(&mut seenBuf, dstOff, src) }
+            _ => {}
+          }
+        }
+      }
+      sc = sc + usize.ONE
+    }
+    ui = ui + usize.ONE
+  }
+
+  // Populate `.got` and queue `.rela.dyn` entries for GOT, GOTTPOFF, and COPY relocations.
+  let mut gotBuf = run Bytes.zeroed(u64.toUsize(gotSize))
+  let mut dynRelas = List<DynRela>.make()
+
+  let gotSymSlice = List<usize>.asSlice(&gotSyms)
+  let mut gi = usize.ZERO
+  while gi < gotSymSlice.length {
+    let sIdx = gotSymSlice[gi]
+    let slotVaddr = gotVaddr + usize.toU64(gi) * 8
+    let st = entriesMut[sIdx].state
+    if st == SymState.Dynamic {
+      run List<DynRela>.append(&mut dynRelas, DynRela {
+        offset: slotVaddr,
+        dynsym: entriesMut[sIdx].dynsymIdx,
+        relType: ElfInput.rGlobDat(),
+        addend: 0,
+      })
+    } else if st == SymState.Defined || st == SymState.Common || st == SymState.Synthetic {
+      putU64Le(&mut gotBuf, gi * 8, entriesMut[sIdx].vaddr)
+      run List<DynRela>.append(&mut dynRelas, DynRela {
+        offset: slotVaddr,
+        dynsym: usize.ZERO,
+        relType: ElfInput.rRelative(),
+        addend: u64.wrappingToI64(entriesMut[sIdx].vaddr),
+      })
+    }
+    gi = gi + usize.ONE
+  }
+
+  // Local GOT slots (from `STB_LOCAL` GOTPCREL relocations).
+  let localGotStart = gotRegularCount
+  let lgKeys = List<u64>.asSlice(&localGotTargets)
+  let lgOffs = List<u64>.asSlice(&localGotOffs)
+  gi = usize.ZERO
+  while gi < lgKeys.length {
+    let targetU = u64.toUsize(u64.shiftRight(lgKeys[gi], 32))
+    let targetS = u64.toUsize(lgKeys[gi] & 0xFFFFFFFF)
+    let secP = List<SecPlacement>.asSlice(&placeMut[targetU])
+    let targetVaddr = secP[targetS].vaddr + lgOffs[gi]
+    let slotIdx = localGotStart + gi
+    putU64Le(&mut gotBuf, slotIdx * 8, targetVaddr)
+    run List<DynRela>.append(&mut dynRelas, DynRela {
+      offset: gotVaddr + usize.toU64(slotIdx) * 8,
+      dynsym: usize.ZERO,
+      relType: ElfInput.rRelative(),
+      addend: u64.wrappingToI64(targetVaddr),
+    })
+    gi = gi + usize.ONE
+  }
+
+  // GOTTPOFF slots (TLS offsets).
+  let gotTpStart = localGotStart + gotLocalCount
+  let tpSymSlice = List<usize>.asSlice(&gotTpOffSyms)
+  gi = usize.ZERO
+  while gi < tpSymSlice.length {
+    let sIdx = tpSymSlice[gi]
+    let slotIdx = gotTpStart + gi
+    let slotVaddr = gotVaddr + usize.toU64(slotIdx) * 8
+    if entriesMut[sIdx].state == SymState.Dynamic {
+      run List<DynRela>.append(&mut dynRelas, DynRela {
+        offset: slotVaddr,
+        dynsym: entriesMut[sIdx].dynsymIdx,
+        relType: ElfInput.rTpoff64(),
+        addend: 0,
+      })
+    } else if shared {
+      run List<DynRela>.append(&mut dynRelas, DynRela {
+        offset: slotVaddr,
+        dynsym: usize.ZERO,
+        relType: ElfInput.rTpoff64(),
+        addend: u64.wrappingToI64(entriesMut[sIdx].vaddr),
+      })
+    } else {
+      // Static Initial-Exec TLS offset in executable: `symTlsOff - alignUp(tlsMemSz, tlsAlign)`.
+      let tpOff = u64.wrappingToI64(entriesMut[sIdx].vaddr) - u64.wrappingToI64(tlsBlockSize)
+      putU64Le(&mut gotBuf, slotIdx * 8, i64.wrappingToU64(tpOff))
+    }
+    gi = gi + usize.ONE
+  }
+
+  // COPY relocations for non-PIC external data references.
+  ci = usize.ZERO
+  while ci < copySlice.length {
+    let sIdx = copySlice[ci]
+    run List<DynRela>.append(&mut dynRelas, DynRela {
+      offset: entriesMut[sIdx].vaddr,
+      dynsym: entriesMut[sIdx].dynsymIdx,
+      relType: ElfInput.rCopy(),
+      addend: 0,
+    })
+    ci = ci + usize.ONE
+  }
+
+  // Build eager-bound `.plt` stubs (8 bytes each: `FF 25 <rel32> 66 90` -> `jmp qword [rip + got]`).
+  let mut pltBuf = Bytes.make()
+  let pltSymSlice = List<usize>.asSlice(&pltSyms)
+  let mut pi = usize.ZERO
+  while pi < pltSymSlice.length {
+    let sIdx = pltSymSlice[pi]
+    let stubVaddr = pltVaddr + usize.toU64(pi) * 8
+    let gotSlotVaddr = gotVaddr + usize.toU64(entriesMut[sIdx].gotSlot) * 8
+    let rel = u64.wrappingToI64(gotSlotVaddr) - u64.wrappingToI64(stubVaddr + 6)
+    run X86Encode.byte(&mut pltBuf, 0xFF)
+    run X86Encode.byte(&mut pltBuf, 0x25)
+    run X86Encode.u32Le(&mut pltBuf, i64.wrappingToU64(rel))
+    run X86Encode.byte(&mut pltBuf, 0x66)
+    run X86Encode.byte(&mut pltBuf, 0x90)
+    pi = pi + usize.ONE
+  }
+
+  // Apply all input relocations across all merged sections (and record `.eh_frame_hdr` entries!).
+  let mut fdeEntries = List<FdeEntry>.make()
+  let ehFdeSlice = List<EhFdePlace>.asSlice(&ehFdes)
+  let mut localGotCursor = usize.ZERO
+  let mut ehFdeCursor = usize.ZERO
+
+  ui = usize.ZERO
+  while ui < unitSlice.length {
+    let secs = List<InputSection>.asSlice(&unitSlice[ui].sections)
+    let secP = List<SecPlacement>.asSlice(&placeMut[ui])
+    let mut sc = usize.ZERO
+    while sc < secs.length {
+      if secP[sc].kept {
+        let rels = List<InputReloc>.asSlice(&secs[sc].relocs)
+        let mut ri = usize.ZERO
+        while ri < rels.length {
+          let r = &rels[ri]
+          let rt = r.relType
+          let mut dstOff = secP[sc].outOffset + r.offset
+          let mut pVaddr = secP[sc].vaddr + r.offset
+          let mut matchedFde = usize.MAX
+
+          if secP[sc].kind == SectionKind.EhFrame {
+            // Map input `.eh_frame` relocation offset to its merged FDE `initial_location` offset.
+            let mut fi = ehFdeCursor
+            while fi < ehFdeSlice.length {
+              if ehFdeSlice[fi].unitIdx == ui && ehFdeSlice[fi].secIdx == sc && ehFdeSlice[fi].inInitLocOff == r.offset {
+                matchedFde = fi
+                dstOff = ehFdeSlice[fi].outInitLocOff
+                pVaddr = ehFrameVaddr + dstOff
+                ehFdeCursor = fi + usize.ONE
+                break
+              }
+              fi = fi + usize.ONE
+            }
+            if matchedFde == usize.MAX {
+              // Non-initial_location `.eh_frame` relocation (e.g. CIE personality); skip or map via CIEs.
+              ri = ri + usize.ONE
+              continue
+            }
+          }
+
+          // Compute target symbol address `sVaddr` and metadata.
+          let mut sVaddr: u64 = 0
+          let mut sSize: u64 = 0
+          let mut sIdx = usize.MAX
+          let mut isDynamic = false
+          if r.targetLocal {
+            sVaddr = secP[r.localSection].vaddr + r.localOffset
+          } else {
+            let symName = Bytes.asSlice(&r.symbol)
+            sIdx = InternIndex.first(&symtab.index, InternIndex.hashBytes(0, symName))
+            while sIdx != usize.MAX && !sameBytes(Bytes.asSlice(&entriesMut[sIdx].name), symName) {
+              sIdx = InternIndex.after(&symtab.index, sIdx)
+            }
+            if sIdx != usize.MAX {
+              sVaddr = entriesMut[sIdx].vaddr
+              sSize = entriesMut[sIdx].size
+              isDynamic = entriesMut[sIdx].state == SymState.Dynamic
+            }
+          }
+
+          if matchedFde != usize.MAX {
+            let funcAddr = i64.wrappingToU64(u64.wrappingToI64(sVaddr) + r.addend)
+            run List<FdeEntry>.append(&mut fdeEntries, FdeEntry {
+              funcVaddr: funcAddr,
+              fdeVaddr: ehFrameVaddr + ehFdeSlice[matchedFde].outFdeOff,
+            })
+          }
+
+          // Compute patched value and apply to destination buffer.
+          let mut writeWidth: usize = 0 // 4 or 8
+          let mut writeVal: u64 = 0
+          if rt == ElfInput.r64() {
+            writeWidth = 8
+            if isDynamic {
+              writeVal = 0
+              run List<DynRela>.append(&mut dynRelas, DynRela {
+                offset: pVaddr,
+                dynsym: entriesMut[sIdx].dynsymIdx,
+                relType: ElfInput.r64(),
+                addend: r.addend,
+              })
+            } else if r.targetLocal || (sIdx != usize.MAX && entriesMut[sIdx].state != SymState.Undefined) {
+              let v = u64.wrappingToI64(sVaddr) + r.addend
+              writeVal = i64.wrappingToU64(v)
+              run List<DynRela>.append(&mut dynRelas, DynRela {
+                offset: pVaddr,
+                dynsym: usize.ZERO,
+                relType: ElfInput.rRelative(),
+                addend: v,
+              })
+            }
+          } else if rt == ElfInput.rPc32() || rt == ElfInput.rPlt32() {
+            writeWidth = 4
+            let targetAddr = if isDynamic && sIdx != usize.MAX && entriesMut[sIdx].pltSlot != usize.MAX {
+              pltVaddr + usize.toU64(entriesMut[sIdx].pltSlot) * 8
+            } else {
+              sVaddr
+            }
+            let delta = u64.wrappingToI64(targetAddr) + r.addend - u64.wrappingToI64(pVaddr)
+            writeVal = i64.wrappingToU64(delta)
+          } else if rt == ElfInput.rGotPcRel() || rt == ElfInput.rGotPcRelX() || rt == ElfInput.rRexGotPcRelX() {
+            writeWidth = 4
+            let slotIdx = if r.targetLocal {
+              let idx = localGotStart + localGotCursor
+              localGotCursor = localGotCursor + usize.ONE
+              idx
+            } else {
+              entriesMut[sIdx].gotSlot
+            }
+            let gotAddr = gotVaddr + usize.toU64(slotIdx) * 8
+            let delta = u64.wrappingToI64(gotAddr) + r.addend - u64.wrappingToI64(pVaddr)
+            writeVal = i64.wrappingToU64(delta)
+          } else if rt == ElfInput.rGotTpOff() {
+            writeWidth = 4
+            let slotIdx = gotTpStart + entriesMut[sIdx].gotTpOffSlot
+            let gotAddr = gotVaddr + usize.toU64(slotIdx) * 8
+            let delta = u64.wrappingToI64(gotAddr) + r.addend - u64.wrappingToI64(pVaddr)
+            writeVal = i64.wrappingToU64(delta)
+          } else if rt == ElfInput.rTpoff32() {
+            writeWidth = 4
+            let tpOff = u64.wrappingToI64(sVaddr) - u64.wrappingToI64(tlsBlockSize) + r.addend
+            writeVal = i64.wrappingToU64(tpOff)
+          } else if rt == ElfInput.rTlsGd() && !shared {
+            // Standard x86-64 GD -> LE relaxation over the 16-byte TLSGD sequence starting at `dstOff - 4`.
+            if secP[sc].kind == SectionKind.Text && dstOff >= 4 {
+              let tpOff = u64.wrappingToI64(sVaddr) - u64.wrappingToI64(tlsBlockSize)
+              let baseAt = u64.toUsize(dstOff) - 4
+              let relax: [u8; 12] = [0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x80]
+              copyInto(&mut textBuf, baseAt, &relax)
+              putU32Le(&mut textBuf, baseAt + 12, i64.wrappingToU64(tpOff))
+              // Skip the paired `call __tls_get_addr@PLT` relocation right after if present.
+              if ri + usize.ONE < rels.length && rels[ri + usize.ONE].offset == r.offset + 5 {
+                ri = ri + usize.ONE
+              }
+            }
+          } else if rt == ElfInput.r32() || rt == ElfInput.r32S() {
+            writeWidth = 4
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(sVaddr) + r.addend)
+          } else if rt == ElfInput.rPc64() {
+            writeWidth = 8
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(sVaddr) + r.addend - u64.wrappingToI64(pVaddr))
+          } else if rt == ElfInput.rGotPc32() {
+            writeWidth = 4
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(gotVaddr) + r.addend - u64.wrappingToI64(pVaddr))
+          } else if rt == ElfInput.rGotOff64() {
+            writeWidth = 8
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(sVaddr) + r.addend - u64.wrappingToI64(gotVaddr))
+          } else if rt == ElfInput.rGotPc64() {
+            writeWidth = 8
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(gotVaddr) + r.addend - u64.wrappingToI64(pVaddr))
+          } else if rt == ElfInput.rSize32() {
+            writeWidth = 4
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(sSize) + r.addend)
+          } else if rt == ElfInput.rSize64() {
+            writeWidth = 8
+            writeVal = i64.wrappingToU64(u64.wrappingToI64(sSize) + r.addend)
+          } else if rt != ElfInput.rNone() {
+            return run ElfInput.linkError(b"unsupported x86-64 relocation type in input object")
+          }
+
+          if writeWidth > usize.ZERO {
+            let at = u64.toUsize(dstOff)
+            match secP[sc].kind {
+              SectionKind.Text => { patchBuf(&mut textBuf, at, writeWidth, writeVal) }
+              SectionKind.Rodata => { patchBuf(&mut rodataBuf, at, writeWidth, writeVal) }
+              SectionKind.Data => { patchBuf(&mut dataBuf, at, writeWidth, writeVal) }
+              SectionKind.Tdata => { patchBuf(&mut tdataBuf, at, writeWidth, writeVal) }
+              SectionKind.InitArray => { patchBuf(&mut initArrBuf, at, writeWidth, writeVal) }
+              SectionKind.FiniArray => { patchBuf(&mut finiArrBuf, at, writeWidth, writeVal) }
+              SectionKind.SilkFrames => { patchBuf(&mut framesBuf, at, writeWidth, writeVal) }
+              SectionKind.SilkSeen => { patchBuf(&mut seenBuf, at, writeWidth, writeVal) }
+              SectionKind.EhFrame => { patchBuf(&mut ehMerged, at, writeWidth, writeVal) }
+              _ => {}
+            }
+          }
+          ri = ri + usize.ONE
+        }
+      }
+      sc = sc + usize.ONE
+    }
+    ui = ui + usize.ONE
+  }
+
+  // ---- Build Sorted `.eh_frame_hdr` Binary Search Table ----
+
+  let fdeMut = List<FdeEntry>.asMutSlice(&mut fdeEntries)
+  // Insertion/shell sort by ascending `funcVaddr` (almost already sorted in text emission order!).
+  let mut fk = usize.ONE
+  while fk < fdeMut.length {
+    let key = fdeMut[fk]
+    let mut fj = fk
+    while fj > usize.ZERO && fdeMut[fj - usize.ONE].funcVaddr > key.funcVaddr {
+      fdeMut[fj] = fdeMut[fj - usize.ONE]
+      fj = fj - usize.ONE
+    }
+    fdeMut[fj] = key
+    fk = fk + usize.ONE
+  }
+
+  let mut ehHdrBytes = Bytes.make()
+  run X86Encode.byte(&mut ehHdrBytes, 1)    // version = 1
+  run X86Encode.byte(&mut ehHdrBytes, 0x1B) // eh_frame_ptr_enc = DW_EH_PE_pcrel | DW_EH_PE_sdata4
+  run X86Encode.byte(&mut ehHdrBytes, 0x03) // fde_count_enc = DW_EH_PE_udata4
+  run X86Encode.byte(&mut ehHdrBytes, 0x3B) // table_enc = DW_EH_PE_datarel | DW_EH_PE_sdata4
+  let ehPtrRel = u64.wrappingToI64(ehFrameVaddr) - u64.wrappingToI64(ehFrameHdrVaddr + 4)
+  run X86Encode.u32Le(&mut ehHdrBytes, i64.wrappingToU64(ehPtrRel))
+  run X86Encode.u32Le(&mut ehHdrBytes, usize.toU64(fdeMut.length))
+  fk = usize.ZERO
+  while fk < fdeMut.length {
+    let fRel = u64.wrappingToI64(fdeMut[fk].funcVaddr) - u64.wrappingToI64(ehFrameHdrVaddr)
+    let eRel = u64.wrappingToI64(fdeMut[fk].fdeVaddr) - u64.wrappingToI64(ehFrameHdrVaddr)
+    run X86Encode.u32Le(&mut ehHdrBytes, i64.wrappingToU64(fRel))
+    run X86Encode.u32Le(&mut ehHdrBytes, i64.wrappingToU64(eRel))
+    fk = fk + usize.ONE
+  }
+
+  // ---- Encode `.dynsym`, `.rela.dyn`, and `.dynamic` ----
+
+  let mut dynsymBytes = Bytes.make()
+  let dynNameOffs = List<u64>.asSlice(&dynSymNameOffs)
+  // Entry 0: STN_UNDEF
+  run appendElfSym(&mut dynsymBytes, 0, 0, 0, 0, 0, 0)
+  di = usize.ZERO
+  while di < impSlice.length {
+    let sIdx = impSlice[di]
+    let symType: u8 = if entriesMut[sIdx].isTls { 6 } else if entriesMut[sIdx].isObject { 1 } else { 2 }
+    let bind: u8 = if entriesMut[sIdx].weak { 2 } else { 1 }
+    let info = u8.bitOr(u8.shiftLeft(bind, 4), symType)
+    let val = if entriesMut[sIdx].hasCopy { entriesMut[sIdx].vaddr } else { 0 }
+    let shndx: u64 = if entriesMut[sIdx].hasCopy { 1 } else { 0 } // defined in .bss for COPY
+    run appendElfSym(&mut dynsymBytes, dynNameOffs[usize.ONE + di], info, 0, shndx, val, entriesMut[sIdx].size)
+    di = di + usize.ONE
+  }
+  di = usize.ZERO
+  while di < expSlice.length {
+    let sIdx = expSlice[di]
+    let symType: u8 = if entriesMut[sIdx].isTls { 6 } else if entriesMut[sIdx].isFunc { 2 } else { 1 }
+    let bind: u8 = if entriesMut[sIdx].weak { 2 } else { 1 }
+    let info = u8.bitOr(u8.shiftLeft(bind, 4), symType)
+    run appendElfSym(&mut dynsymBytes, dynNameOffs[symoffset + di], info, 0, 1, entriesMut[sIdx].vaddr, entriesMut[sIdx].size)
+    di = di + usize.ONE
+  }
+
+  let mut relaDynBytes = Bytes.make()
+  let drSlice = List<DynRela>.asSlice(&dynRelas)
+  let mut dri = usize.ZERO
+  while dri < drSlice.length {
+    let dr = drSlice[dri]
+    let rInfo = u64.shiftLeft(usize.toU64(dr.dynsym), 32) | (dr.relType & 0xFFFFFFFF)
+    run X86Encode.u64Le(&mut relaDynBytes, dr.offset)
+    run X86Encode.u64Le(&mut relaDynBytes, rInfo)
+    run X86Encode.u64Le(&mut relaDynBytes, i64.wrappingToU64(dr.addend))
+    dri = dri + usize.ONE
+  }
+
+  let mut dynamicBytes = Bytes.make()
+  ni = usize.ZERO
+  while ni < neededOffSlice.length {
+    run appendDyn(&mut dynamicBytes, 1, neededOffSlice[ni]) // DT_NEEDED
+    ni = ni + usize.ONE
+  }
+  if sonameOff != 0 { run appendDyn(&mut dynamicBytes, 14, sonameOff) } // DT_SONAME
+  if runpathOff != 0 { run appendDyn(&mut dynamicBytes, 29, runpathOff) } // DT_RUNPATH
+  if initArraySize > 0 {
+    run appendDyn(&mut dynamicBytes, 25, initArrayVaddr) // DT_INIT_ARRAY
+    run appendDyn(&mut dynamicBytes, 27, initArraySize)  // DT_INIT_ARRAYSZ
+  }
+  if finiArraySize > 0 {
+    run appendDyn(&mut dynamicBytes, 26, finiArrayVaddr) // DT_FINI_ARRAY
+    run appendDyn(&mut dynamicBytes, 28, finiArraySize)  // DT_FINI_ARRAYSZ
+  }
+  run appendDyn(&mut dynamicBytes, 0x6FFFFEF5, gnuHashOff) // DT_GNU_HASH
+  run appendDyn(&mut dynamicBytes, 5, dynstrOff)           // DT_STRTAB
+  run appendDyn(&mut dynamicBytes, 6, dynsymOff)           // DT_SYMTAB
+  run appendDyn(&mut dynamicBytes, 10, dynstrSize)         // DT_STRSZ
+  run appendDyn(&mut dynamicBytes, 11, 24)                 // DT_SYMENT
+  if drSlice.length > usize.ZERO {
+    run appendDyn(&mut dynamicBytes, 7, relaDynOff)                         // DT_RELA
+    run appendDyn(&mut dynamicBytes, 8, usize.toU64(drSlice.length) * 24)   // DT_RELASZ
+    run appendDyn(&mut dynamicBytes, 9, 24)                                 // DT_RELAENT
+  }
+  if verneedLibCount > 0 {
+    run appendDyn(&mut dynamicBytes, 0x6FFFFFF0, versymOff)       // DT_VERSYM
+    run appendDyn(&mut dynamicBytes, 0x6FFFFFFE, verneedOff)      // DT_VERNEED
+    run appendDyn(&mut dynamicBytes, 0x6FFFFFFF, verneedLibCount) // DT_VERNEEDNUM
+  }
+  // DT_FLAGS = DF_BIND_NOW (0x8)
+  run appendDyn(&mut dynamicBytes, 30, 0x8)
+  // DT_FLAGS_1 = DF_1_NOW (0x1) | (DF_1_PIE (0x08000000) for executables)
+  let flags1: u64 = if shared { 0x1 } else { 0x08000001 }
+  run appendDyn(&mut dynamicBytes, 0x6FFFFFFB, flags1)
+  run appendDyn(&mut dynamicBytes, 0, 0) // DT_NULL
+
+  // ---- Build Static `.symtab` & `.strtab` (With Human-Readable Silk Names!) ----
+
+  let mut strtab = Bytes.make()
+  run X86Encode.byte(&mut strtab, 0)
+  let mut symtabBytes = Bytes.make()
+  // Entry 0: STN_UNDEF
+  run appendElfSym(&mut symtabBytes, 0, 0, 0, 0, 0, 0)
+  // Emit all defined symbols (applying `FunctionNames` so gdb/perf/objdump show Silk names!).
+  let mut staticSymCount: u64 = 1
+  si = usize.ZERO
+  while si < symCount {
+    if entriesMut[si].state == SymState.Defined || entriesMut[si].state == SymState.Common {
+      let rawName = Bytes.asSlice(&entriesMut[si].name)
+      let displayName = match FunctionNames.lookup(functionNames, rawName) {
+        Option<&[u8]>.Some {value} => value
+        Option<&[u8]>.None => rawName
+      }
+      let nameOff = run appendCstr(&mut strtab, displayName)
+      let symType: u8 = if entriesMut[si].isTls { 6 } else if entriesMut[si].isFunc { 2 } else { 1 }
+      let bind: u8 = if entriesMut[si].weak { 2 } else { 1 }
+      let info = u8.bitOr(u8.shiftLeft(bind, 4), symType)
+      let shndx: u64 = if entriesMut[si].isFunc { 11 } else { 15 } // .text (11) or .data (15)
+      run appendElfSym(&mut symtabBytes, nameOff, info, 0, shndx, entriesMut[si].vaddr, entriesMut[si].size)
+      staticSymCount = staticSymCount + 1
+    }
+    si = si + usize.ONE
+  }
+
+  // ---- Assemble Complete ELF64 Binary Image ----
+
+  let mut out = Bytes.make()
+  // 1. Reserve 64-byte Elf64_Ehdr (patched once `e_shoff` is known).
+  run appendPad(&mut out, 64, 0)
+
+  // 2. Write Program Headers (`Elf64_Phdr`, 56 bytes each).
+  if !shared {
+    // PT_PHDR (6)
+    run appendPhdr(&mut out, 6, 4, 64, 64, phnum * 56, phnum * 56, 8)
+    // PT_INTERP (3)
+    run appendPhdr(&mut out, 3, 4, interpOff, interpOff, usize.toU64(interpBytes.length), usize.toU64(interpBytes.length), 1)
+  }
+  // PT_LOAD 1 (R)
+  run appendPhdr(&mut out, 1, 4, 0, 0, seg1FileSz, seg1FileSz, 0x1000)
+  // PT_LOAD 2 (R|X)
+  run appendPhdr(&mut out, 1, 5, seg2Off, seg2Vaddr, seg2FileSz, seg2FileSz, 0x1000)
+  // PT_LOAD 3 (R|W, RELRO)
+  run appendPhdr(&mut out, 1, 6, seg3Off, seg3Vaddr, seg3FileSz, seg3RelroMemSz, 0x1000)
+  // PT_LOAD 4 (R|W)
+  run appendPhdr(&mut out, 1, 6, seg4Off, seg4Vaddr, seg4FileSz, seg4MemSz, 0x1000)
+  // PT_DYNAMIC (2)
+  run appendPhdr(&mut out, 2, 6, dynamicVaddr, dynamicVaddr, dynamicSize, dynamicSize, 8)
+  // PT_GNU_EH_FRAME (0x6474e550)
+  run appendPhdr(&mut out, 0x6474E550, 4, ehFrameHdrVaddr, ehFrameHdrVaddr, ehFrameHdrSize, ehFrameHdrSize, 4)
+  // PT_GNU_STACK (0x6474e551, RW)
+  run appendPhdr(&mut out, 0x6474E551, 6, 0, 0, 0, 0, 16)
+  // PT_GNU_RELRO (0x6474e552, R)
+  run appendPhdr(&mut out, 0x6474E552, 4, seg3Off, seg3Vaddr, seg3FileSz, seg3RelroMemSz, 1)
+  if hasTls {
+    // PT_TLS (7)
+    run appendPhdr(&mut out, 7, 4, tdataFileOff, tdataVaddr, tdataSize, tlsMemSize, tlsAlign)
+  }
+
+  // 3. Segment 1 payload (PF_R).
+  if !shared {
+    run padToOffset(&mut out, u64.toUsize(interpOff), 0)
+    run Bytes.append(&mut out, interpBytes)
+  }
+  run padToOffset(&mut out, u64.toUsize(gnuHashOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&gnuHashBytes))
+  run padToOffset(&mut out, u64.toUsize(dynsymOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&dynsymBytes))
+  run padToOffset(&mut out, u64.toUsize(dynstrOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&dynstr))
+  run padToOffset(&mut out, u64.toUsize(versymOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&versymBytes))
+  run padToOffset(&mut out, u64.toUsize(verneedOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&verneedBytes))
+  run padToOffset(&mut out, u64.toUsize(relaDynOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&relaDynBytes))
+  run padToOffset(&mut out, u64.toUsize(rodataVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&rodataBuf))
+  run padToOffset(&mut out, u64.toUsize(ehFrameHdrVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&ehHdrBytes))
+  run padToOffset(&mut out, u64.toUsize(ehFrameVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&ehMerged))
+
+  // 4. Segment 2 payload (PF_R | PF_X).
+  run padToOffset(&mut out, u64.toUsize(pltVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&pltBuf))
+  run padToOffset(&mut out, u64.toUsize(textVaddr), 0x90)
+  run Bytes.append(&mut out, Bytes.asSlice(&textBuf))
+
+  // 5. Segment 3 payload (RELRO).
+  run padToOffset(&mut out, u64.toUsize(initArrayVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&initArrBuf))
+  run padToOffset(&mut out, u64.toUsize(finiArrayVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&finiArrBuf))
+  run padToOffset(&mut out, u64.toUsize(dynamicVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&dynamicBytes))
+  run padToOffset(&mut out, u64.toUsize(gotVaddr), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&gotBuf))
+
+  // 6. Segment 4 payload (RW).
+  run padToOffset(&mut out, u64.toUsize(tdataFileOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&tdataBuf))
+  run padToOffset(&mut out, u64.toUsize(seg4Off + dataOffInSeg4), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&dataBuf))
+  run padToOffset(&mut out, u64.toUsize(seg4Off + framesOffInSeg4), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&framesBuf))
+  run padToOffset(&mut out, u64.toUsize(seg4Off + seenOffInSeg4), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&seenBuf))
+
+  // 7. Non-loadable `.symtab`, `.strtab`, `.shstrtab`, and 22 Section Headers for gdb/readelf/perf.
+  let mut shstrtab = Bytes.make()
+  run X86Encode.byte(&mut shstrtab, 0)
+  let nInterp = run appendCstr(&mut shstrtab, b".interp")
+  let nGnuHash = run appendCstr(&mut shstrtab, b".gnu.hash")
+  let nDynsym = run appendCstr(&mut shstrtab, b".dynsym")
+  let nDynstr = run appendCstr(&mut shstrtab, b".dynstr")
+  let nVersym = run appendCstr(&mut shstrtab, b".gnu.version")
+  let nVerneed = run appendCstr(&mut shstrtab, b".gnu.version_r")
+  let nRelaDyn = run appendCstr(&mut shstrtab, b".rela.dyn")
+  let nRodata = run appendCstr(&mut shstrtab, b".rodata")
+  let nEhHdr = run appendCstr(&mut shstrtab, b".eh_frame_hdr")
+  let nEhFrame = run appendCstr(&mut shstrtab, b".eh_frame")
+  let nPlt = run appendCstr(&mut shstrtab, b".plt")
+  let nText = run appendCstr(&mut shstrtab, b".text")
+  let nInitArr = run appendCstr(&mut shstrtab, b".init_array")
+  let nDynamic = run appendCstr(&mut shstrtab, b".dynamic")
+  let nGot = run appendCstr(&mut shstrtab, b".got")
+  let nData = run appendCstr(&mut shstrtab, b".data")
+  let nTdata = run appendCstr(&mut shstrtab, b".tdata")
+  let nFrames = run appendCstr(&mut shstrtab, b"silk_frames")
+  let nBss = run appendCstr(&mut shstrtab, b".bss")
+  let nSymtab = run appendCstr(&mut shstrtab, b".symtab")
+  let nStrtab = run appendCstr(&mut shstrtab, b".strtab")
+  let nShstrtab = run appendCstr(&mut shstrtab, b".shstrtab")
+
+  let symtabFileOff = alignUp(usize.toU64(Bytes.length(&out)), 8)
+  run padToOffset(&mut out, u64.toUsize(symtabFileOff), 0)
+  run Bytes.append(&mut out, Bytes.asSlice(&symtabBytes))
+  let strtabFileOff = usize.toU64(Bytes.length(&out))
+  run Bytes.append(&mut out, Bytes.asSlice(&strtab))
+  let shstrtabFileOff = usize.toU64(Bytes.length(&out))
+  run Bytes.append(&mut out, Bytes.asSlice(&shstrtab))
+
+  let shoff = alignUp(usize.toU64(Bytes.length(&out)), 8)
+  run padToOffset(&mut out, u64.toUsize(shoff), 0)
+
+  // 23 Section Headers (indices 0..22):
+  // 0: NULL
+  run appendShdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+  // 1: .interp
+  let interpLen: u64 = if shared { 0 } else { usize.toU64(interpBytes.length) }
+  run appendShdr(&mut out, nInterp, 1, 0x2, interpOff, interpOff, interpLen, 0, 0, 1, 0)
+  // 2: .gnu.hash
+  run appendShdr(&mut out, nGnuHash, 0x6FFFFFF6, 0x2, gnuHashOff, gnuHashOff, usize.toU64(Bytes.length(&gnuHashBytes)), 3, 0, 8, 0)
+  // 3: .dynsym (link = 4 .dynstr, info = 1)
+  run appendShdr(&mut out, nDynsym, 11, 0x2, dynsymOff, dynsymOff, dynsymSize, 4, 1, 8, 24)
+  // 4: .dynstr
+  run appendShdr(&mut out, nDynstr, 3, 0x2, dynstrOff, dynstrOff, dynstrSize, 0, 0, 1, 0)
+  // 5: .gnu.version
+  run appendShdr(&mut out, nVersym, 0x6FFFFFFF, 0x2, versymOff, versymOff, versymSize, 3, 0, 2, 2)
+  // 6: .gnu.version_r
+  run appendShdr(&mut out, nVerneed, 0x6FFFFFFE, 0x2, verneedOff, verneedOff, verneedSize, 4, verneedLibCount, 8, 0)
+  // 7: .rela.dyn
+  run appendShdr(&mut out, nRelaDyn, 4, 0x2, relaDynOff, relaDynOff, usize.toU64(Bytes.length(&relaDynBytes)), 3, 0, 8, 24)
+  // 8: .rodata
+  run appendShdr(&mut out, nRodata, 1, 0x2, rodataVaddr, rodataVaddr, rodataSize, 0, 0, 16, 0)
+  // 9: .eh_frame_hdr
+  run appendShdr(&mut out, nEhHdr, 1, 0x2, ehFrameHdrVaddr, ehFrameHdrVaddr, ehFrameHdrSize, 0, 0, 4, 0)
+  // 10: .eh_frame
+  run appendShdr(&mut out, nEhFrame, 1, 0x2, ehFrameVaddr, ehFrameVaddr, ehFrameSize, 0, 0, 8, 0)
+  // 11: .text (placed at index 11 to match static symtab shndx = 11)
+  run appendShdr(&mut out, nText, 1, 0x6, textVaddr, textVaddr, textSize, 0, 0, 16, 0)
+  // 12: .plt
+  run appendShdr(&mut out, nPlt, 1, 0x6, pltVaddr, pltVaddr, pltSize, 0, 0, 16, 8)
+  // 13: .init_array
+  run appendShdr(&mut out, nInitArr, 14, 0x3, initArrayVaddr, initArrayVaddr, initArraySize, 0, 0, 8, 8)
+  // 14: .dynamic
+  run appendShdr(&mut out, nDynamic, 6, 0x3, dynamicVaddr, dynamicVaddr, dynamicSize, 4, 0, 8, 16)
+  // 15: .data (index 15 matches static symtab data shndx = 15)
+  run appendShdr(&mut out, nData, 1, 0x3, dataVaddr, seg4Off + dataOffInSeg4, dataSize, 0, 0, 16, 0)
+  // 16: .got
+  run appendShdr(&mut out, nGot, 1, 0x3, gotVaddr, gotVaddr, gotSize, 0, 0, 8, 8)
+  // 17: .tdata
+  run appendShdr(&mut out, nTdata, 1, 0x403, tdataVaddr, tdataFileOff, tdataSize, 0, 0, tlsAlign, 0)
+  // 18: silk_frames
+  run appendShdr(&mut out, nFrames, 1, 0x3, framesVaddr, seg4Off + framesOffInSeg4, framesSize, 0, 0, 8, 0)
+  // 19: .bss
+  run appendShdr(&mut out, nBss, 8, 0x3, bssVaddr, seg4Off + seg4FileSz, bssSize, 0, 0, 16, 0)
+  // 20: .symtab (link = 21 .strtab, info = 1)
+  run appendShdr(&mut out, nSymtab, 2, 0, 0, symtabFileOff, staticSymCount * 24, 21, 1, 8, 24)
+  // 21: .strtab
+  run appendShdr(&mut out, nStrtab, 3, 0, 0, strtabFileOff, usize.toU64(Bytes.length(&strtab)), 0, 0, 1, 0)
+  // 22: .shstrtab
+  run appendShdr(&mut out, nShstrtab, 3, 0, 0, shstrtabFileOff, usize.toU64(Bytes.length(&shstrtab)), 0, 0, 1, 0)
+
+  // 8. Patch the 64-byte Elf64_Ehdr (`ET_DYN = 3`, `EM_X86_64 = 62`).
+  let buf = Bytes.asMutSlice(&mut out)
+  buf[0] = 0x7F
+  buf[1] = 0x45
+  buf[2] = 0x4C
+  buf[3] = 0x46
+  buf[4] = 2 // ELFCLASS64
+  buf[5] = 1 // ELFDATA2LSB
+  buf[6] = 1 // EV_CURRENT
+  buf[7] = 0 // ELFOSABI_NONE
+  putU16Le(&mut out, 16, 3)         // e_type = ET_DYN (PIE executable or shared library)
+  putU16Le(&mut out, 18, 62)        // e_machine = EM_X86_64
+  putU32Le(&mut out, 20, 1)         // e_version = EV_CURRENT
+  putU64Le(&mut out, 24, entryVaddr)// e_entry
+  putU64Le(&mut out, 32, 64)        // e_phoff
+  putU64Le(&mut out, 40, shoff)     // e_shoff
+  putU16Le(&mut out, 52, 64)        // e_ehsize
+  putU16Le(&mut out, 54, 56)        // e_phentsize
+  putU16Le(&mut out, 56, phnum)     // e_phnum
+  putU16Le(&mut out, 58, 64)        // e_shentsize
+  putU16Le(&mut out, 60, 23)        // e_shnum
+  putU16Le(&mut out, 62, 22)        // e_shstrndx = .shstrtab
+
+  return move out
+}
+
+/// Top-level Linux x86-64 direct linker entry point: ingests concatenated Silk
+/// [`X86Object.Fragment`]s plus any native `.o`, `.a`, and `-l` inputs from `options`, combines
+/// them with the built-in glibc 2.28 virtual DSOs and x86-64 `_start` code, and returns the
+/// linked ELF64 PIE executable or shared library bytes.
+pub effect fn link(
+  fragments: &[u8],
+  options: &LinkOptions,
+  functionNames: &FunctionNames,
+) -> Bytes ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut units = List<InputUnit>.make()
+  let mut archives = List<ArchiveIndex>.make()
+  let mut sharedLibs = List<SharedLib>.make()
+
+  // 1. Ingest Silk x86-64 fragments directly from memory.
+  let silkUnit = run ElfInput.ingestFragments(fragments)
+  run List<InputUnit>.append(&mut units, move silkUnit)
+
+  // 2. Include native x86-64 startup unit (`_start`, `silk_gnu_initialize`, `__dso_handle`).
+  let start = run ElfInput.startupUnit(!options.shared && options.includeStart)
+  run List<InputUnit>.append(&mut units, move start)
+
+  // 3. Load explicit `.o` files.
+  let objs = List<Path>.asSlice(&options.objects)
+  let mut i = usize.ZERO
+  while i < objs.length {
+    let raw = run FileSystem.readFile(&objs[i])
+    let u = run ElfInput.parseRelocatable(Bytes.asSlice(&raw), Path.rawBytes(&objs[i]))
+    run List<InputUnit>.append(&mut units, move u)
+    i = i + usize.ONE
+  }
+
+  // 4. Load explicit `.a` archives.
+  let archPaths = List<Path>.asSlice(&options.archives)
+  i = usize.ZERO
+  while i < archPaths.length {
+    let pBytes = Path.rawBytes(&archPaths[i])
+    let raw = run FileSystem.readFile(&archPaths[i])
+    let arch = run ElfInput.parseArchive(Bytes.asSlice(&raw), pBytes, dirnameOf(pBytes))
+    run List<ArchiveIndex>.append(&mut archives, move arch)
+    i = i + usize.ONE
+  }
+
+  // 5. Load non-glibc `-l<name>` libraries via search paths.
+  let libs = List<Bytes>.asSlice(&options.libraries)
+  let search = List<Path>.asSlice(&options.searchPaths)
+  i = usize.ZERO
+  while i < libs.length {
+    let name = Bytes.asSlice(&libs[i])
+    if !isVirtualGlibcLibrary(name) {
+      match move run resolveLibraryFile(name, search) {
+        Option<Path>.Some {value: found} => {
+          run loadSharedOrArchivePath(Path.rawBytes(&found), false, &mut units, &mut archives, &mut sharedLibs, usize.ZERO)
+        }
+        Option<Path>.None => {
+          return run ElfInput.linkError2(b"cannot find library -l", name)
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  // 6. Append the 5 built-in virtual glibc 2.28 + `libgcc_s.so.1` DSOs (`--as-needed`).
+  let mut virtualLibs = run ElfInput.virtualGlibcLibraries()
+  while List<SharedLib>.length(&virtualLibs) > usize.ZERO {
+    run List<SharedLib>.append(&mut sharedLibs, List<SharedLib>.remove(&mut virtualLibs, usize.ZERO))
+  }
+
+  return run linkUnits(
+    move units,
+    move archives,
+    move sharedLibs,
+    options.shared,
+    List<Bytes>.asSlice(&options.rpaths),
+    Bytes.asSlice(&options.soname),
+    functionNames,
+  )
+}
+
+// ---- Low-Level ELF64 Record Writers ----
+
+fn copyInto(dst: &mut Bytes, at: usize, src: &[u8]) -> () {
+  let buf = Bytes.asMutSlice(&mut dst.*)
+  let mut i = usize.ZERO
+  while i < src.length {
+    buf[at + i] = src[i]
+    i = i + usize.ONE
+  }
+}
+
+fn patchBuf(dst: &mut Bytes, at: usize, width: usize, value: u64) -> () {
+  if width == 8 { putU64Le(&mut dst.*, at, value) }
+  else if width == 4 { putU32Le(&mut dst.*, at, value) }
+}
+
+effect fn appendElfSym(out: &mut Bytes, nameOff: u64, info: u8, other: u8, shndx: u64, value: u64, size: u64) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.u32Le(&mut out.*, nameOff)
+  run X86Encode.byte(&mut out.*, info)
+  run X86Encode.byte(&mut out.*, other)
+  run X86Encode.u16Le(&mut out.*, shndx)
+  run X86Encode.u64Le(&mut out.*, value)
+  return run X86Encode.u64Le(&mut out.*, size)
+}
+
+effect fn appendDyn(out: &mut Bytes, tag: u64, val: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.u64Le(&mut out.*, tag)
+  return run X86Encode.u64Le(&mut out.*, val)
+}
+
+effect fn appendPhdr(
+  out: &mut Bytes,
+  pType: u64,
+  pFlags: u64,
+  pOffset: u64,
+  pVaddr: u64,
+  pFilesz: u64,
+  pMemsz: u64,
+  pAlign: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.u32Le(&mut out.*, pType)
+  run X86Encode.u32Le(&mut out.*, pFlags)
+  run X86Encode.u64Le(&mut out.*, pOffset)
+  run X86Encode.u64Le(&mut out.*, pVaddr)
+  run X86Encode.u64Le(&mut out.*, pVaddr) // p_paddr == p_vaddr
+  run X86Encode.u64Le(&mut out.*, pFilesz)
+  run X86Encode.u64Le(&mut out.*, pMemsz)
+  return run X86Encode.u64Le(&mut out.*, pAlign)
+}
+
+effect fn appendShdr(
+  out: &mut Bytes,
+  name: u64,
+  shType: u64,
+  flags: u64,
+  addr: u64,
+  offset: u64,
+  size: u64,
+  link: u64,
+  info: u64,
+  addralign: u64,
+  entsize: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run X86Encode.u32Le(&mut out.*, name)
+  run X86Encode.u32Le(&mut out.*, shType)
+  run X86Encode.u64Le(&mut out.*, flags)
+  run X86Encode.u64Le(&mut out.*, addr)
+  run X86Encode.u64Le(&mut out.*, offset)
+  run X86Encode.u64Le(&mut out.*, size)
+  run X86Encode.u32Le(&mut out.*, link)
+  run X86Encode.u32Le(&mut out.*, info)
+  run X86Encode.u64Le(&mut out.*, addralign)
+  return run X86Encode.u64Le(&mut out.*, entsize)
+}
