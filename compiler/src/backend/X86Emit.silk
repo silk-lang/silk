@@ -112,6 +112,13 @@ struct Emitter {
 /// C alias).
 pub effect fn emit(function: &SsaFunction, symbol: &[u8], exported: &[u8]) -> Function
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  return run emitWithSeen(function, symbol, exported, b"")
+}
+
+/// Emits x86-64 Linux ELF64 machine code for `function` under `symbol`, marking `seenSymbol`
+/// (in `silk_seen`) on entry when `seenSymbol` is non-empty.
+pub effect fn emitWithSeen(function: &SsaFunction, symbol: &[u8], exported: &[u8], seenSymbol: &[u8]) -> Function
+! Unsupported | OutOfMemoryError ? &mut Allocator {
   let frame = run X86Frame.plan(function)
   let blockCount = function.blockCount()
   let mut blockOffsets = run List<usize>.makeWithCapacity(blockCount)
@@ -144,6 +151,16 @@ pub effect fn emit(function: &SsaFunction, symbol: &[u8], exported: &[u8]) -> Fu
   } else {
     run emitPrologue(&mut em, function)
     run emitIncomingParams(&mut em, function)
+    if seenSymbol.length > usize.ZERO {
+      let dispAt = run X86Encode.movMi8(&mut em.code, Mem.ripRel(0), 1)
+      let symIdx = run internSymbol(&mut em, seenSymbol)
+      run List<Relocation>.append(&mut em.relocations, Relocation {
+        offset: dispAt,
+        kind: RelocationKind.Pc32,
+        target: symIdx,
+        addend: -5,
+      })
+    }
   }
 
   let orderLen = List<usize>.length(&em.frame.blockOrder)
@@ -2363,6 +2380,14 @@ effect fn emitCast(em: &mut Emitter, function: &SsaFunction, op: Cast, dstKind: 
 effect fn emitBitcast(em: &mut Emitter, function: &SsaFunction, srcKind: Kind, dstKind: Kind, src: u64, result: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let sz = srcKind.storeSize()
+  if srcKind.isVector() && dstKind.isVector() && sz == 16 && dstKind.storeSize() == 16 {
+    let rDst = valXmm(&em.*, result)
+    let dstOff = valOff(&em.*, result)
+    if rDst == X86Frame.regNone() && dstOff == 0 { return () }
+    let workDst = dstXmmOrScratch(&em.*, result, 0)
+    run loadVec128(&mut em.*, function, src, workDst)
+    return run storeVec128(&mut em.*, result, workDst)
+  }
   if !srcKind.isVector() && !dstKind.isVector() && sz <= 8 {
     if srcKind.isFloat() {
       run loadFloat(&mut em.*, function, src, 0, X86Encode.rax())
@@ -3720,10 +3745,71 @@ effect fn storeVectorLane(em: &mut Emitter, kind: Kind, baseReg: u8, idxReg: u8,
   return ()
 }
 
+fn maskBitMask(elements: usize) -> u64 {
+  if elements >= 64 { return u64.MAX }
+  return u64.shiftLeft(1, usize.toU64(elements)) - 1
+}
+
+effect fn loadMaskBits64(em: &mut Emitter, function: &SsaFunction, value: u64, dstReg: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition == Definition.Constant {
+    let c = function.constantOf(value)
+    if (c.low & 1) == 0 {
+      return run X86Encode.aluRr32(&mut em.code, Alu.Xor, dstReg, dstReg)
+    }
+    return run X86Encode.movImm64(&mut em.code, dstReg, maskBitMask(info.kind.elements))
+  }
+  let off = valOff(&em.*, value)
+  if off == 0 {
+    return run X86Encode.aluRr32(&mut em.code, Alu.Xor, dstReg, dstReg)
+  }
+  let mem = Mem.baseDisp(X86Encode.rbp(), off)
+  let sz = info.kind.storeSize()
+  if sz == 1 { drop run X86Encode.movzxRm8(&mut em.code, dstReg, mem) }
+  else if sz == 2 { drop run X86Encode.movzxRm16(&mut em.code, dstReg, mem) }
+  else if sz == 4 { drop run X86Encode.movRm32(&mut em.code, dstReg, mem) }
+  else { drop run X86Encode.movRm64(&mut em.code, dstReg, mem) }
+  return ()
+}
+
+effect fn storeMaskBits64(em: &mut Emitter, kind: Kind, result: u64, srcReg: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let off = valOff(&em.*, result)
+  if off == 0 { return () }
+  let mem = Mem.baseDisp(X86Encode.rbp(), off)
+  let sz = kind.storeSize()
+  if sz == 1 { drop run X86Encode.movMr8(&mut em.code, mem, srcReg) }
+  else if sz == 2 { drop run X86Encode.movMr16(&mut em.code, mem, srcReg) }
+  else if sz == 4 { drop run X86Encode.movMr32(&mut em.code, mem, srcReg) }
+  else { drop run X86Encode.movMr64(&mut em.code, mem, srcReg) }
+  return ()
+}
+
 effect fn emitVectorBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind: Kind, left: u64, right: u64, result: u64) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  // Native SSE2 fast path for 128-bit and 256-bit integer vectors (`i8`, `i16`, `i32`, `i64`).
   let sz = kind.storeSize()
+  // Fast scalar bitwise operations for bit-packed `mask<N>` vectors (`bits == 1`, `N <= 64`).
+  if kind.bits == 1 && kind.elements <= 64 && (sz == 1 || sz == 2 || sz == 4 || sz == 8)
+    && (op == Binary.And || op == Binary.Or || op == Binary.Xor) {
+    if valOff(&em.*, result) == 0 { return () }
+    run loadMaskBits64(&mut em.*, function, left, X86Encode.rax())
+    run loadMaskBits64(&mut em.*, function, right, X86Encode.rcx())
+    if op == Binary.And { run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx()) }
+    else if op == Binary.Or { run X86Encode.aluRr64(&mut em.code, Alu.Or, X86Encode.rax(), X86Encode.rcx()) }
+    else { run X86Encode.aluRr64(&mut em.code, Alu.Xor, X86Encode.rax(), X86Encode.rcx()) }
+    if kind.elements < 64 {
+      let m = maskBitMask(kind.elements)
+      if m <= 0x7FFFFFFF {
+        run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rax(), u64.wrappingToI32(m))
+      } else {
+        run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), m)
+        run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx())
+      }
+    }
+    return run storeMaskBits64(&mut em.*, kind, result, X86Encode.rax())
+  }
+  // Native SSE2 fast path for 128-bit and 256-bit integer vectors (`i8`, `i16`, `i32`, `i64`).
   if kind.isInteger() && (sz == 16 || sz == 32) && (kind.bits == 8 || kind.bits == 16 || kind.bits == 32 || kind.bits == 64) {
     let laneBytes = kind.bits / 8
     let isBitwiseOrAddSub = op == Binary.Add || op == Binary.Sub || op == Binary.And || op == Binary.Or || op == Binary.Xor
@@ -3886,6 +3972,56 @@ effect fn emitVectorCompare(em: &mut Emitter, function: &SsaFunction, pred: Pred
   let dstOff = valOff(&em.*, result)
   if dstOff == 0 { return () }
   let maskKind = opKind.flags()
+  // Native SSE2 fast path for 128-bit integer vectors (`v16xi8`, `v8xi16`, `v4xi32`).
+  if opKind.isInteger() && opKind.storeSize() == 16 && (opKind.bits == 8 || opKind.bits == 16 || opKind.bits == 32) {
+    let laneBytes = opKind.bits / 8
+    let isUnsigned = pred == Predicate.Ult || pred == Predicate.Ule || pred == Predicate.Ugt || pred == Predicate.Uge
+    let isEq = pred == Predicate.Eq || pred == Predicate.Ne
+    let swapOps = pred == Predicate.Slt || pred == Predicate.Sge || pred == Predicate.Ult || pred == Predicate.Uge
+    let invert = pred == Predicate.Ne || pred == Predicate.Sle || pred == Predicate.Sge || pred == Predicate.Ule || pred == Predicate.Uge
+
+    run loadVec128(&mut em.*, function, left, 0)
+    run loadVec128(&mut em.*, function, right, 1)
+    if isUnsigned {
+      let mut bias = run Bytes.zeroed(16)
+      let bBuf = Bytes.asMutSlice(&mut bias)
+      let mut k = usize.ZERO
+      while k < 16 {
+        if (k % laneBytes) == (laneBytes - usize.ONE) { bBuf[k] = 0x80 }
+        k = k + usize.ONE
+      }
+      let roOff = run addRodata16(&mut em.*, Bytes.asSlice(&bias))
+      let dispAt = run X86Encode.movdquRm(&mut em.code, 2, Mem.ripRel(0))
+      run addRodataReloc(&mut em.*, dispAt, roOff)
+      run X86Encode.pxor(&mut em.code, 0, 2)
+      run X86Encode.pxor(&mut em.code, 1, 2)
+    }
+    let resXmm: u8 = if isEq {
+      run X86Encode.pcmpeq(&mut em.code, laneBytes, 0, 1)
+      0
+    } else if swapOps {
+      run X86Encode.pcmpgt(&mut em.code, laneBytes, 1, 0)
+      1
+    } else {
+      run X86Encode.pcmpgt(&mut em.code, laneBytes, 0, 1)
+      0
+    }
+    if laneBytes == 2 {
+      run X86Encode.packsswb(&mut em.code, resXmm, resXmm)
+    } else if laneBytes == 4 {
+      run X86Encode.packssdw(&mut em.code, resXmm, resXmm)
+      run X86Encode.packsswb(&mut em.code, resXmm, resXmm)
+    }
+    run X86Encode.pmovmskb(&mut em.code, X86Encode.rax(), resXmm)
+    let fullMask: i32 = if laneBytes == 1 { 0xFFFF } else if laneBytes == 2 { 0xFF } else { 0x0F }
+    if laneBytes != 1 {
+      run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rax(), fullMask)
+    }
+    if invert {
+      run X86Encode.aluRi32(&mut em.code, Alu.Xor, X86Encode.rax(), fullMask)
+    }
+    return run storeMaskBits64(&mut em.*, maskKind, result, X86Encode.rax())
+  }
   run zeroMaskSlot(&mut em.*, maskKind, dstOff)
   run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
   drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
@@ -3923,10 +4059,57 @@ effect fn emitVectorCompare(em: &mut Emitter, function: &SsaFunction, pred: Pred
 
 effect fn emitVectorSelect(em: &mut Emitter, function: &SsaFunction, kind: Kind, cond: u64, yes: u64, no: u64, result: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let condKind = function.value(cond).kind
+  // Native SSE2 fast path for 128-bit integer vectors (`v16xi8`, `v8xi16`, `v4xi32`, `v2xi64`).
+  if kind.isInteger() && kind.storeSize() == 16 && (kind.bits == 8 || kind.bits == 16 || kind.bits == 32 || kind.bits == 64) {
+    let rDst = valXmm(&em.*, result)
+    let dstOff = valOff(&em.*, result)
+    if rDst == X86Frame.regNone() && dstOff == 0 { return () }
+    if !condKind.isVector() {
+      let workDst = dstXmmOrScratch(&em.*, result, 0)
+      run loadGp(&mut em.*, function, cond, X86Encode.rax())
+      run X86Encode.testRi8(&mut em.code, X86Encode.rax(), 1)
+      let pickNo = run emitJcc(&mut em.*, X86Encode.ccE())
+      run loadVec128(&mut em.*, function, yes, workDst)
+      let doneSel = run emitJmp(&mut em.*)
+      patchHere(&mut em.*, pickNo)
+      run loadVec128(&mut em.*, function, no, workDst)
+      patchHere(&mut em.*, doneSel)
+      return run storeVec128(&mut em.*, result, workDst)
+    }
+    if condKind.bits == 1 && condKind.elements == kind.elements {
+      let laneBytes = kind.bits / 8
+      // Expand packed bitmask (`N = 16, 8, 4, 2`) into 16-byte lane mask in `xmm2`.
+      run loadMaskBits64(&mut em.*, function, cond, X86Encode.rax())
+      run X86Encode.movdToXmm(&mut em.code, 2, X86Encode.rax())
+      run X86Encode.punpcklbw(&mut em.code, 2, 2)
+      run X86Encode.punpcklwd(&mut em.code, 2, 2)
+      run X86Encode.pshufd(&mut em.code, 2, 2, if laneBytes == 1 { 0x50 } else { 0x00 })
+      let mut bitMask = run Bytes.zeroed(16)
+      let bmBuf = Bytes.asMutSlice(&mut bitMask)
+      let mut k = usize.ZERO
+      while k < 16 {
+        let bitIdx = if laneBytes == 1 { k % 8 } else { k / laneBytes }
+        bmBuf[k] = u8.shiftLeft(1, usize.toU8(bitIdx))
+        k = k + usize.ONE
+      }
+      let roOff = run addRodata16(&mut em.*, Bytes.asSlice(&bitMask))
+      let dispAt = run X86Encode.movdquRm(&mut em.code, 3, Mem.ripRel(0))
+      run addRodataReloc(&mut em.*, dispAt, roOff)
+      run X86Encode.pand(&mut em.code, 2, 3)
+      run X86Encode.pcmpeq(&mut em.code, 1, 2, 3)
+      // Blend: `result = (yes & mask) | ((~mask) & no)`.
+      run loadVec128(&mut em.*, function, yes, 0)
+      run loadVec128(&mut em.*, function, no, 1)
+      run X86Encode.pand(&mut em.code, 0, 2)
+      run X86Encode.pandn(&mut em.code, 2, 1)
+      run X86Encode.por(&mut em.code, 0, 2)
+      return run storeVec128(&mut em.*, result, 0)
+    }
+  }
   let dstOff = valOff(&em.*, result)
   if dstOff == 0 { return () }
   run zeroMaskSlot(&mut em.*, kind, dstOff)
-  let condKind = function.value(cond).kind
   run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 48)
   drop run X86Encode.lea64(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), dstOff))
   drop run X86Encode.movMr64(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), X86Encode.rax())
@@ -4403,12 +4586,62 @@ effect fn emitInsert(em: &mut Emitter, function: &SsaFunction, kind: Kind, vecVa
 
 effect fn emitShuffle(em: &mut Emitter, function: &SsaFunction, kind: Kind, first: u64, second: u64, start: usize, count: usize, result: u64) -> ()
 ! OutOfMemoryError ? &mut Allocator {
+  let srcKind = function.value(first).kind
+  let mask = function.immediatesAt(start, count)
+  // Native single-instruction SSE2 `pshufd` for 4x32-bit single-source shuffles.
+  if kind.isVector() && kind.storeSize() == 16 && srcKind.isVector() && srcKind.storeSize() == 16
+    && kind.bits == 32 && srcKind.bits == 32 && count == 4
+    && mask[0] < 4 && mask[1] < 4 && mask[2] < 4 && mask[3] < 4 {
+    let rDst = valXmm(&em.*, result)
+    let dstOff = valOff(&em.*, result)
+    if rDst == X86Frame.regNone() && dstOff == 0 { return () }
+    let imm: u8 = u64.wrappingToU8(mask[0] | u64.shiftLeft(mask[1], 2) | u64.shiftLeft(mask[2], 4) | u64.shiftLeft(mask[3], 6))
+    let srcXmm = run xmmOrLoadVec128(&mut em.*, function, first, 0)
+    let workDst = dstXmmOrScratch(&em.*, result, 0)
+    run X86Encode.pshufd(&mut em.code, workDst, srcXmm, imm)
+    return run storeVec128(&mut em.*, result, workDst)
+  }
+  // Compact XMM-compatible direct byte shuffle for 16-byte `v16xi8` vectors.
+  if kind.isVector() && kind.storeSize() == 16 && srcKind.isVector() && srcKind.storeSize() == 16
+    && kind.bits == 8 && srcKind.bits == 8 && count == 16 {
+    let rDst = valXmm(&em.*, result)
+    let dstOff = valOff(&em.*, result)
+    if rDst == X86Frame.regNone() && dstOff == 0 { return () }
+    let mut usesSecond = false
+    let mut chk = usize.ZERO
+    while chk < 16 {
+      let pk = mask[chk]
+      if pk >= 16 && pk < 32 { usesSecond = true }
+      chk = chk + usize.ONE
+    }
+    run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 48)
+    let firstXmm = run xmmOrLoadVec128(&mut em.*, function, first, 0)
+    drop run X86Encode.movdquMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 0), firstXmm)
+    if usesSecond {
+      let secXmm = run xmmOrLoadVec128(&mut em.*, function, second, 1)
+      drop run X86Encode.movdquMr(&mut em.code, Mem.baseDisp(X86Encode.rsp(), 16), secXmm)
+    }
+    let mut lane = usize.ZERO
+    while lane < 16 {
+      let pk = mask[lane]
+      let dstDisp: i32 = 32 + usize.toI32(lane)
+      if pk == u64.MAX || pk >= 32 {
+        drop run X86Encode.movMi8(&mut em.code, Mem.baseDisp(X86Encode.rsp(), dstDisp), 0)
+      } else {
+        drop run X86Encode.movzxRm8(&mut em.code, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), u64.wrappingToI32(pk)))
+        drop run X86Encode.movMr8(&mut em.code, Mem.baseDisp(X86Encode.rsp(), dstDisp), X86Encode.rax())
+      }
+      lane = lane + usize.ONE
+    }
+    let workDst = dstXmmOrScratch(&em.*, result, 0)
+    drop run X86Encode.movdquRm(&mut em.code, workDst, Mem.baseDisp(X86Encode.rsp(), 32))
+    run X86Encode.aluRi64(&mut em.code, Alu.Add, X86Encode.rsp(), 48)
+    return run storeVec128(&mut em.*, result, workDst)
+  }
   let dstOff = valOff(&em.*, result)
   if dstOff == 0 { return () }
   run zeroMaskSlot(&mut em.*, kind, dstOff)
-  let srcKind = function.value(first).kind
   let srcElems = srcKind.elements
-  let mask = function.immediatesAt(start, count)
   run vectorAddr(&mut em.*, function, first, X86Encode.rsi())
   run vectorAddr(&mut em.*, function, second, X86Encode.r9())
   drop run X86Encode.lea64(&mut em.code, X86Encode.rdi(), Mem.baseDisp(X86Encode.rbp(), dstOff))
@@ -4436,6 +4669,34 @@ effect fn emitReduce(em: &mut Emitter, function: &SsaFunction, which: Reduction,
 ! OutOfMemoryError ? &mut Allocator {
   let vecKind = function.value(vecVal).kind
   let isFloat = kind.isFloat()
+  let vecSz = vecKind.storeSize()
+  // Fast scalar `any` (`Or`) and `all` (`And`) reductions on bit-packed `mask<N>` vectors.
+  if initVal == none() && !isFloat && vecKind.bits == 1 && vecKind.elements <= 64
+    && (vecSz == 1 || vecSz == 2 || vecSz == 4 || vecSz == 8)
+    && (which == Reduction.Or || which == Reduction.And) {
+    run loadMaskBits64(&mut em.*, function, vecVal, X86Encode.rax())
+    let full = maskBitMask(vecKind.elements)
+    if which == Reduction.Or {
+      if vecKind.elements < 64 {
+        if full <= 0x7FFFFFFF {
+          run X86Encode.aluRi32(&mut em.code, Alu.And, X86Encode.rax(), u64.wrappingToI32(full))
+        } else {
+          run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), full)
+          run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx())
+        }
+      }
+      run X86Encode.testRr64(&mut em.code, X86Encode.rax(), X86Encode.rax())
+      run X86Encode.setcc(&mut em.code, X86Encode.ccNe(), X86Encode.rax())
+      run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+      return run storeGp(&mut em.*, result, X86Encode.rax())
+    }
+    run X86Encode.movImm64(&mut em.code, X86Encode.rcx(), full)
+    run X86Encode.aluRr64(&mut em.code, Alu.And, X86Encode.rax(), X86Encode.rcx())
+    run X86Encode.aluRr64(&mut em.code, Alu.Cmp, X86Encode.rax(), X86Encode.rcx())
+    run X86Encode.setcc(&mut em.code, X86Encode.ccE(), X86Encode.rax())
+    run X86Encode.movzxRr8(&mut em.code, X86Encode.rax(), X86Encode.rax())
+    return run storeGp(&mut em.*, result, X86Encode.rax())
+  }
   let double = kind.bits == 64
   run X86Encode.aluRi64(&mut em.code, Alu.Sub, X86Encode.rsp(), 32)
   run vectorAddr(&mut em.*, function, vecVal, X86Encode.rsi())
