@@ -1,0 +1,1437 @@
+//! Pure x86-64 machine-code encoder for Linux ELF64 code generation.
+//!
+//! # When to use
+//! Use this module to append x86-64 instructions directly to a `Bytes` code buffer without an
+//! external assembler. Every instruction handles REX prefixes (including 8-bit `spl`/`bpl`/
+//! `sil`/`dil`), ModRM/SIB addressing (`rsp`/`r12` SIB escape, `rbp`/`r13` zero-displacement
+//! encoding), RIP-relative addressing, and little-endian immediates.
+//!
+//! # Details
+//! General-purpose registers are numbered `0..15` (`RAX`..`R15`) and vector registers `0..15`
+//! (`XMM0`..`XMM15`). Condition codes follow the x86 `0..15` nibble order (`O`..`G`).
+//! Functions returning `usize` return the byte offset of a 32-bit displacement or relocation
+//! field inside `out` so the caller can patch local branches or record an ELF64 relocation.
+
+import silk.collections.bytes {Bytes}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+// General-purpose register indices (0..15).
+
+/// `rax` / `eax` / `ax` / `al`.
+pub fn rax() -> u8 { return 0 }
+/// `rcx` / `ecx` / `cx` / `cl`.
+pub fn rcx() -> u8 { return 1 }
+/// `rdx` / `edx` / `dx` / `dl`.
+pub fn rdx() -> u8 { return 2 }
+/// `rbx` / `ebx` / `bx` / `bl`.
+pub fn rbx() -> u8 { return 3 }
+/// `rsp` / `esp` / `sp` / `spl`.
+pub fn rsp() -> u8 { return 4 }
+/// `rbp` / `ebp` / `bp` / `bpl`.
+pub fn rbp() -> u8 { return 5 }
+/// `rsi` / `esi` / `si` / `sil`.
+pub fn rsi() -> u8 { return 6 }
+/// `rdi` / `edi` / `di` / `dil`.
+pub fn rdi() -> u8 { return 7 }
+/// `r8` / `r8d` / `r8w` / `r8b`.
+pub fn r8() -> u8 { return 8 }
+/// `r9` / `r9d` / `r9w` / `r9b`.
+pub fn r9() -> u8 { return 9 }
+/// `r10` / `r10d` / `r10w` / `r10b`.
+pub fn r10() -> u8 { return 10 }
+/// `r11` / `r11d` / `r11w` / `r11b`.
+pub fn r11() -> u8 { return 11 }
+/// `r12` / `r12d` / `r12w` / `r12b`.
+pub fn r12() -> u8 { return 12 }
+/// `r13` / `r13d` / `r13w` / `r13b`.
+pub fn r13() -> u8 { return 13 }
+/// `r14` / `r14d` / `r14w` / `r14b`.
+pub fn r14() -> u8 { return 14 }
+/// `r15` / `r15d` / `r15w` / `r15b`.
+pub fn r15() -> u8 { return 15 }
+
+// Condition codes (x86 4-bit cc values).
+
+/// Overflow (`OF == 1`).
+pub fn ccO() -> u8 { return 0x0 }
+/// Not overflow (`OF == 0`).
+pub fn ccNo() -> u8 { return 0x1 }
+/// Unsigned below / carry (`CF == 1`).
+pub fn ccB() -> u8 { return 0x2 }
+/// Unsigned above or equal / no carry (`CF == 0`).
+pub fn ccAe() -> u8 { return 0x3 }
+/// Equal / zero (`ZF == 1`).
+pub fn ccE() -> u8 { return 0x4 }
+/// Not equal / not zero (`ZF == 0`).
+pub fn ccNe() -> u8 { return 0x5 }
+/// Unsigned below or equal (`CF == 1 || ZF == 1`).
+pub fn ccBe() -> u8 { return 0x6 }
+/// Unsigned above (`CF == 0 && ZF == 0`).
+pub fn ccA() -> u8 { return 0x7 }
+/// Sign / negative (`SF == 1`).
+pub fn ccS() -> u8 { return 0x8 }
+/// Not sign / non-negative (`SF == 0`).
+pub fn ccNs() -> u8 { return 0x9 }
+/// Parity / unordered float (`PF == 1`).
+pub fn ccP() -> u8 { return 0xA }
+/// Not parity / ordered float (`PF == 0`).
+pub fn ccNp() -> u8 { return 0xB }
+/// Signed less (`SF != OF`).
+pub fn ccL() -> u8 { return 0xC }
+/// Signed greater or equal (`SF == OF`).
+pub fn ccGe() -> u8 { return 0xD }
+/// Signed less or equal (`ZF == 1 || SF != OF`).
+pub fn ccLe() -> u8 { return 0xE }
+/// Signed greater (`ZF == 0 && SF == OF`).
+pub fn ccG() -> u8 { return 0xF }
+
+/// Negates an x86 condition code (`cc ^ 1`).
+pub fn invertCc(cc: u8) -> u8 { return u8.bitXor(cc, 1) }
+
+/// Standard x86 ALU group-1 sub-opcode extension (`0..7`).
+pub enum Alu {
+  /// `add` (extension 0).
+  Add,
+  /// `or` (extension 1).
+  Or,
+  /// `adc` (extension 2).
+  Adc,
+  /// `sbb` (extension 3).
+  Sbb,
+  /// `and` (extension 4).
+  And,
+  /// `sub` (extension 5).
+  Sub,
+  /// `xor` (extension 6).
+  Xor,
+  /// `cmp` (extension 7).
+  Cmp,
+}
+
+/// Shift/rotate group-2 sub-opcode extension (`0..7`).
+pub enum Shift {
+  /// Rotate left (`rol`).
+  Rol,
+  /// Rotate right (`ror`).
+  Ror,
+  /// Shift left (`shl`).
+  Shl,
+  /// Logical shift right (`shr`).
+  Shr,
+  /// Arithmetic shift right (`sar`).
+  Sar,
+}
+
+/// A memory addressing mode: `[base + disp]`, `[base + index*scale + disp]`, `[rip + disp32]`,
+/// or `fs:[disp32]`.
+pub struct Mem {
+  /// Base register (`0..15`), ignored when `rip` or `fsAbs` is true.
+  pub base: u8,
+  /// Index register (`0..15`), or `255` for no index.
+  pub index: u8,
+  /// Scale (`1`, `2`, `4`, or `8`), used when `index != 255`.
+  pub scale: u8,
+  /// Signed 32-bit displacement.
+  pub disp: i32,
+  /// When true, encodes `[rip + disp32]` (always 4-byte displacement).
+  pub rip: bool,
+  /// When true, encodes `fs:[disp32]` (thread-local pointer base read).
+  pub fsAbs: bool,
+}
+
+impl Copy for Mem {}
+
+impl Mem {
+  /// `[base + disp]`.
+  pub fn baseDisp(base: u8, disp: i32) -> Mem {
+    return Mem {base: base, index: 255, scale: 1, disp: disp, rip: false, fsAbs: false}
+  }
+
+  /// `[base + index*scale + disp]` (`index` must not be `rsp`).
+  pub fn baseIndex(base: u8, index: u8, scale: u8, disp: i32) -> Mem {
+    return Mem {base: base, index: index, scale: scale, disp: disp, rip: false, fsAbs: false}
+  }
+
+  /// `[rip + disp32]` for PC-relative symbol or constant access.
+  pub fn ripRel(disp: i32) -> Mem {
+    return Mem {base: 0, index: 255, scale: 1, disp: disp, rip: true, fsAbs: false}
+  }
+
+  /// `fs:[disp32]` for Linux x86-64 TLS thread-pointer access (`fs:[0]`).
+  pub fn fsDisp(disp: i32) -> Mem {
+    return Mem {base: 0, index: 255, scale: 1, disp: disp, rip: false, fsAbs: true}
+  }
+}
+
+/// Appends one raw byte to `out`.
+pub effect fn byte(out: &mut Bytes, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[value])
+}
+
+/// Appends a little-endian 16-bit integer to `out`.
+pub effect fn u16Le(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let b0 = u64.wrappingToU8(value & 255)
+  let b1 = u64.wrappingToU8(u64.shiftRight(value, 8) & 255)
+  return run Bytes.append(&mut out.*, &[b0, b1])
+}
+
+/// Appends a little-endian 32-bit integer to `out`.
+pub effect fn u32Le(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let b0 = u64.wrappingToU8(value & 255)
+  let b1 = u64.wrappingToU8(u64.shiftRight(value, 8) & 255)
+  let b2 = u64.wrappingToU8(u64.shiftRight(value, 16) & 255)
+  let b3 = u64.wrappingToU8(u64.shiftRight(value, 24) & 255)
+  return run Bytes.append(&mut out.*, &[b0, b1, b2, b3])
+}
+
+/// Appends a little-endian signed 32-bit integer to `out`.
+pub effect fn i32Le(out: &mut Bytes, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run u32Le(&mut out.*, u32.toU64(i32.wrappingToU32(value)))
+}
+
+/// Appends a little-endian 64-bit integer to `out`.
+pub effect fn u64Le(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let b0 = u64.wrappingToU8(value & 255)
+  let b1 = u64.wrappingToU8(u64.shiftRight(value, 8) & 255)
+  let b2 = u64.wrappingToU8(u64.shiftRight(value, 16) & 255)
+  let b3 = u64.wrappingToU8(u64.shiftRight(value, 24) & 255)
+  let b4 = u64.wrappingToU8(u64.shiftRight(value, 32) & 255)
+  let b5 = u64.wrappingToU8(u64.shiftRight(value, 40) & 255)
+  let b6 = u64.wrappingToU8(u64.shiftRight(value, 48) & 255)
+  let b7 = u64.wrappingToU8(u64.shiftRight(value, 56) & 255)
+  return run Bytes.append(&mut out.*, &[b0, b1, b2, b3, b4, b5, b6, b7])
+}
+
+/// Patches a little-endian 32-bit value at byte offset `at` inside `out`.
+pub fn patchU32(out: &mut Bytes, at: usize, value: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  buf[at] = u64.wrappingToU8(value & 255)
+  buf[at + 1] = u64.wrappingToU8(u64.shiftRight(value, 8) & 255)
+  buf[at + 2] = u64.wrappingToU8(u64.shiftRight(value, 16) & 255)
+  buf[at + 3] = u64.wrappingToU8(u64.shiftRight(value, 24) & 255)
+}
+
+/// Patches a PC-relative 32-bit displacement at `patchAt` to target `targetOffset` in `out`.
+pub fn patchRel32(out: &mut Bytes, patchAt: usize, targetOffset: usize) -> () {
+  let nextIp = usize.toI64(patchAt + 4)
+  let target = usize.toI64(targetOffset)
+  let rel = i64.wrappingToU64(target - nextIp)
+  patchU32(&mut out.*, patchAt, rel)
+}
+
+// Internal REX / ModRM / SIB helpers.
+
+fn scaleBits(scale: u8) -> u8 {
+  if scale == 8 { return 3 }
+  if scale == 4 { return 2 }
+  if scale == 2 { return 1 }
+  return 0
+}
+
+fn fitsI8(value: i32) -> bool {
+  return value >= -128 && value <= 127
+}
+
+fn fitsI32(value: i64) -> bool {
+  return value >= -2147483648 && value <= 2147483647
+}
+
+effect fn emitRex(out: &mut Bytes, w: bool, r: bool, x: bool, b: bool, force: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !w && !r && !x && !b && !force { return () }
+  let mut prefix: u8 = 0x40
+  if w { prefix = u8.bitOr(prefix, 0x08) }
+  if r { prefix = u8.bitOr(prefix, 0x04) }
+  if x { prefix = u8.bitOr(prefix, 0x02) }
+  if b { prefix = u8.bitOr(prefix, 0x01) }
+  return run byte(&mut out.*, prefix)
+}
+
+effect fn emitRexRr(out: &mut Bytes, w: bool, reg: u8, rm: u8, byteOp: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = byteOp && ((reg >= 4 && reg <= 7) || (rm >= 4 && rm <= 7))
+  return run emitRex(&mut out.*, w, reg >= 8, false, rm >= 8, force)
+}
+
+effect fn emitRexRm(out: &mut Bytes, w: bool, reg: u8, mem: Mem, byteOp: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = byteOp && reg >= 4 && reg <= 7
+  if mem.rip || mem.fsAbs {
+    return run emitRex(&mut out.*, w, reg >= 8, false, false, force)
+  }
+  let x = mem.index != 255 && mem.index >= 8
+  let b = mem.base >= 8
+  return run emitRex(&mut out.*, w, reg >= 8, x, b, force)
+}
+
+effect fn emitModRmRr(out: &mut Bytes, reg: u8, rm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let r = u8.bitAnd(reg, 7)
+  let m = u8.bitAnd(rm, 7)
+  return run byte(&mut out.*, u8.bitOr(0xC0, u8.bitOr(u8.shiftLeft(r, 3), m)))
+}
+
+// Emits ModRM (+ optional SIB + optional disp) for `mem`, returning the byte offset of the 4-byte
+// displacement if `mem.rip` or `mem.fsAbs`, else the current end offset.
+effect fn emitModRmMem(out: &mut Bytes, reg: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let r = u8.shiftLeft(u8.bitAnd(reg, 7), 3)
+  if mem.rip {
+    run byte(&mut out.*, u8.bitOr(r, 5))
+    let dispAt = Bytes.length(&out.*)
+    run i32Le(&mut out.*, mem.disp)
+    return dispAt
+  }
+  if mem.fsAbs {
+    // SIB disp32-only: mod=00, rm=100, SIB = 0x25 (scale=0, index=4 none, base=5 disp32).
+    run byte(&mut out.*, u8.bitOr(r, 4))
+    run byte(&mut out.*, 0x25)
+    let dispAt = Bytes.length(&out.*)
+    run i32Le(&mut out.*, mem.disp)
+    return dispAt
+  }
+  let baseLow = u8.bitAnd(mem.base, 7)
+  let mut mode: u8 = 0
+  if mem.disp == 0 && baseLow != 5 {
+    mode = 0
+  } else if fitsI8(mem.disp) {
+    mode = 1
+  } else {
+    mode = 2
+  }
+  let modBits = u8.shiftLeft(mode, 6)
+  if mem.index != 255 {
+    run byte(&mut out.*, u8.bitOr(modBits, u8.bitOr(r, 4)))
+    let sib = u8.bitOr(u8.shiftLeft(scaleBits(mem.scale), 6), u8.bitOr(u8.shiftLeft(u8.bitAnd(mem.index, 7), 3), baseLow))
+    run byte(&mut out.*, sib)
+  } else if baseLow == 4 {
+    run byte(&mut out.*, u8.bitOr(modBits, u8.bitOr(r, 4)))
+    run byte(&mut out.*, 0x24)
+  } else {
+    run byte(&mut out.*, u8.bitOr(modBits, u8.bitOr(r, baseLow)))
+  }
+  let dispAt = Bytes.length(&out.*)
+  if mode == 1 {
+    run byte(&mut out.*, i32.wrappingToU8(mem.disp))
+  } else if mode == 2 {
+    run i32Le(&mut out.*, mem.disp)
+  }
+  return dispAt
+}
+
+fn aluExt(op: Alu) -> u8 {
+  return match op {
+    Alu.Add => 0
+    Alu.Or => 1
+    Alu.Adc => 2
+    Alu.Sbb => 3
+    Alu.And => 4
+    Alu.Sub => 5
+    Alu.Xor => 6
+    Alu.Cmp => 7
+  }
+}
+
+fn shiftExt(op: Shift) -> u8 {
+  return match op {
+    Shift.Rol => 0
+    Shift.Ror => 1
+    Shift.Shl => 4
+    Shift.Shr => 5
+    Shift.Sar => 7
+  }
+}
+
+// ---- Basic Control & Miscellaneous ----
+
+/// `nop` (1 byte).
+pub effect fn nop(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run byte(&mut out.*, 0x90)
+}
+
+/// `ret`.
+pub effect fn ret(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run byte(&mut out.*, 0xC3)
+}
+
+/// `leave` (`mov rsp, rbp; pop rbp`).
+pub effect fn leave(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run byte(&mut out.*, 0xC9)
+}
+
+/// `ud2` (guaranteed illegal instruction trap).
+pub effect fn ud2(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0x0B])
+}
+
+/// `int3` (software breakpoint).
+pub effect fn int3(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run byte(&mut out.*, 0xCC)
+}
+
+/// `syscall`.
+pub effect fn syscall(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0x05])
+}
+
+/// `cpuid`.
+pub effect fn cpuid(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0xA2])
+}
+
+/// `rdtsc`.
+pub effect fn rdtsc(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0x31])
+}
+
+/// `xgetbv`.
+pub effect fn xgetbv(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0x01, 0xD0])
+}
+
+/// `pause`.
+pub effect fn pause(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0xF3, 0x90])
+}
+
+/// `mfence`.
+pub effect fn mfence(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0xAE, 0xF0])
+}
+
+/// `lfence`.
+pub effect fn lfence(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0xAE, 0xE8])
+}
+
+/// `sfence`.
+pub effect fn sfence(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x0F, 0xAE, 0xF8])
+}
+
+/// `cdq` (sign-extend `eax` into `edx:eax`).
+pub effect fn cdq(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run byte(&mut out.*, 0x99)
+}
+
+/// `cqo` (sign-extend `rax` into `rdx:rax`).
+pub effect fn cqo(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x48, 0x99])
+}
+
+/// `cwd` (sign-extend `ax` into `dx:ax`).
+pub effect fn cwd(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x66, 0x99])
+}
+
+/// `cbw` (sign-extend `al` into `ax`).
+pub effect fn cbw(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0x66, 0x98])
+}
+
+/// `rep movsb`.
+pub effect fn repMovsb(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0xF3, 0xA4])
+}
+
+/// `rep stosb`.
+pub effect fn repStosb(out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.append(&mut out.*, &[0xF3, 0xAA])
+}
+
+/// `push reg` (64-bit).
+pub effect fn push(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  return run byte(&mut out.*, 0x50 + u8.bitAnd(reg, 7))
+}
+
+/// `pop reg` (64-bit).
+pub effect fn pop(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  return run byte(&mut out.*, 0x58 + u8.bitAnd(reg, 7))
+}
+
+/// `jmp rel32`, returning the byte offset of the 4-byte displacement to patch.
+pub effect fn jmpRel32(out: &mut Bytes) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0xE9)
+  let at = Bytes.length(&out.*)
+  run u32Le(&mut out.*, 0)
+  return at
+}
+
+/// `jcc rel32`, returning the byte offset of the 4-byte displacement to patch.
+pub effect fn jccRel32(out: &mut Bytes, cc: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x0F)
+  run byte(&mut out.*, 0x80 + u8.bitAnd(cc, 15))
+  let at = Bytes.length(&out.*)
+  run u32Le(&mut out.*, 0)
+  return at
+}
+
+/// `jmp reg` (indirect 64-bit jump).
+pub effect fn jmpReg(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xFF)
+  return run emitModRmRr(&mut out.*, 4, reg)
+}
+
+/// `call rel32`, returning the byte offset of the 4-byte displacement (for `R_X86_64_PLT32`).
+pub effect fn callRel32(out: &mut Bytes) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0xE8)
+  let at = Bytes.length(&out.*)
+  run u32Le(&mut out.*, 0)
+  return at
+}
+
+/// `call reg` (indirect 64-bit call).
+pub effect fn callReg(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xFF)
+  return run emitModRmRr(&mut out.*, 2, reg)
+}
+
+// ---- Moves, Loads, Stores, LEA, Conversions ----
+
+/// `mov dst, src` (64-bit register to register).
+pub effect fn movRr64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, src, dst, false)
+  run byte(&mut out.*, 0x89)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// `mov dst, src` (32-bit register to register, zero-extending into 64-bit `dst`).
+pub effect fn movRr32(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, src, dst, false)
+  run byte(&mut out.*, 0x89)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// `mov dst, src` (16-bit register to register).
+pub effect fn movRr16(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x66)
+  run emitRexRr(&mut out.*, false, src, dst, false)
+  run byte(&mut out.*, 0x89)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// `mov dst, src` (8-bit register to register).
+pub effect fn movRr8(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, src, dst, true)
+  run byte(&mut out.*, 0x88)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// `movabs dst, imm64` (full 64-bit immediate load, or compact 32-bit `mov`/`xor` when smaller).
+pub effect fn movImm64(out: &mut Bytes, dst: u8, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == 0 {
+    return run aluRr32(&mut out.*, Alu.Xor, dst, dst)
+  }
+  if value <= 0xFFFFFFFF {
+    run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+    run byte(&mut out.*, 0xB8 + u8.bitAnd(dst, 7))
+    return run u32Le(&mut out.*, value)
+  }
+  let signed = u64.wrappingToI64(value)
+  if fitsI32(signed) {
+    run emitRex(&mut out.*, true, false, false, dst >= 8, false)
+    run byte(&mut out.*, 0xC7)
+    run emitModRmRr(&mut out.*, 0, dst)
+    return run u32Le(&mut out.*, value)
+  }
+  run emitRex(&mut out.*, true, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xB8 + u8.bitAnd(dst, 7))
+  return run u64Le(&mut out.*, value)
+}
+
+/// `mov dst32, imm32` (zero-extends to 64 bits).
+pub effect fn movImm32(out: &mut Bytes, dst: u8, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xB8 + u8.bitAnd(dst, 7))
+  return run u32Le(&mut out.*, value)
+}
+
+/// `mov dst, [mem]` (64-bit load), returning displacement offset.
+pub effect fn movRm64(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, dst, mem, false)
+  run byte(&mut out.*, 0x8B)
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `mov dst32, [mem]` (32-bit zero-extending load), returning displacement offset.
+pub effect fn movRm32(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, false, dst, mem, false)
+  run byte(&mut out.*, 0x8B)
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `movzx dst32, byte ptr [mem]` (8-bit zero-extending load), returning displacement offset.
+pub effect fn movzxRm8(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, false, dst, mem, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xB6])
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `movzx dst32, word ptr [mem]` (16-bit zero-extending load), returning displacement offset.
+pub effect fn movzxRm16(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, false, dst, mem, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xB7])
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `movsx dst64, byte ptr [mem]` (8-bit sign-extending load), returning displacement offset.
+pub effect fn movsxRm8(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, dst, mem, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBE])
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `movsx dst64, word ptr [mem]` (16-bit sign-extending load), returning displacement offset.
+pub effect fn movsxRm16(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, dst, mem, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBF])
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `movsxd dst64, dword ptr [mem]` (32-bit sign-extending load), returning displacement offset.
+pub effect fn movsxdRm(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, dst, mem, false)
+  run byte(&mut out.*, 0x63)
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `mov [mem], src` (64-bit store), returning displacement offset.
+pub effect fn movMr64(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, src, mem, false)
+  run byte(&mut out.*, 0x89)
+  return run emitModRmMem(&mut out.*, src, mem)
+}
+
+/// `mov [mem], src32` (32-bit store), returning displacement offset.
+pub effect fn movMr32(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, false, src, mem, false)
+  run byte(&mut out.*, 0x89)
+  return run emitModRmMem(&mut out.*, src, mem)
+}
+
+/// `mov [mem], src16` (16-bit store), returning displacement offset.
+pub effect fn movMr16(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run byte(&mut out.*, 0x66)
+  run emitRexRm(&mut out.*, false, src, mem, false)
+  run byte(&mut out.*, 0x89)
+  return run emitModRmMem(&mut out.*, src, mem)
+}
+
+/// `mov [mem], src8` (8-bit store), returning displacement offset.
+pub effect fn movMr8(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, false, src, mem, true)
+  run byte(&mut out.*, 0x88)
+  return run emitModRmMem(&mut out.*, src, mem)
+}
+
+/// `mov dword ptr [mem], imm32`, returning displacement offset.
+pub effect fn movMi32(out: &mut Bytes, mem: Mem, imm: u64) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, false, 0, mem, false)
+  run byte(&mut out.*, 0xC7)
+  let dispAt = run emitModRmMem(&mut out.*, 0, mem)
+  run u32Le(&mut out.*, imm)
+  return dispAt
+}
+
+/// `mov qword ptr [mem], imm32` (sign-extended 32-bit immediate store), returning displacement offset.
+pub effect fn movMi64(out: &mut Bytes, mem: Mem, imm: i32) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, 0, mem, false)
+  run byte(&mut out.*, 0xC7)
+  let dispAt = run emitModRmMem(&mut out.*, 0, mem)
+  run i32Le(&mut out.*, imm)
+  return dispAt
+}
+
+/// `movzx dst32, src8` (8-bit to 32/64-bit zero extend).
+pub effect fn movzxRr8(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = src >= 4 && src <= 7
+  run emitRex(&mut out.*, false, dst >= 8, false, src >= 8, force)
+  run Bytes.append(&mut out.*, &[0x0F, 0xB6])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `movzx dst32, src16` (16-bit to 32/64-bit zero extend).
+pub effect fn movzxRr16(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xB7])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `movsx dst64, src8` (8-bit to 64-bit sign extend).
+pub effect fn movsxRr8(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, dst >= 8, false, src >= 8, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBE])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `movsx dst64, src16` (16-bit to 64-bit sign extend).
+pub effect fn movsxRr16(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBF])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `movsxd dst64, src32` (32-bit to 64-bit sign extend).
+pub effect fn movsxdRr(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run byte(&mut out.*, 0x63)
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `lea dst64, [mem]`, returning the displacement offset (for RIP-relative symbol addresses).
+pub effect fn lea64(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRm(&mut out.*, true, dst, mem, false)
+  run byte(&mut out.*, 0x8D)
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// `cmovcc dst64, src64`.
+pub effect fn cmov64(out: &mut Bytes, cc: u8, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run byte(&mut out.*, 0x0F)
+  run byte(&mut out.*, 0x40 + u8.bitAnd(cc, 15))
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `cmovcc dst32, src32`.
+pub effect fn cmov32(out: &mut Bytes, cc: u8, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, dst, src, false)
+  run byte(&mut out.*, 0x0F)
+  run byte(&mut out.*, 0x40 + u8.bitAnd(cc, 15))
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// `setcc dst8`.
+pub effect fn setcc(out: &mut Bytes, cc: u8, dst: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = dst >= 4 && dst <= 7
+  run emitRex(&mut out.*, false, false, false, dst >= 8, force)
+  run byte(&mut out.*, 0x0F)
+  run byte(&mut out.*, 0x90 + u8.bitAnd(cc, 15))
+  return run emitModRmRr(&mut out.*, 0, dst)
+}
+
+/// `bswap reg64`.
+pub effect fn bswap64(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0x0F)
+  return run byte(&mut out.*, 0xC8 + u8.bitAnd(reg, 7))
+}
+
+/// `bswap reg32`.
+pub effect fn bswap32(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0x0F)
+  return run byte(&mut out.*, 0xC8 + u8.bitAnd(reg, 7))
+}
+
+// ---- Integer ALU ----
+
+/// 64-bit `op dst, src` (`add`, `or`, `adc`, `sbb`, `and`, `sub`, `xor`, `cmp`).
+pub effect fn aluRr64(out: &mut Bytes, op: Alu, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, src, dst, false)
+  run byte(&mut out.*, u8.shiftLeft(aluExt(op), 3) + 1)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// 32-bit `op dst, src`.
+pub effect fn aluRr32(out: &mut Bytes, op: Alu, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, src, dst, false)
+  run byte(&mut out.*, u8.shiftLeft(aluExt(op), 3) + 1)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// 16-bit `op dst, src`.
+pub effect fn aluRr16(out: &mut Bytes, op: Alu, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x66)
+  run emitRexRr(&mut out.*, false, src, dst, false)
+  run byte(&mut out.*, u8.shiftLeft(aluExt(op), 3) + 1)
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// 8-bit `op dst, src`.
+pub effect fn aluRr8(out: &mut Bytes, op: Alu, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, src, dst, true)
+  run byte(&mut out.*, u8.shiftLeft(aluExt(op), 3))
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// 64-bit `op dst, imm32` (uses compact sign-extended `imm8` encoding when `imm` fits in `i8`).
+pub effect fn aluRi64(out: &mut Bytes, op: Alu, dst: u8, imm: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, dst >= 8, false)
+  if fitsI8(imm) {
+    run byte(&mut out.*, 0x83)
+    run emitModRmRr(&mut out.*, aluExt(op), dst)
+    return run byte(&mut out.*, i32.wrappingToU8(imm))
+  }
+  run byte(&mut out.*, 0x81)
+  run emitModRmRr(&mut out.*, aluExt(op), dst)
+  return run i32Le(&mut out.*, imm)
+}
+
+/// 32-bit `op dst, imm32` (uses compact sign-extended `imm8` encoding when `imm` fits in `i8`).
+pub effect fn aluRi32(out: &mut Bytes, op: Alu, dst: u8, imm: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+  if fitsI8(imm) {
+    run byte(&mut out.*, 0x83)
+    run emitModRmRr(&mut out.*, aluExt(op), dst)
+    return run byte(&mut out.*, i32.wrappingToU8(imm))
+  }
+  run byte(&mut out.*, 0x81)
+  run emitModRmRr(&mut out.*, aluExt(op), dst)
+  return run i32Le(&mut out.*, imm)
+}
+
+/// 8-bit `op dst8, imm8`.
+pub effect fn aluRi8(out: &mut Bytes, op: Alu, dst: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = dst >= 4 && dst <= 7
+  run emitRex(&mut out.*, false, false, false, dst >= 8, force)
+  run byte(&mut out.*, 0x80)
+  run emitModRmRr(&mut out.*, aluExt(op), dst)
+  return run byte(&mut out.*, imm)
+}
+
+/// 64-bit `op dst, [mem]`.
+pub effect fn aluRm64(out: &mut Bytes, op: Alu, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, dst, mem, false)
+  run byte(&mut out.*, u8.shiftLeft(aluExt(op), 3) + 3)
+  return run emitModRmMem(&mut out.*, dst, mem)
+}
+
+/// 64-bit `test left, right`.
+pub effect fn testRr64(out: &mut Bytes, left: u8, right: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, right, left, false)
+  run byte(&mut out.*, 0x85)
+  return run emitModRmRr(&mut out.*, right, left)
+}
+
+/// 32-bit `test left, right`.
+pub effect fn testRr32(out: &mut Bytes, left: u8, right: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, right, left, false)
+  run byte(&mut out.*, 0x85)
+  return run emitModRmRr(&mut out.*, right, left)
+}
+
+/// 8-bit `test left8, right8`.
+pub effect fn testRr8(out: &mut Bytes, left: u8, right: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, right, left, true)
+  run byte(&mut out.*, 0x84)
+  return run emitModRmRr(&mut out.*, right, left)
+}
+
+/// 8-bit `test reg8, imm8`.
+pub effect fn testRi8(out: &mut Bytes, reg: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = reg >= 4 && reg <= 7
+  run emitRex(&mut out.*, false, false, false, reg >= 8, force)
+  run byte(&mut out.*, 0xF6)
+  run emitModRmRr(&mut out.*, 0, reg)
+  return run byte(&mut out.*, imm)
+}
+
+/// 32-bit `test reg32, imm32`.
+pub effect fn testRi32(out: &mut Bytes, reg: u8, imm: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  run emitModRmRr(&mut out.*, 0, reg)
+  return run u32Le(&mut out.*, imm)
+}
+
+/// 64-bit `neg reg`.
+pub effect fn neg64(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 3, reg)
+}
+
+/// 32-bit `neg reg`.
+pub effect fn neg32(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 3, reg)
+}
+
+/// 64-bit `not reg`.
+pub effect fn not64(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 2, reg)
+}
+
+/// 32-bit `not reg`.
+pub effect fn not32(out: &mut Bytes, reg: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, reg >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 2, reg)
+}
+
+/// Two-operand 64-bit `imul dst, src`.
+pub effect fn imulRr64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xAF])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// Two-operand 32-bit `imul dst, src`.
+pub effect fn imulRr32(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, false, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xAF])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// Two-operand 16-bit `imul dst, src`.
+pub effect fn imulRr16(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x66)
+  run emitRexRr(&mut out.*, false, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xAF])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// One-operand 64-bit widening unsigned multiply `mul src` (`rdx:rax = rax * src`).
+pub effect fn mul64(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 4, src)
+}
+
+/// One-operand 64-bit widening signed multiply `imul src` (`rdx:rax = rax * src`).
+pub effect fn imulOne64(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 5, src)
+}
+
+/// One-operand 32-bit widening unsigned multiply `mul src32` (`edx:eax = eax * src32`).
+pub effect fn mul32(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 4, src)
+}
+
+/// One-operand 16-bit widening unsigned multiply `mul src16` (`dx:ax = ax * src16`).
+pub effect fn mul16(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x66)
+  run emitRex(&mut out.*, false, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 4, src)
+}
+
+/// One-operand 8-bit unsigned multiply `mul src8` (`ax = al * src8`).
+pub effect fn mul8(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = src >= 4 && src <= 7
+  run emitRex(&mut out.*, false, false, false, src >= 8, force)
+  run byte(&mut out.*, 0xF6)
+  return run emitModRmRr(&mut out.*, 4, src)
+}
+
+/// One-operand 8-bit signed multiply `imul src8` (`ax = al * src8`).
+pub effect fn imulOne8(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = src >= 4 && src <= 7
+  run emitRex(&mut out.*, false, false, false, src >= 8, force)
+  run byte(&mut out.*, 0xF6)
+  return run emitModRmRr(&mut out.*, 5, src)
+}
+
+/// 64-bit unsigned divide `div src` (`rdx:rax / src` -> quot `rax`, rem `rdx`).
+pub effect fn div64(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 6, src)
+}
+
+/// 64-bit signed divide `idiv src` (`rdx:rax / src` -> quot `rax`, rem `rdx`).
+pub effect fn idiv64(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 7, src)
+}
+
+/// 32-bit unsigned divide `div src32` (`edx:eax / src32` -> quot `eax`, rem `edx`).
+pub effect fn div32(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 6, src)
+}
+
+/// 32-bit signed divide `idiv src32` (`edx:eax / src32` -> quot `eax`, rem `edx`).
+pub effect fn idiv32(out: &mut Bytes, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, src >= 8, false)
+  run byte(&mut out.*, 0xF7)
+  return run emitModRmRr(&mut out.*, 7, src)
+}
+
+// ---- Shifts, Rotates, Bit Ops ----
+
+/// 64-bit shift/rotate of `dst` by `cl`.
+pub effect fn shiftCl64(out: &mut Bytes, op: Shift, dst: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xD3)
+  return run emitModRmRr(&mut out.*, shiftExt(op), dst)
+}
+
+/// 32-bit shift/rotate of `dst` by `cl`.
+pub effect fn shiftCl32(out: &mut Bytes, op: Shift, dst: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xD3)
+  return run emitModRmRr(&mut out.*, shiftExt(op), dst)
+}
+
+/// 16-bit shift/rotate of `dst` by `cl`.
+pub effect fn shiftCl16(out: &mut Bytes, op: Shift, dst: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x66)
+  run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xD3)
+  return run emitModRmRr(&mut out.*, shiftExt(op), dst)
+}
+
+/// 8-bit shift/rotate of `dst` by `cl`.
+pub effect fn shiftCl8(out: &mut Bytes, op: Shift, dst: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = dst >= 4 && dst <= 7
+  run emitRex(&mut out.*, false, false, false, dst >= 8, force)
+  run byte(&mut out.*, 0xD2)
+  return run emitModRmRr(&mut out.*, shiftExt(op), dst)
+}
+
+/// 64-bit shift/rotate of `dst` by immediate `imm`.
+pub effect fn shiftImm64(out: &mut Bytes, op: Shift, dst: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xC1)
+  run emitModRmRr(&mut out.*, shiftExt(op), dst)
+  return run byte(&mut out.*, imm)
+}
+
+/// 32-bit shift/rotate of `dst` by immediate `imm`.
+pub effect fn shiftImm32(out: &mut Bytes, op: Shift, dst: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xC1)
+  run emitModRmRr(&mut out.*, shiftExt(op), dst)
+  return run byte(&mut out.*, imm)
+}
+
+/// 16-bit shift/rotate of `dst` by immediate `imm`.
+pub effect fn shiftImm16(out: &mut Bytes, op: Shift, dst: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0x66)
+  run emitRex(&mut out.*, false, false, false, dst >= 8, false)
+  run byte(&mut out.*, 0xC1)
+  run emitModRmRr(&mut out.*, shiftExt(op), dst)
+  return run byte(&mut out.*, imm)
+}
+
+/// 8-bit shift/rotate of `dst` by immediate `imm`.
+pub effect fn shiftImm8(out: &mut Bytes, op: Shift, dst: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let force = dst >= 4 && dst <= 7
+  run emitRex(&mut out.*, false, false, false, dst >= 8, force)
+  run byte(&mut out.*, 0xC0)
+  run emitModRmRr(&mut out.*, shiftExt(op), dst)
+  return run byte(&mut out.*, imm)
+}
+
+/// 64-bit `shld dst, src, cl` (double-precision shift left).
+pub effect fn shldCl64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, src, dst, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xA5])
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// 64-bit `shrd dst, src, cl` (double-precision shift right).
+pub effect fn shrdCl64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, src, dst, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xAD])
+  return run emitModRmRr(&mut out.*, src, dst)
+}
+
+/// 64-bit `bsf dst, src` (bit scan forward; sets `ZF` when `src == 0`).
+pub effect fn bsf64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBC])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// 64-bit `bsr dst, src` (bit scan reverse; sets `ZF` when `src == 0`).
+pub effect fn bsr64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBD])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// 64-bit `popcnt dst, src` (requires POPCNT feature; baseline uses software popcount when absent).
+pub effect fn popcnt64(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0xF3)
+  run emitRexRr(&mut out.*, true, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xB8])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+/// 64-bit `bt reg, imm8` (copies bit `imm8` into `CF`).
+pub effect fn btImm64(out: &mut Bytes, reg: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run emitRex(&mut out.*, true, false, false, reg >= 8, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xBA])
+  run emitModRmRr(&mut out.*, 4, reg)
+  return run byte(&mut out.*, imm)
+}
+
+// ---- Atomics ----
+
+/// Atomic `xchg [mem], reg` (implicit LOCK prefix; `widthBytes` is 1, 2, 4, or 8).
+pub effect fn xchgMr(out: &mut Bytes, mem: Mem, reg: u8, widthBytes: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  if widthBytes == 2 { run byte(&mut out.*, 0x66) }
+  run emitRexRm(&mut out.*, widthBytes == 8, reg, mem, widthBytes == 1)
+  if widthBytes == 1 { run byte(&mut out.*, 0x86) } else { run byte(&mut out.*, 0x87) }
+  return run emitModRmMem(&mut out.*, reg, mem)
+}
+
+/// Atomic `lock xadd [mem], reg` (`widthBytes` is 1, 2, 4, or 8).
+pub effect fn lockXadd(out: &mut Bytes, mem: Mem, reg: u8, widthBytes: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0xF0)
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  if widthBytes == 2 { run byte(&mut out.*, 0x66) }
+  run emitRexRm(&mut out.*, widthBytes == 8, reg, mem, widthBytes == 1)
+  run byte(&mut out.*, 0x0F)
+  if widthBytes == 1 { run byte(&mut out.*, 0xC0) } else { run byte(&mut out.*, 0xC1) }
+  return run emitModRmMem(&mut out.*, reg, mem)
+}
+
+/// Atomic `lock cmpxchg [mem], reg` (compares `[mem]` with `rax`/`eax`/`ax`/`al`, swaps `reg` on
+/// equal; `widthBytes` is 1, 2, 4, or 8).
+pub effect fn lockCmpxchg(out: &mut Bytes, mem: Mem, reg: u8, widthBytes: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0xF0)
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  if widthBytes == 2 { run byte(&mut out.*, 0x66) }
+  run emitRexRm(&mut out.*, widthBytes == 8, reg, mem, widthBytes == 1)
+  run byte(&mut out.*, 0x0F)
+  if widthBytes == 1 { run byte(&mut out.*, 0xB0) } else { run byte(&mut out.*, 0xB1) }
+  return run emitModRmMem(&mut out.*, reg, mem)
+}
+
+/// Atomic `lock cmpxchg16b [mem]` (compares 128-bit `[mem]` with `rdx:rax`, stores `rcx:rbx`).
+pub effect fn lockCmpxchg16b(out: &mut Bytes, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run byte(&mut out.*, 0xF0)
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  run emitRexRm(&mut out.*, true, 1, mem, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0xC7])
+  return run emitModRmMem(&mut out.*, 1, mem)
+}
+
+// ---- SSE2 / SSSE3 / SSE4.1 / AES-NI / PCLMUL / SHA ----
+
+// Helper for `[prefix] [REX] 0F op ModRM(reg, rm)`.
+effect fn sse2Rr(out: &mut Bytes, prefix: u8, w: bool, op: u8, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if prefix != 0 { run byte(&mut out.*, prefix) }
+  run emitRexRr(&mut out.*, w, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, op])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+effect fn sse2Rm(out: &mut Bytes, prefix: u8, w: bool, op: u8, reg: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if mem.fsAbs { run byte(&mut out.*, 0x64) }
+  if prefix != 0 { run byte(&mut out.*, prefix) }
+  run emitRexRm(&mut out.*, w, reg, mem, false)
+  run Bytes.append(&mut out.*, &[0x0F, op])
+  return run emitModRmMem(&mut out.*, reg, mem)
+}
+
+// Helper for `[prefix] [REX] 0F 38 op ModRM(dst, src)`.
+effect fn sse38Rr(out: &mut Bytes, prefix: u8, w: bool, op: u8, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if prefix != 0 { run byte(&mut out.*, prefix) }
+  run emitRexRr(&mut out.*, w, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0x38, op])
+  return run emitModRmRr(&mut out.*, dst, src)
+}
+
+// Helper for `[prefix] [REX] 0F 3A op ModRM(dst, src) imm8`.
+effect fn sse3aRr(out: &mut Bytes, prefix: u8, w: bool, op: u8, dst: u8, src: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if prefix != 0 { run byte(&mut out.*, prefix) }
+  run emitRexRr(&mut out.*, w, dst, src, false)
+  run Bytes.append(&mut out.*, &[0x0F, 0x3A, op])
+  run emitModRmRr(&mut out.*, dst, src)
+  return run byte(&mut out.*, imm)
+}
+
+/// `movaps xmmDst, xmmSrc` (128-bit register move).
+pub effect fn movapsRr(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0, false, 0x28, dst, src)
+}
+
+/// `movdqu xmmDst, [mem]` (unaligned 128-bit load).
+pub effect fn movdquRm(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0xF3, false, 0x6F, dst, mem)
+}
+
+/// `movdqu [mem], xmmSrc` (unaligned 128-bit store).
+pub effect fn movdquMr(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0xF3, false, 0x7F, src, mem)
+}
+
+/// `movdqa xmmDst, [mem]` (16-byte aligned 128-bit load).
+pub effect fn movdqaRm(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0x66, false, 0x6F, dst, mem)
+}
+
+/// `movdqa [mem], xmmSrc` (16-byte aligned 128-bit store).
+pub effect fn movdqaMr(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0x66, false, 0x7F, src, mem)
+}
+
+/// `movss xmmDst, [mem]` (32-bit scalar float load).
+pub effect fn movssRm(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0xF3, false, 0x10, dst, mem)
+}
+
+/// `movss [mem], xmmSrc` (32-bit scalar float store).
+pub effect fn movssMr(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0xF3, false, 0x11, src, mem)
+}
+
+/// `movsd xmmDst, [mem]` (64-bit scalar float load).
+pub effect fn movsdRm(out: &mut Bytes, dst: u8, mem: Mem) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0xF2, false, 0x10, dst, mem)
+}
+
+/// `movsd [mem], xmmSrc` (64-bit scalar float store).
+pub effect fn movsdMr(out: &mut Bytes, mem: Mem, src: u8) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rm(&mut out.*, 0xF2, false, 0x11, src, mem)
+}
+
+/// `movd xmmDst, gprSrc32` (32-bit GPR to low lane of XMM, zeroing upper lanes).
+pub effect fn movdToXmm(out: &mut Bytes, xmmDst: u8, gprSrc: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x6E, xmmDst, gprSrc)
+}
+
+/// `movq xmmDst, gprSrc64` (64-bit GPR to low 64 bits of XMM, zeroing upper 64 bits).
+pub effect fn movqToXmm(out: &mut Bytes, xmmDst: u8, gprSrc: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, true, 0x6E, xmmDst, gprSrc)
+}
+
+/// `movd gprDst32, xmmSrc` (low 32 bits of XMM to 32-bit GPR, zero-extending to 64 bits).
+pub effect fn movdFromXmm(out: &mut Bytes, gprDst: u8, xmmSrc: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x7E, xmmSrc, gprDst)
+}
+
+/// `movq gprDst64, xmmSrc` (low 64 bits of XMM to 64-bit GPR).
+pub effect fn movqFromXmm(out: &mut Bytes, gprDst: u8, xmmSrc: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, true, 0x7E, xmmSrc, gprDst)
+}
+
+/// Scalar float `addss`/`addsd` (`double` selects `sd` vs `ss`).
+pub effect fn addFloat(out: &mut Bytes, double: bool, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, false, 0x58, dst, src)
+}
+
+/// Scalar float `subss`/`subsd`.
+pub effect fn subFloat(out: &mut Bytes, double: bool, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, false, 0x5C, dst, src)
+}
+
+/// Scalar float `mulss`/`mulsd`.
+pub effect fn mulFloat(out: &mut Bytes, double: bool, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, false, 0x59, dst, src)
+}
+
+/// Scalar float `divss`/`divsd`.
+pub effect fn divFloat(out: &mut Bytes, double: bool, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, false, 0x5E, dst, src)
+}
+
+/// Scalar float `sqrtss`/`sqrtsd`.
+pub effect fn sqrtFloat(out: &mut Bytes, double: bool, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, false, 0x51, dst, src)
+}
+
+/// Scalar float `ucomiss`/`ucomisd` (sets `ZF`, `PF`, `CF`).
+pub effect fn ucomiFloat(out: &mut Bytes, double: bool, left: u8, right: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0x66 } else { 0 }, false, 0x2E, left, right)
+}
+
+/// `cvtss2sd dst, src` (`f32` -> `f64`).
+pub effect fn cvtss2sd(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0xF3, false, 0x5A, dst, src)
+}
+
+/// `cvtsd2ss dst, src` (`f64` -> `f32`).
+pub effect fn cvtsd2ss(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0xF2, false, 0x5A, dst, src)
+}
+
+/// `cvtsi2ss`/`cvtsi2sd` (32-bit or 64-bit signed integer GPR to scalar float XMM).
+pub effect fn cvtsi2Float(out: &mut Bytes, double: bool, wide64: bool, xmmDst: u8, gprSrc: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, wide64, 0x2A, xmmDst, gprSrc)
+}
+
+/// `cvttss2si`/`cvttsd2si` (truncating scalar float XMM to 32-bit or 64-bit signed integer GPR).
+pub effect fn cvttFloat2Si(out: &mut Bytes, double: bool, wide64: bool, gprDst: u8, xmmSrc: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, if double { 0xF2 } else { 0xF3 }, wide64, 0x2C, gprDst, xmmSrc)
+}
+
+/// `pxor dst, src` (128-bit bitwise XOR).
+pub effect fn pxor(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0xEF, dst, src)
+}
+
+/// `por dst, src` (128-bit bitwise OR).
+pub effect fn por(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0xEB, dst, src)
+}
+
+/// `pand dst, src` (128-bit bitwise AND).
+pub effect fn pand(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0xDB, dst, src)
+}
+
+/// `pandn dst, src` (`dst = (~dst) & src`).
+pub effect fn pandn(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0xDF, dst, src)
+}
+
+/// `pshufd dst, src, imm8` (shuffle 4x32-bit lanes).
+pub effect fn pshufd(out: &mut Bytes, dst: u8, src: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run sse2Rr(&mut out.*, 0x66, false, 0x70, dst, src)
+  return run byte(&mut out.*, imm)
+}
+
+/// `punpcklqdq dst, src` (combine low 64-bit halves of `dst` and `src`).
+pub effect fn punpcklqdq(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x6C, dst, src)
+}
+
+/// `punpckhqdq dst, src` (combine high 64-bit halves of `dst` and `src`).
+pub effect fn punpckhqdq(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x6D, dst, src)
+}
+
+/// `paddb`/`paddw`/`paddd`/`paddq` (`laneBytes` = 1, 2, 4, or 8).
+pub effect fn padd(out: &mut Bytes, laneBytes: usize, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let op: u8 = if laneBytes == 1 { 0xFC } else if laneBytes == 2 { 0xFD } else if laneBytes == 4 { 0xFE } else { 0xD4 }
+  return run sse2Rr(&mut out.*, 0x66, false, op, dst, src)
+}
+
+/// `psubb`/`psubw`/`psubd`/`psubq` (`laneBytes` = 1, 2, 4, or 8).
+pub effect fn psub(out: &mut Bytes, laneBytes: usize, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let op: u8 = if laneBytes == 1 { 0xF8 } else if laneBytes == 2 { 0xF9 } else if laneBytes == 4 { 0xFA } else { 0xFB }
+  return run sse2Rr(&mut out.*, 0x66, false, op, dst, src)
+}
+
+// ---- x86-64 Architecture Intrinsics (SSSE3 / SSE4.1 / AES-NI / PCLMUL / SHA) ----
+
+/// SSSE3 `pshufb dst, src`.
+pub effect fn pshufb(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0x00, dst, src)
+}
+
+/// SSSE3 `pmaddubsw dst, src`.
+pub effect fn pmaddubsw(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0x04, dst, src)
+}
+
+/// SSE2 `pmaddwd dst, src`.
+pub effect fn pmaddwd(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0xF5, dst, src)
+}
+
+/// SSE2 `packuswb dst, src`.
+pub effect fn packuswb(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x67, dst, src)
+}
+
+/// SSE4.1 `packusdw dst, src`.
+pub effect fn packusdw(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0x2B, dst, src)
+}
+
+/// SSE2 `packsswb dst, src`.
+pub effect fn packsswb(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x63, dst, src)
+}
+
+/// SSE2 `packssdw dst, src`.
+pub effect fn packssdw(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0x6B, dst, src)
+}
+
+/// SSE2 `psadbw dst, src`.
+pub effect fn psadbw(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse2Rr(&mut out.*, 0x66, false, 0xF6, dst, src)
+}
+
+/// AES-NI `aesenc dst, src`.
+pub effect fn aesenc(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0xDC, dst, src)
+}
+
+/// AES-NI `aesenclast dst, src`.
+pub effect fn aesenclast(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0xDD, dst, src)
+}
+
+/// AES-NI `aesdec dst, src`.
+pub effect fn aesdec(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0xDE, dst, src)
+}
+
+/// AES-NI `aesdeclast dst, src`.
+pub effect fn aesdeclast(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0xDF, dst, src)
+}
+
+/// AES-NI `aesimc dst, src`.
+pub effect fn aesimc(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0x66, false, 0xDB, dst, src)
+}
+
+/// PCLMULQDQ `pclmulqdq dst, src, imm8`.
+pub effect fn pclmulqdq(out: &mut Bytes, dst: u8, src: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse3aRr(&mut out.*, 0x66, false, 0x44, dst, src, imm)
+}
+
+/// SHA `sha256rnds2 dst, src` (implicit `xmm0` round keys).
+pub effect fn sha256rnds2(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0, false, 0xCB, dst, src)
+}
+
+/// SHA `sha256msg1 dst, src`.
+pub effect fn sha256msg1(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0, false, 0xCC, dst, src)
+}
+
+/// SHA `sha256msg2 dst, src`.
+pub effect fn sha256msg2(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0, false, 0xCD, dst, src)
+}
+
+/// SHA `sha1rnds4 dst, src, imm8`.
+pub effect fn sha1rnds4(out: &mut Bytes, dst: u8, src: u8, imm: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse3aRr(&mut out.*, 0, false, 0xCC, dst, src, imm)
+}
+
+/// SHA `sha1nexte dst, src`.
+pub effect fn sha1nexte(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0, false, 0xC8, dst, src)
+}
+
+/// SHA `sha1msg1 dst, src`.
+pub effect fn sha1msg1(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0, false, 0xC9, dst, src)
+}
+
+/// SHA `sha1msg2 dst, src`.
+pub effect fn sha1msg2(out: &mut Bytes, dst: u8, src: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run sse38Rr(&mut out.*, 0, false, 0xCA, dst, src)
+}

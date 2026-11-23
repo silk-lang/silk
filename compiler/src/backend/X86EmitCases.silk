@@ -1,0 +1,204 @@
+//! Unit checks for `X86Frame`, `X86Helpers`, `X86Emit`, and `X86ElfObject` on `SsaFunction`s.
+
+import backend.SsaFunction {
+  AbiExtension,
+  ArchOperation,
+  Binary,
+  CallingConvention,
+  Cast,
+  Count,
+  Extreme,
+  Kind,
+  MemoryEffect,
+  Modify,
+  Predicate,
+  SsaFunction,
+}
+import backend.X86ElfObject
+import backend.X86Emit
+import backend.X86Frame
+import backend.X86Helpers
+import backend.X86Object {Fragment, Function, Unsupported}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+test effect fn colorsStackSlotsAndEmitsCoreSsaFunctionsToElf64() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run emitClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn emitClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // 1. Verify X86Frame colors two non-overlapping 64-byte aggregate stack slots into ONE slot!
+  let mut f = run SsaFunction.make(b"slot_reuse", 64)
+  let i64K = Kind.integer(64)
+  f.setResult(i64K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+  run f.slotStart(0)
+  let a0 = run f.slotOf(64, 16)
+  let c1 = run f.integer(64, 1)
+  run f.store(c1, a0, 0, 8)
+  let v0 = run f.load(i64K, a0, 0, 8)
+  run f.slotEnd(0)
+  run f.slotStart(1)
+  let a1 = run f.slotOf(64, 16)
+  run f.store(v0, a1, 0, 8)
+  let v1 = run f.load(i64K, a1, 0, 8)
+  run f.slotEnd(1)
+  run f.ret(v1)
+  run f.finish()
+  let frame = run X86Frame.plan(&f)
+  let sOffs = List<i32>.asSlice(&frame.slotOffsets)
+  run Testing.expect(sOffs[0] == sOffs[1], "non-overlapping lifetime-marked slots share the same frame offset")
+  run Testing.expect((0 - sOffs[0]) % 16 == 0, "16-byte aligned aggregate slot has 16-byte aligned start address")
+  let emitted0 = run X86Emit.emit(&f, b"slot_reuse", b"slot_reuse")
+  run Testing.expect(Bytes.length(&emitted0.code) > usize.ZERO, "slot_reuse emits non-empty x86-64 code")
+
+  // 2. Iterative loop with 2 block parameters (tests parallel edge copy & loop back-edge).
+  let mut loopFn = run SsaFunction.make(b"sum_to_n", 64)
+  let nArg = run loopFn.argument(i64K)
+  loopFn.setResult(i64K)
+  let entry = run loopFn.newBlock()
+  let header = run loopFn.newBlock()
+  let body = run loopFn.newBlock()
+  let exitBlk = run loopFn.newBlock()
+  let accP = run loopFn.addParameter(header, i64K)
+  let idxP = run loopFn.addParameter(header, i64K)
+  loopFn.startBlock(entry)
+  let zero = run loopFn.integer(64, 0)
+  let one = run loopFn.integer(64, 1)
+  let initArgs = [zero, zero]
+  run loopFn.jumpWith(header, &initArgs)
+
+  loopFn.startBlock(header)
+  let cond = run loopFn.compare(Predicate.Slt, idxP, nArg)
+  run loopFn.branchIf(cond, body, exitBlk)
+
+  loopFn.startBlock(body)
+  let nextIdx = run loopFn.binary(Binary.Add, idxP, one)
+  let nextAcc = run loopFn.binary(Binary.Add, accP, nextIdx)
+  let nextArgs = [nextAcc, nextIdx]
+  run loopFn.jumpWith(header, &nextArgs)
+
+  loopFn.startBlock(exitBlk)
+  run loopFn.ret(accP)
+  run loopFn.finish()
+  let emittedLoop = run X86Emit.emit(&loopFn, b"sum_to_n", b"sum_to_n")
+  run Testing.expect(Bytes.length(&emittedLoop.code) > usize.ZERO, "sum_to_n emits machine code")
+
+  // 3. Two-register SysV C pair return + count + float + extreme + inline asm.
+  let mut pairFn = run SsaFunction.make(b"c_pair", 64)
+  pairFn.setCallingConvention(CallingConvention.C, false, AbiExtension.None)
+  pairFn.setResults(i64K, Kind.float(64))
+  let p0 = run pairFn.argument(i64K)
+  let p1 = run pairFn.argument(Kind.float(64))
+  let pb0 = run pairFn.newBlock()
+  pairFn.startBlock(pb0)
+  let cnt = run pairFn.countBits(Count.Ones, p0)
+  let ext = run pairFn.cast(Cast.SIToFP, cnt, Kind.float(64))
+  let sumF = run pairFn.binary(Binary.Add, ext, p1)
+  let minF = run pairFn.extreme(Extreme.FloatMinimum, sumF, p1)
+  let asmIn = [p0]
+  let echoed = run pairFn.inlineAsm(b"movq $1, $0", b"=r,r", b"", MemoryEffect.None, false, false, &asmIn, i64K)
+  run pairFn.retPair(echoed, minF)
+  run pairFn.finish()
+  let emittedPair = run X86Emit.emit(&pairFn, b"c_pair", b"c_pair")
+  run Testing.expect(Bytes.length(&emittedPair.code) > usize.ZERO, "c_pair emits machine code")
+
+  // 4. Pack emitted functions + built-in 128-bit helpers into a valid ELF64 .o!
+  let mut frag = Fragment.make()
+  run List<Function>.append(&mut frag.functions, move emitted0)
+  run List<Function>.append(&mut frag.functions, move emittedLoop)
+  run List<Function>.append(&mut frag.functions, move emittedPair)
+  run X86Helpers.appendAll(&mut frag.functions)
+
+  // Also test ArchIntrinsic + AtomicModify + CompareExchange + VaStart emission.
+  let mut misc = run SsaFunction.make(b"misc_ops", 64)
+  misc.setResult(i64K)
+  let vKind = Kind.vector(Kind.integer(8), 16)
+  let vArg0 = run misc.argument(vKind)
+  let vArg1 = run misc.argument(vKind)
+  let mb0 = run misc.newBlock()
+  misc.startBlock(mb0)
+  let vaAddr = run misc.slotOf(24, 8)
+  let atomAddr = run misc.slotOf(8, 8)
+  run misc.vaStart(vaAddr)
+  run misc.vaEnd(vaAddr)
+  let archOps = [vArg0, vArg1]
+  let shuffled = run misc.archIntrinsic(ArchOperation.X86ShuffleBytes, 0, &archOps, vKind)
+  let zeroIdx = run misc.integer(64, 0)
+  let lane0 = run misc.extractElement(shuffled, zeroIdx)
+  let lane64 = run misc.cast(Cast.ZExt, lane0, i64K)
+  run misc.atomicStore(lane64, atomAddr)
+  let five = run misc.integer(64, 5)
+  let old = run misc.atomicModify(Modify.Add, atomAddr, five)
+  let cas = run misc.compareExchange(atomAddr, old, lane64)
+  run misc.ret(cas.value)
+  run misc.finish()
+  let emittedMisc = run X86Emit.emit(&misc, b"misc_ops", b"misc_ops")
+  run List<Function>.append(&mut frag.functions, move emittedMisc)
+
+  // 5. Non-RPO block ordering: b0 -> b2 (defines x) -> b3 (defines & uses tmp) -> b1 (uses x).
+  //    In raw block index order, b1 < b2 < b3 would miscompute x's interval as [b1, b2] and collide
+  //    with tmp in b3; RPO numbering orders b0 -> b2 -> b3 -> b1 so x stays live across b3!
+  let mut rpoFn = run SsaFunction.make(b"non_rpo_blocks", 64)
+  let rArg = run rpoFn.argument(i64K)
+  rpoFn.setResult(i64K)
+  let rb0 = run rpoFn.newBlock()
+  let rb1 = run rpoFn.newBlock()
+  let rb2 = run rpoFn.newBlock()
+  let rb3 = run rpoFn.newBlock()
+  rpoFn.startBlock(rb0)
+  run rpoFn.jump(rb2)
+  rpoFn.startBlock(rb2)
+  let rOne = run rpoFn.integer(64, 1)
+  let rx = run rpoFn.binary(Binary.Add, rArg, rOne)
+  run rpoFn.jump(rb3)
+  rpoFn.startBlock(rb3)
+  let rTwo = run rpoFn.integer(64, 2)
+  let rTmp = run rpoFn.binary(Binary.Mul, rArg, rTwo)
+  let rTmp2 = run rpoFn.binary(Binary.Add, rTmp, rTwo)
+  let rCond = run rpoFn.compare(Predicate.Ne, rTmp2, rOne)
+  run rpoFn.branchIf(rCond, rb1, rb1)
+  rpoFn.startBlock(rb1)
+  run rpoFn.ret(rx)
+  run rpoFn.finish()
+  let rpoFrame = run X86Frame.plan(&rpoFn)
+  let rValOffs = List<i32>.asSlice(&rpoFrame.valueOffsets)
+  let rxOff = rValOffs[u64.toUsize(rx)]
+  let rTmpOff = rValOffs[u64.toUsize(rTmp)]
+  let rTmp2Off = rValOffs[u64.toUsize(rTmp2)]
+  run Testing.expect(rxOff != 0 && rxOff != rTmpOff && rxOff != rTmp2Off,
+    "non-RPO block ordering keeps producer value live across intermediate block in RPO")
+  let emittedRpo = run X86Emit.emit(&rpoFn, b"non_rpo_blocks", b"non_rpo_blocks")
+  run List<Function>.append(&mut frag.functions, move emittedRpo)
+
+  // 6. Bit-packed mask<4> binary XOR (regression test for rcx clobber and mask padding zeroing).
+  let mut maskFn = run SsaFunction.make(b"mask_xor", 64)
+  let mKind = Kind.vector(Kind.integer(1), 4)
+  let m0 = run maskFn.argument(mKind)
+  let m1 = run maskFn.argument(mKind)
+  maskFn.setResult(mKind)
+  let mb = run maskFn.newBlock()
+  maskFn.startBlock(mb)
+  let mXor = run maskFn.binary(Binary.Xor, m0, m1)
+  run maskFn.ret(mXor)
+  run maskFn.finish()
+  let emittedMask = run X86Emit.emit(&maskFn, b"mask_xor", b"mask_xor")
+  run Testing.expect(Bytes.length(&emittedMask.code) > usize.ZERO, "mask<4> binary XOR emits code")
+  run List<Function>.append(&mut frag.functions, move emittedMask)
+
+  let encoded = run frag.encode()
+  let elf = run X86ElfObject.pack(Bytes.asSlice(&encoded))
+  let elfBytes = Bytes.asSlice(&elf)
+  run Testing.expect(elfBytes.length > 256 && elfBytes[0] == 0x7F && elfBytes[1] == 0x45,
+    "packed ELF64 object containing all emitted functions + helpers is well-formed")
+  // e_shnum at ELF64 header offset 60 must be 18 (including `silk_seen`).
+  run Testing.expect(elfBytes[60] == 18 && elfBytes[61] == 0,
+    "packed ELF64 object exposes all 18 sections including silk_seen")
+}

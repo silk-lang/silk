@@ -1,0 +1,249 @@
+//! Unit checks for `X86Encode`, `X86Asm`, `X86Unwind`, `X86Object`, and `X86ElfObject`.
+
+import backend.X86Asm
+import backend.X86Asm {AsmCallReloc, ConstraintKind, OperandBinding, UnsupportedAsm}
+import backend.X86ElfObject
+import backend.X86Encode
+import backend.X86Encode {Alu, Mem, Shift}
+import backend.X86Object
+import backend.X86Object {Fragment, Function, Object, Pointer, Relocation, RodataJumpEntry, Unsupported}
+import backend.X86Unwind
+import backend.X86Unwind {UnwindInfo}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u8
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+fn sameBytes(actual: &[u8], expected: &[u8]) -> bool {
+  if actual.length != expected.length { return false }
+  let mut at = usize.ZERO
+  while at < actual.length {
+    if actual[at] != expected[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+test effect fn encodesCoreInstructionsAndAddressingModes() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run encodeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn encodeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // push rbp; mov rbp, rsp; leave; ret -> 55 48 89 e5 c9 c3
+  let mut buf = Bytes.make()
+  run X86Encode.push(&mut buf, X86Encode.rbp())
+  run X86Encode.movRr64(&mut buf, X86Encode.rbp(), X86Encode.rsp())
+  run X86Encode.leave(&mut buf)
+  run X86Encode.ret(&mut buf)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x55, 0x48, 0x89, 0xE5, 0xC9, 0xC3]),
+    "standard frame prologue and epilogue bytes")
+
+  // 8-bit SPL/SIL require REX=0x40 so they do not encode AH/DH.
+  buf = Bytes.make()
+  run X86Encode.movRr8(&mut buf, X86Encode.rsp(), X86Encode.rsi())
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x40, 0x88, 0xF4]),
+    "mov spl, sil emits REX 0x40")
+
+  // [rsp] needs SIB 0x24; [rbp] with disp 0 needs mod=01 disp8=0.
+  buf = Bytes.make()
+  drop run X86Encode.movRm64(&mut buf, X86Encode.rax(), Mem.baseDisp(X86Encode.rsp(), 0))
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x48, 0x8B, 0x04, 0x24]),
+    "mov rax, [rsp] emits SIB 0x24")
+
+  buf = Bytes.make()
+  drop run X86Encode.movRm64(&mut buf, X86Encode.rax(), Mem.baseDisp(X86Encode.rbp(), 0))
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x48, 0x8B, 0x45, 0x00]),
+    "mov rax, [rbp] emits disp8=0")
+
+  // [r12 + r13*8 + 16]: REX.W|X|B (0x4B), 8B, ModRM(mod=01, reg=0, rm=4 -> 0x44), SIB(scale=3, idx=5, base=4 -> 0xEC), disp8=0x10
+  buf = Bytes.make()
+  drop run X86Encode.movRm64(&mut buf, X86Encode.rax(), Mem.baseIndex(X86Encode.r12(), X86Encode.r13(), 8, 16))
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x4B, 0x8B, 0x44, 0xEC, 0x10]),
+    "mov rax, [r12 + r13*8 + 16] encodes REX.WXB + SIB")
+
+  // TLS base read: mov rax, qword ptr fs:[0] -> 64 48 8b 04 25 00 00 00 00
+  buf = Bytes.make()
+  drop run X86Encode.movRm64(&mut buf, X86Encode.rax(), Mem.fsDisp(0))
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]),
+    "mov rax, fs:[0] encodes FS prefix + SIB disp32")
+
+  // RIP-relative LEA: lea rdi, [rip + 0] -> 48 8d 3d 00 00 00 00, dispAt == 3
+  buf = Bytes.make()
+  let dispAt = run X86Encode.lea64(&mut buf, X86Encode.rdi(), Mem.ripRel(0))
+  run Testing.expect(dispAt == 3 && sameBytes(Bytes.asSlice(&buf), &[0x48, 0x8D, 0x3D, 0x00, 0x00, 0x00, 0x00]),
+    "lea rdi, [rip + 0] returns disp offset 3")
+
+  // Branch patching: jmp to offset 8 (5-byte jmp + 3 nops -> rel32 = 3).
+  buf = Bytes.make()
+  let jAt = run X86Encode.jmpRel32(&mut buf)
+  run X86Encode.nop(&mut buf)
+  run X86Encode.nop(&mut buf)
+  run X86Encode.nop(&mut buf)
+  let target = Bytes.length(&buf)
+  X86Encode.patchRel32(&mut buf, jAt, target)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0xE9, 0x03, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90]),
+    "patchRel32 computes exact signed relative displacement")
+
+  // AES-NI & SHA encodings: aesenc xmm1, xmm2 -> 66 0f 38 dc ca; sha256rnds2 xmm1, xmm2 -> 0f 38 cb ca.
+  buf = Bytes.make()
+  run X86Encode.aesenc(&mut buf, 1, 2)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x66, 0x0F, 0x38, 0xDC, 0xCA]), "aesenc xmm1, xmm2")
+  buf = Bytes.make()
+  run X86Encode.sha256rnds2(&mut buf, 1, 2)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x0F, 0x38, 0xCB, 0xCA]), "sha256rnds2 xmm1, xmm2")
+  buf = Bytes.make()
+  run X86Encode.pclmulqdq(&mut buf, 0, 1, 0x11)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x66, 0x0F, 0x3A, 0x44, 0xC1, 0x11]), "pclmulqdq xmm0, xmm1, 0x11")
+
+  // Atomic lock cmpxchg [rdi], rsi -> f0 48 0f b1 37
+  buf = Bytes.make()
+  drop run X86Encode.lockCmpxchg(&mut buf, Mem.baseDisp(X86Encode.rdi(), 0), X86Encode.rsi(), 8)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0xF0, 0x48, 0x0F, 0xB1, 0x37]), "lock cmpxchg [rdi], rsi")
+
+  // Shifts and ALU sanity.
+  buf = Bytes.make()
+  run X86Encode.aluRi64(&mut buf, Alu.Add, X86Encode.rsp(), 16)
+  run X86Encode.shiftImm64(&mut buf, Shift.Shl, X86Encode.rdx(), 32)
+  run Testing.expect(sameBytes(Bytes.asSlice(&buf), &[0x48, 0x83, 0xC4, 0x10, 0x48, 0xC1, 0xE2, 0x20]),
+    "add rsp, 16 and shl rdx, 32")
+}
+
+test effect fn assemblesStdlibInlineAsmTemplates() -> () ! UnsupportedAsm | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run asmClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn asmClaims() -> () ! UnsupportedAsm | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // Parse constraints & clobbers for syscall3: "={rax},0,{rdi},{rsi},{rdx}" / "rcx,r11,flags".
+  let constraints = run X86Asm.parseConstraints(b"={rax},0,{rdi},{rsi},{rdx}", true)
+  let cs = List<X86Asm.Constraint>.asSlice(&constraints)
+  run Testing.expect(cs.length == 5, "five constraints parsed")
+  run Testing.expect(cs[0].kind == ConstraintKind.FixedReg && cs[0].reg == X86Encode.rax() && cs[0].isOutput, "output rax")
+  run Testing.expect(cs[1].kind == ConstraintKind.TiedOutput, "tied operand 0")
+  run Testing.expect(cs[2].kind == ConstraintKind.FixedReg && cs[2].reg == X86Encode.rdi(), "input rdi")
+  let mask = X86Asm.parseClobberMask(b"rcx,r11,flags")
+  run Testing.expect(mask == (2 | 2048), "clobber mask captures rcx (1) and r11 (11)")
+
+  // Assemble rdtsc template from trace/record.silk.
+  let mut code = Bytes.make()
+  let mut relocs = List<AsmCallReloc>.make()
+  run X86Asm.assemble(&mut code, &mut relocs, b"rdtsc\nshlq $$32, %rdx\norq %rdx, %rax", &[])
+  run Testing.expect(sameBytes(Bytes.asSlice(&code), &[0x0F, 0x31, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09, 0xD0]),
+    "rdtsc + shlq + orq bytes match x86-64")
+
+  // Assemble cpuid template from simd/cpu.silk (semicolon-separated).
+  code = Bytes.make()
+  run X86Asm.assemble(&mut code, &mut relocs, b"movq %rbx, %r8; movl %r9d, %ecx; cpuid; movl %ebx, %eax; movq %r8, %rbx", &[])
+  run Testing.expect(Bytes.length(&code) > usize.ZERO, "cpuid template assembles cleanly")
+
+  // Assemble leaq ($1,$2), $0 and movq $1, $0 with memory operand.
+  code = Bytes.make()
+  let bindings = [
+    OperandBinding {reg: X86Encode.rax(), isMemory: false},
+    OperandBinding {reg: X86Encode.rdi(), isMemory: false},
+    OperandBinding {reg: X86Encode.rsi(), isMemory: false},
+  ]
+  run X86Asm.assemble(&mut code, &mut relocs, b"leaq ($1,$2), $0", &bindings)
+  run Testing.expect(sameBytes(Bytes.asSlice(&code), &[0x48, 0x8D, 0x04, 0x37]), "leaq (%rdi,%rsi), %rax")
+
+  code = Bytes.make()
+  let memBindings = [
+    OperandBinding {reg: X86Encode.rax(), isMemory: false},
+    OperandBinding {reg: X86Encode.rdi(), isMemory: true},
+  ]
+  run X86Asm.assemble(&mut code, &mut relocs, b"movq $1, $0", &memBindings)
+  run Testing.expect(sameBytes(Bytes.asSlice(&code), &[0x48, 0x8B, 0x07]), "movq (%rdi), %rax")
+
+  // Assemble linux/start.silk template with symbolic call relocation.
+  code = Bytes.make()
+  relocs = List<AsmCallReloc>.make()
+  run X86Asm.assemble(&mut code, &mut relocs, b"movq %rsp, %rdi\nandq $$-16, %rsp\ncall silk_raw_process_entry\nud2", &[])
+  run Testing.expect(List<AsmCallReloc>.length(&relocs) == usize.ONE, "start template records call relocation")
+  run Testing.expect(sameBytes(Bytes.asSlice(&List<AsmCallReloc>.asSlice(&relocs)[0].symbol), b"silk_raw_process_entry"),
+    "call relocation targets silk_raw_process_entry")
+}
+
+test effect fn roundTripsFragmentsAndWritesValidElf64Object() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run elfClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn elfClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // Build one fragment containing `add_two(rdi, rsi) -> rax = rdi + rsi` + one data object.
+  let mut code = Bytes.make()
+  run X86Encode.push(&mut code, X86Encode.rbp())
+  run X86Encode.movRr64(&mut code, X86Encode.rbp(), X86Encode.rsp())
+  run X86Encode.movRr64(&mut code, X86Encode.rax(), X86Encode.rdi())
+  run X86Encode.aluRr64(&mut code, Alu.Add, X86Encode.rax(), X86Encode.rsi())
+  run X86Encode.leave(&mut code)
+  run X86Encode.ret(&mut code)
+
+  let mut frag = Fragment.make()
+  run List<Function>.append(&mut frag.functions, Function {
+    symbol: run Bytes.copy(b"add_two"),
+    exported: run Bytes.copy(b"add_two"),
+    code: move code,
+    relocations: List<Relocation>.make(),
+    symbols: List<Bytes>.make(),
+    rodata: Bytes.make(),
+    rodataJumps: List<RodataJumpEntry>.make(),
+    unwind: UnwindInfo.frameOnly(),
+    locations: List<u64>.make(),
+  })
+  let mut img = Bytes.make()
+  run X86Encode.u64Le(&mut img, 42)
+  run List<Object>.append(&mut frag.objects, Object {
+    symbol: run Bytes.copy(b"answer_global"),
+    alignment: 8,
+    image: move img,
+    pointers: List<Pointer>.make(),
+    framed: false,
+    local: false,
+    readonly: true,
+  })
+  run List<Bytes>.append(&mut frag.declaredObjects, run Bytes.copy(b"extern_var"))
+
+  // Round-trip encode/decode.
+  let encoded = run frag.encode()
+  run Testing.expect(run X86Object.declaresObject(Bytes.asSlice(&encoded), b"extern_var"), "declaresObject finds extern_var")
+  let decoded = run X86Object.decode(Bytes.asSlice(&encoded))
+  run Testing.expect(List<Function>.length(&decoded.functions) == usize.ONE, "decoded 1 function")
+  run Testing.expect(List<Object>.length(&decoded.objects) == usize.ONE, "decoded 1 object")
+
+  // Pack into ELF64 .o and verify header invariants.
+  let elf = run X86ElfObject.pack(Bytes.asSlice(&encoded))
+  let bytes = Bytes.asSlice(&elf)
+  run Testing.expect(bytes.length > 64, "ELF64 output has header + sections")
+  run Testing.expect(bytes[0] == 0x7F && bytes[1] == 0x45 && bytes[2] == 0x4C && bytes[3] == 0x46, "ELF magic")
+  run Testing.expect(bytes[4] == 2 && bytes[5] == 1, "ELFCLASS64 + ELFDATA2LSB")
+  run Testing.expect(bytes[16] == 1 && bytes[17] == 0, "ET_REL")
+  run Testing.expect(bytes[18] == 62 && bytes[19] == 0, "EM_X86_64")
+  run Testing.expect(bytes[60] == 18 && bytes[61] == 0, "18 section headers (including silk_seen)")
+
+  // Unwind CIE + FDE check.
+  let mut eh = Bytes.make()
+  run X86Unwind.appendCie(&mut eh)
+  let cieLen = Bytes.length(&eh)
+  run Testing.expect(cieLen >= 16 && cieLen % 8 == usize.ZERO, "CIE is 8-byte aligned")
+  let fdeRel = run X86Unwind.appendFde(&mut eh, 12, UnwindInfo.frameOnly())
+  run Testing.expect(fdeRel == cieLen + 8, "FDE initial_location sits at CIE_end + 8")
+  run Testing.expect(Bytes.length(&eh) % 8 == usize.ZERO, "FDE is 8-byte aligned")
+
+  // Ensure refusal entries in a fragment fail `pack` with `Unsupported`.
+  let mut bad = Fragment.make()
+  run List<Bytes>.append(&mut bad.refused, run Bytes.copy(b"test refusal"))
+  let badBytes = run bad.encode()
+  let refused = match move run Effect.result(X86ElfObject.pack(Bytes.asSlice(&badBytes))) {
+    Result<Bytes, Unsupported | OutOfMemoryError>.Success {..} => false
+    Result<Bytes, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => true
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  run Testing.expect(refused, "pack refuses fragments carrying refusal records")
+}

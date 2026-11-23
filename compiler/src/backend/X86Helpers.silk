@@ -1,0 +1,162 @@
+//! Built-in native x86-64 runtime helper functions emitted alongside Linux direct builds.
+//!
+//! # When to use
+//! `X86Lower.declarations` appends these helpers into the shared declarations fragment so 128-bit
+//! integer division and remainder (`__silk_udivti3`, `__silk_umodti3`, `__silk_divti3`,
+//! `__silk_modti3`) work with zero dependency on `libgcc` or `compiler-rt`.
+//!
+//! # Details
+//! Every helper follows the System V AMD64 calling convention for `(u128, u128) -> u128`:
+//! dividend `(lo=rdi, hi=rsi)`, divisor `(lo=rdx, hi=rcx)`, result `(lo=rax, hi=rdx)`.
+
+import backend.X86Encode
+import backend.X86Encode {Alu, Mem}
+import backend.X86Object {Function, Relocation, RelocationKind, RodataJumpEntry}
+import backend.X86Unwind {UnwindInfo}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// Appends `__silk_udivti3`, `__silk_umodti3`, `__silk_divti3`, and `__silk_modti3` to `out`.
+pub effect fn appendAll(out: &mut List<Function>) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<Function>.append(&mut out.*, run buildUdivmod(b"__silk_udivti3", false))
+  run List<Function>.append(&mut out.*, run buildUdivmod(b"__silk_umodti3", true))
+  run List<Function>.append(&mut out.*, run buildSdivmod(b"__silk_divti3", false))
+  run List<Function>.append(&mut out.*, run buildSdivmod(b"__silk_modti3", true))
+  return ()
+}
+
+// Emits a self-contained 128-bit unsigned restoring shift-subtract division:
+//   input:  (rdi=numLo, rsi=numHi), (rdx=denLo, rcx=denHi)
+//   output: quotient in (rax, rdx) when `!wantRem`, else remainder in (rax, rdx).
+effect fn buildUdivmod(name: &[u8], wantRem: bool) -> Function ! OutOfMemoryError ? &mut Allocator {
+  let mut code = Bytes.make()
+  run X86Encode.push(&mut code, X86Encode.rbp())
+  run X86Encode.movRr64(&mut code, X86Encode.rbp(), X86Encode.rsp())
+
+  // r10 = denLo, r11 = denHi, r8 = remLo = 0, r9 = remHi = 0, rax = numLo, rdx = numHi, rcx = 128.
+  run X86Encode.movRr64(&mut code, X86Encode.r10(), X86Encode.rdx())
+  run X86Encode.movRr64(&mut code, X86Encode.r11(), X86Encode.rcx())
+  run X86Encode.movRr64(&mut code, X86Encode.rax(), X86Encode.rdi())
+  run X86Encode.movRr64(&mut code, X86Encode.rdx(), X86Encode.rsi())
+  run X86Encode.aluRr32(&mut code, Alu.Xor, X86Encode.r8(), X86Encode.r8())
+  run X86Encode.aluRr32(&mut code, Alu.Xor, X86Encode.r9(), X86Encode.r9())
+  run X86Encode.movImm32(&mut code, X86Encode.rcx(), 128)
+
+  let loopHead = Bytes.length(&code)
+  // Shift 256-bit (r9:r8:rdx:rax) left by 1 bit.
+  run X86Encode.aluRr64(&mut code, Alu.Add, X86Encode.rax(), X86Encode.rax())
+  run X86Encode.aluRr64(&mut code, Alu.Adc, X86Encode.rdx(), X86Encode.rdx())
+  run X86Encode.aluRr64(&mut code, Alu.Adc, X86Encode.r8(), X86Encode.r8())
+  run X86Encode.aluRr64(&mut code, Alu.Adc, X86Encode.r9(), X86Encode.r9())
+
+  // Compare (r9:r8) >= (r11:r10).
+  run X86Encode.aluRr64(&mut code, Alu.Cmp, X86Encode.r9(), X86Encode.r11())
+  let skipHi = run X86Encode.jccRel32(&mut code, X86Encode.ccB())
+  let doSubHi = run X86Encode.jccRel32(&mut code, X86Encode.ccA())
+  run X86Encode.aluRr64(&mut code, Alu.Cmp, X86Encode.r8(), X86Encode.r10())
+  let skipLo = run X86Encode.jccRel32(&mut code, X86Encode.ccB())
+
+  let doSub = Bytes.length(&code)
+  X86Encode.patchRel32(&mut code, doSubHi, doSub)
+  run X86Encode.aluRr64(&mut code, Alu.Sub, X86Encode.r8(), X86Encode.r10())
+  run X86Encode.aluRr64(&mut code, Alu.Sbb, X86Encode.r9(), X86Encode.r11())
+  run X86Encode.aluRi64(&mut code, Alu.Or, X86Encode.rax(), 1)
+
+  let skip = Bytes.length(&code)
+  X86Encode.patchRel32(&mut code, skipHi, skip)
+  X86Encode.patchRel32(&mut code, skipLo, skip)
+  run X86Encode.aluRi64(&mut code, Alu.Sub, X86Encode.rcx(), 1)
+  let back = run X86Encode.jccRel32(&mut code, X86Encode.ccNe())
+  X86Encode.patchRel32(&mut code, back, loopHead)
+
+  if wantRem {
+    run X86Encode.movRr64(&mut code, X86Encode.rax(), X86Encode.r8())
+    run X86Encode.movRr64(&mut code, X86Encode.rdx(), X86Encode.r9())
+  }
+  run X86Encode.leave(&mut code)
+  run X86Encode.ret(&mut code)
+
+  return Function {
+    symbol: run Bytes.copy(name),
+    exported: Bytes.make(),
+    code: move code,
+    relocations: List<Relocation>.make(),
+    symbols: List<Bytes>.make(),
+    rodata: Bytes.make(),
+    rodataJumps: List<RodataJumpEntry>.make(),
+    unwind: UnwindInfo.frameOnly(),
+    locations: List<u64>.make(),
+  }
+}
+
+// Emits a 128-bit signed division or remainder by taking absolute values, calling the unsigned
+// helper, and negating the result when the sign bit requires it.
+effect fn buildSdivmod(name: &[u8], wantRem: bool) -> Function ! OutOfMemoryError ? &mut Allocator {
+  let mut code = Bytes.make()
+  run X86Encode.push(&mut code, X86Encode.rbp())
+  run X86Encode.movRr64(&mut code, X86Encode.rbp(), X86Encode.rsp())
+  // Reserve 16 bytes for saved sign flag at [rbp - 8].
+  run X86Encode.aluRi64(&mut code, Alu.Sub, X86Encode.rsp(), 16)
+
+  // Compute result sign flag in r10: `rsi` for rem, `rsi ^ rcx` for div.
+  run X86Encode.movRr64(&mut code, X86Encode.r10(), X86Encode.rsi())
+  if !wantRem {
+    run X86Encode.aluRr64(&mut code, Alu.Xor, X86Encode.r10(), X86Encode.rcx())
+  }
+  drop run X86Encode.movMr64(&mut code, Mem.baseDisp(X86Encode.rbp(), -8), X86Encode.r10())
+
+  // If dividend (rdi:rsi) < 0, negate it: rdi = -rdi, rsi = 0 - rsi - CF.
+  run X86Encode.testRr64(&mut code, X86Encode.rsi(), X86Encode.rsi())
+  let numPos = run X86Encode.jccRel32(&mut code, X86Encode.ccNs())
+  run X86Encode.neg64(&mut code, X86Encode.rdi())
+  run X86Encode.aluRi64(&mut code, Alu.Adc, X86Encode.rsi(), 0)
+  run X86Encode.neg64(&mut code, X86Encode.rsi())
+  let afterNum = Bytes.length(&code)
+  X86Encode.patchRel32(&mut code, numPos, afterNum)
+
+  // If divisor (rdx:rcx) < 0, negate it.
+  run X86Encode.testRr64(&mut code, X86Encode.rcx(), X86Encode.rcx())
+  let denPos = run X86Encode.jccRel32(&mut code, X86Encode.ccNs())
+  run X86Encode.neg64(&mut code, X86Encode.rdx())
+  run X86Encode.aluRi64(&mut code, Alu.Adc, X86Encode.rcx(), 0)
+  run X86Encode.neg64(&mut code, X86Encode.rcx())
+  let afterDen = Bytes.length(&code)
+  X86Encode.patchRel32(&mut code, denPos, afterDen)
+
+  // Call unsigned helper `__silk_udivti3` or `__silk_umodti3`.
+  let callAt = run X86Encode.callRel32(&mut code)
+  let mut relocs = List<Relocation>.make()
+  run List<Relocation>.append(&mut relocs, Relocation {
+    offset: callAt, kind: RelocationKind.Plt32, target: usize.ZERO, addend: -4,
+  })
+  let mut syms = List<Bytes>.make()
+  run List<Bytes>.append(&mut syms, run Bytes.copy(if wantRem { b"__silk_umodti3" } else { b"__silk_udivti3" }))
+
+  // If saved sign flag < 0, negate result (rax:rdx).
+  drop run X86Encode.movRm64(&mut code, X86Encode.r10(), Mem.baseDisp(X86Encode.rbp(), -8))
+  run X86Encode.testRr64(&mut code, X86Encode.r10(), X86Encode.r10())
+  let resPos = run X86Encode.jccRel32(&mut code, X86Encode.ccNs())
+  run X86Encode.neg64(&mut code, X86Encode.rax())
+  run X86Encode.aluRi64(&mut code, Alu.Adc, X86Encode.rdx(), 0)
+  run X86Encode.neg64(&mut code, X86Encode.rdx())
+  let afterRes = Bytes.length(&code)
+  X86Encode.patchRel32(&mut code, resPos, afterRes)
+
+  run X86Encode.leave(&mut code)
+  run X86Encode.ret(&mut code)
+
+  return Function {
+    symbol: run Bytes.copy(name),
+    exported: Bytes.make(),
+    code: move code,
+    relocations: move relocs,
+    symbols: move syms,
+    rodata: Bytes.make(),
+    rodataJumps: List<RodataJumpEntry>.make(),
+    unwind: UnwindInfo.frameOnly(),
+    locations: List<u64>.make(),
+  }
+}
