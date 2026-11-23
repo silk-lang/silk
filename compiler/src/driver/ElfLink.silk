@@ -158,6 +158,8 @@ pub struct IncObjRecord {
   pub isTls: bool,
   /// True for `silk_frames` descriptors.
   pub isFramed: bool,
+  /// True for `silk_seen` test-coverage records.
+  pub isSeen: bool,
 }
 
 /// Resolved address entry for every global symbol in an incremental-ready ELF64 binary.
@@ -206,6 +208,16 @@ pub struct IncrementalState {
   pub rodataCursorFileOff: u64,
   /// Exclusive upper virtual address limit of `.rodata` headroom.
   pub rodataLimitVaddr: u64,
+  /// Next free virtual address in `.data` headroom (bump-only for pointer-bearing/mutable objects).
+  pub dataCursorVaddr: u64,
+  /// Next free file offset in `.data` headroom.
+  pub dataCursorFileOff: u64,
+  /// Exclusive upper virtual address limit of `.data` headroom.
+  pub dataLimitVaddr: u64,
+  /// Next spare `Elf64_Rela` slot file offset inside `.rela.dyn` (pre-filled with `R_X86_64_NONE`).
+  pub relaCursorFileOff: u64,
+  /// Exclusive upper file offset limit of `.rela.dyn` spare slots.
+  pub relaLimitFileOff: u64,
   /// Base virtual address of `.eh_frame_hdr`.
   pub ehFrameHdrVaddr: u64,
   /// Base file offset of `.eh_frame_hdr`.
@@ -226,6 +238,10 @@ pub struct IncrementalState {
   pub textFreeList: List<IncFreeBlock>,
   /// Reusable free blocks in `.rodata`.
   pub rodataFreeList: List<IncFreeBlock>,
+  /// High 64 bits of each previously linked raw `X86Object` chunk digest (for O(dirty) skipping).
+  pub chunkHashHigh: List<u64>,
+  /// Low 64 bits of each previously linked raw `X86Object` chunk digest.
+  pub chunkHashLow: List<u64>,
 }
 
 /// Output of [`linkWithOptions`]: the linked ELF64 bytes plus optional [`IncrementalState`].
@@ -1510,26 +1526,6 @@ pub effect fn linkUnitsWithOptions(
   let tlsPh: u64 = if hasTls { 1 } else { 0 }
   let phnum: u64 = basePhnum + tlsPh
 
-  // Dynamic table entry count (reserve exact space).
-  let mut dynEntries: u64 = usize.toU64(neededSlice.length)
-  if sonameOff != 0 { dynEntries = dynEntries + 1 }
-  if runpathOff != 0 { dynEntries = dynEntries + 1 }
-  if initArraySize > 0 { dynEntries = dynEntries + 2 }
-  if finiArraySize > 0 { dynEntries = dynEntries + 2 }
-  // DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_FLAGS, DT_FLAGS_1, DT_NULL
-  dynEntries = dynEntries + 8
-  if relaDynCount > 0 { dynEntries = dynEntries + 3 } // DT_RELA, DT_RELASZ, DT_RELAENT
-  if verneedLibCount > 0 { dynEntries = dynEntries + 3 } // DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM
-  let dynamicSize: u64 = dynEntries * 16
-
-  let gotRegularCount = List<usize>.length(&gotSyms)
-  let gotLocalCount = List<u64>.length(&localGotTargets)
-  let gotTpCount = List<usize>.length(&gotTpOffSyms)
-  let gotTotalEntries = gotRegularCount + gotLocalCount + gotTpCount
-  let gotSize: u64 = usize.toU64(gotTotalEntries) * 8
-  let pltCount = List<usize>.length(&pltSyms)
-  let pltSize: u64 = usize.toU64(pltCount) * 8
-
   // Identify the Silk unit (for DWARF `.debug_line` and incremental thunk/headroom layout).
   let mut silkUnitIdx = usize.MAX
   ui = usize.ZERO
@@ -1542,6 +1538,29 @@ pub effect fn linkUnitsWithOptions(
   }
 
   let useThunks = incremental && !shared && silkUnitIdx != usize.MAX
+  let relaDynSpare: usize = if useThunks { 512 } else { usize.ZERO }
+  let relaDynTotal = relaDynCount + relaDynSpare
+
+  // Dynamic table entry count (reserve exact space).
+  let mut dynEntries: u64 = usize.toU64(neededSlice.length)
+  if sonameOff != 0 { dynEntries = dynEntries + 1 }
+  if runpathOff != 0 { dynEntries = dynEntries + 1 }
+  if initArraySize > 0 { dynEntries = dynEntries + 2 }
+  if finiArraySize > 0 { dynEntries = dynEntries + 2 }
+  // DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_FLAGS, DT_FLAGS_1, DT_NULL
+  dynEntries = dynEntries + 8
+  if relaDynTotal > usize.ZERO { dynEntries = dynEntries + 3 } // DT_RELA, DT_RELASZ, DT_RELAENT
+  if verneedLibCount > 0 { dynEntries = dynEntries + 3 } // DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM
+  let dynamicSize: u64 = dynEntries * 16
+
+  let gotRegularCount = List<usize>.length(&gotSyms)
+  let gotLocalCount = List<u64>.length(&localGotTargets)
+  let gotTpCount = List<usize>.length(&gotTpOffSyms)
+  let gotTotalEntries = gotRegularCount + gotLocalCount + gotTpCount
+  let gotSize: u64 = usize.toU64(gotTotalEntries) * 8
+  let pltCount = List<usize>.length(&pltSyms)
+  let pltSize: u64 = usize.toU64(pltCount) * 8
+
   let mut silkThunkCount = usize.ZERO
   if useThunks {
     let sFuncs = List<SilkFuncMeta>.asSlice(&unitSlice[silkUnitIdx].silkFunctions)
@@ -1575,6 +1594,7 @@ pub effect fn linkUnitsWithOptions(
   let thunksSize: u64 = thunkSlotsCap * 8
   let textHeadroom: u64 = if useThunks { alignUp(maxU64(262144, textSize), 16) } else { 0 }
   let rodataHeadroom: u64 = if useThunks { alignUp(maxU64(65536, rodataSize), 16) } else { 0 }
+  let dataHeadroom: u64 = if useThunks { 65536 } else { 0 }
 
   // Segment 1 (PF_R, vaddr = 0x0, fileOff = 0x0):
   let mut cur: u64 = 64 + phnum * 56
@@ -1600,7 +1620,7 @@ pub effect fn linkUnitsWithOptions(
   cur = cur + verneedSize
   cur = alignUp(cur, 8)
   let relaDynOff = cur
-  let relaDynSize: u64 = usize.toU64(relaDynCount) * 24
+  let relaDynSize: u64 = usize.toU64(relaDynTotal) * 24
   cur = cur + relaDynSize
   cur = alignUp(cur, 4)
   let ehFrameHdrVaddr = cur
@@ -1656,7 +1676,7 @@ pub effect fn linkUnitsWithOptions(
   rwPos = tdataOffInSeg4 + tdataSize
   let dataOffInSeg4 = alignUp(rwPos, 16)
   let dataVaddr = seg4Vaddr + dataOffInSeg4
-  rwPos = dataOffInSeg4 + dataSize
+  rwPos = dataOffInSeg4 + dataSize + dataHeadroom
   let framesOffInSeg4 = alignUp(rwPos, 8)
   let framesVaddr = seg4Vaddr + framesOffInSeg4
   rwPos = framesOffInSeg4 + framesSize
@@ -2256,6 +2276,13 @@ pub effect fn linkUnitsWithOptions(
     run X86Encode.u64Le(&mut relaDynBytes, i64.wrappingToU64(dr.addend))
     dri = dri + usize.ONE
   }
+  while dri < relaDynTotal {
+    // Spare R_X86_64_NONE (r_info = 0) slot for in-place incremental patching.
+    run X86Encode.u64Le(&mut relaDynBytes, 0)
+    run X86Encode.u64Le(&mut relaDynBytes, 0)
+    run X86Encode.u64Le(&mut relaDynBytes, 0)
+    dri = dri + usize.ONE
+  }
 
   let mut dynamicBytes = Bytes.make()
   ni = usize.ZERO
@@ -2278,10 +2305,10 @@ pub effect fn linkUnitsWithOptions(
   run appendDyn(&mut dynamicBytes, 6, dynsymOff)           // DT_SYMTAB
   run appendDyn(&mut dynamicBytes, 10, dynstrSize)         // DT_STRSZ
   run appendDyn(&mut dynamicBytes, 11, 24)                 // DT_SYMENT
-  if drSlice.length > usize.ZERO {
-    run appendDyn(&mut dynamicBytes, 7, relaDynOff)                         // DT_RELA
-    run appendDyn(&mut dynamicBytes, 8, usize.toU64(drSlice.length) * 24)   // DT_RELASZ
-    run appendDyn(&mut dynamicBytes, 9, 24)                                 // DT_RELAENT
+  if relaDynTotal > usize.ZERO {
+    run appendDyn(&mut dynamicBytes, 7, relaDynOff)        // DT_RELA
+    run appendDyn(&mut dynamicBytes, 8, relaDynSize)       // DT_RELASZ
+    run appendDyn(&mut dynamicBytes, 9, 24)                // DT_RELAENT
   }
   if verneedLibCount > 0 {
     run appendDyn(&mut dynamicBytes, 0x6FFFFFF0, versymOff)       // DT_VERSYM
@@ -2525,7 +2552,7 @@ pub effect fn linkUnitsWithOptions(
   // 14: .dynamic
   run appendShdr(&mut out, nDynamic, 6, 0x3, dynamicVaddr, dynamicVaddr, dynamicSize, 4, 0, 8, 16)
   // 15: .data (index 15 matches static symtab data shndx = 15)
-  run appendShdr(&mut out, nData, 1, 0x3, dataVaddr, seg4Off + dataOffInSeg4, dataSize, 0, 0, 16, 0)
+  run appendShdr(&mut out, nData, 1, 0x3, dataVaddr, seg4Off + dataOffInSeg4, dataSize + dataHeadroom, 0, 0, 16, 0)
   // 16: .got
   run appendShdr(&mut out, nGot, 1, 0x3, gotVaddr, gotVaddr, gotSize, 0, 0, 8, 8)
   // 17: .tdata
@@ -2585,6 +2612,7 @@ pub effect fn linkUnitsWithOptions(
         SectionKind.Data => seg4Off + dataOffInSeg4 + sp.outOffset + om.offset
         SectionKind.Tdata => tdataFileOff + sp.outOffset + om.offset
         SectionKind.SilkFrames => seg4Off + framesOffInSeg4 + sp.outOffset + om.offset
+        SectionKind.SilkSeen => seg4Off + seenOffInSeg4 + sp.outOffset + om.offset
         _ => 0
       }
       run List<IncObjRecord>.append(&mut incObjs, IncObjRecord {
@@ -2596,6 +2624,7 @@ pub effect fn linkUnitsWithOptions(
         size: om.size,
         isTls: om.isTls,
         isFramed: om.isFramed,
+        isSeen: om.isSeen,
       })
       oi = oi + usize.ONE
     }
@@ -2634,6 +2663,7 @@ pub effect fn linkUnitsWithOptions(
 
     let textCursor = alignUp(textVaddr + textSize, 16)
     let rodataCursor = alignUp(rodataVaddr + rodataSize, 16)
+    let dataCursorRel = alignUp(dataSize, 16)
     incState = Option<IncrementalState>.some(IncrementalState {
       inputsHashHigh: 0,
       inputsHashLow: 0,
@@ -2648,6 +2678,11 @@ pub effect fn linkUnitsWithOptions(
       rodataCursorVaddr: rodataCursor,
       rodataCursorFileOff: rodataCursor,
       rodataLimitVaddr: rodataVaddr + rodataSize + rodataHeadroom,
+      dataCursorVaddr: dataVaddr + dataCursorRel,
+      dataCursorFileOff: seg4Off + dataOffInSeg4 + dataCursorRel,
+      dataLimitVaddr: dataVaddr + dataSize + dataHeadroom,
+      relaCursorFileOff: relaDynOff + usize.toU64(drSlice.length) * 24,
+      relaLimitFileOff: relaDynOff + relaDynSize,
       ehFrameHdrVaddr: ehFrameHdrVaddr,
       ehFrameHdrFileOff: ehFrameHdrVaddr,
       ehFrameHdrCount: usize.toU64(fdeMut.length),
@@ -2658,6 +2693,8 @@ pub effect fn linkUnitsWithOptions(
       nativeEhEntries: move nativeEhEntries,
       textFreeList: List<IncFreeBlock>.make(),
       rodataFreeList: List<IncFreeBlock>.make(),
+      chunkHashHigh: List<u64>.make(),
+      chunkHashLow: List<u64>.make(),
     })
   }
 
