@@ -273,7 +273,7 @@ struct Writer {
   variadic: u64,
   /// A step's own step record (`stepRecord`), which its direct callee steps run published in.
   steps: u64,
-  /// How hard the build optimizes the functions it emits, whether it verifies each one's SSA
+  /// How hard the build optimizes the functions it emits, whether it verifies each function's SSA
   /// form after lowering and after each pass, and whether `SsaPackedBytes` SWAR lowering runs.
   level: Level,
   verify: bool,
@@ -303,15 +303,14 @@ impl Copy for CallerCopy {}
 // A writer for `target`, whose memory threads share when `shared`.
 effect fn writerFor(target: &Target, shared: bool) -> Writer ! OutOfMemoryError ? &mut Allocator {
   let bits = u32.toUsize(Target.pointerBits(target))
-  let packBytes = !same(Target.architecture(target), b"aarch64")
   return Writer {lowered: Lowered.make(), function: run SsaFunction.make(b"", bits), counter: usize.ZERO, located: usize.ZERO,
     symbol: Bytes.make(), lines: List<u64>.make(), trap: Option<TrapReport>.none(), observerLocal: usize.MAX, causeLocal: usize.MAX,
     siteLocal: usize.MAX, trapSites: InternIndex.make(), pointerBits: bits, shared: shared, slots: List<u64>.make(),
     slotIds: List<usize>.make(), scalars: List<bool>.make(), companions: List<u64>.make(), companionSlotIds: List<usize>.make(),
     blocks: List<usize>.make(), alignments: List<usize>.make(), copies: List<CallerCopy>.make(), parameters: List<u64>.make(),
     extras: List<u64>.make(), providers: List<u64>.make(), out: none(), failure: none(), context: none(), observer: none(),
-    cause: none(), site: none(), transfer: none(), frame: none(), variadic: none(), steps: none(), level: Level.None, verify: false,
-    packBytes: packBytes}
+    cause: none(), site: none(), transfer: none(), frame: none(), variadic: none(), steps: none(), level: Level.None,
+    verify: false, packBytes: isWasm(target)}
 }
 
 // Finds the hidden diagnostic locals of `function`, whose blocks are about to be emitted, and
@@ -2346,7 +2345,14 @@ effect fn emitScalarBinary(writer: &mut Writer, function: &MirFunction, target: 
   if operation == ScalarBinary.WrappingSubtract { return Value {scalar: kind, value: run binaryOf(&mut writer.*, Binary.Sub, l, r)} }
   if operation == ScalarBinary.WrappingMultiply { return Value {scalar: kind, value: run binaryOf(&mut writer.*, Binary.Mul, l, r)} }
   if operation == ScalarBinary.MultiplyHigh {
-    if kind.bits == 64 { return Value {scalar: kind, value: run highProduct(&mut writer.*, kind, l, r)} }
+    if kind.bits == 64 {
+      if !writer.packBytes {
+        let mut mulOp = Binary.UMulHi
+        if kind.signed { mulOp = Binary.SMulHi }
+        return Value {scalar: kind, value: run binaryOf(&mut writer.*, mulOp, l, r)}
+      }
+      return Value {scalar: kind, value: run highProduct(&mut writer.*, kind, l, r)}
+    }
     // The upper half of the product at twice the width.
     let wide = integerRepresentation(kind.bits * 2, kind.signed)
     let mut extend = Cast.ZExt
@@ -3352,6 +3358,60 @@ effect fn storeWidened(writer: &mut Writer, slot: &Address, value: &Value, room:
   return true
 }
 
+effect fn tryEmitConstantAggregate(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &TypeLayouts,
+  address: &Address,
+  operands: &[AggregateField],
+  span: Location,
+) -> bool ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if operands.length < 4 { return false }
+  let whole = run layoutOf(layouts, &address.ty, function, span)
+  if whole.size < 32 { return false }
+  // Fast pre-check: every field operand must be a plain scalar integer or boolean constant.
+  let mut checkAt = usize.ZERO
+  while checkAt < operands.length {
+    match &operands[checkAt].value {
+      Operand.Integer {..} => {}
+      Operand.Boolean {..} => {}
+      _ => { return false }
+    }
+    checkAt = checkAt + usize.ONE
+  }
+  let mut image = run Bytes.zeroed(whole.size)
+  let mut fieldAt = usize.ZERO
+  while fieldAt < operands.length {
+    let field = run fieldFact(layouts, &address.ty, operands[fieldAt].index, function, span)
+    let metrics = run layoutOf(layouts, &field.ty, function, span)
+    if metrics.size == usize.ZERO || metrics.size > 8 || field.offset > whole.size || metrics.size > whole.size - field.offset {
+      return false
+    }
+    let mut bits: u64 = 0
+    match &operands[fieldAt].value {
+      Operand.Integer {decimal: digits, negative, ty} => {
+        let rep = scalar(&ty, target)
+        if rep.aggregate || rep.pointer || rep.floating || rep.unit || rep.bits > 64 { return false }
+        bits = decimalBits(Bytes.asSlice(&digits), negative)
+      }
+      Operand.Boolean {value} => {
+        if value { bits = 1 }
+      }
+      _ => { return false }
+    }
+    writeWord(&mut image, field.offset, metrics.size, bits)
+    fieldAt = fieldAt + usize.ONE
+  }
+  let mut align = whole.alignment
+  if align < 16 { align = 16 }
+  let name = run contentName(b"silk.rodata.", Bytes.asSlice(&image))
+  run defineObject(&mut writer.*, Bytes.asSlice(&name), align, move image, List<DataPointer>.make(), false, false, true)
+  let roAddr = run addressOf(&mut writer.*, Bytes.asSlice(&name))
+  run copyCall(&mut writer.*, address.value, address.alignment, roAddr, whole.size, true)
+  return true
+}
+
 effect fn emitAssign(
   writer: &mut Writer,
   function: &MirFunction,
@@ -3364,8 +3424,11 @@ effect fn emitAssign(
 ) -> () ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
   let address = run emitPlace(&mut writer.*, function, target, layouts, destination)
   if let Rvalue.Aggregate {fields} = &value.* {
-    run clearPadding(&mut writer.*, layouts, &address)
     let operands = List<AggregateField>.asSlice(&fields)
+    if run tryEmitConstantAggregate(&mut writer.*, function, target, layouts, &address, operands, span) {
+      return ()
+    }
+    run clearPadding(&mut writer.*, layouts, &address)
     let mut fieldAt = usize.ZERO
     while fieldAt < operands.length {
       let selectedField = run projectField(&mut writer.*, function, target, layouts,
@@ -4032,6 +4095,16 @@ effect fn emitCCall(writer: &mut Writer, function: &MirFunction, target: &Target
   return run branch(&mut writer.*, next)
 }
 
+fn isPureCallBlock(function: &MirFunction, block: usize) -> bool {
+  let listed = List<usize>.asSlice(&function.pureCallBlocks)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at] == block { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 effect fn emitCall(
   writer: &mut Writer,
   function: &MirFunction,
@@ -4061,7 +4134,7 @@ effect fn emitCall(
       providers, diagnostics, destination, normal, failure, span, block)
   }
   return run emitCallInner(&mut writer.*, function, target, layouts, identities,
-    callee, arguments, providers, diagnostics, destination, normal, failure, span)
+    callee, arguments, providers, diagnostics, destination, normal, failure, span, block)
 }
 
 // Appends one argument lane passing `value`.
@@ -4083,6 +4156,7 @@ effect fn emitCallInner(
   normal: usize,
   failure: &Option<FailureEdge>,
   span: Location,
+  block: usize,
 ) -> () ! Gap | Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
@@ -4187,6 +4261,10 @@ effect fn emitCallInner(
   if let Callee.Instance {key} = &callee.* {
     let symbol = run InstanceIdentity.name(identities, &key)
     returned = run callNamed(&mut writer.*, Bytes.asSlice(&symbol), resultType, List<u64>.asSlice(&passed))
+    if !outward && !fallible && isPureCallBlock(function, block) {
+      let callInst = writer.function.instructionCount() - usize.ONE
+      writer.function.markPureCall(callInst)
+    }
   } else {
     returned = run callAddress(&mut writer.*, indirect, List<u64>.asSlice(&passed), resultType)
   }
@@ -4760,6 +4838,7 @@ pub effect fn lower(
   }
   let base = run Bytes.copy(Bytes.asSlice(&writer.symbol))
   run beginFunction(&mut writer, Bytes.asSlice(&base))
+  run writer.function.setFeatures(Bytes.asSlice(&function.features))
   if exported {
     writer.function.setCallingConvention(CallingConvention.C, function.variadic, resultExtension)
   }
@@ -5345,6 +5424,7 @@ effect fn emitEnter(writer: &mut Writer, function: &MirFunction, target: &Target
   let takes = run takesResult(function, target, layouts)
   let name = run suffixed(symbol, b"$enter")
   run beginFunction(&mut writer.*, Bytes.asSlice(&name))
+  run writer.function.setFeatures(Bytes.asSlice(&function.features))
   run enterSignature(&mut writer.*, function, target, layouts, takes)
   let transfer = writer.transfer
   let pointer = run pointerType(&mut writer.*)
@@ -5498,6 +5578,7 @@ effect fn emitStep(writer: &mut Writer, function: &MirFunction, target: &Target,
   let name = run suffixed(symbol, b"$step")
   run frameEntry(&mut writer.*, function, target, b"$step")
   run beginFunction(&mut writer.*, Bytes.asSlice(&name))
+  run writer.function.setFeatures(Bytes.asSlice(&function.features))
   writer.transfer = run parameterOf(&mut writer.*, pointer)
   writer.frame = run parameterOf(&mut writer.*, pointer)
   writer.function.setResult(int32)
