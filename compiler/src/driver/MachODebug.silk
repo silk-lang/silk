@@ -1,0 +1,417 @@
+//! Direct DWARF v4 debug-section builder (`__DWARF` segment: `__debug_line`, `__debug_info`,
+//! `__debug_abbrev`, `__debug_str`) for macOS ARM64 (`aarch64-apple-darwin`) Mach-O executables.
+//!
+//! # When to use
+//! Populate a [`DebugLineMap`] in the driver from `EmissionPlan` source locations and pass it
+//! into `MachOLink` so `--debug true` Mach-O executables carry embedded DWARF v4 sections
+//! readable directly by `lldb`, `atos`, and `llvm-dwarfdump` without invoking `dsymutil`.
+
+import backend.AArch64Encode
+import semantic.InternIndex {InternIndex}
+import semantic.SourceLocations {absolutePlace}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// Maps emitted Silk function symbols to their 1-based DWARF file index and declaration origin.
+pub struct DebugLineMap {
+  files: List<Bytes>,
+  symbols: List<Bytes>,
+  fileIndices: List<usize>,
+  origins: List<u64>,
+  index: InternIndex,
+}
+
+/// One emitted function's virtual address range, symbol name, and `(codeOffset, relativePlace)` pairs.
+pub struct FunctionDebugSpan {
+  /// Display/symbol name emitted into `DW_TAG_subprogram`.
+  pub name: Bytes,
+  /// Virtual address of the function's machine code body.
+  pub vaddr: u64,
+  /// Byte length of the function's machine code body.
+  pub codeSize: u64,
+  /// 1-based file index into `DebugLineMap.files`.
+  pub fileIndex: usize,
+  /// Packed declaration origin `(line << 24) | column` for `absolutePlace`.
+  pub origin: u64,
+  /// Flat pairs `[codeOffset0, relPlace0, codeOffset1, relPlace1, ...]`.
+  pub locations: List<u64>,
+}
+
+/// Resolved `(fileIndex, origin)` lookup result for one symbol.
+pub struct SymbolSource {
+  /// 1-based file index into `DebugLineMap.files` (`0` if unknown).
+  pub fileIndex: usize,
+  /// Packed declaration origin `(line << 24) | column`.
+  pub origin: u64,
+}
+impl Copy for SymbolSource {}
+
+/// Encoded DWARF v4 section payloads embedded inside a Mach-O `__DWARF` segment.
+pub struct DwarfSections {
+  /// `__DWARF,__debug_line` DWARF v4 line-number program.
+  pub debugLine: Bytes,
+  /// `__DWARF,__debug_info` DWARF v4 compile unit and subprogram DIEs.
+  pub debugInfo: Bytes,
+  /// `__DWARF,__debug_abbrev` DWARF v4 abbreviation table.
+  pub debugAbbrev: Bytes,
+  /// `__DWARF,__debug_str` NUL-terminated string table.
+  pub debugStr: Bytes,
+}
+
+impl DwarfSections {
+  /// Returns an empty set of DWARF sections (when `--debug false` or no spans are present).
+  pub fn empty() -> DwarfSections {
+    return DwarfSections {
+      debugLine: Bytes.make(),
+      debugInfo: Bytes.make(),
+      debugAbbrev: Bytes.make(),
+      debugStr: Bytes.make(),
+    }
+  }
+
+  /// True when no debug sections were produced.
+  pub fn isEmpty(self: &Self) -> bool {
+    return Bytes.length(&self.debugLine) == usize.ZERO
+  }
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+effect fn writeUleb128(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut v = value
+  while true {
+    let mut b = u64.toU8(u64.bitAnd(v, 0x7F))
+    v = u64.shiftRight(v, 7)
+    if v != 0 {
+      b = u8.bitOr(b, 0x80)
+      run AArch64Encode.byte(&mut out.*, b)
+    } else {
+      run AArch64Encode.byte(&mut out.*, b)
+      return ()
+    }
+  }
+}
+
+effect fn writeSleb128(out: &mut Bytes, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut v = value
+  while true {
+    let raw = i64.wrappingToU64(v)
+    let mut b = u64.toU8(u64.bitAnd(raw, 0x7F))
+    v = i64.shiftRight(v, 7)
+    let signBit = u8.bitAnd(b, 0x40) != 0
+    if (v == 0 && !signBit) || (v == -1 && signBit) {
+      run AArch64Encode.byte(&mut out.*, b)
+      return ()
+    }
+    b = u8.bitOr(b, 0x80)
+    run AArch64Encode.byte(&mut out.*, b)
+  }
+}
+
+impl DebugLineMap {
+  /// Creates an empty debug line map.
+  pub fn make() -> DebugLineMap {
+    return DebugLineMap {
+      files: List<Bytes>.make(),
+      symbols: List<Bytes>.make(),
+      fileIndices: List<usize>.make(),
+      origins: List<u64>.make(),
+      index: InternIndex.make(),
+    }
+  }
+
+  /// True when at least one file and symbol have been registered.
+  pub fn isEmpty(self: &Self) -> bool {
+    return List<Bytes>.length(&self.files) == usize.ZERO || List<Bytes>.length(&self.symbols) == usize.ZERO
+  }
+
+  /// Appends a source file path and returns its 1-based DWARF file index.
+  pub effect fn addFile(self: &mut Self, path: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    run List<Bytes>.append(&mut self.files, run Bytes.copy(path))
+    return List<Bytes>.length(&self.files)
+  }
+
+  /// Registers `symbol` with its 1-based `fileIndex` and packed declaration `origin`.
+  pub effect fn addSymbol(
+    self: &mut Self,
+    symbol: &[u8],
+    fileIndex: usize,
+    origin: u64,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let h = InternIndex.hashBytes(0, symbol)
+    run List<Bytes>.append(&mut self.symbols, run Bytes.copy(symbol))
+    run List<usize>.append(&mut self.fileIndices, fileIndex)
+    run List<u64>.append(&mut self.origins, origin)
+    return run InternIndex.record(&mut self.index, h)
+  }
+
+  /// Looks up the registered `(fileIndex, origin)` for `symbol`, returning `fileIndex == 0` when absent.
+  pub fn lookup(self: &Self, symbol: &[u8]) -> SymbolSource {
+    let syms = List<Bytes>.asSlice(&self.symbols)
+    let h = InternIndex.hashBytes(0, symbol)
+    let mut at = InternIndex.first(&self.index, h)
+    while at != usize.MAX {
+      if sameBytes(Bytes.asSlice(&syms[at]), symbol) {
+        return SymbolSource {
+          fileIndex: List<usize>.get(&self.fileIndices, at),
+          origin: List<u64>.get(&self.origins, at),
+        }
+      }
+      at = InternIndex.after(&self.index, at)
+    }
+    return SymbolSource {fileIndex: usize.ZERO, origin: 0}
+  }
+
+  /// Returns all registered source file paths in 1-based DWARF file-table order.
+  pub fn filePaths(self: &Self) -> &[Bytes] {
+    return List<Bytes>.asSlice(&self.files)
+  }
+}
+
+effect fn internDebugStr(strtab: &mut Bytes, s: &[u8]) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let off = usize.toU64(Bytes.length(&strtab.*))
+  run Bytes.append(&mut strtab.*, s)
+  run AArch64Encode.byte(&mut strtab.*, 0)
+  return off
+}
+
+/// Encodes complete DWARF v4 `__debug_line`, `__debug_info`, `__debug_abbrev`, and `__debug_str`
+/// sections from `files` and `spans` for embedding inside a Mach-O `__DWARF` segment.
+pub effect fn encodeDwarf(
+  files: &[Bytes],
+  spans: &[FunctionDebugSpan],
+) -> DwarfSections ! OutOfMemoryError ? &mut Allocator {
+  if files.length == usize.ZERO || spans.length == usize.ZERO {
+    return DwarfSections.empty()
+  }
+
+  // 1. Encode DWARF v4 `__debug_line`.
+  let mut line = Bytes.make()
+  run AArch64Encode.u32Le(&mut line, 0) // unit_length placeholder
+  run AArch64Encode.u16Le(&mut line, 4) // version 4
+  let headerLenPos = Bytes.length(&line)
+  run AArch64Encode.u32Le(&mut line, 0) // header_length placeholder
+  let headerStart = Bytes.length(&line)
+
+  run AArch64Encode.byte(&mut line, 1)   // minimum_instruction_length = 1
+  run AArch64Encode.byte(&mut line, 1)   // maximum_operations_per_instruction = 1
+  run AArch64Encode.byte(&mut line, 1)   // default_is_stmt = 1
+  run AArch64Encode.byte(&mut line, 251) // line_base = -5
+  run AArch64Encode.byte(&mut line, 14)  // line_range = 14
+  run AArch64Encode.byte(&mut line, 13)  // opcode_base = 13
+  let stdLens: [u8; 12] = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+  run Bytes.append(&mut line, &stdLens)
+  run AArch64Encode.byte(&mut line, 0)   // include_directories terminator
+
+  let mut fi = usize.ZERO
+  while fi < files.length {
+    let p = Bytes.asSlice(&files[fi])
+    if p.length == usize.ZERO {
+      run Bytes.append(&mut line, b"<unknown>")
+    } else {
+      run Bytes.append(&mut line, p)
+    }
+    run AArch64Encode.byte(&mut line, 0)
+    run AArch64Encode.byte(&mut line, 0) // dir_index
+    run AArch64Encode.byte(&mut line, 0) // mtime
+    run AArch64Encode.byte(&mut line, 0) // size
+    fi = fi + usize.ONE
+  }
+  run AArch64Encode.byte(&mut line, 0) // file_names terminator
+
+  let headerEnd = Bytes.length(&line)
+  AArch64Encode.patchU32(&mut line, headerLenPos, usize.toU64(headerEnd - headerStart))
+
+  let mut minPc = u64.MAX
+  let mut maxPc: u64 = 0
+  let mut si = usize.ZERO
+  while si < spans.length {
+    let sp = &spans[si]
+    if sp.codeSize > 0 && sp.fileIndex > usize.ZERO {
+      if sp.vaddr < minPc { minPc = sp.vaddr }
+      if sp.vaddr + sp.codeSize > maxPc { maxPc = sp.vaddr + sp.codeSize }
+
+      // `DW_LNE_set_address`
+      run AArch64Encode.byte(&mut line, 0)
+      run AArch64Encode.byte(&mut line, 9)
+      run AArch64Encode.byte(&mut line, 2)
+      run AArch64Encode.u64Le(&mut line, sp.vaddr)
+
+      if sp.fileIndex != usize.ONE {
+        run AArch64Encode.byte(&mut line, 4) // DW_LNS_set_file
+        run writeUleb128(&mut line, usize.toU64(sp.fileIndex))
+      }
+
+      let mut curOff: u64 = 0
+      let mut curLine: i64 = 1
+      let mut curCol: u64 = 0
+      let mut emittedAny = false
+
+      let locs = List<u64>.asSlice(&sp.locations)
+      let mut li = usize.ZERO
+      while li + usize.ONE < locs.length {
+        let off = locs[li]
+        let relPlace = locs[li + usize.ONE]
+        let placed = absolutePlace(sp.origin, relPlace)
+        if placed != 0 && off >= curOff && off < sp.codeSize {
+          let ln = u64.shiftRight(placed, 24)
+          let col = u64.bitAnd(placed, 16777215)
+          if ln > 0 {
+            let deltaPc = off - curOff
+            if deltaPc > 0 {
+              run AArch64Encode.byte(&mut line, 2) // DW_LNS_advance_pc
+              run writeUleb128(&mut line, deltaPc)
+              curOff = off
+            }
+            let targetLine = u64.toI64(ln)
+            if targetLine != curLine {
+              run AArch64Encode.byte(&mut line, 3) // DW_LNS_advance_line
+              run writeSleb128(&mut line, targetLine - curLine)
+              curLine = targetLine
+            }
+            if col != curCol {
+              run AArch64Encode.byte(&mut line, 5) // DW_LNS_set_column
+              run writeUleb128(&mut line, col)
+              curCol = col
+            }
+            run AArch64Encode.byte(&mut line, 1) // DW_LNS_copy
+            emittedAny = true
+          }
+        }
+        li = li + 2
+      }
+
+      if !emittedAny && sp.origin != 0 {
+        let origLine = u64.shiftRight(sp.origin, 24)
+        let origCol = u64.bitAnd(sp.origin, 16777215)
+        if origLine > 0 {
+          let targetLine = u64.toI64(origLine)
+          if targetLine != curLine {
+            run AArch64Encode.byte(&mut line, 3)
+            run writeSleb128(&mut line, targetLine - curLine)
+          }
+          if origCol != curCol {
+            run AArch64Encode.byte(&mut line, 5)
+            run writeUleb128(&mut line, origCol)
+          }
+          run AArch64Encode.byte(&mut line, 1)
+        }
+      }
+
+      if sp.codeSize > curOff {
+        run AArch64Encode.byte(&mut line, 2)
+        run writeUleb128(&mut line, sp.codeSize - curOff)
+      }
+      run AArch64Encode.byte(&mut line, 0)
+      run AArch64Encode.byte(&mut line, 1)
+      run AArch64Encode.byte(&mut line, 1) // DW_LNE_end_sequence
+    }
+    si = si + usize.ONE
+  }
+
+  let totalLineLen = Bytes.length(&line)
+  if totalLineLen < 4 || minPc == u64.MAX {
+    return DwarfSections.empty()
+  }
+  AArch64Encode.patchU32(&mut line, 0, usize.toU64(totalLineLen - 4))
+
+  // 2. Encode `__debug_abbrev`:
+  //    Abbrev 1: DW_TAG_compile_unit (0x11), DW_CHILDREN_yes (1)
+  //      DW_AT_producer (0x25) DW_FORM_strp (0x0E)
+  //      DW_AT_name     (0x03) DW_FORM_strp (0x0E)
+  //      DW_AT_comp_dir (0x1B) DW_FORM_strp (0x0E)
+  //      DW_AT_low_pc   (0x11) DW_FORM_addr (0x01)
+  //      DW_AT_high_pc  (0x12) DW_FORM_data8 (0x07)
+  //      DW_AT_stmt_list(0x10) DW_FORM_sec_offset (0x17)
+  //    Abbrev 2: DW_TAG_subprogram (0x2E), DW_CHILDREN_no (0)
+  //      DW_AT_name     (0x03) DW_FORM_strp (0x0E)
+  //      DW_AT_low_pc   (0x11) DW_FORM_addr (0x01)
+  //      DW_AT_high_pc  (0x12) DW_FORM_data8 (0x07)
+  //      DW_AT_decl_file(0x3A) DW_FORM_udata (0x0F)
+  //      DW_AT_decl_line(0x3B) DW_FORM_udata (0x0F)
+  let mut abbrev = Bytes.make()
+  let abbrevBytes: [u8; 34] = [
+    1, 0x11, 1,
+    0x25, 0x0E,
+    0x03, 0x0E,
+    0x1B, 0x0E,
+    0x11, 0x01,
+    0x12, 0x07,
+    0x10, 0x17,
+    0, 0,
+    2, 0x2E, 0,
+    0x03, 0x0E,
+    0x11, 0x01,
+    0x12, 0x07,
+    0x3A, 0x0F,
+    0x3B, 0x0F,
+    0, 0,
+    0, 0,
+  ]
+  run Bytes.append(&mut abbrev, &abbrevBytes)
+
+  // 3. Encode `__debug_str` and `__debug_info`.
+  let mut strtab = Bytes.make()
+  let prodOff = run internDebugStr(&mut strtab, b"silk-aarch64-direct")
+  let firstFile = Bytes.asSlice(&files[usize.ZERO])
+  let cuNameOff = run internDebugStr(&mut strtab, if firstFile.length > usize.ZERO { firstFile } else { b"main.silk" })
+  let compDirOff = run internDebugStr(&mut strtab, b"/")
+
+  let mut info = Bytes.make()
+  run AArch64Encode.u32Le(&mut info, 0) // unit_length placeholder
+  run AArch64Encode.u16Le(&mut info, 4) // DWARF version 4
+  run AArch64Encode.u32Le(&mut info, 0) // debug_abbrev_offset = 0
+  run AArch64Encode.byte(&mut info, 8)  // address_size = 8
+
+  // Compile unit DIE (abbrev 1).
+  run AArch64Encode.byte(&mut info, 1)
+  run AArch64Encode.u32Le(&mut info, prodOff)
+  run AArch64Encode.u32Le(&mut info, cuNameOff)
+  run AArch64Encode.u32Le(&mut info, compDirOff)
+  run AArch64Encode.u64Le(&mut info, minPc)
+  run AArch64Encode.u64Le(&mut info, maxPc - minPc)
+  run AArch64Encode.u32Le(&mut info, 0) // stmt_list = 0
+
+  // Subprogram DIEs (abbrev 2).
+  si = usize.ZERO
+  while si < spans.length {
+    let sp = &spans[si]
+    if sp.codeSize > 0 && sp.fileIndex > usize.ZERO {
+      let fnName = Bytes.asSlice(&sp.name)
+      let nameOff = run internDebugStr(&mut strtab, if fnName.length > usize.ZERO { fnName } else { b"<fn>" })
+      let declLine = u64.shiftRight(sp.origin, 24)
+      run AArch64Encode.byte(&mut info, 2)
+      run AArch64Encode.u32Le(&mut info, nameOff)
+      run AArch64Encode.u64Le(&mut info, sp.vaddr)
+      run AArch64Encode.u64Le(&mut info, sp.codeSize)
+      run writeUleb128(&mut info, usize.toU64(sp.fileIndex))
+      run writeUleb128(&mut info, if declLine > 0 { declLine } else { 1 })
+    }
+    si = si + usize.ONE
+  }
+  run AArch64Encode.byte(&mut info, 0) // end children of compile unit
+
+  let infoLen = Bytes.length(&info)
+  AArch64Encode.patchU32(&mut info, 0, usize.toU64(infoLen - 4))
+
+  return DwarfSections {
+    debugLine: move line,
+    debugInfo: move info,
+    debugAbbrev: move abbrev,
+    debugStr: move strtab,
+  }
+}
