@@ -17,16 +17,17 @@ import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.bytes {Bytes}
 import silk.collections.hash {Hash}
 import silk.core.option {Option}
-import silk.core.ownership {Copy}
+import silk.core.ownership {Copy, Drop}
 import silk.core.result {Result}
+import silk.mem.box {Box}
 import silk.mem.pointer {Pointer}
-import silk.mem.shared {Shared}
+import silk.concurrency.atomic {Atomic, CompareExchange, MemoryOrder}
+import silk.concurrency.sync {Arc}
 import silk.mem.interned {Interned}
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.collections.list {List}
-import silk.collections.slice {Slice}
 
 /// One canonical selected application, one C export shim, one type's drop glue, or one erased
 /// helper of an execution package or generic export. Cached projections are derived once. Caller regions are numbered canonically;
@@ -35,46 +36,164 @@ pub union InstanceKey {
   Function {
     pub application: Interned<Application>,
     identity: Interned<DeclarationId>,
-    runtime: Shared<Bytes>,
+    runtime: Arc<Bytes>,
     /// One provider per entry of the substituted requirement row, in canonical key order (D2).
-    providers: Shared<List<ProviderEntry>>,
+    providers: Arc<List<ProviderEntry>>,
     /// [`familyHash`] of `runtime`.
     family: u64,
-    encodings: Shared<KeyEncodings>,
+    encodings: EncodingsCell,
   },
   /// The C ABI definition of `export "C" fn function(...) as "symbol"`: it forwards its C lanes to
   /// the ordinary Silk instance of `function`. Its linkage name is exactly `symbol`.
-  Export {pub function: Interned<DeclarationId>, pub symbol: Shared<Bytes>},
+  Export {pub function: Interned<DeclarationId>, pub symbol: Arc<Bytes>},
   /// Cleans one complete value of `ty` through `&mut ty`: its Drop hook, then its children. The
   /// exact `ty` is its semantic identity; the runtime family erases lifetimes. Definitions use exact body-independent identity. `owner` attributes cleanup.
-  DropGlue {pub ty: Interned<Type>, owner: Interned<DeclarationId>, runtime: Shared<Bytes>, family: u64, encodings: Shared<KeyEncodings>},
+  DropGlue {pub ty: Interned<Type>, owner: Interned<DeclarationId>, runtime: Arc<Bytes>, family: u64, encodings: EncodingsCell},
   /// One erased helper that `creator` prepares at its body node `node`, called only through its
   /// address. Its MIR is prepared and lowered with the creator's. `ordinal` tells apart the
   /// helpers of one role at one node: the step of an observation, `0` for a package helper. The C
   /// thunk of a generic export's instance is the helper of that instance at node `0`
   /// ([`InstanceKey.thunk`]); any function may take its address.
-  Helper {pub creator: Shared<InstanceKey>, pub node: usize, pub ordinal: usize, pub purpose: HelperRole},
+  Helper {pub creator: Arc<InstanceKey>, pub node: usize, pub ordinal: usize, pub purpose: HelperRole},
+}
+
+// Lock-free write-once 128-bit digest slot: `state` transitions 0 (empty) -> 1 (writing) -> 2 (ready).
+// Reads on the hot path execute a single Acquire load with zero locking and zero atomic RMWs.
+struct AtomicDigest {
+  state: u8,
+  high: u64,
+  low: u64,
+}
+
+impl AtomicDigest {
+  fn empty() -> AtomicDigest {
+    return AtomicDigest {state: 0, high: 0, low: 0}
+  }
+}
+
+fn loadDigest(slot: *mut AtomicDigest) -> Option<ContentHash> {
+  let mut anchor = ()
+  let held = unsafe Pointer.borrowMut<(), AtomicDigest>(&mut anchor, slot)
+  let statePtr = Pointer.fromRef<u8>(&held.state)
+  if unsafe Atomic.load<u8>(statePtr, MemoryOrder.Acquire) == 2 {
+    return Option<ContentHash>.some(ContentHash {high: held.high, low: held.low})
+  }
+  return Option<ContentHash>.none()
+}
+
+fn storeDigest(slot: *mut AtomicDigest, digest: ContentHash) -> () {
+  let mut anchor = ()
+  let held = unsafe Pointer.borrowMut<(), AtomicDigest>(&mut anchor, slot)
+  let stateMut = Pointer.fromMutRef<u8>(&mut held.state)
+  if unsafe Atomic.load<u8>(stateMut, MemoryOrder.Acquire) == 2 { return () }
+  match unsafe Atomic.compareExchange<u8>(stateMut, 0, 1, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
+    CompareExchange<u8>.Exchanged => {
+      held.high = digest.high
+      held.low = digest.low
+      unsafe Atomic.store<u8>(stateMut, 2, MemoryOrder.Release)
+    }
+    CompareExchange<u8>.Observed {..} => ()
+  }
+  return ()
 }
 
 /// The digests of a key's unbounded identity encodings, each computed on its first use and shared
 /// by every copy of the key. The key's content never changes, so neither does a digest. Keeping
 /// digests rather than the encodings keeps a key small however deep its types are.
 struct KeyEncodings {
+  refs: usize,
   /// The digest of [`InstanceKey.exactIdentity`], which [`InstanceKey.sameApplication`] compares
   /// and build records name the key by.
-  exact: Option<ContentHash>,
+  exact: AtomicDigest,
   /// The digest of the encoding with every region erased, which [`InstanceKey.sameInstance`]
   /// compares.
-  code: Option<ContentHash>,
+  code: AtomicDigest,
   /// The [`InstanceKey.definitionDigest`] of the key's application canonicalized without its
   /// providers, which every escape walk that reaches the key records; the key's own definition
   /// digest when it has no providers or the bare key cannot be formed.
-  bare: Option<ContentHash>,
+  bare: AtomicDigest,
+  root: UnrootedEncodings | RootedEncodings,
 }
 
-effect fn emptyEncodings() -> Shared<KeyEncodings> ! OutOfMemoryError ? &mut Allocator {
-  return run Shared<KeyEncodings>.make(KeyEncodings {exact: Option<ContentHash>.none(), code: Option<ContentHash>.none(),
-    bare: Option<ContentHash>.none()})
+struct UnrootedEncodings {}
+struct RootedEncodings {
+  storage: Box<KeyEncodings>,
+}
+
+// Single-allocation atomic-refcounted handle to `KeyEncodings` with interior `*mut` provenance
+// for lock-free write-once digest caching across `NativeThread` codegen workers.
+struct EncodingsCell {
+  cell: *mut KeyEncodings,
+}
+
+impl EncodingsCell {
+  effect fn make() -> EncodingsCell ! OutOfMemoryError ? &mut Allocator {
+    let mut storage = run Box<KeyEncodings>.make(KeyEncodings {
+      refs: usize.ONE,
+      exact: AtomicDigest.empty(),
+      code: AtomicDigest.empty(),
+      bare: AtomicDigest.empty(),
+      root: UnrootedEncodings {},
+    })
+    let cell = Pointer.fromMutRef<KeyEncodings>(&mut storage.getMut()[0])
+    let mut anchor = ()
+    unsafe {
+      let fresh = Pointer.borrowMut<(), KeyEncodings>(&mut anchor, cell)
+      fresh.root = RootedEncodings {storage: move storage}
+    }
+    return EncodingsCell {cell: cell}
+  }
+
+  fn clone(self: &Self) -> EncodingsCell {
+    let mut anchor = ()
+    let held = unsafe Pointer.borrowMut<(), KeyEncodings>(&mut anchor, self.cell)
+    let _prev = unsafe Atomic.fetchAdd<usize>(Pointer.fromMutRef<usize>(&mut held.refs), usize.ONE, MemoryOrder.Relaxed)
+    return EncodingsCell {cell: self.cell}
+  }
+
+  fn address(self: &Self) -> usize {
+    return Pointer.address<KeyEncodings>(self.cell)
+  }
+
+  fn exactPtr(self: &Self) -> *mut AtomicDigest {
+    let mut anchor = ()
+    let held = unsafe Pointer.borrowMut<(), KeyEncodings>(&mut anchor, self.cell)
+    return Pointer.fromMutRef<AtomicDigest>(&mut held.exact)
+  }
+
+  fn codePtr(self: &Self) -> *mut AtomicDigest {
+    let mut anchor = ()
+    let held = unsafe Pointer.borrowMut<(), KeyEncodings>(&mut anchor, self.cell)
+    return Pointer.fromMutRef<AtomicDigest>(&mut held.code)
+  }
+
+  fn barePtr(self: &Self) -> *mut AtomicDigest {
+    let mut anchor = ()
+    let held = unsafe Pointer.borrowMut<(), KeyEncodings>(&mut anchor, self.cell)
+    return Pointer.fromMutRef<AtomicDigest>(&mut held.bare)
+  }
+}
+
+fn releaseEncodingsBox(storage: Box<KeyEncodings>) -> () { return () }
+
+impl Drop for EncodingsCell {
+  fn drop(self: &mut EncodingsCell) -> () {
+    let mut anchor = ()
+    let held = unsafe Pointer.borrowMut<(), KeyEncodings>(&mut anchor, self.cell)
+    if unsafe Atomic.fetchSubtract<usize>(Pointer.fromMutRef<usize>(&mut held.refs), usize.ONE, MemoryOrder.Release) == usize.ONE {
+      Atomic.fence(MemoryOrder.Acquire)
+      let root = Intrinsic.replace(held.root, UnrootedEncodings {})
+      match move root {
+        RootedEncodings {storage} => releaseEncodingsBox(move storage)
+        UnrootedEncodings _none => ()
+      }
+    }
+    return ()
+  }
+}
+
+effect fn emptyEncodings() -> EncodingsCell ! OutOfMemoryError ? &mut Allocator {
+  return run EncodingsCell.make()
 }
 
 /// What an erased helper does.
@@ -276,12 +395,10 @@ impl InstanceKey {
     // equals what [`InstanceKey.encoding`] computes. Seeding the digest spares the first exact
     // comparison of this key from encoding it again.
     if let Option<InstanceKey>.Some {value: chosen} = &best {
-      if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(&chosen) {
+      if let Option<EncodingsCell>.Some {value: cache} = move encodingsOf(&chosen) {
         let runtime = run InstanceKey.runtimeEncoding(&chosen)
         let digest = identityOf(Bytes.asSlice(&runtime), Bytes.asSlice(&bestRecord))
-        Shared<KeyEncodings>.withMut<()>(&cache, |encodings: &mut KeyEncodings| -> () {
-          encodings.exact = Option<ContentHash>.some(digest)
-        })
+        storeDigest(EncodingsCell.exactPtr(&cache), digest)
       }
     }
     return match move best {
@@ -363,16 +480,16 @@ impl InstanceKey {
       application: run Types.internApplication(move application),
       identity: move identity,
       family: family,
-      runtime: run Shared<Bytes>.make(move runtime),
-      providers: run Shared<List<ProviderEntry>>.make(move providers),
+      runtime: run Arc<Bytes>.make(move runtime),
+      providers: run Arc<List<ProviderEntry>>.make(move providers),
       encodings: run emptyEncodings(),
     })
   }
   /// The providers serving this instance's requirement row; none for other keys.
-  pub fn providers(self: &Self) -> Option<Shared<List<ProviderEntry>>> {
+  pub fn providers(self: &Self) -> Option<Arc<List<ProviderEntry>>> {
     return match &self.* {
-      InstanceKey.Function {providers, ..} => Option<Shared<List<ProviderEntry>>>.some(Shared<List<ProviderEntry>>.clone(&providers))
-      _ => Option<Shared<List<ProviderEntry>>>.none()
+      InstanceKey.Function {providers, ..} => Option<Arc<List<ProviderEntry>>>.some(Arc<List<ProviderEntry>>.clone(&providers))
+      _ => Option<Arc<List<ProviderEntry>>>.none()
     }
   }
   /// The drop glue of `ty`, or absence when the type mentions no declaration that could own cleanup.
@@ -425,7 +542,7 @@ impl InstanceKey {
       if !Numbering.bytes(&mut numbering, RuntimeEncoding.declarationPayload(&owner)) { return failedGlue(&numbering) }
       let family = familyHash(&runtime)
       let candidate = InstanceKey.DropGlue {ty: move ty, family: family,
-        owner: run Types.internDeclaration(DeclarationId.copy(&owner)), runtime: run Shared<Bytes>.make(move runtime),
+        owner: run Types.internDeclaration(DeclarationId.copy(&owner)), runtime: run Arc<Bytes>.make(move runtime),
         encodings: run emptyEncodings()}
       let available = Numbering.remainingBytes(&numbering)
       let mut coordinates = RuntimeEncoding.limitedCoordinates(available)
@@ -487,20 +604,20 @@ impl InstanceKey {
       InstanceKey.Function {application, identity, runtime, providers, family, encodings} => InstanceKey.Function {
         application: Interned<Application>.clone(&application),
         identity: Interned<DeclarationId>.clone(&identity),
-        runtime: Shared<Bytes>.clone(&runtime),
-        providers: Shared<List<ProviderEntry>>.clone(&providers),
+        runtime: Arc<Bytes>.clone(&runtime),
+        providers: Arc<List<ProviderEntry>>.clone(&providers),
         family: family,
-        encodings: Shared<KeyEncodings>.clone(&encodings),
+        encodings: EncodingsCell.clone(&encodings),
       }
       InstanceKey.Export {function, symbol} => InstanceKey.Export {
-        function: Interned<DeclarationId>.clone(&function), symbol: Shared<Bytes>.clone(&symbol),
+        function: Interned<DeclarationId>.clone(&function), symbol: Arc<Bytes>.clone(&symbol),
       }
       InstanceKey.DropGlue {ty, owner, runtime, family, encodings} => InstanceKey.DropGlue {
-        ty: Interned<Type>.clone(&ty), owner: Interned<DeclarationId>.clone(&owner), runtime: Shared<Bytes>.clone(&runtime), family: family,
-        encodings: Shared<KeyEncodings>.clone(&encodings),
+        ty: Interned<Type>.clone(&ty), owner: Interned<DeclarationId>.clone(&owner), runtime: Arc<Bytes>.clone(&runtime), family: family,
+        encodings: EncodingsCell.clone(&encodings),
       }
       InstanceKey.Helper {creator, node, ordinal, purpose} => InstanceKey.Helper {
-        creator: Shared<InstanceKey>.clone(&creator), node: node, ordinal: ordinal, purpose: purpose,
+        creator: Arc<InstanceKey>.clone(&creator), node: node, ordinal: ordinal, purpose: purpose,
       }
     }
   }
@@ -509,13 +626,13 @@ impl InstanceKey {
       InstanceKey.Function {identity, ..} => Interned<DeclarationId>.clone(&identity)
       InstanceKey.Export {function, ..} => Interned<DeclarationId>.clone(&function)
       InstanceKey.DropGlue {owner, ..} => Interned<DeclarationId>.clone(&owner)
-      InstanceKey.Helper {creator, ..} => Shared<InstanceKey>.with<Interned<DeclarationId>>(&creator, InstanceKey.identity)
+      InstanceKey.Helper {creator, ..} => InstanceKey.identity(Arc<InstanceKey>.get(&creator))
     }
   }
   /// The C thunk of `target`, one instantiation of a generic export. Its symbol is derived from
   /// the instantiation, so every distinct instantiation has its own thunk.
   pub effect fn thunk(target: &InstanceKey) -> InstanceKey ! OutOfMemoryError ? &mut Allocator {
-    return InstanceKey.Helper {creator: run Shared<InstanceKey>.make(InstanceKey.copy(target)), node: usize.ZERO,
+    return InstanceKey.Helper {creator: run Arc<InstanceKey>.make(InstanceKey.copy(target)), node: usize.ZERO,
       ordinal: usize.ZERO, purpose: HelperRole.Thunk}
   }
   /// Whether C code enters this definition: an export shim or a generic export's thunk. Its lanes
@@ -535,10 +652,10 @@ impl InstanceKey {
     }
   }
   /// The exact linkage name of a C export shim; every other key derives its symbol from content.
-  pub fn exportSymbol(self: &Self) -> Option<Shared<Bytes>> {
+  pub fn exportSymbol(self: &Self) -> Option<Arc<Bytes>> {
     return match & self.* {
-      InstanceKey.Export {symbol, ..} => Option<Shared<Bytes>>.some(Shared<Bytes>.clone(&symbol))
-      _ => Option<Shared<Bytes>>.none()
+      InstanceKey.Export {symbol, ..} => Option<Arc<Bytes>>.some(Arc<Bytes>.clone(&symbol))
+      _ => Option<Arc<Bytes>>.none()
     }
   }
   /// The cleaned type of a drop glue instance.
@@ -570,7 +687,7 @@ impl InstanceKey {
   }
   /// The `ContentHash` of [`exactIdentity`], computed once per key and kept with it.
   pub effect fn identityDigest(self: &Self) -> ContentHash ! OutOfMemoryError ? &mut Allocator {
-    if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(self) {
+    if let Option<EncodingsCell>.Some {value: cache} = move encodingsOf(self) {
       return run cachedDigest(self, &cache, true)
     }
     return ContentHash.of(Bytes.asSlice(&run InstanceKey.exactIdentity(self)))
@@ -579,7 +696,7 @@ impl InstanceKey {
   /// and the name a walk's record gives an instance it reached. Lifetimes never decide which code
   /// runs (IMPL-007), so this does not depend on which pattern a process reached first.
   pub effect fn definitionDigest(self: &Self) -> ContentHash ! OutOfMemoryError ? &mut Allocator {
-    if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(self) {
+    if let Option<EncodingsCell>.Some {value: cache} = move encodingsOf(self) {
       return run cachedDigest(self, &cache, false)
     }
     return run freshDigest(self, false)
@@ -597,10 +714,10 @@ impl InstanceKey {
   pub fn runtimeHash(self: &Self) -> u64 {
     return match & self.* {
       InstanceKey.Function {family, ..} => family
-      InstanceKey.Export {symbol, ..} => Shared<Bytes>.with<u64>(&symbol, familyHash)
+      InstanceKey.Export {symbol, ..} => familyHash(Arc<Bytes>.get(&symbol))
       InstanceKey.DropGlue {family, ..} => family
       InstanceKey.Helper {creator, node, ordinal, purpose} => Hash.mix(&Hash.seed(Hash.mix(&Hash.seed(Hash.mix(&Hash.seed(
-        Shared<InstanceKey>.with<u64>(&creator, InstanceKey.runtimeHash)), usize.toU64(node))), usize.toU64(ordinal))),
+        InstanceKey.runtimeHash(Arc<InstanceKey>.get(&creator))), usize.toU64(node))), usize.toU64(ordinal))),
         roleWord(purpose))
     }
   }
@@ -626,14 +743,14 @@ impl InstanceKey {
       }
     }
   }
-  fn runtimeBytes(self: &Self) -> Option<Shared<Bytes>> {
+  fn runtimeBytes(self: &Self) -> Option<Arc<Bytes>> {
     return match & self.* {
-      InstanceKey.Function {runtime, ..} => Option<Shared<Bytes>>.some(
-        Shared<Bytes>.clone(&runtime),
+      InstanceKey.Function {runtime, ..} => Option<Arc<Bytes>>.some(
+        Arc<Bytes>.clone(&runtime),
       )
-      InstanceKey.Export {..} => Option<Shared<Bytes>>.none()
-      InstanceKey.DropGlue {runtime, ..} => Option<Shared<Bytes>>.some(Shared<Bytes>.clone(&runtime))
-      InstanceKey.Helper {..} => Option<Shared<Bytes>>.none()
+      InstanceKey.Export {..} => Option<Arc<Bytes>>.none()
+      InstanceKey.DropGlue {runtime, ..} => Option<Arc<Bytes>>.some(Arc<Bytes>.clone(&runtime))
+      InstanceKey.Helper {..} => Option<Arc<Bytes>>.none()
     }
   }
   /// Canonical erased family bytes. Complete code identity additionally includes selected MIR.
@@ -653,8 +770,7 @@ impl InstanceKey {
       // site, ordinal and role.
       let mut encoded = Bytes.make()
       run RuntimeEncoding.word(&mut encoded, 6)
-      let created = Shared<InstanceKey>.with<InstanceKey>(&creator, InstanceKey.copy)
-      let base = run InstanceKey.runtimeEncoding(&created)
+      let base = run InstanceKey.runtimeEncoding(Arc<InstanceKey>.get(&creator))
       run RuntimeEncoding.field(&mut encoded, Bytes.asSlice(&base))
       run RuntimeEncoding.word(&mut encoded, usize.toU64(node))
       run RuntimeEncoding.word(&mut encoded, usize.toU64(ordinal))
@@ -662,8 +778,8 @@ impl InstanceKey {
       return move encoded
     }
     let runtime = match move InstanceKey.runtimeBytes(self) {
-      Option<Shared<Bytes>>.Some {value} => move value
-      Option<Shared<Bytes>>.None => { return absurd<Bytes>() }
+      Option<Arc<Bytes>>.Some {value} => move value
+      Option<Arc<Bytes>>.None => { return absurd<Bytes>() }
     }
     return run copyShared(&runtime)
   }
@@ -691,22 +807,11 @@ impl InstanceKey {
         let identityField = run RuntimeEncoding.openField(&mut output)
         run Application.encodeInto(&selected, &mut output, true, &mut coordinates.*)
         RuntimeEncoding.closeField(&mut output, identityField, &mut coordinates.*)
-        let count = Shared<List<ProviderEntry>>.with<usize>(
-          &providers,
-          |entries: &List<ProviderEntry>| -> usize {
-            return List<ProviderEntry>.length(entries)
-          },
-        )
-        run RuntimeEncoding.recordWord(&mut output, usize.toU64(count), &mut coordinates.*)
+        let entries = List<ProviderEntry>.asSlice(Arc<List<ProviderEntry>>.get(&providers))
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(entries.length), &mut coordinates.*)
         let mut at = usize.ZERO
-        while at < count {
-          let entry = Shared<List<ProviderEntry>>.with<ProviderEntry>(
-            &providers,
-            |entries: &List<ProviderEntry>| -> ProviderEntry {
-              let listed = List<ProviderEntry>.asSlice(entries)
-              return ProviderEntry.copy(&listed[at])
-            },
-          )
+        while at < entries.length {
+          let entry = &entries[at]
           let capabilityField = run RuntimeEncoding.openField(&mut output)
           run Type.encodeInto(&mut output, &entry.key.capability, Application.bodyDeclaration(&selected), true, &mut coordinates.*)
           RuntimeEncoding.closeField(&mut output, capabilityField, &mut coordinates.*)
@@ -729,10 +834,9 @@ impl InstanceKey {
         if !RuntimeEncoding.declarationFits(&function, &mut coordinates.*) { return Bytes.make() }
         let declaration = DeclarationId.copyShared(&function)
         run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
-        let count = Shared<Bytes>.with<usize>(&symbol, Bytes.length)
-        if !RuntimeEncoding.recordPayload(&mut coordinates.*, count) { return Bytes.make() }
-        let symbolBytes = run copyShared(&symbol)
-        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&symbolBytes), &mut coordinates.*)
+        let symbolSlice = Bytes.asSlice(Arc<Bytes>.get(&symbol))
+        if !RuntimeEncoding.recordPayload(&mut coordinates.*, symbolSlice.length) { return Bytes.make() }
+        run RuntimeEncoding.recordField(&mut output, symbolSlice, &mut coordinates.*)
       }
       InstanceKey.DropGlue {ty, owner, ..} => {
         run RuntimeEncoding.recordWord(&mut output, 2, &mut coordinates.*)
@@ -744,8 +848,7 @@ impl InstanceKey {
       }
       InstanceKey.Helper {creator, node, ordinal, purpose} => {
         run RuntimeEncoding.recordWord(&mut output, 4, &mut coordinates.*)
-        let creating = Shared<InstanceKey>.with<InstanceKey>(&creator, InstanceKey.copy)
-        let created = run InstanceKey.encodingAt(&creating, &mut coordinates.*)
+        let created = run InstanceKey.encodingAt(Arc<InstanceKey>.get(&creator), &mut coordinates.*)
         if coordinates.exceeded { return Bytes.make() }
         run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&created), &mut coordinates.*)
         run RuntimeEncoding.recordWord(&mut output, usize.toU64(node), &mut coordinates.*)
@@ -757,7 +860,7 @@ impl InstanceKey {
   }
   /// Definitions and references use the same body-independent linkage symbol, even in cycles.
   pub effect fn symbol(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-    if let Option<Shared<Bytes>>.Some {value} = move InstanceKey.exportSymbol(self) {
+    if let Option<Arc<Bytes>>.Some {value} = move InstanceKey.exportSymbol(self) {
       return run copyShared(&value)
     }
     let identity = run InstanceKey.encoding(self)
@@ -765,7 +868,7 @@ impl InstanceKey {
   }
   /// A stable family label for worklist ordering and diagnostics, never an emitted symbol.
   pub effect fn runtimeName(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-    if let Option<Shared<Bytes>>.Some {value} = move InstanceKey.exportSymbol(self) {
+    if let Option<Arc<Bytes>>.Some {value} = move InstanceKey.exportSymbol(self) {
       return run copyShared(&value)
     }
     let runtime = run InstanceKey.runtimeEncoding(self)
@@ -794,10 +897,10 @@ impl InstanceKey {
     return match &self.* {
       InstanceKey.Export {..} => Option<NameOrder>.none()
       InstanceKey.Function {family, runtime, ..} => Option<NameOrder>.some(NameOrder {
-        first: family, second: Shared<Bytes>.with<u64>(&runtime, secondHash),
+        first: family, second: secondHash(Arc<Bytes>.get(&runtime)),
       })
       InstanceKey.DropGlue {family, runtime, ..} => Option<NameOrder>.some(NameOrder {
-        first: family, second: Shared<Bytes>.with<u64>(&runtime, secondHash),
+        first: family, second: secondHash(Arc<Bytes>.get(&runtime)),
       })
       InstanceKey.Helper {..} => {
         let runtime = run InstanceKey.runtimeEncoding(self)
@@ -849,11 +952,11 @@ fn secondHash(runtime: &Bytes) -> u64 {
 }
 
 // The cached encodings of a function or drop glue key; other keys are cheap to encode.
-fn encodingsOf(key: &InstanceKey) -> Option<Shared<KeyEncodings>> {
+fn encodingsOf(key: &InstanceKey) -> Option<EncodingsCell> {
   return match &key.* {
-    InstanceKey.Function {encodings, ..} => Option<Shared<KeyEncodings>>.some(Shared<KeyEncodings>.clone(&encodings))
-    InstanceKey.DropGlue {encodings, ..} => Option<Shared<KeyEncodings>>.some(Shared<KeyEncodings>.clone(&encodings))
-    _ => Option<Shared<KeyEncodings>>.none()
+    InstanceKey.Function {encodings, ..} => Option<EncodingsCell>.some(EncodingsCell.clone(&encodings))
+    InstanceKey.DropGlue {encodings, ..} => Option<EncodingsCell>.some(EncodingsCell.clone(&encodings))
+    _ => Option<EncodingsCell>.none()
   }
 }
 
@@ -874,46 +977,33 @@ fn identityOf(runtime: &[u8], exact: &[u8]) -> ContentHash {
 }
 
 // The digest `exact` selects, computed into `cache` unless an earlier use already did.
-effect fn cachedDigest(key: &InstanceKey, cache: &Shared<KeyEncodings>, exact: bool) -> ContentHash
+effect fn cachedDigest(key: &InstanceKey, cache: &EncodingsCell, exact: bool) -> ContentHash
 ! OutOfMemoryError ? &mut Allocator {
-  let kept = Shared<KeyEncodings>.with<Option<ContentHash>>(cache, |encodings: &KeyEncodings| -> Option<ContentHash> {
-    let mut held = &encodings.code
-    if exact { held = &encodings.exact }
-    if let Option<ContentHash>.Some {value} = &held.* { return Option<ContentHash>.some(value) }
-    return Option<ContentHash>.none()
-  })
-  if let Option<ContentHash>.Some {value} = move kept { return value }
+  let slot = if exact { EncodingsCell.exactPtr(cache) } else { EncodingsCell.codePtr(cache) }
+  if let Option<ContentHash>.Some {value} = move loadDigest(slot) { return value }
   let computed = run freshDigest(key, exact)
-  Shared<KeyEncodings>.withMut<()>(cache, |encodings: &mut KeyEncodings| -> () {
-    if exact { encodings.exact = Option<ContentHash>.some(computed) } else { encodings.code = Option<ContentHash>.some(computed) }
-  })
+  storeDigest(slot, computed)
   return computed
 }
 
 impl InstanceKey {
   /// The bare definition digest [`InstanceKey.keepBare`] kept for this key and its copies, if any.
   pub fn keptBare(self: &Self) -> Option<ContentHash> {
-    if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(self) {
-      return Shared<KeyEncodings>.with<Option<ContentHash>>(&cache, |encodings: &KeyEncodings| -> Option<ContentHash> {
-        return encodings.bare
-      })
+    if let Option<EncodingsCell>.Some {value: cache} = move encodingsOf(self) {
+      return loadDigest(EncodingsCell.barePtr(&cache))
     }
     return Option<ContentHash>.none()
   }
   /// Keeps `digest` as the bare definition digest of this key and every copy of it.
   pub fn keepBare(self: &Self, digest: ContentHash) -> () {
-    if let Option<Shared<KeyEncodings>>.Some {value: cache} = move encodingsOf(self) {
-      Shared<KeyEncodings>.withMut<()>(&cache, |encodings: &mut KeyEncodings| -> () {
-        encodings.bare = Option<ContentHash>.some(digest)
-      })
+    if let Option<EncodingsCell>.Some {value: cache} = move encodingsOf(self) {
+      storeDigest(EncodingsCell.barePtr(&cache), digest)
     }
   }
 }
 
-fn cacheAddress(cache: &Shared<KeyEncodings>) -> usize {
-  return Shared<KeyEncodings>.with<usize>(cache, |encodings: &KeyEncodings| -> usize {
-    return Pointer.address<KeyEncodings>(Pointer.fromRef<KeyEncodings>(encodings))
-  })
+fn cacheAddress(cache: &EncodingsCell) -> usize {
+  return EncodingsCell.address(cache)
 }
 
 // Whether two keys have one unbounded encoding: [`InstanceKey.exactIdentity`] when `exact`,
@@ -921,9 +1011,8 @@ fn cacheAddress(cache: &Shared<KeyEncodings>) -> usize {
 // digests are, as for every content the build cache names. Function and drop glue keys digest
 // once and compare their caches.
 effect fn sameDigest(left: &InstanceKey, right: &InstanceKey, exact: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
-  if let Option<Shared<KeyEncodings>>.Some {value: first} = move encodingsOf(left) {
-    if let Option<Shared<KeyEncodings>>.Some {value: second} = move encodingsOf(right) {
-      // Copies of one key share its cache, and two borrows of one cache would trap.
+  if let Option<EncodingsCell>.Some {value: first} = move encodingsOf(left) {
+    if let Option<EncodingsCell>.Some {value: second} = move encodingsOf(right) {
       if cacheAddress(&first) == cacheAddress(&second) { return true }
       let one = run cachedDigest(left, &first, exact)
       let other = run cachedDigest(right, &second, exact)
@@ -936,64 +1025,31 @@ effect fn sameDigest(left: &InstanceKey, right: &InstanceKey, exact: bool) -> bo
 }
 
 // Whether two package helpers' creators share one erased family.
-fn sameCreator(left: &Shared<InstanceKey>, right: &Shared<InstanceKey>) -> bool {
-  let first = Shared<InstanceKey>.with<InstanceKey>(left, InstanceKey.copy)
-  let second = Shared<InstanceKey>.with<InstanceKey>(right, InstanceKey.copy)
-  return InstanceKey.sameRuntimeBase(&first, &second)
+fn sameCreator(left: &Arc<InstanceKey>, right: &Arc<InstanceKey>) -> bool {
+  return InstanceKey.sameRuntimeBase(Arc<InstanceKey>.get(left), Arc<InstanceKey>.get(right))
 }
 
 fn familyHash(runtime: &Bytes) -> u64 {
   return InternIndex.hashBytes(Hash.mix(&Hash.seed(0), 0), Bytes.asSlice(runtime))
 }
 
-// Copies shared bytes without letting a borrow escape the handle.
-effect fn copyShared(value: &Shared<Bytes>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let count = Shared<Bytes>.with<usize>(value,
-    |bytes: &Bytes| -> usize { return Bytes.asSlice(bytes).length })
-  let mut copied = run Bytes.zeroed(count)
-  let target = Bytes.asMutSlice(&mut copied)
-  Shared<Bytes>.with<()>(value, |bytes: &Bytes| -> () {
-    return Slice.copyInto<u8>(move target, usize.ZERO, Bytes.asSlice(bytes))
-  })
-  return move copied
+effect fn copyShared(value: &Arc<Bytes>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  return run Bytes.copy(Bytes.asSlice(Arc<Bytes>.get(value)))
 }
 
-effect fn appendShared(output: &mut Bytes, value: &Shared<Bytes>) -> () ! OutOfMemoryError ? &mut Allocator {
-  let copied = run copyShared(value)
-  return run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&copied))
+effect fn appendShared(output: &mut Bytes, value: &Arc<Bytes>) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(Arc<Bytes>.get(value)))
 }
 
-fn sameRuntime(left: &Shared<Bytes>, right: &Shared<Bytes>) -> bool {
-  let firstAddress = Shared<Bytes>.with<usize>(
-    left,
-    |value: &Bytes| -> usize {
-      return Pointer.address<Bytes>(Pointer.fromRef<Bytes>(value))
-    },
-  )
-  let secondAddress = Shared<Bytes>.with<usize>(
-    right,
-    |value: &Bytes| -> usize {
-      return Pointer.address<Bytes>(Pointer.fromRef<Bytes>(value))
-    },
-  )
+fn sameRuntime(left: &Arc<Bytes>, right: &Arc<Bytes>) -> bool {
+  let first = Arc<Bytes>.get(left)
+  let second = Arc<Bytes>.get(right)
+  let firstAddress = Pointer.address<Bytes>(Pointer.fromRef<Bytes>(first))
+  let secondAddress = Pointer.address<Bytes>(Pointer.fromRef<Bytes>(second))
   if firstAddress == secondAddress {
     return true
   }
-  return Shared<Bytes>.with<bool>(
-    left,
-    |first: &Bytes| -> bool {
-      return sameRuntimeRight(first, right)
-    },
-  )
-}
-
-fn sameRuntimeRight(first: &Bytes, right: &Shared<Bytes>) -> bool {
-  return Shared<Bytes>.with<bool>(
-    right,
-    |second: &Bytes| -> bool {
-      return RuntimeEncoding.equals(Bytes.asSlice(first), Bytes.asSlice(second))
-    },
-  )
+  return RuntimeEncoding.equals(Bytes.asSlice(first), Bytes.asSlice(second))
 }
 
 

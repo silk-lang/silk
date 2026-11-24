@@ -1,4 +1,4 @@
-//! Hash-bucketed lookup for append-only tables interned under a structural equality.
+//! Open-addressed hash index for append-only tables interned under a structural equality.
 //!
 //! # When to use
 //! Use [`InternIndex`] beside a `List` whose entries are interned under an equality that cannot
@@ -8,89 +8,128 @@
 //!
 //! # Details
 //! Entries recorded under one hash are presented oldest first, so a lookup finds the same equal
-//! entry a full scan of the table finds first. Each bucket chains its entries in table order and
-//! the bucket count doubles before it falls under four thirds of the entry count, so recording
-//! and finding the first candidate take expected constant time. Only entries whose hashes collide
-//! reach the caller's comparison.
+//! entry a full scan of the table finds first. Distinct hashes occupy one slot each in an
+//! `h2`-tagged open-addressed linear-probing table (1-byte control tag per slot plus 4-byte entry
+//! index) that doubles before exceeding 75% load, while entries sharing the exact same 64-bit hash
+//! link in insertion order via `successors`. Only entries whose hashes match reach the caller's
+//! comparison.
 //!
 //! # Gotchas
 //! The index cannot check the caller's hash. A hash that differs for two equal values lets the
 //! table hold both, and a lookup then finds only the entry recorded under the probe's own hash.
 
-import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import silk.collections.list {List}
 
-/// The entries of one append-only table, bucketed by caller-computed hashes.
+/// The entries of one append-only table, indexed by caller-computed hashes.
 pub struct InternIndex {
-  // Each bucket's oldest and newest entry plus one, or zero for an empty bucket. Entries are
-  // 32-bit: the semantic store's largest tables hold millions of entries, and their indexes are a
-  // large share of its memory.
-  heads: List<u32>,
-  tails: List<u32>,
-  // For each recorded entry, its hash and the next newer entry in its bucket, or `u32.MAX`.
+  // Open-addressed control bytes: `0` is empty; `0x80 | h2(mixed)` marks an occupied slot.
+  controls: List<u8>,
+  // For each occupied slot in `controls`, the oldest entry recorded under its exact 64-bit hash.
+  slots: List<u32>,
+  // For each recorded entry, its hash and the next newer entry with the exact same hash, or `u32.MAX`.
   hashes: List<u64>,
   successors: List<u32>,
 }
 
-// The bucket of one hash in a power-of-two table. The hash is mixed first, so callers may key
-// entries by small ordinals.
-fn bucketOf(hash: u64, width: usize) -> usize {
-  return u64.toUsize(u64.bitAnd(Hash.mix(&Hash.seed(0), hash), usize.toU64(width - usize.ONE)))
+fn fullWord(bytes: &[u8], start: usize) -> u64 {
+  unsafe {
+    let base = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+    return Pointer.readUnaligned<u64>(
+      Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(Pointer.at<u8>(base, start)),
+    )
+  }
 }
 
-// The first entry, from `entry` along its bucket chain, recorded under exactly `hash`.
-fn withHash(index: &InternIndex, entry: u32, hash: u64) -> usize {
-  let mut at = entry
-  while at != u32.MAX && List<u64>.get(&index.hashes, u32.toUsize(at)) != hash {
-    at = List<u32>.get(&index.successors, u32.toUsize(at))
-  }
-  if at == u32.MAX { return usize.MAX }
-  return u32.toUsize(at)
+fn mixHash(hash: u64) -> u64 {
+  return Hash.mix(&Hash.seed(0), hash)
 }
 
-// Appends one recorded entry to the tail of its bucket chain.
-fn link(index: &mut InternIndex, entry: usize, width: usize) -> () {
-  let bucket = bucketOf(List<u64>.get(&index.hashes, entry), width)
-  let tail = List<u32>.get(&index.tails, bucket)
-  let next = usize.toU32(entry + usize.ONE)
-  if tail == 0 {
-    List<u32>.set(&mut index.heads, bucket, next)
-  } else {
-    List<u32>.set(&mut index.successors, u32.toUsize(tail) - usize.ONE, usize.toU32(entry))
+// 7-bit fingerprint with high bit set so every occupied control byte is non-zero.
+fn controlTag(mixed: u64) -> u8 {
+  return u64.toU8(u64.bitOr(u64.shiftRight(mixed, 57), 128))
+}
+
+fn homeSlot(mixed: u64, mask: usize) -> usize {
+  return u64.toUsize(u64.bitAnd(mixed, usize.toU64(mask)))
+}
+
+fn insertSlot(
+  controls: &mut List<u8>,
+  slots: &mut List<u32>,
+  hashes: &[u64],
+  successors: &mut List<u32>,
+  entry: usize,
+  hash: u64,
+) -> () {
+  let mut ctrlSlice = List<u8>.asMutSlice(&mut controls.*)
+  let mut slotSlice = List<u32>.asMutSlice(&mut slots.*)
+  let mut succSlice = List<u32>.asMutSlice(&mut successors.*)
+  let mask = ctrlSlice.length - usize.ONE
+  let mixed = mixHash(hash)
+  let tag = controlTag(mixed)
+  let mut pos = homeSlot(mixed, mask)
+  while true {
+    let ctrl = ctrlSlice[pos]
+    if ctrl == 0 {
+      ctrlSlice[pos] = tag
+      slotSlice[pos] = usize.toU32(entry)
+      return ()
+    }
+    if ctrl == tag {
+      let head = u32.toUsize(slotSlice[pos])
+      if hashes[head] == hash {
+        let mut tail = head
+        while succSlice[tail] != u32.MAX {
+          tail = u32.toUsize(succSlice[tail])
+        }
+        succSlice[tail] = usize.toU32(entry)
+        return ()
+      }
+    }
+    pos = usize.bitAnd(pos + usize.ONE, mask)
   }
-  List<u32>.set(&mut index.tails, bucket, next)
   return ()
 }
 
-effect fn emptyBuckets(width: usize) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
-  let mut buckets = run List<u32>.makeWithCapacity(width)
-  run List<u32>.appendRepeated(&mut buckets, 0, width)
-  return move buckets
+effect fn emptyControls(width: usize) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut controls = run List<u8>.makeWithCapacity(width)
+  run List<u8>.appendRepeated(&mut controls, 0, width)
+  return move controls
 }
 
-// Relinks every recorded entry, in table order, into a table of `width` buckets.
+effect fn emptySlots(width: usize) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut slots = run List<u32>.makeWithCapacity(width)
+  run List<u32>.appendRepeated(&mut slots, 0, width)
+  return move slots
+}
+
+// Rebuilds the open-addressed table to `width` slots, relinking every recorded entry in order.
 effect fn rebuild(index: &mut InternIndex, width: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  let heads = run emptyBuckets(width)
-  let tails = run emptyBuckets(width)
-  index.heads = move heads
-  index.tails = move tails
+  let mut controls = run emptyControls(width)
+  let mut slots = run emptySlots(width)
   let count = List<u64>.length(&index.hashes)
+  let hashes = List<u64>.asSlice(&index.hashes)
   let mut entry = usize.ZERO
   while entry < count {
     List<u32>.set(&mut index.successors, entry, u32.MAX)
-    link(&mut index.*, entry, width)
+    insertSlot(&mut controls, &mut slots, hashes, &mut index.successors, entry, hashes[entry])
     entry = entry + usize.ONE
   }
+  drop hashes
+  index.controls = move controls
+  index.slots = move slots
   return ()
 }
 
 impl InternIndex {
-  /// Folds a byte string's length and then each byte into `start`.
+  /// Folds a byte string's length and then its bytes in 8-byte words into `start`.
   ///
   /// # Details
   ///
@@ -100,53 +139,88 @@ impl InternIndex {
   pub fn hashBytes(start: u64, bytes: &[u8]) -> u64 {
     let mut hashed = Hash.combine(start, usize.toU64(bytes.length))
     let mut at = usize.ZERO
-    while at < bytes.length {
-      hashed = Hash.combine(hashed, u8.toU64(bytes[at]))
-      at = at + usize.ONE
+    while at + 8 <= bytes.length {
+      hashed = Hash.combine(hashed, fullWord(bytes, at))
+      at = at + 8
+    }
+    if at < bytes.length {
+      let mut tail: u64 = 0
+      let mut shift: u64 = 0
+      while at < bytes.length {
+        tail = u64.bitOr(tail, u64.shiftLeft(u8.toU64(bytes[at]), shift))
+        shift = shift + 8
+        at = at + usize.ONE
+      }
+      hashed = Hash.combine(hashed, tail)
     }
     return hashed
   }
+
   /// Creates an index that has recorded no entry. It allocates nothing until the first record.
   pub fn make() -> InternIndex {
     return InternIndex {
-      heads: List<u32>.make(),
-      tails: List<u32>.make(),
+      controls: List<u8>.make(),
+      slots: List<u32>.make(),
       hashes: List<u64>.make(),
       successors: List<u32>.make(),
     }
   }
+
   /// Creates an index that records `entries` entries without growing.
   ///
   /// # Details
   ///
   /// The index holds the same entries in the same chains as one made by [`InternIndex.make`]; it
-  /// only skips the relinking that each doubling of the bucket table costs.
+  /// only skips the rehashing that each doubling of the probe table costs.
   pub effect fn withCapacity(entries: usize) -> InternIndex ! OutOfMemoryError ? &mut Allocator {
     let mut width: usize = 16
     while width * 3 < entries * 4 { width = width + width }
     return InternIndex {
-      heads: run emptyBuckets(width),
-      tails: run emptyBuckets(width),
+      controls: run emptyControls(width),
+      slots: run emptySlots(width),
       hashes: run List<u64>.makeWithCapacity(entries),
       successors: run List<u32>.makeWithCapacity(entries),
     }
   }
+
   /// Returns the oldest entry recorded under `hash`, or `usize.MAX` when none is.
   pub fn first(self: &Self, hash: u64) -> usize {
-    let width = List<u32>.length(&self.heads)
+    let width = List<u8>.length(&self.controls)
     if width == usize.ZERO {
       return usize.MAX
     }
-    let head = List<u32>.get(&self.heads, bucketOf(hash, width))
-    if head == 0 {
-      return usize.MAX
+    let controls = List<u8>.asSlice(&self.controls)
+    let slots = List<u32>.asSlice(&self.slots)
+    let hashes = List<u64>.asSlice(&self.hashes)
+    let mask = width - usize.ONE
+    let mixed = mixHash(hash)
+    let tag = controlTag(mixed)
+    let mut pos = homeSlot(mixed, mask)
+    while true {
+      let ctrl = controls[pos]
+      if ctrl == 0 {
+        return usize.MAX
+      }
+      if ctrl == tag {
+        let head = u32.toUsize(slots[pos])
+        if hashes[head] == hash {
+          return head
+        }
+      }
+      pos = usize.bitAnd(pos + usize.ONE, mask)
     }
-    return withHash(self, head - 1, hash)
+    return usize.MAX
   }
+
   /// Returns the next newer entry recorded under the same hash as `entry`, or `usize.MAX`.
   pub fn after(self: &Self, entry: usize) -> usize {
-    return withHash(self, List<u32>.get(&self.successors, entry), List<u64>.get(&self.hashes, entry))
+    let next = List<u32>.get(&self.successors, entry)
+    if next == u32.MAX {
+      return usize.MAX
+    }
+    return u32.toUsize(next)
   }
+
   /// Records the table's next entry under `hash`; its ordinal is the number of earlier records.
   ///
   /// # Gotchas
@@ -165,18 +239,18 @@ impl InternIndex {
     if entry == List<u32>.capacity(&self.successors) {
       run List<u32>.reserve(&mut self.successors, usize.ONE)
     }
-    let mut width = List<u32>.length(&self.heads)
+    let width = List<u8>.length(&self.controls)
     if width * 3 < (entry + usize.ONE) * 4 {
       let mut grown = width + width
       if grown == usize.ZERO {
         grown = 16
       }
       run rebuild(&mut self.*, grown)
-      width = grown
     }
     run List<u64>.append(&mut self.hashes, hash)
     run List<u32>.append(&mut self.successors, u32.MAX)
-    link(&mut self.*, entry, width)
+    let hashes = List<u64>.asSlice(&self.hashes)
+    insertSlot(&mut self.controls, &mut self.slots, hashes, &mut self.successors, entry, hash)
     return ()
   }
 }

@@ -4,7 +4,7 @@ import semantic.ErasedRecursion
 import semantic.ErasureIndex {ErasureIndex}
 import semantic.ErasureRound {ErasureRound}
 import backend.Mir {ErasureFact, CallTerminator as MirCallTerminator}
-import semantic.Types {Types}
+import semantic.Types {TypeTable, Types}
 import CompilerBug
 import Tracing
 import silk.trace {Trace}
@@ -18,7 +18,8 @@ import backend.InstanceKey {InstanceKey, ProviderEntry}
 import backend.PackageSettings {Mode as PackageMode}
 import backend.CodegenUnits {CodegenUnit}
 import backend.Bitcode
-import backend.MirInline
+import backend.FragmentIcf
+import backend.FragmentIcf {FoldResult, FragmentRef}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.InstanceIdentity {InstanceIdentity}
 import semantic.RuntimeEncoding {Coordinates}
@@ -67,7 +68,6 @@ import semantic.StableKey
 import semantic.CacheImage
 import semantic.BuildRecord
 import semantic.CostLedger as CostLedger {Ledger as CostTable, Site as CostSite}
-import semantic.WalkShare {WalkShared}
 import semantic.Lifetime {CanonicalizationFailure}
 import semantic.ExecutionStorage {ExecutionStorage}
 import semantic.Retention {Root as RetentionRoot}
@@ -104,7 +104,11 @@ import semantic.Type {
   Type,
 }
 import semantic.TypedBody {uncheckedReason, uncheckedReasonCount}
+import silk.concurrency.atomic {Atomic, MemoryOrder}
+import silk.concurrency.thread {Transferable}
+import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
 import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.mem.pointer {Pointer}
 import silk.collections.bytes {Bytes}
 import silk.core.effect {Effect}
 import silk.collections.hash {Hash, Word}
@@ -112,6 +116,7 @@ import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.core.result {Result}
 import silk.mem.shared {Shared}
+import silk.concurrency.sync {Arc}
 import silk.mem.interned {Interned}
 import silk.num.u8
 import silk.num.usize
@@ -139,14 +144,10 @@ import semantic.SemanticModel {
 import semantic.ResolverState {
   DigestSet,
   HeaderConflict,
+  PreEmitOutcome,
   Resolver,
-  SharedBuild,
-  SharedWalk,
-  UnrecordedBuild,
-  absentEntry,
   appendDeclarationRejection,
   headerRejection,
-  unshared,
 }
 import semantic.SemanticInputs {
   BackendInstance,
@@ -794,6 +795,15 @@ effect fn exportedObjectFor(resolver: &Resolver, signature: &CAbi.Signature, con
 pub effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
 ! OutOfMemoryError
 ? &mut Allocator | &mut Types {
+  let mut pre = PreEmitOutcome.Empty
+  if key.name < List<usize>.length(&resolver.preEmitSlots) {
+    let slot = List<usize>.get(&resolver.preEmitSlots, key.name)
+    if slot != usize.ZERO {
+      List<usize>.set(&mut resolver.preEmitSlots, key.name, usize.ZERO)
+      let items = List<PreEmitOutcome>.asMutSlice(&mut resolver.preEmitted)
+      pre = Intrinsic.replace(items[slot - usize.ONE], PreEmitOutcome.Empty)
+    }
+  }
   let subjects = List<LlvmInput>.asSlice(&resolver.llvmInputs)
   let subject = &subjects[key.name]
   let inputs = List<EmissionInputs>.asSlice(&resolver.emissionInputs)
@@ -801,51 +811,60 @@ pub effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
   let functions = List<MirFunction>.asSlice(&resolver.mirValues)
   let function = &functions[input.mir]
   let dependencies = run copyEmissionDependencies(List<Dependency>.asSlice(&subject.dependencies))
-  // The target support module's C exports are the link's C library, not the module's interface.
-  let mut hostExport = true
-  if let InstanceKey.Export {function: declaration, ..} = &function.key {
-    let linkOnly = List<ModuleId>.asSlice(&resolver.linkOnlySupport)
-    let mut linkAt = usize.ZERO
-    while linkAt < linkOnly.length {
-      let support = &linkOnly[linkAt]
-      if Interned<DeclarationId>.with<bool>(&declaration, |identity: &DeclarationId| -> bool {
-        return ModuleId.equals(DeclarationId.moduleId(identity), support)
-      }) { hostExport = false }
-      linkAt = linkAt + usize.ONE
+  let mut text = Bytes.make()
+  let mut declarations = List<LlvmCode.Declaration>.make()
+  let mut hadPre = false
+  match move pre {
+    PreEmitOutcome.Text {text: preText, foreign: preForeign} => {
+      text = move preText
+      declarations = move preForeign
+      hadPre = true
     }
+    PreEmitOutcome.Gap {gap: preGap} => {
+      let gap = run Shared<BackendGap>.make(move preGap)
+      run observeLlvmGap(&mut resolver.*, key.name)
+      return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
+    }
+    PreEmitOutcome.Oom => {
+      fail OutOfMemoryError {}
+    }
+    PreEmitOutcome.Empty => ()
   }
-  let emitted = run Effect.result(emitInstance(&resolver.*, function, input, hostExport))
-  let text = match move emitted {
-    Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
-      BackendGap {code, owner, source} => {
-        let raised = BackendGap {code: code, owner: move owner, source: move source}
-        let placed = match &input.anchor {
-          Option<Anchor>.Some {value: anchor} => BackendGap.anchored(move raised, &anchor)
-          Option<Anchor>.None => move raised
+  if !hadPre {
+    let hostExport = isHostExport(&resolver.*, function)
+    let emitted = run Effect.result(emitInstance(&resolver.*, function, input, hostExport))
+    text = match move emitted {
+      Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => move value
+      Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+        BackendGap {code, owner, source} => {
+          let raised = BackendGap {code: code, owner: move owner, source: move source}
+          let placed = match &input.anchor {
+            Option<Anchor>.Some {value: anchor} => BackendGap.anchored(move raised, &anchor)
+            Option<Anchor>.None => move raised
+          }
+          let gap = run Shared<BackendGap>.make(move placed)
+          run observeLlvmGap(&mut resolver.*, key.name)
+          return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
         }
-        let gap = run Shared<BackendGap>.make(move placed)
-        run observeLlvmGap(&mut resolver.*, key.name)
-        return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
-      }
-      OutOfMemoryError {} => {
-        fail OutOfMemoryError {}
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
       }
     }
-  }
-  let foreign = run Effect.result(foreignDeclarationsFor(&resolver.*, List<CAbi.Signature>.asSlice(&input.foreign)))
-  let declarations = match move foreign {
-    Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
-    Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
-      BackendGap {code, owner, source} => {
-        let gap = run Shared<BackendGap>.make(
-          BackendGap {code: code, owner: move owner, source: move source},
-        )
-        run observeLlvmGap(&mut resolver.*, key.name)
-        return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
-      }
-      OutOfMemoryError {} => {
-        fail OutOfMemoryError {}
+    let foreign = run Effect.result(foreignDeclarationsFor(&resolver.*, List<CAbi.Signature>.asSlice(&input.foreign)))
+    declarations = match move foreign {
+      Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
+      Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+        BackendGap {code, owner, source} => {
+          let gap = run Shared<BackendGap>.make(
+            BackendGap {code: code, owner: move owner, source: move source},
+          )
+          run observeLlvmGap(&mut resolver.*, key.name)
+          return memberSuccess(Value.Unsupported {gap: move gap}, move dependencies)
+        }
+        OutOfMemoryError {} => {
+          fail OutOfMemoryError {}
+        }
       }
     }
   }
@@ -861,6 +880,15 @@ pub effect fn resolveLlvmText(resolver: &mut Resolver, key: Key) -> Answer
   }
   let index = List<InstanceDefinition>.length(&resolver.llvmValues)
   run List<InstanceDefinition>.append(&mut resolver.llvmValues, move value)
+  // Once emission succeeds, `Family.LlvmText` memoizes the definition and only `EmissionInputs.llvm`
+  // is ever read again; release the prepared vectors immediately instead of retaining 100k+ copies.
+  let emissionSlot = List<LlvmInput>.asSlice(&resolver.llvmInputs)[key.name].emission
+  let mut cleared = &mut List<EmissionInputs>.asMutSlice(&mut resolver.emissionInputs)[emissionSlot]
+  List<TypeLayout>.clearAndFree(&mut cleared.layouts)
+  List<CAbi.Signature>.clearAndFree(&mut cleared.foreign)
+  Bytes.clearAndFree(&mut cleared.encoding)
+  List<InstanceIdentity>.clearAndFree(&mut cleared.identities)
+  cleared.suspension = Option<CoroutineFacts>.none()
   return memberSuccess(Value.LlvmText {index: index}, move dependencies)
 }
 
@@ -1066,16 +1094,16 @@ pub effect fn resolveEmissionInputs(
         )
       }
     }
-    let resolvedLayouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-    let facts = Shared<BackendLayout>.clone(&resolvedLayouts[layoutIndex])
-    let typeLayout = TypeLayout {ty: Interned<Type>.clone(&needed.ty), layout: Shared<BackendLayout>.clone(&facts)}
+    let resolvedLayouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+    let facts = Interned<BackendLayout>.clone(&resolvedLayouts[layoutIndex])
+    let typeLayout = TypeLayout {ty: Interned<Type>.clone(&needed.ty), layout: Interned<BackendLayout>.clone(&facts)}
     run List<usize>.append(&mut contentIndices, layoutIndex)
     run List<TypeLayout>.append(&mut layouts, move typeLayout)
     run InternIndex.record(&mut supplied, usize.toU64(application))
-    let count = Shared<BackendLayout>.with<usize>(&facts, BackendLayout.childCount)
+    let count = Interned<BackendLayout>.with<usize>(&facts, BackendLayout.childCount)
     let mut fieldAt = usize.ZERO
     while fieldAt < count {
-      let selectedField = Shared<BackendLayout>.with<Option<Interned<Type>>>(&facts,
+      let selectedField = Interned<BackendLayout>.with<Option<Interned<Type>>>(&facts,
         |layout: &BackendLayout| -> Option<Interned<Type>> {
           return BackendLayout.childAt(layout, fieldAt)
         },
@@ -1098,7 +1126,11 @@ pub effect fn resolveEmissionInputs(
   // Code identity erases regions: every region pattern of an application is one definition.
   let mut coordinates = RuntimeEncoding.codeCoordinates()
   let initialFunctions = List<MirFunction>.asSlice(&resolver.mirValues)
-  let recipe = run InstanceRecipe.make(&initialFunctions[mirIndex])
+  let recipe = if recording(&resolver.*) {
+    run InstanceRecipe.make(&initialFunctions[mirIndex])
+  } else {
+    run InstanceRecipe.calleesOnly(&initialFunctions[mirIndex])
+  }
   let callees = List<InstanceKey>.asSlice(&recipe.callees)
   let encoded = run InstanceText.encodings(&recipe, &mut coordinates)
   let identities = run InstanceText.identities(&recipe, List<Bytes>.asSlice(&encoded))
@@ -1625,6 +1657,7 @@ effect fn appendResolvedDefinitions(
   reached: &[CollectedText],
   plan: &EmissionPlan,
   order: &[usize],
+  fold: &FoldResult,
   text: &mut Bytes,
   write: bool,
 ) -> List<usize> ! BackendGap | OutOfMemoryError ? &mut Allocator {
@@ -1638,8 +1671,14 @@ effect fn appendResolvedDefinitions(
   at = usize.ZERO
   while at < order.length {
     let identity = &identities[order[at]]
-    if write {
-      run Bytes.append(&mut text.*, collectedBytes(resolver, &reached[identity.representative]))
+    let keep = fold.foldedCount == usize.ZERO || List<bool>.get(&fold.kept, at)
+    if write && keep {
+      let written = collectedBytes(resolver, &reached[identity.representative])
+      if fold.foldedCount != usize.ZERO {
+        run FragmentIcf.appendRewrittenBitcode(&mut text.*, written, fold)
+      } else {
+        run Bytes.append(&mut text.*, written)
+      }
     }
     let reason = uncheckedReason(identity.borrow)
     if reason != usize.MAX {
@@ -1870,11 +1909,45 @@ effect fn assembleEmissionChecked(
     run Bytes.append(&mut text, Bytes.asSlice(&definedObjects))
   }
   let order = run emissionOrder(&plan)
+  let mut fold = FoldResult.empty()
+  if !resolver.direct && !resolver.lineTables && !resolver.coverage {
+    let orderSlice = List<usize>.asSlice(&order)
+    let idSlice = List<EmissionIdentity>.asSlice(&plan.identities)
+    let mut retainedIds = List<bool>.make()
+    run List<bool>.appendRepeated(&mut retainedIds, false, idSlice.length)
+    let mut r = usize.ZERO
+    while r < roots.length {
+      if roots[r].retained {
+        if let Option<usize>.Some {value: rid} = move run EmissionPlan.lookup(&plan, &roots[r].key) {
+          List<bool>.set(&mut retainedIds, rid, true)
+        }
+      }
+      r = r + usize.ONE
+    }
+    let mut icfItems = List<FragmentRef>.make()
+    run List<FragmentRef>.reserveExact(&mut icfItems, orderSlice.length)
+    let mut fi = usize.ZERO
+    while fi < orderSlice.length {
+      let id = orderSlice[fi]
+      let identity = &idSlice[id]
+      run List<FragmentRef>.append(
+        &mut icfItems,
+        FragmentRef {
+          symbol: Bytes.asSlice(&identity.symbol),
+          bytes: collectedBytes(resolver, &reached[identity.representative]),
+          retained: List<bool>.get(&retainedIds, id),
+        },
+      )
+      fi = fi + usize.ONE
+    }
+    fold = run FragmentIcf.foldBitcode(List<FragmentRef>.asSlice(&icfItems))
+  }
   let unchecked = run appendResolvedDefinitions(
     resolver,
     reached,
     &plan,
     List<usize>.asSlice(&order),
+    &fold,
     &mut text,
     whole,
   )
@@ -1890,11 +1963,29 @@ effect fn assembleEmissionChecked(
       runtimeHead = move unitHead
       run Bytes.append(&mut runtimeHead, Bytes.asSlice(&runtime))
     }
+    let mut activeOrder = List<usize>.make()
+    if fold.foldedCount != usize.ZERO {
+      let rawOrder = List<usize>.asSlice(&order)
+      run List<usize>.reserveExact(&mut activeOrder, rawOrder.length - fold.foldedCount)
+      let mut oi = usize.ZERO
+      while oi < rawOrder.length {
+        if List<bool>.get(&fold.kept, oi) {
+          run List<usize>.append(&mut activeOrder, rawOrder[oi])
+        }
+        oi = oi + usize.ONE
+      }
+    }
+    let unitOrder = if fold.foldedCount != usize.ZERO {
+      List<usize>.asSlice(&activeOrder)
+    } else {
+      List<usize>.asSlice(&order)
+    }
     units = run assembleUnits(
       resolver,
       reached,
       &plan,
-      List<usize>.asSlice(&order),
+      unitOrder,
+      &fold,
       Bytes.asSlice(&header),
       Bytes.asSlice(&definedObjects),
       Bytes.asSlice(&runtimeHead),
@@ -1917,7 +2008,7 @@ effect fn assembleEmissionChecked(
 // A definitions unit's body is also a pack (see `BuildRecord.Pack`), which `packed` describes. A
 // unit whose definitions are exactly a held pack's, in its order, is left `stored`: its body is
 // that pack's, unread, and its head is written from the names the pack lists.
-effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &EmissionPlan, order: &[usize], header: &[u8],
+effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &EmissionPlan, order: &[usize], fold: &FoldResult, header: &[u8],
   tail: &[u8], runtimeHead: &[u8], packed: &mut PackedBuild) -> List<CodegenUnit> ! OutOfMemoryError ? &mut Allocator {
   let identities = List<EmissionIdentity>.asSlice(&plan.identities)
   let packs = List<HeldPack>.asSlice(&resolver.packs)
@@ -2091,7 +2182,18 @@ effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &E
       run Bytes.append(&mut body, tail)
       digest = ContentHash.of(Bytes.asSlice(&body))
     }
-    let head = run Bytes.copy(header)
+    let mut head = run Bytes.copy(header)
+    if fold.foldedCount != usize.ZERO {
+      let unitBytes = if unit < unitCount && stored {
+        Bytes.asSlice(&packs[List<usize>.get(&matched, unit)].body)
+      } else {
+        Bytes.asSlice(&body)
+      }
+      let aliasFrag = run FragmentIcf.unitAliasFragment(unitBytes, fold)
+      if Bytes.length(&aliasFrag) > usize.ZERO {
+        run Bytes.append(&mut head, Bytes.asSlice(&aliasFrag))
+      }
+    }
     let mut origins = ContentHash {high: 0, low: 0}
     if unit < List<u64>.length(&originHigh) {
       origins = ContentHash {high: List<u64>.get(&originHigh, unit), low: List<u64>.get(&originLow, unit)}
@@ -2295,254 +2397,247 @@ pub fn splicedAt(summary: &SuspensionSummary, index: usize) -> Option<&InstanceK
   return Option<&InstanceKey>.none()
 }
 
-// What one copy of the process lowered of a shared build walk, as bytes another process reads
-// (`sharedState`): whether the copy read a growth guard or reported anything (`unfit`), a record no walk order holds together,
-// and the definition and text of each entry that emitted one. An entry is entered (leaf zero)
-// when `lowered` says this copy lowered its instance without a report; any other, and each
-// referenced instance this copy never entered, is an absent leaf.
-effect fn sharedPart(capture: BuildCapture, lowered: &[bool], values: &[InstanceDefinition], unfit: bool) -> Bytes
-! OutOfMemoryError ? &mut Allocator {
-  let mut record = BuildRecord.make(capture.observing, true)
-  let mut captured = move capture
-  let count = List<CaptureEntry>.length(&captured.entries)
-  let mut absent = DigestSet.make()
-  let mut missing = List<ContentHash>.make()
-  let mut emitted = List<usize>.make()
-  run List<BuildRecord.Entry>.reserveExact(&mut record.entries, count)
-  let mut at = usize.ZERO
-  while at < count {
-    let entry = &List<CaptureEntry>.asSlice(&captured.entries)[at]
-    let owned = at < lowered.length && lowered[at] && entry.alias == usize.MAX
-    let mut references = List<BuildRecord.Reference>.make()
-    if owned {
-      let targets = List<ContentHash>.asSlice(&entry.targets)
-      let edges = List<ContentHash>.asSlice(&entry.edges)
-      run List<BuildRecord.Reference>.reserveExact(&mut references, targets.length)
-      let mut reference = usize.ZERO
-      while reference < targets.length {
-        let mut target = BuildCapture.find(&captured, targets[reference])
-        if target == usize.MAX {
-          let mut place = DigestSet.find(&absent, targets[reference])
-          if place == usize.MAX {
-            place = List<ContentHash>.length(&missing)
-            drop run DigestSet.add(&mut absent, targets[reference])
-            run List<ContentHash>.append(&mut missing, targets[reference])
-          }
-          target = count + place
-        }
-        run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: target, edge: edges[reference]})
-        reference = reference + usize.ONE
-      }
-      run List<usize>.append(&mut emitted, entry.value)
+// Whether `function`'s C export is a host interface export (not a target link-only support export).
+fn isHostExport(resolver: &Resolver, function: &MirFunction) -> bool {
+  if let InstanceKey.Export {function: declaration, ..} = &function.key {
+    let linkOnly = List<ModuleId>.asSlice(&resolver.linkOnlySupport)
+    let mut linkAt = usize.ZERO
+    while linkAt < linkOnly.length {
+      let support = &linkOnly[linkAt]
+      if Interned<DeclarationId>.with<bool>(&declaration, |identity: &DeclarationId| -> bool {
+        return ModuleId.equals(DeclarationId.moduleId(identity), support)
+      }) { return false }
+      linkAt = linkAt + usize.ONE
     }
-    let mut leaf = BuildRecord.ABSENT
-    if owned { leaf = 0 }
-    let taken = &mut List<CaptureEntry>.asMutSlice(&mut captured.entries)[at]
-    let exact = taken.digest
-    let declaration = Intrinsic.replace(taken.declaration, Bytes.make())
-    let facts = Intrinsic.replace(taken.facts, BuildRecord.unknownFacts())
-    let kept = &List<CaptureEntry>.asSlice(&captured.entries)[at]
-    at = at + usize.ONE
-    run List<BuildRecord.Entry>.append(&mut record.entries, BuildRecord.Entry {exact: exact, hash: kept.hash, family: kept.family,
-      declaration: move declaration, parent: usize.MAX, position: usize.ZERO, requested: false, alias: usize.MAX, leaf: leaf,
-      references: move references, summary: kept.summary, facts: move facts})
   }
-  let named = List<ContentHash>.asSlice(&missing)
-  at = usize.ZERO
-  while at < named.length {
-    run List<BuildRecord.Entry>.append(&mut record.entries, absentEntry(named[at]))
-    at = at + usize.ONE
-  }
-  let mut output = Bytes.make()
-  let mut flag: u64 = 0
-  if unfit { flag = 1 }
-  run RuntimeEncoding.word(&mut output, flag)
-  let encoded = run BuildRecord.encode(&record)
-  run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoded))
-  let texts = List<usize>.asSlice(&emitted)
-  at = usize.ZERO
-  while at < texts.length {
-    if texts[at] == usize.MAX {
-      run RuntimeEncoding.word(&mut output, 0)
-    } else {
-      run RuntimeEncoding.word(&mut output, 1)
-      let definition = run BuildRecord.encodeDefinition(&values[texts[at]])
-      run RuntimeEncoding.field(&mut output, Bytes.asSlice(&definition))
-      run RuntimeEncoding.field(&mut output, Bytes.asSlice(&values[texts[at]].text))
-    }
-    at = at + usize.ONE
-  }
-  return move output
+  return true
 }
 
-// The parts copies of the process lowered of one shared build walk from `roots` (`sharedPart`), as
-// the state of one record for `rewalkBuild`: the entry of each instance a copy lowered, once,
-// with its definition held; an absent leaf for each other instance a copy reached or a reference
-// names; and each entry's parent the first entry found to reference it, walking out from the
-// roots, so a key the walk needs is found through that entry's MIR (`rewalkKey`). None when a
-// part does not decode, rests on a growth guard or a report, or lowered a body that suspends, or
-// one that observes diagnostics in a walk that did not, which only a walk of its own decides.
-effect fn sharedState(parts: &[Bytes], roots: &[BuildRoot]) -> Option<ReplayState> ! OutOfMemoryError ? &mut Allocator {
-  let mut merged = BuildRecord.make(false, true)
-  let mut definitions = List<Option<InstanceDefinition>>.make()
-  let mut held = List<bool>.make()
-  // Each placed digest sits at its entry's index in `merged`.
-  let mut placed = DigestSet.make()
-  // The part each merged entry came from, whose indexes its references still hold.
-  let mut sources = List<usize>.make()
-  let mut exacts = List<List<ContentHash>>.make()
-  let mut records = List<BuildRecord.Record>.make()
-  let mut refused = BuildRecord.FACT_SUSPENDS
-  let mut part = usize.ZERO
-  while part < parts.length {
-    let bytes = Bytes.asSlice(&parts[part])
-    let mut reader = StableKey.reader()
-    let unfit = StableKey.readWord(bytes, &mut reader)
-    let recorded = StableKey.readField(bytes, &mut reader)
-    if StableKey.failed(&reader) || unfit != 0 { return Option<ReplayState>.none() }
-    let mut record = match move run BuildRecord.decode(StableKey.view(bytes, recorded)) {
-      Option<BuildRecord.Record>.Some {value} => move value
-      Option<BuildRecord.Record>.None => { return Option<ReplayState>.none() }
-    }
-    // Every copy walked in one mode: observing diagnostics, or lowering nothing that observes them.
-    if part == usize.ZERO {
-      merged.observing = record.observing
-      if !record.observing { refused = refused + BuildRecord.FACT_OBSERVES }
-    } else if record.observing != merged.observing {
-      return Option<ReplayState>.none()
-    }
-    let entries = List<BuildRecord.Entry>.asMutSlice(&mut record.entries)
-    let mut names = List<ContentHash>.make()
-    let mut at = usize.ZERO
-    while at < entries.length {
-      let exact = entries[at].exact
-      run List<ContentHash>.append(&mut names, exact)
-      if entries[at].leaf == 0 {
-        // The definition is read whether or not another part gave the instance first.
-        let mut definition = Option<InstanceDefinition>.none()
-        if StableKey.readWord(bytes, &mut reader) == 1 {
-          let described = StableKey.readField(bytes, &mut reader)
-          let text = StableKey.readField(bytes, &mut reader)
-          if StableKey.failed(&reader) { return Option<ReplayState>.none() }
-          let mut read = match move run BuildRecord.decodeDefinition(StableKey.view(bytes, described)) {
-            Option<InstanceDefinition>.Some {value} => move value
-            Option<InstanceDefinition>.None => { return Option<ReplayState>.none() }
-          }
-          read.text = run Bytes.copy(StableKey.view(bytes, text))
-          definition = Option<InstanceDefinition>.some(move read)
+// One immutable emission job for parallel NativeThread codegen.
+struct EmitJob {
+  llvmSlot: usize,
+  emissionSlot: usize,
+  mirIndex: usize,
+  hostExport: bool,
+}
+
+impl Copy for EmitJob {}
+
+// Read-only pointers and disjoint output array shared across NativeThread workers during `preEmitBatch`.
+// Safety: `preEmitBatch` joins every spawned thread before mutating or freeing any referenced storage,
+// every worker writes only to the unique index it atomically claimed via `cursor`, and `emitJobPure`
+// reads only immutable `Resolver` config, `MirFunction`, `Interned<Layout>`, `Interned<Type>`, and `Arc`-backed ids.
+struct ParallelEmitBatch {
+  resolver: *const Resolver,
+  jobs: [*]const EmitJob,
+  outcomes: [*]mut PreEmitOutcome,
+  cursor: *mut usize,
+  count: usize,
+}
+
+impl Transferable for ParallelEmitBatch {}
+impl Copy for ParallelEmitBatch {}
+
+// One deferred emission item collected during `buildFromTimed` and materialized after restarts settle.
+union PendingEmit {
+  First {
+    key: Key,
+    prepared: Shared<Result<Answer, NoRejection>>,
+    instance: InstanceKey,
+    entry: usize,
+    lowered: usize,
+    locationModule: usize,
+    locationDeclaration: usize,
+    requester: Option<RelatedSite>,
+    enteredModule: ModuleId,
+    enteredSpan: Span,
+    costFrom: u64,
+    costSteps: usize,
+  },
+  Alias {
+    instance: InstanceKey,
+    entry: usize,
+    ownerEntry: usize,
+    lowered: usize,
+  },
+}
+
+effect fn emitJobPure(resolver: &Resolver, function: &MirFunction, input: &EmissionInputs, hostExport: bool) -> PreEmitOutcome
+  ? &mut Allocator | &mut Types {
+  let emitted = run Effect.result(emitInstance(resolver, function, input, hostExport))
+  let text = match move emitted {
+    Result<Bytes, BackendGap | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner, source} => {
+        let raised = BackendGap {code: code, owner: move owner, source: move source}
+        let placed = match &input.anchor {
+          Option<Anchor>.Some {value: anchor} => BackendGap.anchored(move raised, &anchor)
+          Option<Anchor>.None => move raised
         }
-        if StableKey.failed(&reader) || u64.bitAnd(entries[at].facts.flags, refused) != 0 { return Option<ReplayState>.none() }
-        if run DigestSet.add(&mut placed, exact) {
-          let taken = &mut entries[at]
-          run List<BuildRecord.Entry>.append(&mut merged.entries, Intrinsic.replace(taken.*, absentEntry(exact)))
-          run List<Option<InstanceDefinition>>.append(&mut definitions, move definition)
-          run List<bool>.append(&mut held, true)
-          run List<usize>.append(&mut sources, part)
-        }
+        return PreEmitOutcome.Gap {gap: move placed}
       }
-      at = at + usize.ONE
+      OutOfMemoryError {} => { return PreEmitOutcome.Oom }
     }
-    if !StableKey.finished(bytes, &reader) { return Option<ReplayState>.none() }
-    run List<List<ContentHash>>.append(&mut exacts, move names)
-    run List<BuildRecord.Record>.append(&mut records, move record)
-    part = part + usize.ONE
   }
-  let lowered = List<BuildRecord.Entry>.length(&merged.entries)
-  // An absent leaf that names what admission compares of its key, for an instance no part lowered.
-  let listed = List<BuildRecord.Record>.asMutSlice(&mut records)
-  part = usize.ZERO
-  while part < listed.length {
-    let entries = List<BuildRecord.Entry>.asMutSlice(&mut listed[part].entries)
-    let mut at = usize.ZERO
-    while at < entries.length {
-      let exact = entries[at].exact
-      if u64.bitAnd(entries[at].facts.flags, BuildRecord.FACT_KNOWN) != 0 && run DigestSet.add(&mut placed, exact) {
-        let taken = &mut entries[at]
-        run List<BuildRecord.Entry>.append(&mut merged.entries, Intrinsic.replace(taken.*, absentEntry(exact)))
-        run List<Option<InstanceDefinition>>.append(&mut definitions, Option<InstanceDefinition>.none())
-        run List<bool>.append(&mut held, false)
+  let foreign = run Effect.result(foreignDeclarationsFor(resolver, List<CAbi.Signature>.asSlice(&input.foreign)))
+  let declarations = match move foreign {
+    Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Success {value} => move value
+    Result<List<LlvmCode.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+      BackendGap {code, owner, source} => {
+        return PreEmitOutcome.Gap {gap: BackendGap {code: code, owner: move owner, source: move source}}
       }
-      at = at + usize.ONE
+      OutOfMemoryError {} => { return PreEmitOutcome.Oom }
     }
-    part = part + usize.ONE
   }
-  let mut absent = List<ContentHash>.make()
-  let known = List<BuildRecord.Entry>.length(&merged.entries)
-  let from = List<usize>.asSlice(&sources)
-  let named = List<List<ContentHash>>.asSlice(&exacts)
-  let resolved = List<BuildRecord.Entry>.asMutSlice(&mut merged.entries)
+  return PreEmitOutcome.Text {text: move text, foreign: move declarations}
+}
+
+fn runEmitWorker(batch: ParallelEmitBatch) -> () {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  let mut anchor = ()
+  let mut outAnchor = ()
+  let resolver = unsafe Pointer.borrow<(), Resolver>(&anchor, batch.resolver)
+  let jobs = unsafe Pointer.borrowMany<(), EmitJob>(&anchor, batch.jobs, batch.count)
+  let outcomes = unsafe Pointer.borrowManyMut<(), PreEmitOutcome>(&mut outAnchor, batch.outcomes, batch.count)
+  let functions = List<MirFunction>.asSlice(&resolver.mirValues)
+  let inputs = List<EmissionInputs>.asSlice(&resolver.emissionInputs)
+  while true {
+    let idx = unsafe Atomic.fetchAdd<usize>(batch.cursor, usize.ONE, MemoryOrder.Relaxed)
+    if idx >= batch.count { break }
+    let job = jobs[idx]
+    let outcome = run emitJobPure(resolver, &functions[job.mirIndex], &inputs[job.emissionSlot], job.hostExport)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+      |> Effect.provideMut<Types>(&mut types)
+    outcomes[idx] = move outcome
+  }
+  return ()
+}
+
+// Pre-emits all uncached deferred definitions in parallel across up to `thisStore.walkWorkers` native threads.
+// Results are stored in `thisStore.resolver.preEmitted` and indexed by `preEmitSlots[llvmSlot]` so
+// `resolveLlvmText` publishes them in exact deterministic walk order.
+@trace(name: "codegen.parallel_emit")
+effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  List<PreEmitOutcome>.clearAndFree(&mut thisStore.resolver.preEmitted)
+  List<usize>.clearAndFree(&mut thisStore.resolver.preEmitSlots)
+  if thisStore.walkWorkers < 2 { return () }
+  let llvmCount = List<LlvmInput>.length(&thisStore.resolver.llvmInputs)
+  if llvmCount == usize.ZERO { return () }
+  let mut seen = List<bool>.make()
+  run List<bool>.appendRepeated(&mut seen, false, llvmCount)
+  let mut jobs = List<EmitJob>.make()
   let mut at = usize.ZERO
-  while at < lowered {
-    let names = List<ContentHash>.asSlice(&named[from[at]])
-    let references = List<BuildRecord.Reference>.asMutSlice(&mut resolved[at].references)
-    let mut reference = usize.ZERO
-    while reference < references.length {
-      let target = names[references[reference].target]
-      let mut found = DigestSet.find(&placed, target)
-      if found == usize.MAX {
-        found = known + List<ContentHash>.length(&absent)
-        drop run DigestSet.add(&mut placed, target)
-        run List<ContentHash>.append(&mut absent, target)
+  while at < pending.length {
+    if let PendingEmit.First {key, prepared, ..} = &pending[at] {
+      let emIndex = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&prepared, answerEmissionInputsIndex)
+      if let Option<usize>.Some {value: emissionSlot} = move emIndex {
+        let inputs = List<EmissionInputs>.asSlice(&thisStore.resolver.emissionInputs)
+        let llvmSlot = inputs[emissionSlot].llvm
+        let mirIndex = inputs[emissionSlot].mir
+        if llvmSlot < llvmCount && !List<bool>.get(&seen, llvmSlot) {
+          let llvmKey = Key {
+            family: Family.LlvmText,
+            module: key.module,
+            name: llvmSlot,
+            declaration: key.declaration,
+            member: key.member,
+            external: false,
+          }
+          let word = run internKey(&mut thisStore.resolver, llvmKey)
+          if !Query.isComplete(&mut thisStore.query, word) {
+            let functions = List<MirFunction>.asSlice(&thisStore.resolver.mirValues)
+            List<bool>.set(&mut seen, llvmSlot, true)
+            let hostExport = isHostExport(&thisStore.resolver, &functions[mirIndex])
+            run List<EmitJob>.append(&mut jobs, EmitJob {
+              llvmSlot: llvmSlot,
+              emissionSlot: emissionSlot,
+              mirIndex: mirIndex,
+              hostExport: hostExport,
+            })
+          }
+        }
       }
-      references[reference].target = found
-      reference = reference + usize.ONE
     }
     at = at + usize.ONE
   }
-  let unnamed = List<ContentHash>.asSlice(&absent)
+  let jobCount = List<EmitJob>.length(&jobs)
+  if jobCount < 2 || jobCount < thisStore.walkFrontier { return () }
+  let mut workers = thisStore.walkWorkers
+  if workers > jobCount { workers = jobCount }
+  let mut outcomes = List<PreEmitOutcome>.make()
+  run List<PreEmitOutcome>.reserveExact(&mut outcomes, jobCount)
   at = usize.ZERO
-  while at < unnamed.length {
-    run List<BuildRecord.Entry>.append(&mut merged.entries, absentEntry(unnamed[at]))
-    run List<Option<InstanceDefinition>>.append(&mut definitions, Option<InstanceDefinition>.none())
-    run List<bool>.append(&mut held, false)
+  while at < jobCount {
+    run List<PreEmitOutcome>.append(&mut outcomes, PreEmitOutcome.Empty)
     at = at + usize.ONE
   }
-  // Each entry's parent: none for a root, else the first entry found to reference it.
-  let total = List<BuildRecord.Entry>.length(&merged.entries)
-  let mut reached = List<bool>.make()
-  run List<bool>.appendRepeated(&mut reached, false, total)
-  let mut queue = List<usize>.make()
-  let all = List<BuildRecord.Entry>.asMutSlice(&mut merged.entries)
-  at = usize.ZERO
-  while at < total {
-    all[at].parent = usize.MAX
-    all[at].position = usize.MAX
-    at = at + usize.ONE
+  let mut cursor = usize.ZERO
+  let jobPtr = match move Pointer.nonNullMany<EmitJob>(Pointer.fromSlice<EmitJob>(List<EmitJob>.asSlice(&jobs))) {
+    Option<[*]const EmitJob>.Some {value} => value
+    Option<[*]const EmitJob>.None => { return () }
   }
-  at = usize.ZERO
-  while at < roots.length {
-    let entry = DigestSet.find(&placed, run instanceDigest(&roots[at].key))
-    if entry != usize.MAX && !List<bool>.get(&reached, entry) {
-      List<bool>.set(&mut reached, entry, true)
-      all[entry].position = at
-      run List<usize>.append(&mut queue, entry)
-    }
-    at = at + usize.ONE
+  let outPtr = match move Pointer.nonNullManyMut<PreEmitOutcome>(Pointer.fromMutSlice<PreEmitOutcome>(List<PreEmitOutcome>.asMutSlice(&mut outcomes))) {
+    Option<[*]mut PreEmitOutcome>.Some {value} => value
+    Option<[*]mut PreEmitOutcome>.None => { return () }
   }
-  let mut next = usize.ZERO
-  while next < List<usize>.length(&queue) {
-    let entry = List<usize>.get(&queue, next)
-    next = next + usize.ONE
-    let count = List<BuildRecord.Reference>.length(&all[entry].references)
-    let mut reference = usize.ZERO
-    while reference < count {
-      let target = List<BuildRecord.Reference>.asSlice(&all[entry].references)[reference].target
-      if !List<bool>.get(&reached, target) {
-        List<bool>.set(&mut reached, target, true)
-        all[target].parent = entry
-        all[target].position = reference
-        run List<usize>.append(&mut queue, target)
+  let batch = ParallelEmitBatch {
+    resolver: Pointer.fromRef<Resolver>(&thisStore.resolver),
+    jobs: jobPtr,
+    outcomes: outPtr,
+    cursor: Pointer.fromMutRef<usize>(&mut cursor),
+    count: jobCount,
+  }
+  let mut handles = List<JoinHandle<()>>.make()
+  run List<JoinHandle<()>>.reserveExact(&mut handles, workers - usize.ONE)
+  let mut w = usize.ONE
+  while w < workers {
+    let workerBatch = batch
+    let spawned = run Effect.result(NativeThread.spawn(|| -> () {
+      runEmitWorker(workerBatch)
+      return ()
+    }))
+    match move spawned {
+      Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Success {value} => {
+        run List<JoinHandle<()>>.append(&mut handles, move value)
       }
-      reference = reference + usize.ONE
+      Result<JoinHandle<()>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
+        SpawnError ignored => {
+          drop ignored
+          break
+        }
+        OutOfMemoryError exhausted => {
+          // Join any already-started workers before propagating OOM so stack pointers stay valid.
+          while List<JoinHandle<()>>.length(&handles) > usize.ZERO {
+            let last = List<JoinHandle<()>>.length(&handles) - usize.ONE
+            let h = List<JoinHandle<()>>.remove(&mut handles, last)
+            h.join()
+          }
+          fail move exhausted
+        }
+      }
     }
+    w = w + usize.ONE
   }
-  let mut definitionRoots = List<usize>.make()
-  run List<usize>.appendRepeated(&mut definitionRoots, usize.MAX, total)
-  let mut places = List<TextPlace>.make()
-  run List<TextPlace>.appendRepeated(&mut places, TextPlace {pack: usize.MAX, member: usize.MAX}, total)
-  return Option<ReplayState>.some(ReplayState {record: move merged, recordRoot: usize.MAX, roots: move definitionRoots,
-    definitions: move definitions, places: move places, held: move held, packRoots: List<usize>.make(), guarded: false, borrowed: false,
-    waiting: List<WaitingEntry>.make(), waitedOn: List<usize>.make(), summaries: List<SummaryRoot>.make()})
+  runEmitWorker(batch)
+  while List<JoinHandle<()>>.length(&handles) > usize.ZERO {
+    let last = List<JoinHandle<()>>.length(&handles) - usize.ONE
+    let h = List<JoinHandle<()>>.remove(&mut handles, last)
+    h.join()
+  }
+  let mut slots = List<usize>.make()
+  run List<usize>.appendRepeated(&mut slots, usize.ZERO, llvmCount)
+  let jobSlice = List<EmitJob>.asSlice(&jobs)
+  at = usize.ZERO
+  while at < jobCount {
+    List<usize>.set(&mut slots, jobSlice[at].llvmSlot, at + usize.ONE)
+    at = at + usize.ONE
+  }
+  thisStore.resolver.preEmitted = move outcomes
+  thisStore.resolver.preEmitSlots = move slots
+  return ()
 }
 
 // One reached instance of a captured walk, before its references are resolved to entries.
@@ -2640,8 +2735,8 @@ pub effect fn keyFacts(instance: &InstanceKey) -> BuildRecord.Facts ! OutOfMemor
 // Whether `instance` carries providers. A key without them is its own bare key: canonicalizing its
 // application again gives it back, so the walks skip doing so, which cost about 5% of a cold build.
 pub fn providedKey(instance: &InstanceKey) -> bool {
-  if let Option<Shared<List<ProviderEntry>>>.Some {value} = InstanceKey.providers(instance) {
-    return Shared<List<ProviderEntry>>.with<usize>(&value, |listed: &List<ProviderEntry>| -> usize { return List<ProviderEntry>.length(listed) }) > usize.ZERO
+  if let Option<Arc<List<ProviderEntry>>>.Some {value} = InstanceKey.providers(instance) {
+    return List<ProviderEntry>.length(Arc<List<ProviderEntry>>.get(&value)) > usize.ZERO
   }
   return false
 }
@@ -4524,35 +4619,7 @@ pub fn digestedLlvmInputs(thisStore: &Semantic) -> usize {
   return count
 }
 
-/// Walks the last build again in this process when copies of the process lowered it
-/// (`shareWalks`), so the store holds the build's record and every unit it rests on, as a build
-/// that shared nothing does, and `cacheImage` writes them. It lowers each instance a copy
-/// lowered, which the shared build saved the caller from waiting for; a cache writer that runs
-/// after the build returned calls it. Does nothing after any other build, and leaves the store
-/// without a record when the walk fails where the build did not.
-pub effect fn recordSharedBuild(thisStore: &mut Semantic) -> ()
-! Cycle | OutOfMemoryError
-? &mut Allocator | &mut Types {
-  let pending = match move Intrinsic.replace(thisStore.unrecorded, Option<UnrecordedBuild>.none()) {
-    Option<UnrecordedBuild>.Some {value} => move value
-    Option<UnrecordedBuild>.None => { return () }
-  }
-  // The packs are the ones the build assembled and its caller stored.
-  let packed = Intrinsic.replace(thisStore.packedBuild, PackedBuild.make())
-  let walked = run Effect.result(buildFrom(&mut thisStore.*, &pending.module, pending.runtimeSelected,
-    List<BuildRoot>.asSlice(&pending.roots), pending.entrySpan, pending.closureNodes, false, &Option<FrameSelection>.none(), &mut unshared()))
-  thisStore.packedBuild = move packed
-  // A walk that fails where the build did not leaves the store without a record.
-  match move walked {
-    Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => { drop value }
-    Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
-      Cycle cycle => { fail move cycle }
-      OutOfMemoryError exhausted => { fail move exhausted }
-      InvalidModulePath invalid => { drop invalid }
-      RevisionMismatch mismatch => { drop mismatch }
-    }
-  }
-}
+
 
 /// The `--costs` report of the last build walk: the `limit` calls in the root package whose
 /// generated functions cost the most, by LLVM text, then functions, then static evaluation steps,
@@ -4974,33 +5041,8 @@ pub effect fn emitArtifactRoots(thisStore: &mut Semantic, module: &ModuleId, run
     }
   }
   thisStore.replay = Option<ReplayState>.none()
-  // A cold build lowers every instance it reaches, which copies of the process share; the walk
-  // itself then runs over what they lowered, and walks alone where that does not decide it.
-  if thisStore.walkWorkers > usize.ONE && Graph.recording(&thisStore.resolver.graph) {
-    let SharedBuild {built: whole, state: lowered} = move run sharedBuildState(&mut thisStore.*, module, runtimeSelected,
-      roots, origin, closureNodes)
-    if let Option<BackendBuild>.Some {value: built} = move whole {
-      return run withUnemittedBodies(move built, unchecked)
-    }
-    if let Option<ReplayState>.Some {value: state} = move lowered {
-      if let Option<BackendBuild>.Some {value: rewalked} = move run rewalkBuild(&mut thisStore.*, move state, module,
-        roots, origin, true) {
-        let mut kept = List<BuildRoot>.make()
-        let listed = roots
-        let mut rootAt = usize.ZERO
-        while rootAt < listed.length {
-          run List<BuildRoot>.append(&mut kept, BuildRoot {key: InstanceKey.copy(&listed[rootAt].key), span: listed[rootAt].span,
-            retained: listed[rootAt].retained})
-          rootAt = rootAt + usize.ONE
-        }
-        thisStore.unrecorded = Option<UnrecordedBuild>.some(UnrecordedBuild {module: ModuleId.copy(module), runtimeSelected: runtimeSelected,
-          roots: move kept, entrySpan: origin, closureNodes: closureNodes})
-        return run withUnemittedBodies(move rewalked, unchecked)
-      }
-    }
-  }
   let built = run buildFrom(&mut thisStore.*, module, runtimeSelected, roots, origin,
-    closureNodes, false, &Option<FrameSelection>.none(), &mut unshared())
+    closureNodes, false, &Option<FrameSelection>.none())
   return run withUnemittedBodies(move built, unchecked)
 }
 
@@ -5061,7 +5103,7 @@ pub effect fn rootExports(thisStore: &mut Semantic, request: &mut Request, modul
     if failures.length > usize.ZERO {
       continue
     }
-    let symbol = run Shared<Bytes>.make(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
+    let symbol = run Arc<Bytes>.make(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
     run recordExportedFunction(&mut thisStore.*, moduleOrdinal, candidate.declaration, &function)
     run List<BuildRoot>.append(&mut roots.*, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span, retained: false})
   }
@@ -5678,19 +5720,17 @@ pub effect fn rootRetained(thisStore: &mut Semantic, request: &mut Request, root
 // that reaches a suspension boundary is walked again with its closed suspendable set and the
 // selected execution-storage exports as further roots (SUSP private lowering model).
 //
-// A walk `sharing` shares starts copies of the process once it has entered `sharing.frontier`
-// instances (`WalkShared`); one that ends sooner is the walk of one process. Each copy lowers the instances it claims, and with nothing left of
-// its own, the ones another copy has claimed and not finished. Such a walk only lowers: it runs
-// no program-wide check and assembles nothing, and leaves what each copy lowered in
-// `sharing.parts`, which `rewalkBuild` walks in the order one process would.
+// When `thisStore.walkWorkers > 1`, non-discovery builds defer backend codegen (`emitInstance`)
+// until the walk finishes collecting MIR and emission inputs, then emit all instances in parallel
+// across `NativeThread` workers before publishing them in exact walk order.
 pub effect fn buildFrom(thisStore: &mut Semantic, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], entrySpan: Span,
-  closureNodes: usize, observing: bool, frames: &Option<FrameSelection>, sharing: &mut SharedWalk) -> BackendBuild
+  closureNodes: usize, observing: bool, frames: &Option<FrameSelection>) -> BackendBuild
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
   let clock = run Progress.enterQuery(&mut thisStore.resolver.progress, u8.toUsize(Family.value(Family.CleanupFree)) + 2, "BuildWalk")
   let traced = run Tracing.enterQuery(u8.toUsize(Family.value(Family.CleanupFree)) + 2, "BuildWalk", usize.MAX)
   let attempted = run Effect.result(buildFromTimed(&mut thisStore.*, module, runtimeSelected, roots, entrySpan, closureNodes, observing, frames,
-    &mut sharing.*, false))
+    false))
   Tracing.leaveQuery(traced)
   run Progress.leaveQuery(&mut thisStore.resolver.progress, clock)
   return match move attempted {
@@ -5701,32 +5741,14 @@ pub effect fn buildFrom(thisStore: &mut Semantic, module: &ModuleId, runtimeSele
 
 @trace(name: "codegen.walk")
 pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], entrySpan: Span,
-  closureNodes: usize, observing: bool, frames: &Option<FrameSelection>, sharing: &mut SharedWalk, discovering: bool) -> BackendBuild
+  closureNodes: usize, observing: bool, frames: &Option<FrameSelection>, discovering: bool) -> BackendBuild
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
   Trace.set("roots", &roots.length)
   Trace.set("observing", &observing)
   Trace.set("discovering", &discovering)
-  // Until copies start, the walk is the walk of one process, and a program too small to start
-  // them ends as one.
-  let mayShare = sharing.workers > usize.ONE
-  let mut sharedWalk = false
-  let mut share = WalkShared.none()
-  // The visits whose instance another copy claimed first, each with its claim's key, which
-  // this copy takes over once it has nothing else and the claim is still unfinished.
-  let mut lostVisits = List<BackendVisit>.make()
-  let mut lostOrigins = List<VisitOrigin>.make()
-  let mut lostKeys = List<u64>.make()
-  // This copy's unfinished claims, innermost last: the slot and key of each, and how many
-  // visits were pending when it was made, below which everything under it has been walked.
-  let mut claimLengths = List<usize>.make()
-  let mut claimSlots = List<usize>.make()
-  let mut claimKeys = List<u64>.make()
-  // Whether the visit about to be popped is one taken over from another copy.
-  let mut takeOver = false
-  // Whether this copy lowered each capture entry's instance without a report.
-  let mut lowerings = List<bool>.make()
   let mut pending = List<BackendVisit>.make()
+  let mut pendingEmits = List<PendingEmit>.make()
   thisStore.resolver.emittedMir = List<usize>.make()
   CostTable.restart(&mut thisStore.resolver.costs)
   // A revisable store's whole-program walk is captured as a build record (see `BuildRecord`):
@@ -5794,66 +5816,6 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
   let mut walking = true
   while walking {
     while true {
-      if mayShare {
-        // A proof needs the coordinator's complete graph, including provider choices made by other roots.
-        if !sharing.started && (capturing || (discovering && !thisStore.resolver.erasureRound.owesProof)) && List<InstanceKey>.length(&visited) >= sharing.frontier {
-          sharing.started = true
-          // A copy has no other thread, and holds nothing of the trace this process has yet to write.
-          run Tracing.flush()
-          share = run WalkShared.start(sharing.workers)
-          sharedWalk = WalkShared.active(&share)
-          if WalkShared.isCopy(&share) {
-            // A copy continues the walk from the middle of it, so it has no session of its own.
-            Tracing.silence()
-            thisStore.walkCopy = true
-            thisStore.resolver.progress = Progress.off()
-          }
-        }
-        if WalkShared.active(&share) {
-          while List<usize>.length(&claimLengths) > usize.ZERO
-            && List<usize>.get(&claimLengths, List<usize>.length(&claimLengths) - usize.ONE) >= List<BackendVisit>.length(&pending) {
-            let last = List<usize>.length(&claimLengths) - usize.ONE
-            WalkShared.done(&share, List<usize>.get(&claimSlots, last), List<u64>.get(&claimKeys, last))
-            drop List<usize>.pop(&mut claimLengths)
-            drop List<usize>.pop(&mut claimSlots)
-            drop List<u64>.pop(&mut claimKeys)
-          }
-          if List<BackendVisit>.length(&pending) == usize.ZERO {
-            while !takeOver {
-              let lost = match move List<BackendVisit>.pop(&mut lostVisits) {
-                Option<BackendVisit>.Some {value} => move value
-                _ => { break }
-              }
-              let lostOrigin = match move List<VisitOrigin>.pop(&mut lostOrigins) {
-                Option<VisitOrigin>.Some {value} => value
-                Option<VisitOrigin>.None => { return CompilerBug.panic(b"a lost build visit has no origin") }
-              }
-              let lostKey = match move List<u64>.pop(&mut lostKeys) {
-                Option<u64>.Some {value} => value
-                Option<u64>.None => { return CompilerBug.panic(b"a lost build visit has no claim") }
-              }
-              if WalkShared.inProgress(&share, lostKey) {
-                run List<BackendVisit>.append(&mut pending, move lost)
-                run List<VisitOrigin>.append(&mut origins, lostOrigin)
-                takeOver = true
-              }
-            }
-            if !takeOver {
-              if WalkShared.isCopy(&share) {
-                let unfit = capture.guarded || List<Shared<Rejection>>.length(&refusals) > usize.ZERO
-                  || List<Shared<BackendGap>>.length(&gaps) > usize.ZERO
-                let sent = if discovering { run ErasureRound.encode(&thisStore.resolver.erasureRound, unfit) } else { run sharedPart(Intrinsic.replace(capture, run BuildCapture.make(false, &[])), List<bool>.asSlice(&lowerings),
-                  List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues), unfit) }
-                WalkShared.send(&share, Bytes.asSlice(&sent))
-              }
-              match move run WalkShared.collect(Intrinsic.replace(share, WalkShared.none())) {
-                Option<List<Bytes>>.Some {value} => { sharing.parts = move value }
-                Option<List<Bytes>>.None => { sharing.failed = true }
-              }
-            }
-          }
-        }
-      }
       if List<BackendVisit>.length(&pending) == usize.ZERO { break }
       let visit = match move List<BackendVisit>.pop(&mut pending) {
         Option<BackendVisit>.Some {value} => move value
@@ -5882,11 +5844,6 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
       let resuming = nextSite
       nextSite = usize.MAX
       let instance = move entered.key
-      // A visit taken over is entered whoever claimed it, and was found visited when it was lost.
-      let taken = takeOver
-      takeOver = false
-      let mut lostEdge = Option<Edge>.none()
-      if WalkShared.active(&share) && !taken { lostEdge = Option<Edge>.some(Edge.copy(&entered.edge)) }
       let mut leave = false
       // Entry shims and drop glue carry no application to admit; only function instances specialize.
       let candidate = if resuming == usize.MAX { InstanceKey.application(&instance) } else { Option<Interned<Application>>.none() }
@@ -5992,38 +5949,11 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
           }
         }
       }
-      if resuming == usize.MAX && !taken && run applicationVisited(List<InstanceKey>.asSlice(&visited), &visitedLookup, &instance) {
+      if resuming == usize.MAX && run applicationVisited(List<InstanceKey>.asSlice(&visited), &visitedLookup, &instance) {
         if leave {
           Admission.leave(&mut admission)
         }
         continue
-      }
-      if let Option<Edge>.Some {value: reached} = move lostEdge {
-        // A later region pattern of an application this copy lowered shares its definition.
-        let named = run internBackendInstance(&mut thisStore.resolver, &instance, observing)
-        let mine = named < List<bool>.length(&walked) && List<bool>.get(&walked, named)
-        if !mine {
-          let claimed = run definitionDigest(&instance)
-          let slot = WalkShared.claim(&share, claimed.low)
-          if slot == usize.MAX {
-            if leave { Admission.leave(&mut admission) }
-            // The entry tells the walk that reads the parts what admission compares of the key.
-            if capturing {
-              run BuildCapture.enter(&mut capture, &instance, origin)
-              run List<bool>.append(&mut lowerings, false)
-            }
-            run List<InstanceKey>.append(&mut visited, InstanceKey.copy(&instance))
-            run InternIndex.record(&mut visitedLookup, InstanceKey.runtimeHash(&instance))
-            run List<BackendVisit>.append(&mut lostVisits, BackendVisit.Enter {key: move instance, edge: move reached, span: entered.span,
-              module: move entered.module, cleanup: move entered.cleanup, requester: move entered.requester})
-            run List<VisitOrigin>.append(&mut lostOrigins, origin)
-            run List<u64>.append(&mut lostKeys, claimed.low)
-            continue
-          }
-          run List<usize>.append(&mut claimLengths, List<BackendVisit>.length(&pending))
-          run List<usize>.append(&mut claimSlots, slot)
-          run List<u64>.append(&mut claimKeys, claimed.low)
-        }
       }
       if leave {
         run List<BackendVisit>.append(&mut pending, BackendVisit.Leave)
@@ -6031,7 +5961,6 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
       }
       let entry = List<CaptureEntry>.length(&capture.entries)
       if capturing { run BuildCapture.enter(&mut capture, &instance, origin) }
-      if mayShare && capturing { run List<bool>.append(&mut lowerings, false) }
       if resuming == usize.MAX {
         run List<InstanceKey>.append(&mut visited, InstanceKey.copy(&instance))
         run InternIndex.record(&mut visitedLookup, InstanceKey.runtimeHash(&instance))
@@ -6064,11 +5993,16 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
       // reached publishes its body from its own MIR (`exactBackendVariant`).
       let lowered = run internBackendInstance(&mut thisStore.resolver, &instance, observing)
       if resuming == usize.MAX && !run firstInWalk(&mut walked, lowered) {
-        let shared = textOf(List<usize>.asSlice(&texts), lowered)
-        if capturing { BuildCapture.alias(&mut capture, entry, textOf(List<usize>.asSlice(&owners), lowered), shared) }
-        if shared != usize.MAX {
-          run List<CollectedText>.append(&mut emitted, CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: shared,
-            pack: usize.MAX, member: usize.MAX})
+        if !discovering {
+          run List<PendingEmit>.append(
+            &mut pendingEmits,
+            PendingEmit.Alias {
+              instance: InstanceKey.copy(&instance),
+              entry: entry,
+              ownerEntry: textOf(List<usize>.asSlice(&owners), lowered),
+              lowered: lowered,
+            },
+          )
         }
         continue
       }
@@ -6077,7 +6011,6 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
       let costSteps = thisStore.resolver.costs.processSteps
       let mut costFrom: u64 = 0
       if thisStore.resolver.costs.enabled { costFrom = run Progress.stamp() }
-      let mut costBytes = usize.ZERO
       // Discovery follows calls before inlining. When the final variant already preserves those
       // calls, both walks can use the same query and the same lowered body.
       let raw = discovering && inlinesMir(&thisStore.resolver, &Option<CoroutineFacts>.none(), &instance)
@@ -6162,16 +6095,13 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
             Span.make(usize.ZERO, usize.ZERO),
           )
         }
-        let answer = if discovering { Shared<Result<Answer, NoRejection>>.clone(&prepared) } else {
-          run demandPreparedText(&mut thisStore.resolver, &mut thisStore.query, key, &prepared)
-        }
-        let canonicalFailure = Shared<Result<Answer, NoRejection>>.with<Option<CanonicalizationFailure>>(&answer, answerCanonicalizationFailure)
+        let canonicalFailure = Shared<Result<Answer, NoRejection>>.with<Option<CanonicalizationFailure>>(&prepared, answerCanonicalizationFailure)
         if let Option<CanonicalizationFailure>.Some {..} = move canonicalFailure {
           run List<Shared<Rejection>>.append(&mut refusals, run reject(&thisStore.resolver, &entered.module,
             RejectionCode.Undetermined, entered.span))
           continue
         }
-        let reported = run reportedDiagnostics(&mut thisStore.query, &answer)
+        let reported = run reportedDiagnostics(&mut thisStore.query, &prepared)
         let refused = List<Shared<Rejection>>.asSlice(&reported)
         let mut refusedAt = usize.ZERO
         while refusedAt < refused.length {
@@ -6199,7 +6129,7 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
           continue
         }
         let gap = Shared<Result<Answer, NoRejection>>.with<Option<Shared<BackendGap>>>(
-          &answer,
+          &prepared,
           answerBackendGap,
         )
         // Validate every exact application before collecting its content answer.
@@ -6207,37 +6137,24 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
           run List<Shared<BackendGap>>.append(&mut gaps, move value)
           continue
         }
-        let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(
-          &answer,
-          answerLlvmTextIndex,
-        )
-        if let Option<usize>.Some {value} = move index {
-          run List<CollectedText>.append(
-            &mut emitted,
-            CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: value,
-              pack: usize.MAX, member: usize.MAX},
+        if !discovering {
+          run List<PendingEmit>.append(
+            &mut pendingEmits,
+            PendingEmit.First {
+              key: key,
+              prepared: move prepared,
+              instance: InstanceKey.copy(&instance),
+              entry: entry,
+              lowered: lowered,
+              locationModule: location.module,
+              locationDeclaration: location.declaration,
+              requester: copyRequestSite(&entered.requester),
+              enteredModule: ModuleId.copy(&entered.module),
+              enteredSpan: entered.span,
+              costFrom: costFrom,
+              costSteps: costSteps,
+            },
           )
-          run recordText(&mut texts, lowered, value)
-          costBytes = Bytes.length(&List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues)[value].text)
-          if capturing {
-            let emissionUnit = run emissionInputsUnit(&mut thisStore.resolver, key, &prepared)
-            BuildCapture.emitted(&mut capture, entry, value, emissionUnit)
-          }
-        }
-        // A dispatcher is shared by every caller of this interface operation. Charge its
-        // generated body to the operation declaration, independent of which caller ran first.
-        if thisStore.resolver.costs.enabled && !discovering {
-          let fresh = thisStore.resolver.costs.processSteps - costSteps
-          let steps = run CostTable.lowered(&mut thisStore.resolver.costs, &instance, fresh)
-          let site = if operationDispatch(&instance) == OperationDispatch.Erased {
-            let declared = resolvedModule(&thisStore.resolver, location.module)
-            let span = run declarationSpan(&mut thisStore.resolver, &declared, location.declaration)
-            RelatedSite {module: move declared, span: span}
-          } else { requestSite(&entered.requester, &entered.module, entered.span) }
-          let charged = site.span.end != usize.ZERO && !toolchainModule(&site.module) && CostTable.inRoot(&thisStore.resolver.costs, &site.module)
-          let costTo = run Progress.stamp()
-          let elapsed = costTo - costFrom
-          run CostTable.charge(&mut thisStore.resolver.costs, charged, &site.module, site.span, costBytes, steps, elapsed)
         }
         if capturing {
           let mirWord = run internKey(&mut thisStore.resolver, declarationAccess274)
@@ -6257,7 +6174,6 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
         }
       }
       run recordText(&mut owners, lowered, entry)
-      if mayShare && capturing { List<bool>.set(&mut lowerings, entry, true) }
       if let Option<usize>.Some {value: selectedMir} = move mirIndex {
         let anchor = run instanceAnchor(&mut thisStore.resolver, &instance)
         let functions = List<MirFunction>.asSlice(&thisStore.resolver.mirValues)
@@ -6268,7 +6184,7 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
         if functions[selectedMir].observes { observes = true }
         // A program that observes diagnostics is emitted from the observing walk, so the rest of
         // this one would be thrown away.
-        if observes && !observing && !sharedWalk && !discovering { break }
+        if observes && !observing && !discovering { break }
         let reached = List<usize>.length(&thisStore.resolver.emittedMir)
         if resuming == usize.MAX { run List<usize>.append(&mut thisStore.resolver.emittedMir, selectedMir) }
         else { List<usize>.set(&mut thisStore.resolver.emittedMir, List<DiscoverySite>.asSlice(&sites)[resuming].body, selectedMir) }
@@ -6286,7 +6202,7 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
             run List<usize>.append(&mut summarized, entry)
           } else { List<SuspensionSummary>.set(&mut summaries, summaryAt, move summary) }
         }
-        if dispatcher != usize.MAX && !sharedWalk {
+        if dispatcher != usize.MAX {
           if resuming == usize.MAX {
             run List<DiscoverySite>.append(&mut sites, DiscoverySite {dispatcher: dispatcher, admission: run Admission.copy(&admission),
               span: entered.span, module: ModuleId.copy(&entered.module), requester: copyRequestSite(&entered.requester),
@@ -6348,16 +6264,13 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
     }
     // Each closed wave preserves the ordinary visits it has already made. Reopen only
     // dispatchers whose contract grew. New witnesses can add conversions to any contract.
-    if discovering && !sharedWalk && List<Shared<Rejection>>.length(&refusals) == usize.ZERO && List<Shared<BackendGap>>.length(&gaps) == usize.ZERO {
+    if discovering && List<Shared<Rejection>>.length(&refusals) == usize.ZERO && List<Shared<BackendGap>>.length(&gaps) == usize.ZERO {
       if List<usize>.length(&dirty) == usize.ZERO {
         run changedDispatchers(&mut thisStore.resolver, List<DiscoverySite>.asSlice(&sites), &mut dirty)
       }
       if let Option<usize>.Some {value: siteAt} = move List<usize>.pop(&mut dirty) {
         let site = &List<DiscoverySite>.asSlice(&sites)[siteAt]
         let dispatcher = &List<DiscoveryDispatch>.asSlice(&thisStore.resolver.erasureDispatchers)[site.dispatcher]
-        // Workers send portable observations. This coordinator already owns the complete
-        // admission paths and reached MIR for the initial graph and all subsequent waves.
-        sharing.started = true
         admission = run Admission.copy(&site.admission)
         nextSite = siteAt
         run List<BackendVisit>.append(&mut pending, BackendVisit.Enter {key: InstanceKey.copy(&dispatcher.instance),
@@ -6370,7 +6283,7 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
     }
     // A NonParking value the program never runs is still proved, as the bootstrap does: the
     // instances that would run it join the walk.
-    if sharedWalk || (observes && !observing && !discovering) {
+    if observes && !observing && !discovering {
       walking = false
     } else {
       walking = run requestUnreached(List<SuspensionSummary>.asSlice(&summaries), List<usize>.asSlice(&summarized),
@@ -6378,21 +6291,9 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
     }
   }
   run Progress.endItem(&mut thisStore.resolver.progress)
-  if sharedWalk {
-    let unfit = capture.guarded || List<Shared<Rejection>>.length(&refusals) > usize.ZERO
-      || List<Shared<BackendGap>>.length(&gaps) > usize.ZERO
-    if discovering {
-      if unfit || thisStore.resolver.erasureRound.owesProof { sharing.failed = true }
-    } else if !sharing.failed {
-      let own = run sharedPart(move capture, List<bool>.asSlice(&lowerings), List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues), unfit)
-      run List<Bytes>.append(&mut sharing.parts, move own)
-    }
-    return BackendBuild.Unsupported {gaps: List<Shared<BackendGap>>.make()}
-  }
   // The observing walk reports every refusal and gap itself.
   if observes && !observing && !discovering {
-    // The walk met the observation before it started any copy, so the observing walk may share.
-    return run buildFrom(&mut thisStore.*, module, runtimeSelected, roots, entrySpan, closureNodes, true, frames, &mut sharing.*)
+    return run buildFrom(&mut thisStore.*, module, runtimeSelected, roots, entrySpan, closureNodes, true, frames)
   }
   if List<Shared<Rejection>>.length(&refusals) > usize.ZERO {
     let first = List<Shared<Rejection>>.remove(&mut refusals, usize.ZERO)
@@ -6520,19 +6421,91 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
       let extended = run frameRoots(&mut selection, roots, List<StorageExport>.asSlice(&exports))
       let chosen = Option<FrameSelection>.some(move selection)
       return run buildFrom(&mut thisStore.*, module, runtimeSelected, List<BuildRoot>.asSlice(&extended), entrySpan,
-        closureNodes, observing, &chosen, &mut unshared())
+        closureNodes, observing, &chosen)
     }
   }
-  if thisStore.resolver.trimsEmitted && thisStore.resolver.direct && !capturing && !thisStore.resolver.revisable && !mayWriteErasure(&thisStore.resolver) {
-    let mut trimAt = usize.ZERO
-    let trimCount = List<bool>.length(&thisStore.resolver.splicedCopies)
-    while trimAt < trimCount {
-      if List<bool>.get(&thisStore.resolver.splicedCopies, trimAt) {
-        List<bool>.set(&mut thisStore.resolver.splicedCopies, trimAt, false)
-        run MirInline.residue(&mut List<MirFunction>.asMutSlice(&mut thisStore.resolver.mirValues)[trimAt])
+  // All walk restarts and whole-program checks have settled: emit uncached definitions in parallel
+  // across NativeThread workers, then publish into `Family.LlvmText` in exact walk order.
+  run preEmitBatch(&mut thisStore.*, List<PendingEmit>.asSlice(&pendingEmits))
+  let emitList = List<PendingEmit>.asSlice(&pendingEmits)
+  let mut pi = usize.ZERO
+  while pi < emitList.length {
+    match &emitList[pi] {
+      PendingEmit.First {
+        key,
+        prepared,
+        instance,
+        entry,
+        lowered,
+        locationModule,
+        locationDeclaration,
+        requester,
+        enteredModule,
+        enteredSpan,
+        costFrom,
+        costSteps,
+      } => {
+        let answer = run demandPreparedText(&mut thisStore.resolver, &mut thisStore.query, key, &prepared)
+        let gap = Shared<Result<Answer, NoRejection>>.with<Option<Shared<BackendGap>>>(&answer, answerBackendGap)
+        if let Option<Shared<BackendGap>>.Some {value} = move gap {
+          run List<Shared<BackendGap>>.append(&mut gaps, move value)
+        } else {
+          let mut costBytes = usize.ZERO
+          let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerLlvmTextIndex)
+          if let Option<usize>.Some {value} = move index {
+            run List<CollectedText>.append(
+              &mut emitted,
+              CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: value,
+                pack: usize.MAX, member: usize.MAX},
+            )
+            run recordText(&mut texts, lowered, value)
+            costBytes = Bytes.length(&List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues)[value].text)
+            if capturing {
+              let emissionUnit = run emissionInputsUnit(&mut thisStore.resolver, key, &prepared)
+              BuildCapture.emitted(&mut capture, entry, value, emissionUnit)
+            }
+          }
+          if thisStore.resolver.costs.enabled {
+            let fresh = thisStore.resolver.costs.processSteps - costSteps
+            let steps = run CostTable.lowered(&mut thisStore.resolver.costs, &instance, fresh)
+            let site = if operationDispatch(&instance) == OperationDispatch.Erased {
+              let declared = resolvedModule(&thisStore.resolver, locationModule)
+              let span = run declarationSpan(&mut thisStore.resolver, &declared, locationDeclaration)
+              RelatedSite {module: move declared, span: span}
+            } else { requestSite(&requester, &enteredModule, enteredSpan) }
+            let charged = site.span.end != usize.ZERO && !toolchainModule(&site.module) && CostTable.inRoot(&thisStore.resolver.costs, &site.module)
+            let costTo = run Progress.stamp()
+            let elapsed = costTo - costFrom
+            run CostTable.charge(&mut thisStore.resolver.costs, charged, &site.module, site.span, costBytes, steps, elapsed)
+          }
+        }
       }
-      trimAt = trimAt + usize.ONE
+      PendingEmit.Alias {instance, entry, ownerEntry, lowered} => {
+        let shared = textOf(List<usize>.asSlice(&texts), lowered)
+        if capturing { BuildCapture.alias(&mut capture, entry, ownerEntry, shared) }
+        if shared != usize.MAX {
+          run List<CollectedText>.append(
+            &mut emitted,
+            CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: shared,
+              pack: usize.MAX, member: usize.MAX},
+          )
+        }
+      }
     }
+    pi = pi + usize.ONE
+  }
+  List<PreEmitOutcome>.clearAndFree(&mut thisStore.resolver.preEmitted)
+  List<usize>.clearAndFree(&mut thisStore.resolver.preEmitSlots)
+  if List<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
+    return BackendBuild.Unsupported {gaps: move gaps}
+  }
+  if thisStore.resolver.trimsEmitted && (thisStore.resolver.closedErasures || !mayWriteErasure(&thisStore.resolver)) {
+    List<MirFunction>.clearAndFree(&mut thisStore.resolver.coalescedValues)
+    List<usize>.clearAndFree(&mut thisStore.resolver.coalescedIndex)
+    List<MirFunction>.clearAndFree(&mut thisStore.resolver.mirValues)
+    List<bool>.clearAndFree(&mut thisStore.resolver.splicedCopies)
+    List<usize>.clearAndFree(&mut thisStore.resolver.emittedMir)
+    thisStore.resolver.mirReleasedCount = usize.ZERO
   }
   let mut packed = PackedBuild.make()
   let starts = run collectedOrigins(&mut thisStore.resolver, List<CollectedText>.asSlice(&emitted))
@@ -6545,6 +6518,16 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
     entrySpan,
     &mut packed,
   )
+  // After assembly has copied all fragment bytes into `text`/`units`, `BuildRecord.encodeDefinition`
+  // only reads `encoding`, `symbol`, `foreign`, and `borrow` — release the duplicate `.text` buffers.
+  if thisStore.resolver.trimsEmitted {
+    let mut defs = List<InstanceDefinition>.asMutSlice(&mut thisStore.resolver.llvmValues)
+    let mut di = usize.ZERO
+    while di < defs.length {
+      Bytes.clearAndFree(&mut defs[di].text)
+      di = di + usize.ONE
+    }
+  }
   thisStore.packedBuild = move packed
   if capturing {
     if let BackendBuild.Module {..} = &assembled {
@@ -6572,34 +6555,7 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
   return move assembled
 }
 
-// Lowers every instance a build from `roots` reaches, shared between copies of the process
-// (`SharedWalk`), and gives what they lowered as the state of a record to walk again
-// (`rewalkBuild`): each instance's facts and references, and its definition where a copy
-// emitted one. A walk that ended before it started any copy is the build itself. Neither when
-// the copies did not lower the whole walk between them.
-@trace(name: "codegen.shared")
-pub effect fn sharedBuildState(thisStore: &mut Semantic, module: &ModuleId, runtimeSelected: bool, roots: &[BuildRoot], entrySpan: Span,
-  closureNodes: usize) -> SharedBuild
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
-? &mut Allocator | &mut Types {
-  let mut sharing = SharedWalk {workers: thisStore.walkWorkers, frontier: thisStore.walkFrontier, started: false, parts: List<Bytes>.make(),
-    failed: false}
-  let walked = run Effect.result(buildFrom(&mut thisStore.*, module, runtimeSelected, roots, entrySpan, closureNodes, false,
-    &Option<FrameSelection>.none(), &mut sharing))
-  // A copy ends in the walk; one that left it failed, and must not go on as the build.
-  if thisStore.walkCopy { WalkShared.abandon() }
-  let built = match move walked {
-    Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
-    Result<BackendBuild, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
-  }
-  if List<Bytes>.length(&sharing.parts) == usize.ZERO && !sharing.failed {
-    return SharedBuild {built: Option<BackendBuild>.some(move built), state: Option<ReplayState>.none()}
-  }
-  drop built
-  let mut state = Option<ReplayState>.none()
-  if !sharing.failed { state = run sharedState(List<Bytes>.asSlice(&sharing.parts), roots) }
-  return SharedBuild {built: Option<BackendBuild>.none(), state: move state}
-}
+
 
 // The edge a walk over what copies of the process lowered followed to reach reference
 // `position` of node `parent`, read from that node's MIR, which is lowered here when no key of

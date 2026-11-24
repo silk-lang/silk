@@ -73,7 +73,7 @@ final-link setting outside the profile's identity, and another target refuses it
 unsupported combination.
 
 A compilation may set `codegen-units`, a whole number from 1 to 256: how many codegen units an
-optimized executable splits into (one module when unset or `1`). It changes no
+optimized executable splits into (8 when unset on `speed` builds, 1 otherwise). It changes no
 source-visible fact, but it is part of the profile's identity, so each count keeps its own cache.
 
 Safety and threading choices are source-visible policy requests; they never change the language's
@@ -277,8 +277,8 @@ object's cache key, so changing either the variable or the profile rebuilds the 
 profile describes one build of the program: regenerate it after changing the source or the
 compiler.
 
-An optimized (`speed`) executable is one module unless its profile sets `codegen-units`
-above 1. Then, when it holds more than 4 MB of bitcode, it splits into that many codegen units,
+An optimized (`speed`) executable defaults `codegen-units` to 8 (set `codegen-units = 1` for
+one module). When `codegen-units` is above 1 and it holds more than 4 MB of bitcode, it splits into that many codegen units,
 which Clang optimizes on separate threads; an unoptimized build already splits by module. The units follow the call graph:
 a function that only one group of functions calls joins that group, up to an even share of the
 program, and every unit keeps its own internal copy of each function that asks to be inlined that

@@ -1,0 +1,884 @@
+//! Transitive identical code folding (ICF) for Silk Bitcode `SLKF` fragments and x86-64
+//! [`X86Object.Fragment`] streams.
+//!
+//! # When to use
+//! Call [`foldBitcode`] across content-named LLVM Bitcode fragments before writing a monolithic
+//! module or assembling codegen units, then rewrite surviving fragments via
+//! [`appendRewrittenBitcode`] or emit per-unit `SLKA` alias tables via [`unitAliasFragment`].
+//! Call [`foldX86Fragment`] on a decoded [`X86Object.Fragment`] before linking or incremental
+//! patching in the direct x86-64 backend.
+//!
+//! # Details
+//! Both passes iterate to a fixed point (up to 8 rounds), canonicalizing self-references and
+//! cross-references through the current equivalence map so callers whose callees folded in an
+//! earlier round fold transitively in subsequent rounds. Retained Bitcode roots are never folded
+//! away, but identical non-retained fragments fold into them.
+
+import backend.Bitcode
+import backend.X86Object {
+  Fragment as X86Fragment,
+  Function as X86Function,
+  Object as X86ObjectEntry,
+  Pointer as X86Pointer,
+  Relocation as X86Relocation,
+  RelocationKind as X86RelocationKind,
+  RodataJumpEntry as X86RodataJump,
+}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// One candidate Bitcode fragment for [`foldBitcode`].
+pub struct FragmentRef<'a> {
+  /// Link symbol name of the definition represented by `bytes`.
+  pub symbol: &'a [u8],
+  /// Serialized `SLKF` fragment bytes.
+  pub bytes: &'a [u8],
+  /// When true, this fragment must be kept (it may still act as a canonical target for non-retained
+  /// duplicates).
+  pub retained: bool,
+}
+
+impl<'a> Copy for FragmentRef<'a> {}
+
+/// Result of folding a list of Bitcode fragments.
+pub struct FoldResult {
+  /// Parallel to the input `FragmentRef` slice: true when that fragment is kept, false when folded.
+  pub kept: List<bool>,
+  aliasFrom: List<Bytes>,
+  aliasTo: List<Bytes>,
+  aliasLookup: InternIndex,
+  /// Number of fragments folded away.
+  pub foldedCount: usize,
+}
+
+impl FoldResult {
+  /// An empty fold result that keeps every definition unchanged.
+  pub fn empty() -> FoldResult {
+    return FoldResult {
+      kept: List<bool>.make(),
+      aliasFrom: List<Bytes>.make(),
+      aliasTo: List<Bytes>.make(),
+      aliasLookup: InternIndex.make(),
+      foldedCount: usize.ZERO,
+    }
+  }
+
+  /// Returns the canonical symbol name for `symbol`, or `symbol` itself when it was not folded.
+  pub fn resolve<'a>(self: &'a Self, symbol: &'a [u8]) -> &'a [u8] {
+    if self.foldedCount == usize.ZERO {
+      return symbol
+    }
+    let froms = List<Bytes>.asSlice(&self.aliasFrom)
+    let tos = List<Bytes>.asSlice(&self.aliasTo)
+    let mut probe = InternIndex.first(&self.aliasLookup, InternIndex.hashBytes(0, symbol))
+    while probe != usize.MAX {
+      if sameBytes(Bytes.asSlice(&froms[probe]), symbol) {
+        return Bytes.asSlice(&tos[probe])
+      }
+      probe = InternIndex.after(&self.aliasLookup, probe)
+    }
+    return symbol
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn isSlkf(bytes: &[u8], at: usize) -> bool {
+  return at + 8 <= bytes.length
+    && bytes[at] == 83
+    && bytes[at + usize.ONE] == 76
+    && bytes[at + 2] == 75
+    && bytes[at + 3] == 70
+}
+
+fn takeVarint(bytes: &[u8], at: &mut usize) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while true {
+    let byte = u8.toU64(bytes[at.*])
+    at.* = at.* + usize.ONE
+    value = u64.bitOr(value, u64.shiftLeft(u64.bitAnd(byte, 127), shift))
+    if byte < 128 {
+      return value
+    }
+    shift = shift + 7
+  }
+  return value
+}
+
+effect fn putVarint(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  while rest >= 128 {
+    run List<u8>.append(&mut out.*, u64.toU8(u64.bitOr(u64.bitAnd(rest, 127), 128)))
+    rest = u64.shiftRight(rest, 7)
+  }
+  return run List<u8>.append(&mut out.*, u64.toU8(rest))
+}
+
+fn hasFlag(flags: u64, bit: u64) -> bool {
+  return u64.bitAnd(flags, bit) != 0
+}
+
+// Parsed global-table slice inside a single SLKF fragment.
+struct ParsedGlobal {
+  nameStart: usize,
+  nameLen: usize,
+  metaStart: usize,
+  metaLen: usize,
+}
+
+impl Copy for ParsedGlobal {}
+
+// Parsed metadata for one candidate SLKF fragment.
+struct ParsedFragment {
+  eligible: bool,
+  globalStart: usize,
+  globalCount: usize,
+  tailStart: usize,
+  tailHash: u64,
+}
+
+impl Copy for ParsedFragment {}
+
+fn findBitcodeSymbol<'a>(items: &[FragmentRef<'a>], symLookup: &InternIndex, name: &[u8]) -> usize {
+  let mut probe = InternIndex.first(symLookup, InternIndex.hashBytes(0, name))
+  while probe != usize.MAX {
+    if sameBytes(items[probe].symbol, name) {
+      return probe
+    }
+    probe = InternIndex.after(symLookup, probe)
+  }
+  return usize.MAX
+}
+
+effect fn parseBitcodeFragment<'a>(
+  item: FragmentRef<'a>,
+  globals: &mut List<ParsedGlobal>,
+) -> ParsedFragment ! OutOfMemoryError ? &mut Allocator {
+  let bytes = item.bytes
+  if !Bitcode.isContentSymbol(item.symbol)
+    || !isSlkf(bytes, usize.ZERO)
+    || Bitcode.fragmentEnd(bytes, usize.ZERO) != bytes.length {
+    return ParsedFragment {
+      eligible: false,
+      globalStart: usize.ZERO,
+      globalCount: usize.ZERO,
+      tailStart: usize.ZERO,
+      tailHash: 0,
+    }
+  }
+  let mut cursor: usize = 8
+  let count = u64.toUsize(takeVarint(bytes, &mut cursor))
+  let globalStart = List<ParsedGlobal>.length(&globals.*)
+  let mut definedCount = usize.ZERO
+  let mut definedSelfFunc = false
+  let mut gi = usize.ZERO
+  while gi < count {
+    let nameLen = u64.toUsize(takeVarint(bytes, &mut cursor))
+    let nameStart = cursor
+    cursor = cursor + nameLen
+    let metaStart = cursor
+    let flags = takeVarint(bytes, &mut cursor)
+    let mut skip = usize.ZERO
+    while skip < 9 {
+      let _ignored = takeVarint(bytes, &mut cursor)
+      skip = skip + usize.ONE
+    }
+    let metaLen = cursor - metaStart
+    if hasFlag(flags, Bitcode.flagDefined()) {
+      definedCount = definedCount + usize.ONE
+      if hasFlag(flags, Bitcode.flagFunction())
+        && sameBytes(Slice.view<u8>(bytes, nameStart, nameLen), item.symbol) {
+        definedSelfFunc = true
+      }
+    }
+    run List<ParsedGlobal>.append(
+      &mut globals.*,
+      ParsedGlobal {nameStart: nameStart, nameLen: nameLen, metaStart: metaStart, metaLen: metaLen},
+    )
+    gi = gi + usize.ONE
+  }
+  if definedCount != usize.ONE || !definedSelfFunc {
+    return ParsedFragment {
+      eligible: false,
+      globalStart: globalStart,
+      globalCount: count,
+      tailStart: cursor,
+      tailHash: 0,
+    }
+  }
+  let tailHash = InternIndex.hashBytes(1, Slice.view<u8>(bytes, cursor, bytes.length - cursor))
+  return ParsedFragment {
+    eligible: true,
+    globalStart: globalStart,
+    globalCount: count,
+    tailStart: cursor,
+    tailHash: tailHash,
+  }
+}
+
+fn bitcodeRoundHash<'a>(
+  items: &[FragmentRef<'a>],
+  parsed: &[ParsedFragment],
+  globals: &[ParsedGlobal],
+  symLookup: &InternIndex,
+  canonical: &[usize],
+  index: usize,
+) -> u64 {
+  let meta = parsed[index]
+  let bytes = items[index].bytes
+  let selfSym = items[index].symbol
+  let mut h = Hash.combine(meta.tailHash, usize.toU64(meta.globalCount))
+  let mut gi = usize.ZERO
+  while gi < meta.globalCount {
+    let g = globals[meta.globalStart + gi]
+    let raw = Slice.view<u8>(bytes, g.nameStart, g.nameLen)
+    h = InternIndex.hashBytes(h, Slice.view<u8>(bytes, g.metaStart, g.metaLen))
+    if sameBytes(raw, selfSym) {
+      h = Hash.combine(h, 0x5E1F5E1F)
+    } else {
+      let targetIdx = findBitcodeSymbol(items, symLookup, raw)
+      let resolved = if targetIdx != usize.MAX { items[canonical[targetIdx]].symbol } else { raw }
+      h = Hash.combine(h, InternIndex.hashBytes(3, resolved))
+    }
+    gi = gi + usize.ONE
+  }
+  return h
+}
+
+fn bitcodeExactMatch<'a>(
+  items: &[FragmentRef<'a>],
+  parsed: &[ParsedFragment],
+  globals: &[ParsedGlobal],
+  symLookup: &InternIndex,
+  canonical: &[usize],
+  left: usize,
+  right: usize,
+) -> bool {
+  let pa = parsed[left]
+  let pb = parsed[right]
+  if pa.tailHash != pb.tailHash || pa.globalCount != pb.globalCount {
+    return false
+  }
+  let bytesA = items[left].bytes
+  let bytesB = items[right].bytes
+  let tailA = Slice.view<u8>(bytesA, pa.tailStart, bytesA.length - pa.tailStart)
+  let tailB = Slice.view<u8>(bytesB, pb.tailStart, bytesB.length - pb.tailStart)
+  if !sameBytes(tailA, tailB) {
+    return false
+  }
+  let selfA = items[left].symbol
+  let selfB = items[right].symbol
+  let mut gi = usize.ZERO
+  while gi < pa.globalCount {
+    let ga = globals[pa.globalStart + gi]
+    let gb = globals[pb.globalStart + gi]
+    let metaA = Slice.view<u8>(bytesA, ga.metaStart, ga.metaLen)
+    let metaB = Slice.view<u8>(bytesB, gb.metaStart, gb.metaLen)
+    if !sameBytes(metaA, metaB) {
+      return false
+    }
+    let rawA = Slice.view<u8>(bytesA, ga.nameStart, ga.nameLen)
+    let rawB = Slice.view<u8>(bytesB, gb.nameStart, gb.nameLen)
+    let isSelfA = sameBytes(rawA, selfA)
+    let isSelfB = sameBytes(rawB, selfB)
+    if isSelfA != isSelfB {
+      return false
+    }
+    if !isSelfA {
+      let idxA = findBitcodeSymbol(items, symLookup, rawA)
+      let idxB = findBitcodeSymbol(items, symLookup, rawB)
+      let nameA = if idxA != usize.MAX { items[canonical[idxA]].symbol } else { rawA }
+      let nameB = if idxB != usize.MAX { items[canonical[idxB]].symbol } else { rawB }
+      if !sameBytes(nameA, nameB) {
+        return false
+      }
+    }
+    gi = gi + usize.ONE
+  }
+  return true
+}
+
+/// Transitively folds identical content-named `SLKF` Bitcode fragments.
+///
+/// Retained fragments are never folded away, while identical non-retained fragments fold into
+/// retained representatives first and otherwise into the earliest equivalent fragment.
+pub effect fn foldBitcode<'a>(items: &[FragmentRef<'a>]) -> FoldResult
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = items.length
+  if count < 2 {
+    return FoldResult.empty()
+  }
+  let mut symLookup = run InternIndex.withCapacity(count)
+  let mut canonical = List<usize>.make()
+  let mut kept = List<bool>.make()
+  let mut parsed = List<ParsedFragment>.make()
+  let mut globals = List<ParsedGlobal>.make()
+  run List<usize>.reserveExact(&mut canonical, count)
+  run List<bool>.appendRepeated(&mut kept, true, count)
+  run List<ParsedFragment>.reserveExact(&mut parsed, count)
+  let mut at = usize.ZERO
+  while at < count {
+    run InternIndex.record(&mut symLookup, InternIndex.hashBytes(0, items[at].symbol))
+    run List<usize>.append(&mut canonical, at)
+    let pf = run parseBitcodeFragment(items[at], &mut globals)
+    run List<ParsedFragment>.append(&mut parsed, pf)
+    at = at + usize.ONE
+  }
+  let parsedSlice = List<ParsedFragment>.asSlice(&parsed)
+  let globalsSlice = List<ParsedGlobal>.asSlice(&globals)
+  let mut totalFolded = usize.ZERO
+  let mut round = usize.ZERO
+  while round < 8 {
+    let mut merged = usize.ZERO
+    let mut bucket = InternIndex.make()
+    let mut bucketItems = List<usize>.make()
+    // Seed retained roots first so identical non-retained duplicates fold into them.
+    at = usize.ZERO
+    while at < count {
+      if items[at].retained && List<bool>.get(&kept, at) && parsedSlice[at].eligible {
+        let h = bitcodeRoundHash(items, parsedSlice, globalsSlice, &symLookup, List<usize>.asSlice(&canonical), at)
+        run InternIndex.record(&mut bucket, h)
+        run List<usize>.append(&mut bucketItems, at)
+      }
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < count {
+      if !items[at].retained && List<bool>.get(&kept, at) && parsedSlice[at].eligible {
+        let h = bitcodeRoundHash(items, parsedSlice, globalsSlice, &symLookup, List<usize>.asSlice(&canonical), at)
+        let mut matched = usize.MAX
+        let mut probe = InternIndex.first(&bucket, h)
+        let cands = List<usize>.asSlice(&bucketItems)
+        while probe != usize.MAX {
+          let cand = cands[probe]
+          if bitcodeExactMatch(items, parsedSlice, globalsSlice, &symLookup, List<usize>.asSlice(&canonical), cand, at) {
+            matched = cand
+            break
+          }
+          probe = InternIndex.after(&bucket, probe)
+        }
+        if matched != usize.MAX {
+          let target = List<usize>.get(&canonical, matched)
+          List<usize>.set(&mut canonical, at, target)
+          List<bool>.set(&mut kept, at, false)
+          merged = merged + usize.ONE
+          totalFolded = totalFolded + usize.ONE
+        } else {
+          run InternIndex.record(&mut bucket, h)
+          run List<usize>.append(&mut bucketItems, at)
+        }
+      }
+      at = at + usize.ONE
+    }
+    if merged == usize.ZERO {
+      break
+    }
+    at = usize.ZERO
+    while at < count {
+      let mut root = List<usize>.get(&canonical, at)
+      while root != List<usize>.get(&canonical, root) {
+        root = List<usize>.get(&canonical, root)
+      }
+      List<usize>.set(&mut canonical, at, root)
+      at = at + usize.ONE
+    }
+    round = round + usize.ONE
+  }
+  if totalFolded == usize.ZERO {
+    return FoldResult.empty()
+  }
+  let mut aliasFrom = List<Bytes>.make()
+  let mut aliasTo = List<Bytes>.make()
+  let mut aliasLookup = run InternIndex.withCapacity(totalFolded)
+  run List<Bytes>.reserveExact(&mut aliasFrom, totalFolded)
+  run List<Bytes>.reserveExact(&mut aliasTo, totalFolded)
+  at = usize.ZERO
+  while at < count {
+    if !List<bool>.get(&kept, at) {
+      let from = items[at].symbol
+      let to = items[List<usize>.get(&canonical, at)].symbol
+      run InternIndex.record(&mut aliasLookup, InternIndex.hashBytes(0, from))
+      run List<Bytes>.append(&mut aliasFrom, run Bytes.copy(from))
+      run List<Bytes>.append(&mut aliasTo, run Bytes.copy(to))
+    }
+    at = at + usize.ONE
+  }
+  return FoldResult {
+    kept: move kept,
+    aliasFrom: move aliasFrom,
+    aliasTo: move aliasTo,
+    aliasLookup: move aliasLookup,
+    foldedCount: totalFolded,
+  }
+}
+
+/// Appends `bytes` (one or more Bitcode fragments) to `output`, rewriting any global symbol
+/// references aliased by `fold` to their canonical names.
+pub effect fn appendRewrittenBitcode(
+  output: &mut Bytes,
+  bytes: &[u8],
+  fold: &FoldResult,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  if fold.foldedCount == usize.ZERO || bytes.length == usize.ZERO {
+    return run Bytes.append(&mut output.*, bytes)
+  }
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if !isSlkf(bytes, at) {
+      let end = if Bitcode.isAliasFragment(bytes, at) {
+        Bitcode.fragmentEnd(bytes, at)
+      } else {
+        bytes.length
+      }
+      run Bytes.append(&mut output.*, Slice.view<u8>(bytes, at, end - at))
+      at = end
+      continue
+    }
+    let end = Bitcode.fragmentEnd(bytes, at)
+    let mut cursor = at + 8
+    let globals = u64.toUsize(takeVarint(bytes, &mut cursor))
+    let mut changed = false
+    let mut gi = usize.ZERO
+    while gi < globals {
+      let nameLen = u64.toUsize(takeVarint(bytes, &mut cursor))
+      let raw = Slice.view<u8>(bytes, cursor, nameLen)
+      cursor = cursor + nameLen
+      if !sameBytes(raw, fold.resolve(raw)) {
+        changed = true
+      }
+      let mut skip = usize.ZERO
+      while skip < 10 {
+        let _ignored = takeVarint(bytes, &mut cursor)
+        skip = skip + usize.ONE
+      }
+      gi = gi + usize.ONE
+    }
+    if !changed {
+      run Bytes.append(&mut output.*, Slice.view<u8>(bytes, at, end - at))
+      at = end
+      continue
+    }
+    let tailStart = cursor
+    let mut rebuilt = List<u8>.make()
+    run List<u8>.reserveExact(&mut rebuilt, end - at)
+    run List<u8>.appendBytes(&mut rebuilt, b"SLKF")
+    run List<u8>.appendRepeated(&mut rebuilt, 0, 4)
+    run putVarint(&mut rebuilt, usize.toU64(globals))
+    cursor = at + 8
+    let _g = takeVarint(bytes, &mut cursor)
+    gi = usize.ZERO
+    while gi < globals {
+      let nameLen = u64.toUsize(takeVarint(bytes, &mut cursor))
+      let raw = Slice.view<u8>(bytes, cursor, nameLen)
+      cursor = cursor + nameLen
+      let resolved = fold.resolve(raw)
+      run putVarint(&mut rebuilt, usize.toU64(resolved.length))
+      run List<u8>.appendBytes(&mut rebuilt, resolved)
+      let metaStart = cursor
+      let mut skip = usize.ZERO
+      while skip < 10 {
+        let _ignored = takeVarint(bytes, &mut cursor)
+        skip = skip + usize.ONE
+      }
+      run List<u8>.appendBytes(&mut rebuilt, Slice.view<u8>(bytes, metaStart, cursor - metaStart))
+      gi = gi + usize.ONE
+    }
+    run List<u8>.appendBytes(&mut rebuilt, Slice.view<u8>(bytes, tailStart, end - tailStart))
+    let payloadLen = usize.toU64(List<u8>.length(&rebuilt) - 8)
+    let mut slice = List<u8>.asMutSlice(&mut rebuilt)
+    slice[4] = u64.toU8(u64.bitAnd(payloadLen, 255))
+    slice[5] = u64.toU8(u64.bitAnd(u64.shiftRight(payloadLen, 8), 255))
+    slice[6] = u64.toU8(u64.bitAnd(u64.shiftRight(payloadLen, 16), 255))
+    slice[7] = u64.toU8(u64.shiftRight(payloadLen, 24))
+    drop slice
+    run Bytes.append(&mut output.*, List<u8>.asSlice(&rebuilt))
+    at = end
+  }
+  return ()
+}
+
+/// Builds a compact `SLKA` alias fragment containing only the symbol aliases from `fold`
+/// referenced by `SLKF` fragments in `unitBytes`, or an empty [`Bytes`] if none apply.
+pub effect fn unitAliasFragment(unitBytes: &[u8], fold: &FoldResult) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if fold.foldedCount == usize.ZERO || unitBytes.length == usize.ZERO {
+    return Bytes.make()
+  }
+  let mut froms = List<Bytes>.make()
+  let mut tos = List<Bytes>.make()
+  let mut seen = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < unitBytes.length {
+    if !isSlkf(unitBytes, at) {
+      if Bitcode.isAliasFragment(unitBytes, at) {
+        at = Bitcode.fragmentEnd(unitBytes, at)
+        continue
+      }
+      break
+    }
+    let end = Bitcode.fragmentEnd(unitBytes, at)
+    let mut cursor = at + 8
+    let globals = u64.toUsize(takeVarint(unitBytes, &mut cursor))
+    let mut gi = usize.ZERO
+    while gi < globals {
+      let nameLen = u64.toUsize(takeVarint(unitBytes, &mut cursor))
+      let raw = Slice.view<u8>(unitBytes, cursor, nameLen)
+      cursor = cursor + nameLen
+      let resolved = fold.resolve(raw)
+      if !sameBytes(raw, resolved) {
+        let h = InternIndex.hashBytes(0, raw)
+        let mut probe = InternIndex.first(&seen, h)
+        let fromSlice = List<Bytes>.asSlice(&froms)
+        let mut found = false
+        while probe != usize.MAX {
+          if sameBytes(Bytes.asSlice(&fromSlice[probe]), raw) {
+            found = true
+            break
+          }
+          probe = InternIndex.after(&seen, probe)
+        }
+        drop fromSlice
+        if !found {
+          run InternIndex.record(&mut seen, h)
+          run List<Bytes>.append(&mut froms, run Bytes.copy(raw))
+          run List<Bytes>.append(&mut tos, run Bytes.copy(resolved))
+        }
+      }
+      let mut skip = usize.ZERO
+      while skip < 10 {
+        let _ignored = takeVarint(unitBytes, &mut cursor)
+        skip = skip + usize.ONE
+      }
+      gi = gi + usize.ONE
+    }
+    at = end
+  }
+  if List<Bytes>.length(&froms) == usize.ZERO {
+    return Bytes.make()
+  }
+  return run Bitcode.aliasFragment(List<Bytes>.asSlice(&froms), List<Bytes>.asSlice(&tos))
+}
+
+fn relocKindTag(kind: X86RelocationKind) -> u64 {
+  return match kind {
+    X86RelocationKind.Pc32 => 0
+    X86RelocationKind.Plt32 => 1
+    X86RelocationKind.Abs64 => 2
+    X86RelocationKind.GotPcRel => 3
+    X86RelocationKind.GotTpOff => 4
+    X86RelocationKind.LocalRodataPc32 => 5
+  }
+}
+
+fn findX86Symbol(functions: &[X86Function], symLookup: &InternIndex, name: &[u8]) -> usize {
+  let mut probe = InternIndex.first(symLookup, InternIndex.hashBytes(0, name))
+  while probe != usize.MAX {
+    if sameBytes(Bytes.asSlice(&functions[probe].symbol), name) {
+      return probe
+    }
+    probe = InternIndex.after(symLookup, probe)
+  }
+  return usize.MAX
+}
+
+fn x86RoundHash(
+  functions: &[X86Function],
+  symLookup: &InternIndex,
+  canonical: &[usize],
+  index: usize,
+) -> u64 {
+  let f = &functions[index]
+  let selfSym = Bytes.asSlice(&f.symbol)
+  let mut h = InternIndex.hashBytes(0, Bytes.asSlice(&f.code))
+  h = InternIndex.hashBytes(h, Bytes.asSlice(&f.rodata))
+  h = Hash.combine(h, if f.unwind.hasFramePointer { 1 } else { 0 })
+  h = Hash.combine(h, u8.toU64(f.unwind.pushRbpEnd))
+  h = Hash.combine(h, u8.toU64(f.unwind.movRbpEnd))
+  h = Hash.combine(h, f.unwind.savedCalleeMask)
+  h = Hash.combine(h, u8.toU64(f.unwind.savesEnd))
+  let jumps = List<X86RodataJump>.asSlice(&f.rodataJumps)
+  h = Hash.combine(h, usize.toU64(jumps.length))
+  let mut at = usize.ZERO
+  while at < jumps.length {
+    h = Hash.combine(h, usize.toU64(jumps[at].rodataOffset))
+    h = Hash.combine(h, usize.toU64(jumps[at].tableOffset))
+    h = Hash.combine(h, usize.toU64(jumps[at].targetCodeOffset))
+    at = at + usize.ONE
+  }
+  let relocs = List<X86Relocation>.asSlice(&f.relocations)
+  let syms = List<Bytes>.asSlice(&f.symbols)
+  h = Hash.combine(h, usize.toU64(relocs.length))
+  at = usize.ZERO
+  while at < relocs.length {
+    let r = relocs[at]
+    h = Hash.combine(h, usize.toU64(r.offset))
+    h = Hash.combine(h, relocKindTag(r.kind))
+    h = Hash.combine(h, i64.wrappingToU64(r.addend))
+    if relocKindTag(r.kind) != 5 && r.target < syms.length {
+      let raw = Bytes.asSlice(&syms[r.target])
+      if sameBytes(raw, selfSym) {
+        h = Hash.combine(h, 0x5E1F5E1F)
+      } else {
+        let targetIdx = findX86Symbol(functions, symLookup, raw)
+        let resolved = if targetIdx != usize.MAX { Bytes.asSlice(&functions[canonical[targetIdx]].symbol) } else { raw }
+        h = Hash.combine(h, InternIndex.hashBytes(3, resolved))
+      }
+    }
+    at = at + usize.ONE
+  }
+  let locs = List<u64>.asSlice(&f.locations)
+  h = Hash.combine(h, usize.toU64(locs.length))
+  at = usize.ZERO
+  while at < locs.length {
+    h = Hash.combine(h, locs[at])
+    at = at + usize.ONE
+  }
+  return h
+}
+
+fn x86ExactMatch(
+  functions: &[X86Function],
+  symLookup: &InternIndex,
+  canonical: &[usize],
+  left: usize,
+  right: usize,
+) -> bool {
+  let a = &functions[left]
+  let b = &functions[right]
+  if !sameBytes(Bytes.asSlice(&a.code), Bytes.asSlice(&b.code)) { return false }
+  if !sameBytes(Bytes.asSlice(&a.rodata), Bytes.asSlice(&b.rodata)) { return false }
+  if a.unwind.hasFramePointer != b.unwind.hasFramePointer
+    || a.unwind.pushRbpEnd != b.unwind.pushRbpEnd
+    || a.unwind.movRbpEnd != b.unwind.movRbpEnd
+    || a.unwind.savedCalleeMask != b.unwind.savedCalleeMask
+    || a.unwind.savesEnd != b.unwind.savesEnd {
+    return false
+  }
+  let jumpsA = List<X86RodataJump>.asSlice(&a.rodataJumps)
+  let jumpsB = List<X86RodataJump>.asSlice(&b.rodataJumps)
+  if jumpsA.length != jumpsB.length { return false }
+  let mut at = usize.ZERO
+  while at < jumpsA.length {
+    if jumpsA[at].rodataOffset != jumpsB[at].rodataOffset
+      || jumpsA[at].tableOffset != jumpsB[at].tableOffset
+      || jumpsA[at].targetCodeOffset != jumpsB[at].targetCodeOffset {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  let relsA = List<X86Relocation>.asSlice(&a.relocations)
+  let relsB = List<X86Relocation>.asSlice(&b.relocations)
+  if relsA.length != relsB.length { return false }
+  let symsA = List<Bytes>.asSlice(&a.symbols)
+  let symsB = List<Bytes>.asSlice(&b.symbols)
+  let selfA = Bytes.asSlice(&a.symbol)
+  let selfB = Bytes.asSlice(&b.symbol)
+  at = usize.ZERO
+  while at < relsA.length {
+    let ra = relsA[at]
+    let rb = relsB[at]
+    if ra.offset != rb.offset || relocKindTag(ra.kind) != relocKindTag(rb.kind) || ra.addend != rb.addend {
+      return false
+    }
+    if relocKindTag(ra.kind) != 5 {
+      if ra.target >= symsA.length || rb.target >= symsB.length { return false }
+      let rawA = Bytes.asSlice(&symsA[ra.target])
+      let rawB = Bytes.asSlice(&symsB[rb.target])
+      let isSelfA = sameBytes(rawA, selfA)
+      let isSelfB = sameBytes(rawB, selfB)
+      if isSelfA != isSelfB { return false }
+      if !isSelfA {
+        let idxA = findX86Symbol(functions, symLookup, rawA)
+        let idxB = findX86Symbol(functions, symLookup, rawB)
+        let nameA = if idxA != usize.MAX { Bytes.asSlice(&functions[canonical[idxA]].symbol) } else { rawA }
+        let nameB = if idxB != usize.MAX { Bytes.asSlice(&functions[canonical[idxB]].symbol) } else { rawB }
+        if !sameBytes(nameA, nameB) { return false }
+      }
+    }
+    at = at + usize.ONE
+  }
+  let locsA = List<u64>.asSlice(&a.locations)
+  let locsB = List<u64>.asSlice(&b.locations)
+  if locsA.length != locsB.length { return false }
+  at = usize.ZERO
+  while at < locsA.length {
+    if locsA[at] != locsB[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Folds identical content-named x86-64 functions in `fragment` and rewrites all symbol references
+/// in remaining functions and static data objects to point to canonical representatives.
+pub effect fn foldX86Fragment(fragment: &mut X86Fragment) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = List<X86Function>.length(&fragment.functions)
+  if count < 2 { return usize.ZERO }
+  let mut symLookup = InternIndex.make()
+  let mut canonical = List<usize>.make()
+  let mut kept = List<bool>.make()
+  let mut eligible = List<bool>.make()
+  run List<usize>.reserveExact(&mut canonical, count)
+  run List<bool>.appendRepeated(&mut kept, true, count)
+  run List<bool>.reserveExact(&mut eligible, count)
+  let funcs = List<X86Function>.asSlice(&fragment.functions)
+  let mut at = usize.ZERO
+  while at < count {
+    let f = &funcs[at]
+    run InternIndex.record(&mut symLookup, InternIndex.hashBytes(0, Bytes.asSlice(&f.symbol)))
+    run List<usize>.append(&mut canonical, at)
+    let ok = Bitcode.isContentSymbol(Bytes.asSlice(&f.symbol))
+      && Bytes.length(&f.exported) == usize.ZERO
+    run List<bool>.append(&mut eligible, ok)
+    at = at + usize.ONE
+  }
+  let mut totalFolded = usize.ZERO
+  let mut round = usize.ZERO
+  while round < 8 {
+    let mut merged = usize.ZERO
+    let mut bucket = InternIndex.make()
+    let mut bucketItems = List<usize>.make()
+    at = usize.ZERO
+    while at < count {
+      if List<bool>.get(&kept, at) && List<bool>.get(&eligible, at) {
+        let h = x86RoundHash(funcs, &symLookup, List<usize>.asSlice(&canonical), at)
+        let mut matched = usize.MAX
+        let mut probe = InternIndex.first(&bucket, h)
+        let cands = List<usize>.asSlice(&bucketItems)
+        while probe != usize.MAX {
+          let cand = cands[probe]
+          if x86ExactMatch(funcs, &symLookup, List<usize>.asSlice(&canonical), cand, at) {
+            matched = cand
+            break
+          }
+          probe = InternIndex.after(&bucket, probe)
+        }
+        if matched != usize.MAX {
+          let target = List<usize>.get(&canonical, matched)
+          List<usize>.set(&mut canonical, at, target)
+          List<bool>.set(&mut kept, at, false)
+          merged = merged + usize.ONE
+          totalFolded = totalFolded + usize.ONE
+        } else {
+          run InternIndex.record(&mut bucket, h)
+          run List<usize>.append(&mut bucketItems, at)
+        }
+      }
+      at = at + usize.ONE
+    }
+    if merged == usize.ZERO { break }
+    at = usize.ZERO
+    while at < count {
+      let mut root = List<usize>.get(&canonical, at)
+      while root != List<usize>.get(&canonical, root) {
+        root = List<usize>.get(&canonical, root)
+      }
+      List<usize>.set(&mut canonical, at, root)
+      at = at + usize.ONE
+    }
+    round = round + usize.ONE
+  }
+  if totalFolded == usize.ZERO { return usize.ZERO }
+  let mut aliasFrom = List<Bytes>.make()
+  let mut aliasTo = List<Bytes>.make()
+  let mut aliasLookup = InternIndex.make()
+  at = usize.ZERO
+  while at < count {
+    if !List<bool>.get(&kept, at) {
+      let from = Bytes.asSlice(&funcs[at].symbol)
+      let to = Bytes.asSlice(&funcs[List<usize>.get(&canonical, at)].symbol)
+      run InternIndex.record(&mut aliasLookup, InternIndex.hashBytes(0, from))
+      run List<Bytes>.append(&mut aliasFrom, run Bytes.copy(from))
+      run List<Bytes>.append(&mut aliasTo, run Bytes.copy(to))
+    }
+    at = at + usize.ONE
+  }
+  drop funcs
+  let fold = FoldResult {
+    kept: List<bool>.make(),
+    aliasFrom: move aliasFrom,
+    aliasTo: move aliasTo,
+    aliasLookup: move aliasLookup,
+    foldedCount: totalFolded,
+  }
+  // Filter kept functions and rewrite all symbol references in place.
+  let oldFunctions = Intrinsic.replace(fragment.functions, List<X86Function>.make())
+  let mut keptFunctions = List<X86Function>.make()
+  run List<X86Function>.reserveExact(&mut keptFunctions, count - totalFolded)
+  let mut oldList = move oldFunctions
+  let mut reversed = List<X86Function>.make()
+  while let Option<X86Function>.Some {value} = List<X86Function>.pop(&mut oldList) {
+    run List<X86Function>.append(&mut reversed, move value)
+  }
+  at = usize.ZERO
+  while let Option<X86Function>.Some {value} = List<X86Function>.pop(&mut reversed) {
+    if List<bool>.get(&kept, at) {
+      let mut func = move value
+      let mut syms = List<Bytes>.asMutSlice(&mut func.symbols)
+      let mut si = usize.ZERO
+      while si < syms.length {
+        let mut replacement = Option<Bytes>.none()
+        let raw = Bytes.asSlice(&syms[si])
+        let resolved = fold.resolve(raw)
+        if !sameBytes(raw, resolved) {
+          replacement = Option<Bytes>.some(run Bytes.copy(resolved))
+        }
+        if let Option<Bytes>.Some {value: next} = move replacement {
+          syms[si] = move next
+        }
+        si = si + usize.ONE
+      }
+      drop syms
+      run List<X86Function>.append(&mut keptFunctions, move func)
+    }
+    at = at + usize.ONE
+  }
+  fragment.functions = move keptFunctions
+  // Rewrite function pointers inside static data objects (vtables, jump tables, etc.).
+  let mut objs = List<X86ObjectEntry>.asMutSlice(&mut fragment.objects)
+  let mut oi = usize.ZERO
+  while oi < objs.length {
+    let mut ptrs = List<X86Pointer>.asMutSlice(&mut objs[oi].pointers)
+    let mut pi = usize.ZERO
+    while pi < ptrs.length {
+      let mut replacement = Option<Bytes>.none()
+      let raw = Bytes.asSlice(&ptrs[pi].symbol)
+      let resolved = fold.resolve(raw)
+      if !sameBytes(raw, resolved) {
+        replacement = Option<Bytes>.some(run Bytes.copy(resolved))
+      }
+      if let Option<Bytes>.Some {value: next} = move replacement {
+        ptrs[pi].symbol = move next
+      }
+      pi = pi + usize.ONE
+    }
+    oi = oi + usize.ONE
+  }
+  return totalFolded
+}

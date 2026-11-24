@@ -165,6 +165,7 @@ import silk.core.option {Option}
 import silk.core.ownership {Copy}
 import silk.core.result {Result}
 import silk.mem.shared {Shared}
+import silk.concurrency.sync {Arc}
 import silk.mem.interned {Interned}
 import silk.mem.frozen {Frozen}
 import silk.num.u8
@@ -1698,8 +1699,8 @@ effect fn measuredLayout(resolver: &mut Resolver, owner: &mut Query<Answer, NoRe
   let layout = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, declarationAccess178, span)
   let selected = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&layout, layoutIndex)
   if let Option<usize>.Some {value} = move selected {
-    let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-    return Option<LayoutMetrics>.some(Shared<BackendLayout>.with<LayoutMetrics>(&layouts[value], BackendLayout.metrics))
+    let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+    return Option<LayoutMetrics>.some(Interned<BackendLayout>.with<LayoutMetrics>(&layouts[value], BackendLayout.metrics))
   }
   return Option<LayoutMetrics>.none()
 }
@@ -2607,15 +2608,11 @@ fn providerEntryCount(values: &List<ProviderEntry>) -> usize { return List<Provi
 // This instance's own providers, copied out of its key in canonical key order.
 effect fn instanceProviders(instance: &InstanceKey) -> List<ProviderEntry> ! OutOfMemoryError ? &mut Allocator {
   let mut copied = List<ProviderEntry>.make()
-  if let Option<Shared<List<ProviderEntry>>>.Some {value: listed} = move InstanceKey.providers(instance) {
-    let count = Shared<List<ProviderEntry>>.with<usize>(&listed, providerEntryCount)
+  if let Option<Arc<List<ProviderEntry>>>.Some {value: listed} = move InstanceKey.providers(instance) {
+    let entries = List<ProviderEntry>.asSlice(Arc<List<ProviderEntry>>.get(&listed))
     let mut at = usize.ZERO
-    while at < count {
-      let entry = Shared<List<ProviderEntry>>.with<ProviderEntry>(&listed, |values: &List<ProviderEntry>| -> ProviderEntry {
-        let entries = List<ProviderEntry>.asSlice(values)
-        return ProviderEntry.copy(&entries[at])
-      })
-      run List<ProviderEntry>.append(&mut copied, move entry)
+    while at < entries.length {
+      run List<ProviderEntry>.append(&mut copied, ProviderEntry.copy(&entries[at]))
       at = at + usize.ONE
     }
   }
@@ -2646,7 +2643,7 @@ effect fn exportShim(
   dependencies: List<Dependency>,
   identity: &Interned<DeclarationId>,
   key: Key,
-  symbol: &Shared<Bytes>,
+  symbol: &Arc<Bytes>,
   written: ForeignHeader,
   observing: bool,
 ) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -3911,24 +3908,45 @@ enum InlineRule {
   Quiet,
   // Either of the last two.
   ForwarderOrQuiet,
+  // An explicit `@inlineAlways` small leaf (`MirInline.alwaysLeaf`), spliced across all builds
+  // (including dev and LLVM) so trivial generic wrappers never enter codegen or ELF.
+  AlwaysLeaf,
+}
+
+// Whether `key` carries an explicit `@inlineAlways` directive (reads only `SourceFacet.Directives`,
+// so callers of ordinary non-`@inlineAlways` functions never depend on the callee's body).
+effect fn explicitInlineAlways(resolver: &mut Resolver, key: &InstanceKey) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Interned<Type>>.Some {..} = move InstanceKey.glueType(key) {
+    return false
+  }
+  let location = match move run locationOfInstance(&mut resolver.*, key) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return false }
+  }
+  if location.declaration == usize.MAX { return false }
+  let module = resolvedModule(&resolver.*, location.module)
+  let mode = run declarationInlining(&mut resolver.*, &module, location.declaration)
+  return mode == MirInlining.Always
 }
 
 // The one inlining rule of a call. A suspension point of a frame variant inlines only what frame
 // selection chose, and a frame variant's other calls inline a value forwarder, whatever the
-// backend: LLVM inlines too late to coalesce these into the frame. An LLVM build does so only in a
-// frame for which selection chose a callee (`selected`). Beyond that only the direct backend
-// inlines, a quiet inlinable callee at any call that is not a suspension point; LLVM inlines
-// such callees itself, and splicing them in MIR first only costs an LLVM build time and memory.
-fn inlineRule(direct: bool, framed: bool, selected: bool, suspending: bool) -> InlineRule {
-  if suspending { return InlineRule.Frame }
-  if framed && direct { return InlineRule.ForwarderOrQuiet }
-  if framed && selected { return InlineRule.Forwarder }
-  if direct { return InlineRule.Quiet }
-  return InlineRule.Never
+// backend: LLVM inlines too late to coalesce these into the frame. Optimized direct builds inline
+// any quiet inlinable callee; all other builds (dev and LLVM) splice explicit `@inlineAlways`
+// small leaves so trivial generic wrappers disappear before codegen.
+fn inlineRule(direct: bool, fullInlining: bool, framed: bool, selected: bool, suspending: bool) -> InlineRule {
+  if suspending { return if fullInlining { InlineRule.Frame } else { InlineRule.Never } }
+  if fullInlining && framed && direct { return InlineRule.ForwarderOrQuiet }
+  if fullInlining && framed && selected { return InlineRule.Forwarder }
+  if fullInlining && direct { return InlineRule.Quiet }
+  return InlineRule.AlwaysLeaf
 }
 
-// Whether this MIR variant runs inlining. LLVM selects callees only in suspendable frames;
-// direct builds may also inline synchronous calls. Line tables keep every authored boundary.
+// Whether this MIR variant runs full inlining through the raw-MIR wrapper query. LLVM selects
+// callees only in suspendable frames; direct builds may also inline synchronous calls. Line tables
+// keep every authored boundary. Dev and non-framed LLVM builds splice explicit `@inlineAlways`
+// small leaves in place during single-pass `lowerMir` without a second `Family.Mir` query.
 pub fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>, key: &InstanceKey) -> bool {
   if !instanceInlining(resolver, key) || instanceLines(resolver, key) { return false }
   if resolver.direct { return true }
@@ -3936,8 +3954,49 @@ pub fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>, key: &Ins
   return false
 }
 
-// Inlines calls of the instance being lowered, in an optimized build without line tables, under
-// each call's `inlineRule`.
+// Whether `function` has any direct instance call whose target carries an explicit `@inlineAlways`
+// directive. Reads only `SourceFacet.Directives`, so callers of ordinary functions gain no
+// `Family.Mir` dependency and perform zero extra work.
+effect fn hasExplicitAlwaysCall(resolver: &mut Resolver, function: &MirFunction) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut targets = List<InstanceKey>.make()
+  let blocks = List<MirBlock>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let MirTerminator.Call {call} = &blocks[at].terminator {
+      if let MirCallTerminator {callee: MirCallee.Instance {key: target}, ..} = &call.get().* {
+        run List<InstanceKey>.append(&mut targets, InstanceKey.copy(&target))
+      }
+    }
+    at = at + usize.ONE
+  }
+  let listed = List<InstanceKey>.asSlice(&targets)
+  let mut ti = usize.ZERO
+  while ti < listed.length {
+    if run explicitInlineAlways(&mut resolver.*, &listed[ti]) { return true }
+    ti = ti + usize.ONE
+  }
+  return false
+}
+
+// Fast pre-check before copying raw MIR in the `inlinesMir` wrapper path: returns false when
+// `resolver.mirValues[mirIndex]` has zero direct instance calls, avoiding `MirInline.copy`.
+fn mayInlineAnyCall(resolver: &Resolver, mirIndex: usize) -> bool {
+  let blocks = List<MirBlock>.asSlice(&List<MirFunction>.asSlice(&resolver.mirValues)[mirIndex].blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    if let MirTerminator.Call {call} = &blocks[at].terminator {
+      if let MirCallTerminator {callee: MirCallee.Instance {..}, ..} = &call.get().* {
+        return true
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Inlines calls of the instance being lowered, in a build without line tables, under each call's
+// `inlineRule`.
 //
 // A quiet callee's un-inlined MIR is inlinable and nothing its calls reach suspends
 // (`quietBody`); the calls it makes stay calls in the caller. A value forwarder in a frame variant can call nothing that suspends, since the
@@ -3953,7 +4012,7 @@ pub fn inlinesMir(resolver: &Resolver, facts: &Option<CoroutineFacts>, key: &Ins
 effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>, function: &mut MirFunction, facts: &Option<CoroutineFacts>, observing: bool) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if !inlinesMir(&resolver.*, facts, &function.key) { return () }
+  let fullInlining = instanceInlining(&resolver.*, &function.key) && !instanceLines(&resolver.*, &function.key)
   let mut candidates = List<InstanceKey>.make()
   let mut rawFacts = Option<CoroutineFacts>.none()
   let mut framed = false
@@ -3998,7 +4057,12 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   let mut expansions = List<InlineExpansion>.make()
   // The blocks control can come back to: a call there runs many times, so a build for speed
   // inlines a larger body at it. A spliced body's blocks count as its call's block does.
-  let mut cyclic = run MirInline.loopBlocks(&function.*)
+  let mut cyclic = List<bool>.make()
+  if fullInlining && resolver.direct {
+    cyclic = run MirInline.loopBlocks(&function.*)
+  } else {
+    run List<bool>.appendRepeated(&mut cyclic, false, List<MirBlock>.length(&function.blocks))
+  }
   // The blocks still to visit, the next one last: the function's own in order, and a spliced
   // body's right after its call, so its calls are settled before the budget goes to calls
   // further on, as they would be in the callee's own lowering.
@@ -4064,8 +4128,11 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
       ancestor = prior[ancestor].parent
     }
     if recursive { continue }
-    let rule = inlineRule(resolver.direct, framed, List<InstanceKey>.length(&candidates) != usize.ZERO, suspending)
+    let rule = inlineRule(resolver.direct, fullInlining, framed, List<InstanceKey>.length(&candidates) != usize.ZERO, suspending)
     if rule == InlineRule.Never { continue }
+    if rule == InlineRule.AlwaysLeaf {
+      if !run explicitInlineAlways(&mut resolver.*, &selected) { continue }
+    }
     let mut largeAlways = false
     // A quiet callee's summary is read first, so the caller depends on the body of a callee it
     // does not inline only through that summary.
@@ -4108,6 +4175,10 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     let mut allowed = rule == InlineRule.Quiet
     // Whether the body is spliced as a quiet one, which cannot park.
     let mut asQuiet = rule == InlineRule.Quiet
+    if rule == InlineRule.AlwaysLeaf {
+      allowed = MirInline.alwaysLeaf(callee, resolver.direct)
+      asQuiet = allowed
+    }
     if rule == InlineRule.Frame { allowed = MirInline.eligible(callee, resolver.direct) }
     if rule == InlineRule.Forwarder || rule == InlineRule.ForwarderOrQuiet { allowed = MirInline.valueForwarder(callee, resolver.direct) }
     if !allowed && rule == InlineRule.ForwarderOrQuiet {
@@ -4238,9 +4309,10 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     }
     each = each + usize.ONE
   }
-  // An LLVM build keeps the references of its frames' spliced callees, as it always did; LLVM
-  // drops a definition that nothing calls any more itself.
-  if !resolver.direct { return () }
+  // An LLVM build keeps the references of its frames' spliced callees (`inlined`), as it always
+  // did, while pruning spliced quiet / `@inlineAlways` leaf callees (`quiet`) so trivial generic
+  // wrappers never enter codegen or Clang.
+  if !resolver.direct && List<InstanceKey>.length(&function.quiet) == usize.ZERO { return () }
   // A spliced instance the function no longer uses is no longer referenced, so a build that
   // splices it everywhere never reaches it and writes no code for it. What it still uses is
   // found from one walk. A whole-program proof that names such an instance finds it in
@@ -4248,7 +4320,7 @@ effect fn inlineCalls(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   let mut used = InstanceTable.make()
   run stillUsed(&function.*, &mut used)
   let mut gone = InstanceTable.make()
-  let mut pass = usize.ZERO
+  let mut pass = if resolver.direct { usize.ZERO } else { usize.ONE }
   while pass < 2 {
     let mut spliced = List<InstanceKey>.asSlice(&function.inlined)
     if pass == usize.ONE { spliced = List<InstanceKey>.asSlice(&function.quiet) }
@@ -4309,8 +4381,7 @@ pub effect fn lowerMir(
     suspending = Option<List<InstanceKey>>.some(move callees)
   }
   if let InstanceKey.Helper {creator, node, ordinal, purpose} = &instance {
-    let creating = Shared<InstanceKey>.with<InstanceKey>(&creator, InstanceKey.copy)
-    return run resolveHelperMir(&mut resolver.*, &mut owner.*, &instance, &creating, node, ordinal, purpose, observing)
+    return run resolveHelperMir(&mut resolver.*, &mut owner.*, &instance, Arc<InstanceKey>.get(&creator), node, ordinal, purpose, observing)
   }
   if let Option<Interned<Type>>.Some {value: glued} = move InstanceKey.glueType(&instance) {
     return run resolveGlueMir(&mut resolver.*, &mut owner.*, move instance, &glued, observing)
@@ -4338,8 +4409,11 @@ pub effect fn lowerMir(
       Option<usize>.None => { return CompilerBug.panic(b"a raw MIR answer has no lowering outcome") }
     }
     let construction = Shared<Result<Answer, NoRejection>>.with<bool>(&answer, answerMirConstruction)
-    // Synthetic producers have no source-body inlining tail.
-    if !construction { return memberSuccess(Value.Mir {index: index, construction: false}, move dependencies) }
+    // Synthetic producers have no source-body inlining tail, and bodies with no direct instance
+    // calls reuse the raw MIR directly without copying.
+    if !construction || !mayInlineAnyCall(&resolver.*, index) {
+      return memberSuccess(Value.Mir {index: index, construction: construction}, move dependencies)
+    }
     let mut function = run MirInline.copy(&List<MirFunction>.asSlice(&resolver.mirValues)[index])
     run inlineCalls(&mut resolver.*, &mut owner.*, &mut dependencies, &mut function, &selfFacts, observing)
     let copied = List<MirFunction>.length(&resolver.mirValues)
@@ -4474,7 +4548,7 @@ pub effect fn lowerMir(
       }
       return CompilerBug.panic(b"MIR was demanded for a C import, whose definition is C code")
     }
-    if let Option<Shared<Bytes>>.Some {value: symbol} = move InstanceKey.exportSymbol(&instance) {
+    if let Option<Arc<Bytes>>.Some {value: symbol} = move InstanceKey.exportSymbol(&instance) {
       return run exportShim(&mut resolver.*, &mut owner.*, move dependencies, &identity, key, &symbol, move foreign, observing)
     }
     // The exported definition's own body lowers below like any ordinary function.
@@ -4486,7 +4560,9 @@ pub effect fn lowerMir(
     )
   }
   // A function with static work lowers the selected body for this application, never an
-  // abstract all-arms body.
+  // abstract all-arms body. Ordinary closures (literalKind) whose own body and enclosing
+  // declarations need no static residualization reuse their shared Family.Body(member=0) across
+  // all monomorphized instantiations instead of re-running Body checking per type argument.
   let declarationAccess187 = declarationPosition(&resolver.*, key)
   let routing = run needsStaticResidualization(
     &mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, declarationAccess187,
@@ -4494,7 +4570,45 @@ pub effect fn lowerMir(
   let mut bodyMember = usize.ZERO
   match move routing {
     Result<bool, Shared<Rejection>>.Success {value: routed} => {
-      if routed || Interned<DeclarationId>.with<bool>(&identity, literalKind) {
+      let mut needsSelected = routed
+      if !needsSelected && Interned<DeclarationId>.with<bool>(&identity, literalKind) {
+        let application = run InstanceKey.selected(&instance)
+        if Application.hasStatics(&application) {
+          needsSelected = true
+        } else {
+          // Walk enclosing parent chain in this module to check if any enclosing declaration
+          // needs static residualization (e.g. a closure inside a generic `static if`/`static for`).
+          let mut cur = declarationAccess187
+          let mut parentChain = List<usize>.make()
+          let srcAns = run observedDeclaration(&mut resolver.*, &module, declarationAccess187, SourceFacet.Header)
+          if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &srcAns, &module) {
+            let decls = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+            while cur < decls.length {
+              if let Option<usize>.Some {value: p} = &decls[cur].parent {
+                let pKind = DeclarationId.kind(&decls[p].identity)
+                if pKind == OwnerKind.Implementation || pKind == OwnerKind.Interface || serviceKind(pKind) { break }
+                run List<usize>.append(&mut parentChain, p)
+                cur = p
+              } else { break }
+            }
+          }
+          let parents = List<usize>.asSlice(&parentChain)
+          let mut pi = usize.ZERO
+          while pi < parents.length && !needsSelected {
+            let pRouting = run needsStaticResidualization(
+              &mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, parents[pi],
+            )
+            match move pRouting {
+              Result<bool, Shared<Rejection>>.Success {value: pRouted} => { if pRouted { needsSelected = true } }
+              Result<bool, Shared<Rejection>>.Failure {error} => {
+                return run mirRejection(&identity, move error, move dependencies)
+              }
+            }
+            pi = pi + usize.ONE
+          }
+        }
+      }
+      if needsSelected {
         let application = run InstanceKey.selected(&instance)
         let interned = run internSelectedApplication(&mut resolver.*, &application)
         bodyMember = interned + usize.ONE
@@ -5310,6 +5424,10 @@ pub effect fn lowerMir(
   completed.function.inlining = run declarationInlining(&mut resolver.*, &module, declarationAccess182)
   completed.function.optimizeSize = run declarationOptimizeSize(&mut resolver.*, &module, declarationAccess182)
   completed.function.variadic = run declarationVariadicExport(&mut resolver.*, &module, declarationAccess182)
+  if !selfRaw && !inlinesMir(&resolver.*, &selfFacts, &instance)
+    && run hasExplicitAlwaysCall(&mut resolver.*, &completed.function) {
+    run inlineCalls(&mut resolver.*, &mut owner.*, &mut dependencies, &mut completed.function, &selfFacts, observing)
+  }
   if thunked {
     run List<MirFunction>.append(&mut completed.helpers, run MirFunction.cThunk(&completed.function, observing))
   }
@@ -5330,8 +5448,8 @@ effect fn storeLayout(resolver: &mut Resolver, computed: Option<BackendLayout>, 
 ! OutOfMemoryError ? &mut Allocator {
   return match move computed {
     Option<BackendLayout>.Some {value} => {
-      let index = List<Shared<BackendLayout>>.length(&resolver.layoutValues)
-      run List<Shared<BackendLayout>>.append(&mut resolver.*.layoutValues, run Shared<BackendLayout>.make(move value))
+      let index = List<Interned<BackendLayout>>.length(&resolver.layoutValues)
+      run List<Interned<BackendLayout>>.append(&mut resolver.*.layoutValues, run Interned<BackendLayout>.make(move value))
       run List<Bytes>.append(&mut resolver.*.layoutContents, Bytes.make())
       return memberSuccess(Value.Layout {index: index}, move dependencies)
     }
@@ -5373,8 +5491,8 @@ pub effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Answer, N
     }
     let selected = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&child, answerLayoutIndex)
     if let Option<usize>.Some {value: index} = move selected {
-      let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-      let metrics = Shared<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
+      let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+      let metrics = Interned<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
       return run storeLayout(&mut resolver.*, BackendLayout.sequence(&array.element, array.length, metrics), move dependencies)
     }
     return memberSuccess(Value.LayoutUnsupported, move dependencies)
@@ -5410,8 +5528,8 @@ pub effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Answer, N
         Option<usize>.Some {value} => value
         Option<usize>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
       }
-      let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-      let metrics = Shared<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
+      let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+      let metrics = Interned<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
       run List<LayoutFieldInput>.append(&mut inputs, LayoutFieldInput {ty: move memberType, metrics: metrics})
       at = at + usize.ONE
     }
@@ -5452,8 +5570,8 @@ pub effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Answer, N
         Option<usize>.Some {value} => value
         Option<usize>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
       }
-      let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-      let metrics = Shared<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
+      let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+      let metrics = Interned<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
       run List<LayoutFieldInput>.append(&mut inputs, LayoutFieldInput {ty: Interned<Type>.clone(&listed[at]), metrics: metrics})
       at = at + usize.ONE
     }
@@ -5498,7 +5616,7 @@ pub effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Answer, N
   if let Node.UnionHeader {variants, ..} = writtenHeader.header {
     let mut dependencies = List<Dependency>.make()
     let nominal = NominalUnion {module: moduleOrdinal, declaration: declaration, count: variants.length}
-    let mut records = List<Shared<BackendLayout>>.make()
+    let mut records = List<Interned<BackendLayout>>.make()
     let mut tag = usize.ZERO
     while tag < nominal.count {
       let shaped = run variantShape(&mut resolver.*, &mut owner.*, &mut dependencies, &module, &ty, &nominal, tag, writtenHeader.span)
@@ -5524,19 +5642,19 @@ pub effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Answer, N
           Option<usize>.Some {value} => value
           Option<usize>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
         }
-        let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-        let metrics = Shared<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
+        let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+        let metrics = Interned<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
         run List<LayoutFieldInput>.append(&mut inputs, LayoutFieldInput {ty: Interned<Type>.clone(&fieldTypes[at]), metrics: metrics})
         at = at + usize.ONE
       }
       let record = run BackendLayout.record(List<LayoutFieldInput>.asSlice(&inputs))
       match move record {
-        Option<BackendLayout>.Some {value} => { run List<Shared<BackendLayout>>.append(&mut records, run Shared<BackendLayout>.make(move value)) }
+        Option<BackendLayout>.Some {value} => { run List<Interned<BackendLayout>>.append(&mut records, run Interned<BackendLayout>.make(move value)) }
         Option<BackendLayout>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
       }
       tag = tag + usize.ONE
     }
-    let computed = run BackendLayout.variants(List<Shared<BackendLayout>>.asSlice(&records), nominal.count)
+    let computed = run BackendLayout.variants(List<Interned<BackendLayout>>.asSlice(&records), nominal.count)
     return run storeLayout(&mut resolver.*, move computed, move dependencies)
   }
   let mut count = usize.MAX
@@ -5581,8 +5699,8 @@ pub effect fn resolveLayout(resolver: &mut Resolver, owner: &mut Query<Answer, N
       Option<usize>.Some {value} => value
       Option<usize>.None => { return memberSuccess(Value.LayoutUnsupported, move dependencies) }
     }
-    let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-    let metrics = Shared<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
+    let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+    let metrics = Interned<BackendLayout>.with<LayoutMetrics>(&layouts[index], BackendLayout.metrics)
     run List<LayoutFieldInput>.append(&mut inputs, LayoutFieldInput {ty: move fieldType, metrics: metrics})
     at = at + usize.ONE
   }
@@ -6659,13 +6777,13 @@ pub effect fn foreignLayouts(resolver: &mut Resolver, owner: &mut Query<Answer, 
       return CompilerBug.panic(b"an admitted C lane has neither a layout nor a refusal")
     }
   }
-  let layouts = List<Shared<BackendLayout>>.asSlice(&resolver.layoutValues)
-  let layout = Shared<BackendLayout>.clone(&layouts[index])
-  run TypeLayouts.append(&mut output.*, TypeLayout {ty: Interned<Type>.clone(ty), layout: Shared<BackendLayout>.clone(&layout)})
-  let count = Shared<BackendLayout>.with<usize>(&layout, BackendLayout.childCount)
+  let layouts = List<Interned<BackendLayout>>.asSlice(&resolver.layoutValues)
+  let layout = Interned<BackendLayout>.clone(&layouts[index])
+  run TypeLayouts.append(&mut output.*, TypeLayout {ty: Interned<Type>.clone(ty), layout: Interned<BackendLayout>.clone(&layout)})
+  let count = Interned<BackendLayout>.with<usize>(&layout, BackendLayout.childCount)
   let mut at = usize.ZERO
   while at < count {
-    let child = Shared<BackendLayout>.with<Option<Interned<Type>>>(&layout, |value: &BackendLayout| -> Option<Interned<Type>> {
+    let child = Interned<BackendLayout>.with<Option<Interned<Type>>>(&layout, |value: &BackendLayout| -> Option<Interned<Type>> {
       return BackendLayout.childAt(value, at)
     })
     if let Option<Interned<Type>>.Some {value} = move child {
