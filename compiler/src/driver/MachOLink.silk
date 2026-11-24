@@ -1,0 +1,2082 @@
+//! In-process macOS ARM64 (`aarch64-apple-darwin`) direct Mach-O (`MH_EXECUTE`) linker and
+//! pure-Silk ad-hoc SHA-256 code signer.
+//!
+//! # When to use
+//! Links Silk [`AArch64Object.Fragment`] streams directly from memory against built-in
+//! `/usr/lib/libSystem.B.dylib` (from [`DarwinLink.libSystem`]) and optional SDK `.tbd` stubs into
+//! a directly runnable Apple Silicon `MH_EXECUTE` binary — with zero `clang`, `ld`, `dsymutil`, or
+//! `codesign` subprocesses on pure-Silk builds.
+//!
+//! # Details
+//! - Emits 16 KB (`0x4000`) aligned segments: `__PAGEZERO` (4 GB), `__TEXT` (`__text`, `__stubs`,
+//!   `__const`), `__DATA_CONST` (`__got`), `__DATA` (`__data`, `__thread_vars`, `__thread_data`,
+//!   `__silk_frames`, `__silk_seen`), optional `__DWARF` (`__debug_line`, `__debug_info`,
+//!   `__debug_abbrev`, `__debug_str`), and `__LINKEDIT`.
+//! - Encodes `LC_DYLD_CHAINED_FIXUPS` (`DYLD_CHAINED_PTR_64_OFFSET` format 6),
+//!   `LC_DYLD_EXPORTS_TRIE`, `LC_SYMTAB`, `LC_DYSYMTAB`, `LC_LOAD_DYLINKER` (`/usr/lib/dyld`),
+//!   `LC_UUID`, `LC_BUILD_VERSION` (macOS 14.0), `LC_SOURCE_VERSION`, `LC_MAIN`, `LC_LOAD_DYLIB`
+//!   (`/usr/lib/libSystem.B.dylib`), and pure-Silk SHA-256 `LC_CODE_SIGNATURE`
+//!   (`CSMAGIC_EMBEDDED_SIGNATURE` + `CSMAGIC_CODEDIRECTORY` v`0x20400`, `CS_ADHOC | CS_LINKER_SIGNED`).
+//! - When `LinkOptions.incremental` is true, reserves 12-byte fixed Silk call thunks, padded
+//!   function slots, `__text`/`__const`/`__data` headroom, and pre-allocated chained-fixup page
+//!   entries covering the entire `__DATA` headroom so [`MachOIncremental`] can patch binaries in
+//!   `O(dirty)` time without resizing any segment or load command.
+
+import backend.AArch64Encode
+import driver.MachODebug
+import driver.MachODebug {DebugLineMap, DwarfSections, FunctionDebugSpan}
+import driver.MachOInput
+import driver.MachOInput {
+  InputReloc,
+  InputSection,
+  InputSymbol,
+  LinkError,
+  SilkFuncMeta,
+  SilkObjMeta,
+  TbdLibrary,
+}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.crypto.sha2 {Sha256}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+fn pageSize() -> u64 { return 16384 } // Apple Silicon 16 KB segment alignment (0x4000)
+fn textBaseVm() -> u64 { return 0x100000000 } // Standard 4 GB __PAGEZERO end
+fn codeSignPageSize() -> u64 { return 4096 } // Mach-O CodeDirectory 4 KB hash page size
+
+/// Configuration passed to [`linkWithOptions`].
+pub struct LinkOptions {
+  /// Enable incremental-ready `MH_EXECUTE` layout (12-byte fixed Silk call thunks, function
+  /// padding, `__text`/`__const`/`__data` headroom, pre-allocated chained fixup pages, and emitted
+  /// [`IncrementalState`] for `O(dirty)` APFS CoW patching).
+  pub incremental: bool,
+  /// Code-signature identifier embedded in `CS_CodeDirectory` (defaults to `"silk-direct"` when empty).
+  pub identifier: Bytes,
+  /// Optional additional TAPI v4 `.tbd` stub texts loaded alongside `/usr/lib/libSystem.B.dylib`.
+  pub extraTbdTexts: List<Bytes>,
+}
+
+impl LinkOptions {
+  /// Default configuration for a pure-Silk macOS ARM64 `MH_EXECUTE` binary.
+  pub fn executable() -> LinkOptions {
+    return LinkOptions {
+      incremental: false,
+      identifier: Bytes.make(),
+      extraTbdTexts: List<Bytes>.make(),
+    }
+  }
+}
+
+/// One free reusable block inside a segment's headroom pool for incremental Mach-O patching.
+pub struct IncFreeBlock {
+  /// Virtual address of the free block.
+  pub vaddr: u64,
+  /// File offset of the free block.
+  pub fileOff: u64,
+  /// Allocated byte capacity of the free block.
+  pub cap: u64,
+}
+impl Copy for IncFreeBlock {}
+
+/// Tracked placement and digest of one Silk function in an incremental-ready `MH_EXECUTE` binary.
+pub struct IncFuncRecord {
+  /// Primary Silk symbol name.
+  pub symbol: Bytes,
+  /// Optional exported C alias (empty if none).
+  pub exported: Bytes,
+  /// High 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestHigh: u64,
+  /// Low 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestLow: u64,
+  /// Current virtual address of the function's machine code body.
+  pub bodyVaddr: u64,
+  /// Current file offset of the function's machine code body.
+  pub bodyFileOff: u64,
+  /// Current byte length of the function's machine code body.
+  pub bodySize: u64,
+  /// Allocated byte capacity at `bodyVaddr` (allows in-place rewrites up to `bodyCap`).
+  pub bodyCap: u64,
+  /// Fixed 12-byte slot index inside the thunk table.
+  pub thunkSlot: usize,
+  /// Current virtual address of the function's local `.rodata` slice (`0` if none).
+  pub rodataVaddr: u64,
+  /// Current file offset of the function's local `.rodata` slice (`0` if none).
+  pub rodataFileOff: u64,
+  /// Current byte length of the function's local `.rodata` slice.
+  pub rodataSize: u64,
+  /// Allocated byte capacity at `rodataVaddr`.
+  pub rodataCap: u64,
+  /// File offset of this function's pointer field inside `__DATA,__silk_frames` (`0` if none).
+  pub silkFrameFileOff: u64,
+  /// Chained-fixup `next` 4-byte stride preserved at `silkFrameFileOff`.
+  pub silkFrameNextStride: u64,
+}
+
+/// Tracked placement and digest of one Silk data object in an incremental-ready `MH_EXECUTE` binary.
+pub struct IncObjRecord {
+  /// Object symbol name.
+  pub symbol: Bytes,
+  /// High 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestHigh: u64,
+  /// Low 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestLow: u64,
+  /// Virtual address (or TLV byte offset when `isTls` is true).
+  pub vaddr: u64,
+  /// File offset in the Mach-O binary.
+  pub fileOff: u64,
+  /// Byte length of the object's image.
+  pub size: u64,
+  /// True for thread-local `__thread_data` objects.
+  pub isTls: bool,
+  /// True for `__silk_frames` descriptors.
+  pub isFramed: bool,
+  /// True for `__silk_seen` test-coverage records.
+  pub isSeen: bool,
+}
+
+/// Resolved address entry for every global symbol in an incremental-ready `MH_EXECUTE` binary.
+pub struct IncGlobalRecord {
+  /// Raw Silk/C symbol name.
+  pub name: Bytes,
+  /// Resolved address (fixed thunk vaddr for Silk functions; runtime vaddr or TLV offset otherwise).
+  pub vaddr: u64,
+  /// `__DATA_CONST,__got` slot virtual address (`0` if none).
+  pub gotSlotVaddr: u64,
+  /// `__TEXT,__stubs` stub virtual address (`0` if none).
+  pub stubVaddr: u64,
+  /// `__DATA_CONST,__got` TLVP slot virtual address (`0` if none).
+  pub tlvpSlotVaddr: u64,
+  /// Dynamic bind ordinal in `LC_DYLD_CHAINED_FIXUPS` (`0xFFFFFFFF` if not dynamically imported).
+  pub bindOrdinal: u64,
+  /// True when imported dynamically from a dylib.
+  pub isDynamic: bool,
+  /// True when thread-local.
+  pub isTls: bool,
+}
+
+/// Complete persistent layout state emitted alongside an incremental-ready Mach-O executable.
+pub struct IncrementalState {
+  /// Combined fingerprint of options/inputs (high 64 bits).
+  pub inputsHashHigh: u64,
+  /// Combined fingerprint of options/inputs (low 64 bits).
+  pub inputsHashLow: u64,
+  /// Exact byte size of the linked Mach-O executable.
+  pub binarySize: u64,
+  /// Base virtual address of the 12-byte Silk thunk table inside `__TEXT,__text`.
+  pub thunksVaddr: u64,
+  /// Base file offset of the 12-byte Silk thunk table.
+  pub thunksFileOff: u64,
+  /// Number of thunk slots currently assigned.
+  pub thunksCount: u64,
+  /// Total capacity of the thunk table in slots.
+  pub thunksCap: u64,
+  /// Next free virtual address in `__TEXT,__text` headroom.
+  pub textCursorVaddr: u64,
+  /// Next free file offset in `__TEXT,__text` headroom.
+  pub textCursorFileOff: u64,
+  /// Exclusive upper virtual address limit of `__TEXT,__text` headroom.
+  pub textLimitVaddr: u64,
+  /// Next free virtual address in `__TEXT,__const` headroom.
+  pub constCursorVaddr: u64,
+  /// Next free file offset in `__TEXT,__const` headroom.
+  pub constCursorFileOff: u64,
+  /// Exclusive upper virtual address limit of `__TEXT,__const` headroom.
+  pub constLimitVaddr: u64,
+  /// Next free virtual address in `__DATA,__data` bump-only headroom.
+  pub dataCursorVaddr: u64,
+  /// Next free file offset in `__DATA,__data` bump-only headroom.
+  pub dataCursorFileOff: u64,
+  /// Exclusive upper virtual address limit of `__DATA,__data` headroom.
+  pub dataLimitVaddr: u64,
+  /// Virtual address of the start of `__DATA` segment.
+  pub dataSegVmAddr: u64,
+  /// File offset of the start of `__DATA` segment.
+  pub dataSegFileOff: u64,
+  /// Number of 16 KB pages in `__DATA` segment (covered by `LC_DYLD_CHAINED_FIXUPS`).
+  pub dataSegPageCount: u64,
+  /// File offset of `page_start[0]` for `__DATA` inside `LC_DYLD_CHAINED_FIXUPS` (`0` if none).
+  pub chainedDataPageStartsFileOff: u64,
+  /// File offset of `LC_CODE_SIGNATURE` (`codeLimit` of `CS_CodeDirectory`).
+  pub csDataOff: u64,
+  /// File offset of the first 32-byte SHA-256 code-page hash slot inside `LC_CODE_SIGNATURE`.
+  pub csHashTableFileOff: u64,
+  /// Total number of 4 KB code pages hashed in `LC_CODE_SIGNATURE`.
+  pub csPageCount: u64,
+  /// Tracked Silk functions.
+  pub funcs: List<IncFuncRecord>,
+  /// Tracked Silk data objects.
+  pub objs: List<IncObjRecord>,
+  /// Resolved global symbol address table.
+  pub globals: List<IncGlobalRecord>,
+  /// Reusable free blocks in `__TEXT,__text`.
+  pub textFreeList: List<IncFreeBlock>,
+  /// Reusable free blocks in `__TEXT,__const`.
+  pub constFreeList: List<IncFreeBlock>,
+  /// High 64 bits of each previously linked raw `AArch64Object` chunk digest.
+  pub chunkHashHigh: List<u64>,
+  /// Low 64 bits of each previously linked raw `AArch64Object` chunk digest.
+  pub chunkHashLow: List<u64>,
+  /// Last chained-fixup `__DATA` segment offset per 16 KB page (`0xFFFFFFFF` if page has none).
+  pub dataPageLastOff: List<u64>,
+  /// Last chained-fixup 64-bit word per 16 KB `__DATA` page (with `next == 0`).
+  pub dataPageLastWord: List<u64>,
+}
+
+/// Output of [`linkWithOptions`]: complete Mach-O `MH_EXECUTE` image plus optional [`IncrementalState`].
+pub struct LinkOutput {
+  /// Directly runnable, ad-hoc signed Apple Silicon `MH_EXECUTE` binary.
+  pub binary: Bytes,
+  /// Persistent incremental state when `LinkOptions.incremental` was enabled.
+  pub state: Option<IncrementalState>,
+}
+
+// ---- Low-level encoding helpers ----
+
+fn alignUp(val: u64, align: u64) -> u64 {
+  if align <= 1 { return val }
+  let rem = val % align
+  if rem == 0 { return val }
+  return val + (align - rem)
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn readU32Le(buf: &[u8], at: usize) -> u32 {
+  return u8.toU32(buf[at])
+    | u32.shiftLeft(u8.toU32(buf[at + 1]), 8)
+    | u32.shiftLeft(u8.toU32(buf[at + 2]), 16)
+    | u32.shiftLeft(u8.toU32(buf[at + 3]), 24)
+}
+
+fn patchU64Le(out: &mut Bytes, at: usize, value: u64) -> () {
+  AArch64Encode.patchU32(&mut out.*, at, value & 0xFFFFFFFF)
+  AArch64Encode.patchU32(&mut out.*, at + 4, u64.shiftRight(value, 32))
+}
+
+effect fn writeU32Be(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run AArch64Encode.byte(&mut out.*, u64.wrappingToU8(u64.shiftRight(value, 24)))
+  run AArch64Encode.byte(&mut out.*, u64.wrappingToU8(u64.shiftRight(value, 16)))
+  run AArch64Encode.byte(&mut out.*, u64.wrappingToU8(u64.shiftRight(value, 8)))
+  return run AArch64Encode.byte(&mut out.*, u64.wrappingToU8(value))
+}
+
+effect fn writeU64Be(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeU32Be(&mut out.*, u64.shiftRight(value, 32))
+  return run writeU32Be(&mut out.*, value & 0xFFFFFFFF)
+}
+
+effect fn writeUleb128(out: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut v = value
+  while true {
+    let mut b = u64.wrappingToU8(v & 0x7F)
+    v = u64.shiftRight(v, 7)
+    if v != 0 {
+      b = b | 0x80
+      run AArch64Encode.byte(&mut out.*, b)
+    } else {
+      run AArch64Encode.byte(&mut out.*, b)
+      return ()
+    }
+  }
+}
+
+effect fn writeFixed16(out: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i = usize.ZERO
+  while i < 16 {
+    let b = if i < text.length { text[i] } else { 0 }
+    run AArch64Encode.byte(&mut out.*, b)
+    i = i + usize.ONE
+  }
+  return ()
+}
+
+/// Patches an ARM64 `b` or `bl` instruction at `at` (located at virtual address `instrVa`) to
+/// branch to `targetVa`.
+pub fn patchBranch26Va(buf: &mut Bytes, at: usize, instrVa: u64, targetVa: u64) -> () {
+  let orig = readU32Le(Bytes.asSlice(&buf.*), at)
+  let delta = u64.wrappingToI64(targetVa) - u64.wrappingToI64(instrVa)
+  let imm26 = u32.bitAnd(i64.wrappingToU32(i64.shiftRight(delta, 2)), 0x03FFFFFF)
+  let word = (orig & 0xFC000000) | imm26
+  AArch64Encode.patchU32(&mut buf.*, at, u32.toU64(word))
+}
+
+/// Patches an ARM64 `PAGEOFF12` instruction at `at` (`add (immediate)` or scaled `ldr`/`str`)
+/// with the 12-bit page offset of `targetVa`.
+pub fn patchPageOff12Auto(buf: &mut Bytes, at: usize, targetVa: u64) -> () {
+  let orig = readU32Le(Bytes.asSlice(&buf.*), at)
+  // `add (immediate)` has bits `28..24 == 10001` (`(orig & 0x1F000000) == 0x11000000`).
+  if (orig & 0x1F000000) == 0x11000000 {
+    AArch64Encode.patchAdd12(&mut buf.*, at, targetVa)
+  } else {
+    AArch64Encode.patchLdrSt12(&mut buf.*, at, targetVa)
+  }
+}
+
+/// Relaxes an ARM64 `GOT_LOAD_PAGEOFF12` `ldr xD, [xN, #0]` instruction into `add xD, xN, #pageoff`
+/// addressing `targetVa` directly without a `__got` slot (standard Apple `ld64` GOT relaxation).
+pub fn relaxGotLdrToAdd12(buf: &mut Bytes, at: usize, targetVa: u64) -> () {
+  let orig = readU32Le(Bytes.asSlice(&buf.*), at)
+  let rnRd = orig & 0x3FF
+  let imm12 = u32.shiftLeft(u64.wrappingToU32(targetVa & 0xFFF), 10)
+  AArch64Encode.patchU32(&mut buf.*, at, u32.toU64(0x91000000 | imm12 | rnRd))
+}
+
+/// Emits a 12-byte ARM64 thunk at `buf` (located at `thunkVa`) jumping to `targetVa`:
+/// uses `b target; brk #0; brk #0` when within `±128 MB`, else `adrp x16; add x16; br x16`.
+pub effect fn emitThunk12(buf: &mut Bytes, thunkVa: u64, targetVa: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let delta = u64.wrappingToI64(targetVa) - u64.wrappingToI64(thunkVa)
+  if delta >= -134217728 && delta <= 134217724 && (delta & 3) == 0 {
+    let bAt = run AArch64Encode.b(&mut buf.*)
+    patchBranch26Va(&mut buf.*, bAt, thunkVa, targetVa)
+    run AArch64Encode.brk(&mut buf.*, 0)
+    return run AArch64Encode.brk(&mut buf.*, 0)
+  }
+  let x16 = AArch64Encode.x16()
+  let pAt = run AArch64Encode.adrp(&mut buf.*, x16)
+  let oAt = Bytes.length(&buf.*)
+  run AArch64Encode.addImm(&mut buf.*, true, x16, x16, 0, false)
+  run AArch64Encode.br(&mut buf.*, x16)
+  AArch64Encode.patchAdrp21(&mut buf.*, pAt, thunkVa, targetVa)
+  AArch64Encode.patchAdd12(&mut buf.*, oAt, targetVa)
+  return ()
+}
+
+/// Encodes a 12-byte ARM64 stub (`adrp x16, got@PAGE; ldr x16, [x16, got@PAGEOFF]; br x16`)
+/// targeting `gotSlotVa` from `stubVa`.
+effect fn emitDylibStub12(buf: &mut Bytes, stubVa: u64, gotSlotVa: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let x16 = AArch64Encode.x16()
+  let pAt = run AArch64Encode.adrp(&mut buf.*, x16)
+  let oAt = Bytes.length(&buf.*)
+  run AArch64Encode.ldr64Imm(&mut buf.*, x16, x16, 0)
+  run AArch64Encode.br(&mut buf.*, x16)
+  AArch64Encode.patchAdrp21(&mut buf.*, pAt, stubVa, gotSlotVa)
+  AArch64Encode.patchLdrSt12(&mut buf.*, oAt, gotSlotVa)
+  return ()
+}
+
+// ---- Pure-Silk Ad-Hoc SHA-256 `LC_CODE_SIGNATURE` ----
+
+/// Returns the exact byte size of an ad-hoc SHA-256 `LC_CODE_SIGNATURE` SuperBlob covering
+/// `codeLimit` bytes with code-directory identifier `identifier`.
+pub fn codeSignatureSize(codeLimit: u64, identifierLen: usize) -> u64 {
+  let nCodeSlots = (codeLimit + codeSignPageSize() - 1) / codeSignPageSize()
+  let cdLen: u64 = 88 + usize.toU64(identifierLen) + 1 + nCodeSlots * 32
+  let total = 20 + cdLen
+  return alignUp(total, 16)
+}
+
+/// Returns the byte offset from the start of the `LC_CODE_SIGNATURE` blob to the first 32-byte
+/// SHA-256 code-page hash slot.
+pub fn codeSignatureHashOffset(identifierLen: usize) -> u64 {
+  return 20 + 88 + usize.toU64(identifierLen) + 1
+}
+
+/// Builds a valid Apple Silicon ad-hoc SHA-256 `LC_CODE_SIGNATURE` blob (`CSMAGIC_EMBEDDED_SIGNATURE`
+/// + `CSMAGIC_CODEDIRECTORY` v`0x20400`, `CS_ADHOC | CS_LINKER_SIGNED`) hashing every 4 KB page of
+/// `imagePrefix` (`0 .. imagePrefix.length`).
+pub effect fn encodeAdHocCodeSignature(
+  imagePrefix: &[u8],
+  textFileSize: u64,
+  identifier: &[u8],
+) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let ident = if identifier.length > usize.ZERO { identifier } else { b"silk-direct" }
+  let codeLimit = usize.toU64(imagePrefix.length)
+  let nCodeSlots = (codeLimit + codeSignPageSize() - 1) / codeSignPageSize()
+  let identOff: u64 = 88
+  let hashOff: u64 = identOff + usize.toU64(ident.length) + 1
+  let cdLen: u64 = hashOff + nCodeSlots * 32
+  let totalUnpadded: u64 = 20 + cdLen
+  let totalPadded = alignUp(totalUnpadded, 16)
+
+  let mut out = run Bytes.makeWithCapacity(u64.toUsize(totalPadded))
+
+  // `CS_SuperBlob` (12 bytes) + 1 `CS_BlobIndex` (8 bytes) = 20 bytes (big-endian).
+  run writeU32Be(&mut out, 0xFADE0CC0) // CSMAGIC_EMBEDDED_SIGNATURE
+  run writeU32Be(&mut out, totalUnpadded)
+  run writeU32Be(&mut out, 1)          // count = 1 (CodeDirectory)
+  run writeU32Be(&mut out, 0)          // CSSLOT_CODEDIRECTORY
+  run writeU32Be(&mut out, 20)         // offset = 20
+
+  // `CS_CodeDirectory` v0x20400 (88-byte fixed header, big-endian).
+  run writeU32Be(&mut out, 0xFADE0C02) // CSMAGIC_CODEDIRECTORY
+  run writeU32Be(&mut out, cdLen)
+  run writeU32Be(&mut out, 0x00020400) // version 2.4 (execSeg fields)
+  run writeU32Be(&mut out, 0x00020002) // CS_ADHOC (0x2) | CS_LINKER_SIGNED (0x20000)
+  run writeU32Be(&mut out, hashOff)
+  run writeU32Be(&mut out, identOff)
+  run writeU32Be(&mut out, 0)          // nSpecialSlots
+  run writeU32Be(&mut out, nCodeSlots)
+  run writeU32Be(&mut out, codeLimit)  // codeLimit (32-bit)
+  run AArch64Encode.byte(&mut out, 32) // hashSize = 32 (SHA-256)
+  run AArch64Encode.byte(&mut out, 2)  // hashType = CS_HASHTYPE_SHA256
+  run AArch64Encode.byte(&mut out, 0)  // platform = 0
+  run AArch64Encode.byte(&mut out, 12) // pageSize = log2(4096) = 12
+  run writeU32Be(&mut out, 0)          // spare2
+  run writeU32Be(&mut out, 0)          // scatterOffset
+  run writeU32Be(&mut out, 0)          // teamOffset
+  run writeU32Be(&mut out, 0)          // spare3
+  run writeU64Be(&mut out, 0)          // codeLimit64
+  run writeU64Be(&mut out, 0)          // execSegBase (__TEXT fileoff = 0)
+  run writeU64Be(&mut out, textFileSize) // execSegLimit (__TEXT filesize)
+  run writeU64Be(&mut out, 1)          // execSegFlags (CS_EXECSEG_MAIN_BINARY = 1)
+
+  // Identifier C-string.
+  run Bytes.append(&mut out, ident)
+  run AArch64Encode.byte(&mut out, 0)
+
+  // SHA-256 hash over each 4 KB page `0 .. nCodeSlots - 1`.
+  let mut p: u64 = 0
+  while p < nCodeSlots {
+    let start = u64.toUsize(p * codeSignPageSize())
+    let rem = imagePrefix.length - start
+    let chunkLen = if rem < 4096 { rem } else { 4096 }
+    let digest = Sha256.hash(Slice.view<u8>(imagePrefix, start, chunkLen))
+    run Bytes.append(&mut out, &digest)
+    p = p + 1
+  }
+
+  while usize.toU64(Bytes.length(&out)) < totalPadded {
+    run AArch64Encode.byte(&mut out, 0)
+  }
+  return move out
+}
+
+// ---- Symbol table & synthetic section bounds ----
+
+enum SynthKind {
+  None,
+  StartSilkFrames,
+  StopSilkFrames,
+  StartSilkSeen,
+  StopSilkSeen,
+}
+
+struct LinkSym {
+  name: Bytes,
+  machoName: Bytes,
+  defined: bool,
+  isFunc: bool,
+  isTls: bool,
+  isDynamic: bool,
+  weakRef: bool,
+  synth: SynthKind,
+  section: usize,    // section index in `InputUnit`
+  offset: u64,       // offset inside `section`
+  size: u64,
+  vaddr: u64,        // final runtime address (or thunk vaddr in incremental mode)
+  bodyVaddr: u64,    // actual function body vaddr (differs from vaddr when thunked)
+  thunkSlot: usize,  // `usize.MAX` if not thunked
+  dylibOrdinal: u8,  // 1-based ordinal into `LC_LOAD_DYLIB` (1 = libSystem.B.dylib)
+  bindOrdinal: u64,  // `u64.MAX` if not dynamically bound
+  gotSlotIdx: usize, // `usize.MAX` if no `__got` slot
+  stubIdx: usize,    // `usize.MAX` if no `__stubs` entry
+  tlvDescOff: u64,   // byte offset inside `__DATA,__thread_vars` if `isTls`
+  tlvpSlotIdx: usize, // `__got` slot holding address of `tlv_descriptor`
+}
+
+struct LinkSymTab {
+  entries: List<LinkSym>,
+  index: InternIndex,
+}
+
+fn isStartFramesName(name: &[u8]) -> bool {
+  return sameBytes(name, b"\x01section$start$__DATA$__silk_frames")
+    || sameBytes(name, b"section$start$__DATA$__silk_frames")
+    || sameBytes(name, b"__start_silk_frames")
+}
+
+fn isStopFramesName(name: &[u8]) -> bool {
+  return sameBytes(name, b"\x01section$end$__DATA$__silk_frames")
+    || sameBytes(name, b"section$end$__DATA$__silk_frames")
+    || sameBytes(name, b"__stop_silk_frames")
+}
+
+fn isStartSeenName(name: &[u8]) -> bool {
+  return sameBytes(name, b"\x01section$start$__DATA$__silk_seen")
+    || sameBytes(name, b"section$start$__DATA$__silk_seen")
+    || sameBytes(name, b"__start_silk_seen")
+}
+
+fn isStopSeenName(name: &[u8]) -> bool {
+  return sameBytes(name, b"\x01section$end$__DATA$__silk_seen")
+    || sameBytes(name, b"section$end$__DATA$__silk_seen")
+    || sameBytes(name, b"__stop_silk_seen")
+}
+
+fn classifySynth(name: &[u8]) -> SynthKind {
+  if isStartFramesName(name) { return SynthKind.StartSilkFrames }
+  if isStopFramesName(name) { return SynthKind.StopSilkFrames }
+  if isStartSeenName(name) { return SynthKind.StartSilkSeen }
+  if isStopSeenName(name) { return SynthKind.StopSilkSeen }
+  return SynthKind.None
+}
+
+effect fn symTabIntern(tab: &mut LinkSymTab, name: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let h = InternIndex.hashBytes(0, name)
+  let entries = List<LinkSym>.asSlice(&tab.entries)
+  let mut at = InternIndex.first(&tab.index, h)
+  while at != usize.MAX {
+    if sameBytes(Bytes.asSlice(&entries[at].name), name) { return at }
+    at = InternIndex.after(&tab.index, at)
+  }
+  let idx = entries.length
+  let synth = classifySynth(name)
+  run List<LinkSym>.append(&mut tab.entries, LinkSym {
+    name: run Bytes.copy(name),
+    machoName: run MachOInput.toMachOSymbol(name),
+    defined: synth != SynthKind.None,
+    isFunc: false,
+    isTls: false,
+    isDynamic: false,
+    weakRef: false,
+    synth: synth,
+    section: usize.MAX,
+    offset: 0,
+    size: 0,
+    vaddr: 0,
+    bodyVaddr: 0,
+    thunkSlot: usize.MAX,
+    dylibOrdinal: 0,
+    bindOrdinal: u64.MAX,
+    gotSlotIdx: usize.MAX,
+    stubIdx: usize.MAX,
+    tlvDescOff: 0,
+    tlvpSlotIdx: usize.MAX,
+  })
+  run InternIndex.record(&mut tab.index, h)
+  return idx
+}
+
+// ---- `LC_DYLD_CHAINED_FIXUPS` builder (`DYLD_CHAINED_PTR_64_OFFSET`, format 6) ----
+
+struct ChainedFixupSite {
+  segIdx: u8,         // 0 = `__DATA_CONST`, 1 = `__DATA`
+  segOff: u64,        // byte offset from start of segment (must be 4-byte aligned, typically 8-byte)
+  isBind: bool,
+  bindOrdinal: u64,   // when `isBind`
+  targetVmAddr: u64,  // when `!isBind` (rebase target)
+  addend: i64,
+}
+impl Copy for ChainedFixupSite {}
+
+fn sortFixupsByOff(sites: &mut [ChainedFixupSite]) -> () {
+  // Insertion/shell sort by `(segIdx, segOff)` — fast for already-nearly-sorted fixup lists.
+  let n = sites.length
+  let mut gap = n / 2
+  while gap > usize.ZERO {
+    let mut i = gap
+    while i < n {
+      let cur = sites[i]
+      let mut j = i
+      while j >= gap {
+        let prev = sites[j - gap]
+        let prevGreater = (prev.segIdx > cur.segIdx) || (prev.segIdx == cur.segIdx && prev.segOff > cur.segOff)
+        if !prevGreater { break }
+        sites[j] = prev
+        j = j - gap
+      }
+      sites[j] = cur
+      i = i + usize.ONE
+    }
+    gap = gap / 2
+  }
+}
+
+/// Encodes a single `DYLD_CHAINED_PTR_64_OFFSET` (format 6) 64-bit word.
+pub fn encodeChainedRebase(targetVmAddr: u64, nextStride4: u64) -> u64 {
+  let targetOff = (targetVmAddr - textBaseVm()) & 0xFFFFFFFFF // 36 bits
+  return targetOff | u64.shiftLeft(nextStride4 & 0xFFF, 51)
+}
+
+/// Encodes a single `DYLD_CHAINED_PTR_64_OFFSET` (format 6) 64-bit bind word.
+pub fn encodeChainedBind(ordinal: u64, addend: i64, nextStride4: u64) -> u64 {
+  let ord24 = ordinal & 0xFFFFFF
+  let add8 = i64.wrappingToU64(addend) & 0xFF
+  return u64.shiftLeft(1, 63)
+    | u64.shiftLeft(nextStride4 & 0xFFF, 51)
+    | u64.shiftLeft(add8, 24)
+    | ord24
+}
+
+struct ChainedFixupsResult {
+  blob: Bytes,
+  dataPageStartsRelOff: u64, // offset inside `blob` to `__DATA`'s `page_start[0]` array (0 if none)
+  dataPageLastOff: List<u64>,
+  dataPageLastWord: List<u64>,
+}
+
+effect fn buildChainedFixups(
+  segCount: usize,
+  dataConstSegIdx: usize,
+  dataConstVmAddr: u64,
+  dataConstPageCount: usize,
+  dataSegIdx: usize,
+  dataSegVmAddr: u64,
+  dataPageCount: usize,
+  dataConstBuf: &mut Bytes,
+  dataBuf: &mut Bytes,
+  sites: &mut List<ChainedFixupSite>,
+  importNames: &[Bytes],
+  importDylibs: &[u8],
+  importWeaks: &[bool],
+) -> ChainedFixupsResult ! OutOfMemoryError ? &mut Allocator {
+  sortFixupsByOff(List<ChainedFixupSite>.asMutSlice(&mut sites.*))
+  let sSlice = List<ChainedFixupSite>.asSlice(&sites.*)
+
+  // Build `page_start` arrays for `__DATA_CONST` and `__DATA` and patch chained words into segment buffers!
+  let mut dcStarts = run List<u16>.makeWithCapacity(dataConstPageCount)
+  let mut p = usize.ZERO
+  while p < dataConstPageCount {
+    run List<u16>.append(&mut dcStarts, 0xFFFF)
+    p = p + usize.ONE
+  }
+  let mut dStarts = run List<u16>.makeWithCapacity(dataPageCount)
+  let mut dLastOff = run List<u64>.makeWithCapacity(dataPageCount)
+  let mut dLastWord = run List<u64>.makeWithCapacity(dataPageCount)
+  p = usize.ZERO
+  while p < dataPageCount {
+    run List<u16>.append(&mut dStarts, 0xFFFF)
+    run List<u64>.append(&mut dLastOff, 0xFFFFFFFF)
+    run List<u64>.append(&mut dLastWord, 0)
+    p = p + usize.ONE
+  }
+
+  // Group consecutive sites on the same `(segIdx, pageIdx)` and chain them via `next = (nextOff - curOff) / 4`.
+  let dcMut = List<u16>.asMutSlice(&mut dcStarts)
+  let dMut = List<u16>.asMutSlice(&mut dStarts)
+  let dLastOffMut = List<u64>.asMutSlice(&mut dLastOff)
+  let dLastWordMut = List<u64>.asMutSlice(&mut dLastWord)
+  let mut i = usize.ZERO
+  while i < sSlice.length {
+    let cur = sSlice[i]
+    let pageIdx = u64.toUsize(cur.segOff / pageSize())
+    let pageOff = cur.segOff % pageSize()
+    let mut isFirst = true
+    if i > usize.ZERO {
+      let prev = sSlice[i - usize.ONE]
+      if prev.segIdx == cur.segIdx && u64.toUsize(prev.segOff / pageSize()) == pageIdx {
+        isFirst = false
+      }
+    }
+    if isFirst {
+      if cur.segIdx == 0 && pageIdx < dcMut.length {
+        dcMut[pageIdx] = u64.wrappingToU16(pageOff)
+      } else if cur.segIdx == 1 && pageIdx < dMut.length {
+        dMut[pageIdx] = u64.wrappingToU16(pageOff)
+      }
+    }
+    let mut nextStride: u64 = 0
+    if i + usize.ONE < sSlice.length {
+      let nxt = sSlice[i + usize.ONE]
+      if nxt.segIdx == cur.segIdx && u64.toUsize(nxt.segOff / pageSize()) == pageIdx {
+        nextStride = (nxt.segOff - cur.segOff) / 4
+      }
+    }
+    let word = if cur.isBind {
+      encodeChainedBind(cur.bindOrdinal, cur.addend, nextStride)
+    } else {
+      encodeChainedRebase(cur.targetVmAddr, nextStride)
+    }
+    if cur.segIdx == 0 {
+      patchU64Le(&mut dataConstBuf.*, u64.toUsize(cur.segOff), word)
+    } else {
+      patchU64Le(&mut dataBuf.*, u64.toUsize(cur.segOff), word)
+      if nextStride == 0 && pageIdx < dLastOffMut.length {
+        dLastOffMut[pageIdx] = cur.segOff
+        dLastWordMut[pageIdx] = word
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  // Build `dyld_chained_starts_in_segment` structs.
+  let mut dcSegStruct = Bytes.make()
+  if dataConstPageCount > usize.ZERO {
+    let structSize = alignUp(22 + usize.toU64(dataConstPageCount) * 2, 4)
+    run AArch64Encode.u32Le(&mut dcSegStruct, structSize)
+    run AArch64Encode.u16Le(&mut dcSegStruct, pageSize())
+    run AArch64Encode.u16Le(&mut dcSegStruct, 6) // DYLD_CHAINED_PTR_64_OFFSET
+    run AArch64Encode.u64Le(&mut dcSegStruct, dataConstVmAddr - textBaseVm())
+    run AArch64Encode.u32Le(&mut dcSegStruct, 0) // max_valid_pointer
+    run AArch64Encode.u16Le(&mut dcSegStruct, usize.toU64(dataConstPageCount))
+    let dcS = List<u16>.asSlice(&dcStarts)
+    p = usize.ZERO
+    while p < dcS.length {
+      run AArch64Encode.u16Le(&mut dcSegStruct, u16.toU64(dcS[p]))
+      p = p + usize.ONE
+    }
+    while usize.toU64(Bytes.length(&dcSegStruct)) < structSize {
+      run AArch64Encode.byte(&mut dcSegStruct, 0)
+    }
+  }
+
+  let mut dSegStruct = Bytes.make()
+  if dataPageCount > usize.ZERO {
+    let structSize = alignUp(22 + usize.toU64(dataPageCount) * 2, 4)
+    run AArch64Encode.u32Le(&mut dSegStruct, structSize)
+    run AArch64Encode.u16Le(&mut dSegStruct, pageSize())
+    run AArch64Encode.u16Le(&mut dSegStruct, 6) // DYLD_CHAINED_PTR_64_OFFSET
+    run AArch64Encode.u64Le(&mut dSegStruct, dataSegVmAddr - textBaseVm())
+    run AArch64Encode.u32Le(&mut dSegStruct, 0)
+    run AArch64Encode.u16Le(&mut dSegStruct, usize.toU64(dataPageCount))
+    let dS = List<u16>.asSlice(&dStarts)
+    p = usize.ZERO
+    while p < dS.length {
+      run AArch64Encode.u16Le(&mut dSegStruct, u16.toU64(dS[p]))
+      p = p + usize.ONE
+    }
+    while usize.toU64(Bytes.length(&dSegStruct)) < structSize {
+      run AArch64Encode.byte(&mut dSegStruct, 0)
+    }
+  }
+
+  // Build `dyld_chained_starts_in_image`.
+  let mut startsInImage = Bytes.make()
+  let imgHeaderSize = alignUp(4 + usize.toU64(segCount) * 4, 8)
+  let dcRelOff: u64 = if Bytes.length(&dcSegStruct) > usize.ZERO { imgHeaderSize } else { 0 }
+  let dRelOff: u64 = if Bytes.length(&dSegStruct) > usize.ZERO {
+    alignUp(imgHeaderSize + usize.toU64(Bytes.length(&dcSegStruct)), 8)
+  } else {
+    0
+  }
+  run AArch64Encode.u32Le(&mut startsInImage, usize.toU64(segCount))
+  let mut s = usize.ZERO
+  while s < segCount {
+    if s == dataConstSegIdx { run AArch64Encode.u32Le(&mut startsInImage, dcRelOff) }
+    else if s == dataSegIdx { run AArch64Encode.u32Le(&mut startsInImage, dRelOff) }
+    else { run AArch64Encode.u32Le(&mut startsInImage, 0) }
+    s = s + usize.ONE
+  }
+  while usize.toU64(Bytes.length(&startsInImage)) < imgHeaderSize {
+    run AArch64Encode.byte(&mut startsInImage, 0)
+  }
+  if Bytes.length(&dcSegStruct) > usize.ZERO {
+    run Bytes.append(&mut startsInImage, Bytes.asSlice(&dcSegStruct))
+  }
+  if Bytes.length(&dSegStruct) > usize.ZERO {
+    while usize.toU64(Bytes.length(&startsInImage)) < dRelOff {
+      run AArch64Encode.byte(&mut startsInImage, 0)
+    }
+    run Bytes.append(&mut startsInImage, Bytes.asSlice(&dSegStruct))
+  }
+  while Bytes.length(&startsInImage) % 8 != usize.ZERO {
+    run AArch64Encode.byte(&mut startsInImage, 0)
+  }
+
+  // Build imports array and symbol string pool (`DYLD_CHAINED_IMPORT = 1`).
+  let mut symPool = Bytes.make()
+  run AArch64Encode.byte(&mut symPool, 0) // leading NUL
+  let mut importsBuf = Bytes.make()
+  i = usize.ZERO
+  while i < importNames.length {
+    let nameOff = usize.toU64(Bytes.length(&symPool))
+    run Bytes.append(&mut symPool, Bytes.asSlice(&importNames[i]))
+    run AArch64Encode.byte(&mut symPool, 0)
+    let libOrd = u8.toU64(importDylibs[i]) & 0xFF
+    let weakBit: u64 = if importWeaks[i] { u64.shiftLeft(1, 8) } else { 0 }
+    let entry = libOrd | weakBit | u64.shiftLeft(nameOff & 0x7FFFFF, 9)
+    run AArch64Encode.u32Le(&mut importsBuf, entry)
+    i = i + usize.ONE
+  }
+  while Bytes.length(&symPool) % 8 != usize.ZERO {
+    run AArch64Encode.byte(&mut symPool, 0)
+  }
+
+  // Assemble full `LC_DYLD_CHAINED_FIXUPS` payload.
+  let startsOff: u64 = 32
+  let importsOff = startsOff + usize.toU64(Bytes.length(&startsInImage))
+  let symbolsOff = importsOff + usize.toU64(Bytes.length(&importsBuf))
+  let mut blob = Bytes.make()
+  run AArch64Encode.u32Le(&mut blob, 0) // fixups_version = 0
+  run AArch64Encode.u32Le(&mut blob, startsOff)
+  run AArch64Encode.u32Le(&mut blob, importsOff)
+  run AArch64Encode.u32Le(&mut blob, symbolsOff)
+  run AArch64Encode.u32Le(&mut blob, usize.toU64(importNames.length))
+  run AArch64Encode.u32Le(&mut blob, 1) // DYLD_CHAINED_IMPORT
+  run AArch64Encode.u32Le(&mut blob, 0) // symbols_format = uncompressed
+  run AArch64Encode.u32Le(&mut blob, 0) // pad to 32 bytes
+  run Bytes.append(&mut blob, Bytes.asSlice(&startsInImage))
+  run Bytes.append(&mut blob, Bytes.asSlice(&importsBuf))
+  run Bytes.append(&mut blob, Bytes.asSlice(&symPool))
+  while Bytes.length(&blob) % 8 != usize.ZERO {
+    run AArch64Encode.byte(&mut blob, 0)
+  }
+
+  let dataPageStartsRelOff = if dRelOff > 0 { startsOff + dRelOff + 22 } else { 0 }
+  return ChainedFixupsResult {
+    blob: move blob,
+    dataPageStartsRelOff: dataPageStartsRelOff,
+    dataPageLastOff: move dLastOff,
+    dataPageLastWord: move dLastWord,
+  }
+}
+
+// ---- `LC_DYLD_EXPORTS_TRIE` builder ----
+
+effect fn encodeExportsTrie(mainVmAddr: u64) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  // Exports `_main` (`EXPORT_SYMBOL_FLAGS_KIND_REGULAR = 0`, offset = `mainVmAddr - textBaseVm()`).
+  let mut termPayload = Bytes.make()
+  run writeUleb128(&mut termPayload, 0) // flags = regular
+  run writeUleb128(&mut termPayload, mainVmAddr - textBaseVm())
+  let termLen = usize.toU64(Bytes.length(&termPayload))
+
+  // Root node: `[0 (terminal_size), 1 (child_count), "_main\0", childOff (ULEB128)]`.
+  // Child node starts at offset `2 + 6 + 1 = 9`.
+  let mut out = Bytes.make()
+  run AArch64Encode.byte(&mut out, 0) // root terminal_size = 0
+  run AArch64Encode.byte(&mut out, 1) // 1 child
+  run Bytes.append(&mut out, b"_main")
+  run AArch64Encode.byte(&mut out, 0)
+  run writeUleb128(&mut out, 9)       // offset of child node
+  // Child node at offset 9:
+  run writeUleb128(&mut out, termLen)
+  run Bytes.append(&mut out, Bytes.asSlice(&termPayload))
+  run AArch64Encode.byte(&mut out, 0) // 0 children
+  while Bytes.length(&out) % 8 != usize.ZERO {
+    run AArch64Encode.byte(&mut out, 0)
+  }
+  return move out
+}
+
+// ---- Section/Segment Command Writers ----
+
+effect fn emitSegmentCmd(
+  out: &mut Bytes,
+  name: &[u8],
+  vmaddr: u64,
+  vmsize: u64,
+  fileoff: u64,
+  filesize: u64,
+  maxprot: u64,
+  initprot: u64,
+  nsects: usize,
+  flags: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run AArch64Encode.u32Le(&mut out.*, 0x19) // LC_SEGMENT_64
+  run AArch64Encode.u32Le(&mut out.*, 72 + usize.toU64(nsects) * 80)
+  run writeFixed16(&mut out.*, name)
+  run AArch64Encode.u64Le(&mut out.*, vmaddr)
+  run AArch64Encode.u64Le(&mut out.*, vmsize)
+  run AArch64Encode.u64Le(&mut out.*, fileoff)
+  run AArch64Encode.u64Le(&mut out.*, filesize)
+  run AArch64Encode.u32Le(&mut out.*, maxprot)
+  run AArch64Encode.u32Le(&mut out.*, initprot)
+  run AArch64Encode.u32Le(&mut out.*, usize.toU64(nsects))
+  return run AArch64Encode.u32Le(&mut out.*, flags)
+}
+
+effect fn emitExecSection64(
+  out: &mut Bytes,
+  sectName: &[u8],
+  segName: &[u8],
+  addr: u64,
+  size: u64,
+  offset: u64,
+  alignLog2: u64,
+  flags: u64,
+  reserved1: u64,
+  reserved2: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeFixed16(&mut out.*, sectName)
+  run writeFixed16(&mut out.*, segName)
+  run AArch64Encode.u64Le(&mut out.*, addr)
+  run AArch64Encode.u64Le(&mut out.*, size)
+  run AArch64Encode.u32Le(&mut out.*, if size > 0 { offset } else { 0 })
+  run AArch64Encode.u32Le(&mut out.*, alignLog2)
+  run AArch64Encode.u32Le(&mut out.*, 0) // reloff
+  run AArch64Encode.u32Le(&mut out.*, 0) // nreloc
+  run AArch64Encode.u32Le(&mut out.*, flags)
+  run AArch64Encode.u32Le(&mut out.*, reserved1)
+  run AArch64Encode.u32Le(&mut out.*, reserved2)
+  return run AArch64Encode.u32Le(&mut out.*, 0) // reserved3
+}
+
+// ---- Main Direct Mach-O Linker ----
+
+/// Links back-to-back encoded [`AArch64Object.Fragment`]s into a directly runnable, ad-hoc signed
+/// Apple Silicon Mach-O executable using default options and no debug info.
+pub effect fn link(fragments: &[u8]) -> Bytes ! LinkError | OutOfMemoryError ? &mut Allocator {
+  let options = LinkOptions.executable()
+  let debugMap = DebugLineMap.make()
+  let out = run linkWithOptions(fragments, &options, &debugMap)
+  return move out.binary
+}
+
+/// Links back-to-back encoded [`AArch64Object.Fragment`]s into a directly runnable, ad-hoc signed
+/// Apple Silicon Mach-O executable with full options, optional embedded `__DWARF` debug info, and
+/// optional [`IncrementalState`] for `O(dirty)` APFS CoW incremental patching.
+pub effect fn linkWithOptions(
+  fragments: &[u8],
+  options: &LinkOptions,
+  debugMap: &DebugLineMap,
+) -> LinkOutput ! LinkError | OutOfMemoryError ? &mut Allocator {
+  // 1. Record raw chunk hashes (for O(dirty) skipping in `MachOIncremental`) and decode input unit.
+  let mut chunkHashHigh = List<u64>.make()
+  let mut chunkHashLow = List<u64>.make()
+  if options.incremental {
+    let mut scan = usize.ZERO
+    while scan + 8 <= fragments.length {
+      let magic = u32.toU64(readU32Le(fragments, scan))
+      if magic != 0x34366100 { break }
+      let cLen = u32.toUsize(readU32Le(fragments, scan + 4))
+      if cLen < 8 || scan + cLen > fragments.length { break }
+      let h = MachOInput.hashRawChunk(Slice.view<u8>(fragments, scan, cLen))
+      run List<u64>.append(&mut chunkHashHigh, h.high)
+      run List<u64>.append(&mut chunkHashLow, h.low)
+      scan = scan + cLen
+    }
+  }
+
+  let unit = run MachOInput.fromAArch64Fragments(fragments)
+
+  // 2. Load TAPI v4 dynamic libraries (`libSystem.B.dylib` first at ordinal 1, plus any extra TBDs).
+  let mut tbdLibs = List<TbdLibrary>.make()
+  run List<TbdLibrary>.append(&mut tbdLibs, run MachOInput.builtinLibSystem())
+  let extraTbds = List<Bytes>.asSlice(&options.extraTbdTexts)
+  let mut ti = usize.ZERO
+  while ti < extraTbds.length {
+    run List<TbdLibrary>.append(&mut tbdLibs, run MachOInput.parseTbdV4(Bytes.asSlice(&extraTbds[ti])))
+    ti = ti + usize.ONE
+  }
+
+  // 3. Populate global symbol table from defined symbols and weak refs.
+  let mut symtab = LinkSymTab {entries: List<LinkSym>.make(), index: InternIndex.make()}
+  let unitSyms = List<InputSymbol>.asSlice(&unit.symbols)
+  let mut i = usize.ZERO
+  while i < unitSyms.length {
+    let s = &unitSyms[i]
+    let idx = run symTabIntern(&mut symtab, Bytes.asSlice(&s.name))
+    let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[idx]
+    if !e.defined || !s.weak {
+      e.defined = true
+      e.isFunc = s.isFunc
+      e.isTls = s.isTls
+      e.section = s.section
+      e.offset = s.offset
+      e.size = s.size
+    }
+    i = i + usize.ONE
+  }
+
+  let weakRefs = List<Bytes>.asSlice(&unit.weakRefs)
+  i = usize.ZERO
+  while i < weakRefs.length {
+    let idx = run symTabIntern(&mut symtab, Bytes.asSlice(&weakRefs[i]))
+    let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[idx]
+    e.weakRef = true
+    i = i + usize.ONE
+  }
+
+  // 4. Scan all relocations to intern referenced symbols and allocate GOT / Stub / TLVP slots.
+  let mut gotSyms = List<usize>.make()
+  let mut stubSyms = List<usize>.make()
+  let mut importNames = List<Bytes>.make()
+  let mut importDylibs = List<u8>.make()
+  let mut importWeaks = List<bool>.make()
+
+  let unitSecs = List<InputSection>.asSlice(&unit.sections)
+  let tbdSlice = List<TbdLibrary>.asSlice(&tbdLibs)
+  let mut si = usize.ZERO
+  while si < unitSecs.length {
+    let rels = List<InputReloc>.asSlice(&unitSecs[si].relocs)
+    let mut ri = usize.ZERO
+    while ri < rels.length {
+      let rel = &rels[ri]
+      if !rel.targetLocal {
+        let symIdx = run symTabIntern(&mut symtab, Bytes.asSlice(&rel.symbol))
+        let isUndef = !List<LinkSym>.asSlice(&symtab.entries)[symIdx].defined
+        if isUndef {
+          // Resolve against loaded TAPI v4 `.tbd` libraries.
+          let mut foundLib: u8 = 0
+          let mName = Bytes.asSlice(&List<LinkSym>.asSlice(&symtab.entries)[symIdx].machoName)
+          let mut li = usize.ZERO
+          while li < tbdSlice.length {
+            if tbdSlice[li].contains(mName) {
+              foundLib = usize.toU8(li + usize.ONE)
+              break
+            }
+            li = li + usize.ONE
+          }
+          let isWeak = List<LinkSym>.asSlice(&symtab.entries)[symIdx].weakRef
+          if foundLib == 0 && !isWeak {
+            // Check raw name without leading underscore (e.g. `dyld_stub_binder`).
+            let rawN = Bytes.asSlice(&List<LinkSym>.asSlice(&symtab.entries)[symIdx].name)
+            li = usize.ZERO
+            while li < tbdSlice.length {
+              if tbdSlice[li].contains(rawN) {
+                foundLib = usize.toU8(li + usize.ONE)
+                break
+              }
+              li = li + usize.ONE
+            }
+          }
+          if foundLib == 0 && !isWeak {
+            return run MachOInput.linkError2(b"undefined macOS ARM64 symbol: ", Bytes.asSlice(&rel.symbol))
+          }
+          let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[symIdx]
+          if !e.isDynamic && foundLib > 0 {
+            e.isDynamic = true
+            e.dylibOrdinal = foundLib
+            e.bindOrdinal = usize.toU64(List<Bytes>.length(&importNames))
+            run List<Bytes>.append(&mut importNames, run Bytes.copy(Bytes.asSlice(&e.machoName)))
+            run List<u8>.append(&mut importDylibs, foundLib)
+            run List<bool>.append(&mut importWeaks, e.weakRef)
+          }
+        }
+
+        // Allocate `__got`, `__stubs`, or TLVP slot as required by relocation kind.
+        let needGot = rel.relType == MachOInput.rGotLoadPage21() || rel.relType == MachOInput.rGotLoadPageOff12()
+        let needTlvp = rel.relType == MachOInput.rTlvpLoadPage21() || rel.relType == MachOInput.rTlvpLoadPageOff12()
+        let isBranch = rel.relType == MachOInput.rBranch26()
+        let eDyn = List<LinkSym>.asSlice(&symtab.entries)[symIdx].isDynamic
+        let eDef = List<LinkSym>.asSlice(&symtab.entries)[symIdx].defined
+        // Relax local defined `GOT_LOAD` references to `ADRP + ADD` (no `__got` slot needed).
+        if (needGot && (eDyn || !eDef)) || (isBranch && eDyn) {
+          if List<LinkSym>.asSlice(&symtab.entries)[symIdx].gotSlotIdx == usize.MAX {
+            let slot = List<usize>.length(&gotSyms)
+            run List<usize>.append(&mut gotSyms, symIdx)
+            let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[symIdx]
+            e.gotSlotIdx = slot
+          }
+        }
+        if isBranch && eDyn {
+          if List<LinkSym>.asSlice(&symtab.entries)[symIdx].stubIdx == usize.MAX {
+            let stIdx = List<usize>.length(&stubSyms)
+            run List<usize>.append(&mut stubSyms, symIdx)
+            let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[symIdx]
+            e.stubIdx = stIdx
+          }
+        }
+        if needTlvp {
+          if List<LinkSym>.asSlice(&symtab.entries)[symIdx].tlvpSlotIdx == usize.MAX {
+            let slot = List<usize>.length(&gotSyms)
+            run List<usize>.append(&mut gotSyms, symIdx)
+            let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[symIdx]
+            e.tlvpSlotIdx = slot
+          }
+        }
+      }
+      ri = ri + usize.ONE
+    }
+    si = si + usize.ONE
+  }
+
+  // Assign `__DATA,__thread_vars` descriptors for every defined TLS symbol + bind `__tlv_bootstrap`.
+  let mut tlsSyms = List<usize>.make()
+  i = usize.ZERO
+  while i < List<LinkSym>.length(&symtab.entries) {
+    if List<LinkSym>.asSlice(&symtab.entries)[i].defined && List<LinkSym>.asSlice(&symtab.entries)[i].isTls {
+      let off = usize.toU64(List<usize>.length(&tlsSyms)) * 24
+      let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[i]
+      e.tlvDescOff = off
+      run List<usize>.append(&mut tlsSyms, i)
+    }
+    i = i + usize.ONE
+  }
+  let hasTls = List<usize>.length(&tlsSyms) > usize.ZERO
+  let mut tlvBootstrapBindOrd = u64.MAX
+  if hasTls {
+    tlvBootstrapBindOrd = usize.toU64(List<Bytes>.length(&importNames))
+    run List<Bytes>.append(&mut importNames, run Bytes.copy(b"__tlv_bootstrap"))
+    run List<u8>.append(&mut importDylibs, 1) // libSystem.B.dylib
+    run List<bool>.append(&mut importWeaks, false)
+  }
+
+  // 5. Incremental layout preparation: per-function padding + fixed 12-byte thunk table.
+  let silkFuncs = List<SilkFuncMeta>.asSlice(&unit.silkFuncs)
+  let mut funcBodyOffs = run List<u64>.makeWithCapacity(silkFuncs.length)
+  let mut funcBodyCaps = run List<u64>.makeWithCapacity(silkFuncs.length)
+  let mut textBuf = Bytes.make()
+  let mut thunksRelOff: u64 = 0
+  let mut thunksCount: u64 = 0
+  let mut thunksCap: u64 = 0
+  let mut textHeadroomStart: u64 = 0
+  let mut textHeadroomEnd: u64 = 0
+
+  if options.incremental {
+    // Emit each function padded to at least `alignUp(max(codeSize + 16, 64), 16)` so minor edits fit in place.
+    let rawText = Bytes.asSlice(&unitSecs[0].data)
+    i = usize.ZERO
+    while i < silkFuncs.length {
+      let fm = &silkFuncs[i]
+      while Bytes.length(&textBuf) % 16 != usize.ZERO { run AArch64Encode.nop(&mut textBuf) }
+      let off = usize.toU64(Bytes.length(&textBuf))
+      let cap = alignUp(if fm.codeSize + 16 > 64 { fm.codeSize + 16 } else { 64 }, 16)
+      run Bytes.append(&mut textBuf, Slice.view<u8>(rawText, u64.toUsize(fm.textOff), u64.toUsize(fm.codeSize)))
+      while usize.toU64(Bytes.length(&textBuf)) < off + cap {
+        run AArch64Encode.nop(&mut textBuf)
+      }
+      run List<u64>.append(&mut funcBodyOffs, off)
+      run List<u64>.append(&mut funcBodyCaps, cap)
+      i = i + usize.ONE
+    }
+    // Fixed 12-byte thunk table right after function bodies (16-byte aligned).
+    while Bytes.length(&textBuf) % 16 != usize.ZERO { run AArch64Encode.nop(&mut textBuf) }
+    thunksRelOff = usize.toU64(Bytes.length(&textBuf))
+    thunksCount = usize.toU64(silkFuncs.length)
+    thunksCap = if thunksCount * 2 > 256 { thunksCount * 2 } else { 256 }
+    let mut tSlot: u64 = 0
+    while tSlot < thunksCap {
+      run AArch64Encode.brk(&mut textBuf, 0)
+      run AArch64Encode.brk(&mut textBuf, 0)
+      run AArch64Encode.brk(&mut textBuf, 0)
+      tSlot = tSlot + 1
+    }
+    while Bytes.length(&textBuf) % 16 != usize.ZERO { run AArch64Encode.nop(&mut textBuf) }
+    textHeadroomStart = usize.toU64(Bytes.length(&textBuf))
+    let rawLen = usize.toU64(Bytes.length(&textBuf))
+    let extraText = if rawLen > 65536 { rawLen } else { 65536 }
+    let pad = run Bytes.zeroed(u64.toUsize(alignUp(extraText, 16)))
+    run Bytes.append(&mut textBuf, Bytes.asSlice(&pad))
+    textHeadroomEnd = usize.toU64(Bytes.length(&textBuf))
+  } else {
+    textBuf = run Bytes.copy(Bytes.asSlice(&unitSecs[0].data))
+    i = usize.ZERO
+    while i < silkFuncs.length {
+      run List<u64>.append(&mut funcBodyOffs, silkFuncs[i].textOff)
+      run List<u64>.append(&mut funcBodyCaps, silkFuncs[i].codeSize)
+      i = i + usize.ONE
+    }
+  }
+
+  let bodyOffsSlice = List<u64>.asSlice(&funcBodyOffs)
+  let bodyCapsSlice = List<u64>.asSlice(&funcBodyCaps)
+
+  // Map original Silk text offsets -> padded text offsets when incremental.
+  let mut constBuf = run Bytes.copy(Bytes.asSlice(&unitSecs[1].data))
+  let mut constHeadroomStart = usize.toU64(Bytes.length(&constBuf))
+  let mut constHeadroomEnd = constHeadroomStart
+  if options.incremental {
+    while Bytes.length(&constBuf) % 16 != usize.ZERO { run AArch64Encode.byte(&mut constBuf, 0) }
+    constHeadroomStart = usize.toU64(Bytes.length(&constBuf))
+    let extraConst = if constHeadroomStart > 32768 { constHeadroomStart } else { 32768 }
+    let pad = run Bytes.zeroed(u64.toUsize(alignUp(extraConst, 16)))
+    run Bytes.append(&mut constBuf, Bytes.asSlice(&pad))
+    constHeadroomEnd = usize.toU64(Bytes.length(&constBuf))
+  }
+
+  let mut dataSecBuf = run Bytes.copy(Bytes.asSlice(&unitSecs[2].data))
+  let mut dataHeadroomStart = usize.toU64(Bytes.length(&dataSecBuf))
+  let mut dataHeadroomEnd = dataHeadroomStart
+  if options.incremental {
+    while Bytes.length(&dataSecBuf) % 16 != usize.ZERO { run AArch64Encode.byte(&mut dataSecBuf, 0) }
+    dataHeadroomStart = usize.toU64(Bytes.length(&dataSecBuf))
+    let extraData = if dataHeadroomStart > 65536 { dataHeadroomStart } else { 65536 }
+    let pad = run Bytes.zeroed(u64.toUsize(alignUp(extraData, 16)))
+    run Bytes.append(&mut dataSecBuf, Bytes.asSlice(&pad))
+    dataHeadroomEnd = usize.toU64(Bytes.length(&dataSecBuf))
+  }
+
+  let threadDataBuf = Bytes.asSlice(&unitSecs[3].data)
+  let mut framesBuf = run Bytes.copy(Bytes.asSlice(&unitSecs[4].data))
+  let seenBuf = Bytes.asSlice(&unitSecs[5].data)
+
+  // 6. Compute exact Mach-O segment & section virtual addresses and file offsets (16 KB aligned).
+  let hasStubs = List<usize>.length(&stubSyms) > usize.ZERO
+  let hasConst = Bytes.length(&constBuf) > usize.ZERO
+  let hasGot = List<usize>.length(&gotSyms) > usize.ZERO
+  let hasFrames = Bytes.length(&framesBuf) > usize.ZERO
+  let hasSeen = seenBuf.length > usize.ZERO
+  let hasDwarf = !debugMap.isEmpty()
+
+  let mut textSects: usize = 1 // __text
+  if hasStubs { textSects = textSects + usize.ONE }
+  if hasConst { textSects = textSects + usize.ONE }
+
+  let dataConstSects: usize = if hasGot { 1 } else { 0 }
+
+  let mut dataSects: usize = 1 // __data (always present so __DATA exists for incremental headroom)
+  if hasTls { dataSects = dataSects + 2 } // __thread_vars + __thread_data
+  if hasFrames { dataSects = dataSects + usize.ONE }
+  if hasSeen { dataSects = dataSects + usize.ONE }
+
+  let dwarfSects: usize = if hasDwarf { 4 } else { 0 }
+
+  // Count load commands & compute exact `sizeofcmds`.
+  // Segments: __PAGEZERO (0), __TEXT (1), __DATA_CONST (2), __DATA (3), [__DWARF (4)], __LINKEDIT (4 or 5)
+  let numSegs: usize = if hasDwarf { 6 } else { 5 }
+  let dataConstSegIdx: usize = 2
+  let dataSegIdx: usize = 3
+
+  let mut sizeofCmds: u64 = 0
+  sizeofCmds = sizeofCmds + 72                                    // __PAGEZERO
+  sizeofCmds = sizeofCmds + 72 + usize.toU64(textSects) * 80      // __TEXT
+  sizeofCmds = sizeofCmds + 72 + usize.toU64(dataConstSects) * 80 // __DATA_CONST
+  sizeofCmds = sizeofCmds + 72 + usize.toU64(dataSects) * 80      // __DATA
+  if hasDwarf {
+    sizeofCmds = sizeofCmds + 72 + usize.toU64(dwarfSects) * 80   // __DWARF
+  }
+  sizeofCmds = sizeofCmds + 72 // __LINKEDIT
+  sizeofCmds = sizeofCmds + 16 // LC_DYLD_CHAINED_FIXUPS
+  sizeofCmds = sizeofCmds + 16 // LC_DYLD_EXPORTS_TRIE
+  sizeofCmds = sizeofCmds + 24 // LC_SYMTAB
+  sizeofCmds = sizeofCmds + 80 // LC_DYSYMTAB
+  sizeofCmds = sizeofCmds + 32 // LC_LOAD_DYLINKER ("/usr/lib/dyld\0" padded to 8)
+  sizeofCmds = sizeofCmds + 24 // LC_UUID
+  sizeofCmds = sizeofCmds + 24 // LC_BUILD_VERSION
+  sizeofCmds = sizeofCmds + 16 // LC_SOURCE_VERSION
+  sizeofCmds = sizeofCmds + 24 // LC_MAIN
+  let mut dylibCmdSizes = List<u64>.make()
+  ti = usize.ZERO
+  while ti < tbdSlice.length {
+    let nameLen = usize.toU64(Bytes.length(&tbdSlice[ti].installName)) + 1
+    let cmdSz = alignUp(24 + nameLen, 8)
+    run List<u64>.append(&mut dylibCmdSizes, cmdSz)
+    sizeofCmds = sizeofCmds + cmdSz
+    ti = ti + usize.ONE
+  }
+  sizeofCmds = sizeofCmds + 16 // LC_CODE_SIGNATURE
+  let ncmds = numSegs + 10 + tbdSlice.length
+
+  // `__TEXT` layout starting at file offset `alignUp(32 + sizeofCmds, 16)`.
+  let textSectFileOff = alignUp(32 + sizeofCmds, 16)
+  let textSectVmAddr = textBaseVm() + textSectFileOff
+  let textSectSize = usize.toU64(Bytes.length(&textBuf))
+
+  let stubsFileOff = alignUp(textSectFileOff + textSectSize, 16)
+  let stubsVmAddr = textBaseVm() + stubsFileOff
+  let stubsSize = usize.toU64(List<usize>.length(&stubSyms)) * 12
+
+  let constFileOff = alignUp(stubsFileOff + stubsSize, 16)
+  let constVmAddr = textBaseVm() + constFileOff
+  let constSize = usize.toU64(Bytes.length(&constBuf))
+
+  let textSegSize = alignUp(constFileOff + constSize, pageSize())
+
+  // `__DATA_CONST` layout.
+  let dataConstFileOff = textSegSize
+  let dataConstVmAddr = textBaseVm() + dataConstFileOff
+  let gotSize = usize.toU64(List<usize>.length(&gotSyms)) * 8
+  let dataConstSegSize = alignUp(if gotSize > 0 { gotSize } else { 16 }, pageSize())
+  let dataConstPageCount = u64.toUsize(dataConstSegSize / pageSize())
+
+  // `__DATA` layout: fixed sections first (`__thread_vars`, `__thread_data`, `__silk_frames`,
+  // `__silk_seen`), and `__data` (with incremental bump-only headroom) LAST so every bump-allocated
+  // pointer in `__data` headroom sits at a strictly higher segment offset than all earlier fixups.
+  let dataSegFileOff = dataConstFileOff + dataConstSegSize
+  let dataSegVmAddr = textBaseVm() + dataSegFileOff
+
+  let tvRelOff: u64 = 0
+  let tvSize = usize.toU64(List<usize>.length(&tlsSyms)) * 24
+
+  let tdRelOff = alignUp(tvRelOff + tvSize, 16)
+  let tdSize = usize.toU64(threadDataBuf.length)
+
+  let framesRelOff = alignUp(tdRelOff + tdSize, 8)
+  let framesSize = usize.toU64(Bytes.length(&framesBuf))
+
+  let seenRelOff = alignUp(framesRelOff + framesSize, 8)
+  let seenSize = usize.toU64(seenBuf.length)
+
+  let dataRelOff = alignUp(seenRelOff + seenSize, 16)
+  let dataSize = usize.toU64(Bytes.length(&dataSecBuf))
+
+  let dataSegRawSize = dataRelOff + dataSize
+  let dataSegSize = alignUp(if dataSegRawSize > 0 { dataSegRawSize } else { 16 }, pageSize())
+  let dataPageCount = u64.toUsize(dataSegSize / pageSize())
+
+  // 7. Assign final virtual addresses to every symbol & build function body -> padded offset map.
+  let funcCount = silkFuncs.length
+
+  // Helper lookup: map original `textOff` -> `(bodyVmAddr, thunkSlot)` for Silk functions.
+  // Assign thunk slots for every Silk function when incremental.
+  let thunksBaseVm = textSectVmAddr + thunksRelOff
+  let thunksBaseFile = textSectFileOff + thunksRelOff
+
+  let mut funcThunkSlot = run List<usize>.makeWithCapacity(funcCount)
+  i = usize.ZERO
+  while i < funcCount {
+    let fm = &silkFuncs[i]
+    let slot = if options.incremental { i } else { usize.MAX }
+    run List<usize>.append(&mut funcThunkSlot, slot)
+    let bodyVa = textSectVmAddr + bodyOffsSlice[i]
+    let symVa = if options.incremental { thunksBaseVm + usize.toU64(i) * 12 } else { bodyVa }
+
+    let sIdx = run symTabIntern(&mut symtab, Bytes.asSlice(&fm.symbol))
+    let e = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[sIdx]
+    e.bodyVaddr = bodyVa
+    e.vaddr = symVa
+    e.thunkSlot = slot
+
+    let exp = Bytes.asSlice(&fm.exported)
+    if exp.length > usize.ZERO && !sameBytes(exp, Bytes.asSlice(&fm.symbol)) {
+      let eIdx = run symTabIntern(&mut symtab, exp)
+      let ee = &mut List<LinkSym>.asMutSlice(&mut symtab.entries)[eIdx]
+      ee.bodyVaddr = bodyVa
+      ee.vaddr = symVa
+      ee.thunkSlot = slot
+    }
+    i = i + usize.ONE
+  }
+
+  // Assign addresses to non-function defined symbols and synthetic bounds.
+  let framesVmStart = dataSegVmAddr + framesRelOff
+  let framesVmStop = framesVmStart + framesSize
+  let seenVmStart = dataSegVmAddr + seenRelOff
+  let seenVmStop = seenVmStart + seenSize
+
+  let symsLen = List<LinkSym>.length(&symtab.entries)
+  let symsMut = List<LinkSym>.asMutSlice(&mut symtab.entries)
+  i = usize.ZERO
+  while i < symsLen {
+    let e = &mut symsMut[i]
+    if e.synth == SynthKind.StartSilkFrames {
+      e.vaddr = framesVmStart
+    } else if e.synth == SynthKind.StopSilkFrames {
+      e.vaddr = framesVmStop
+    } else if e.synth == SynthKind.StartSilkSeen {
+      e.vaddr = seenVmStart
+    } else if e.synth == SynthKind.StopSilkSeen {
+      e.vaddr = seenVmStop
+    } else if e.defined && !e.isFunc {
+      if e.section == 1 { e.vaddr = constVmAddr + e.offset }
+      else if e.section == 2 { e.vaddr = dataSegVmAddr + dataRelOff + e.offset }
+      else if e.section == 3 { e.vaddr = dataSegVmAddr + tvRelOff + e.tlvDescOff }
+      else if e.section == 4 { e.vaddr = framesVmStart + e.offset }
+      else if e.section == 5 { e.vaddr = seenVmStart + e.offset }
+      e.bodyVaddr = e.vaddr
+    }
+    i = i + usize.ONE
+  }
+
+  // Locate entry point (`main`).
+  let mainIdx = run symTabIntern(&mut symtab, b"main")
+  if !List<LinkSym>.asSlice(&symtab.entries)[mainIdx].defined {
+    return run MachOInput.linkError(b"entry point `main` is not defined")
+  }
+  let mainVmAddr = List<LinkSym>.asSlice(&symtab.entries)[mainIdx].vaddr
+  let mainEntryOff = mainVmAddr - textBaseVm()
+
+  // Populate fixed 12-byte Silk call thunks when incremental.
+  if options.incremental {
+    i = usize.ZERO
+    while i < funcCount {
+      let thunkVa = thunksBaseVm + usize.toU64(i) * 12
+      let bodyVa = textSectVmAddr + bodyOffsSlice[i]
+      let mut tBytes = Bytes.make()
+      run emitThunk12(&mut tBytes, thunkVa, bodyVa)
+      let tSlice = Bytes.asSlice(&tBytes)
+      let dstMut = Bytes.asMutSlice(&mut textBuf)
+      let dstOff = u64.toUsize(thunksRelOff + usize.toU64(i) * 12)
+      let mut k = usize.ZERO
+      while k < 12 {
+        dstMut[dstOff + k] = tSlice[k]
+        k = k + usize.ONE
+      }
+      i = i + usize.ONE
+    }
+  }
+
+  // 8. Build `__TEXT,__stubs`, `__DATA_CONST,__got`, `__DATA,__thread_vars`, and record chained fixups.
+  let mut stubsBuf = Bytes.make()
+  let stubList = List<usize>.asSlice(&stubSyms)
+  i = usize.ZERO
+  while i < stubList.length {
+    let sIdx = stubList[i]
+    let gotIdx = List<LinkSym>.asSlice(&symtab.entries)[sIdx].gotSlotIdx
+    let stubVa = stubsVmAddr + usize.toU64(i) * 12
+    let gotVa = dataConstVmAddr + usize.toU64(gotIdx) * 8
+    run emitDylibStub12(&mut stubsBuf, stubVa, gotVa)
+    i = i + usize.ONE
+  }
+
+  let mut dataConstBuf = run Bytes.zeroed(u64.toUsize(dataConstSegSize))
+  let mut chainedSites = List<ChainedFixupSite>.make()
+  let gotList = List<usize>.asSlice(&gotSyms)
+  i = usize.ZERO
+  while i < gotList.length {
+    let sIdx = gotList[i]
+    let e = &List<LinkSym>.asSlice(&symtab.entries)[sIdx]
+    let slotOff = usize.toU64(i) * 8
+    if e.isDynamic {
+      run List<ChainedFixupSite>.append(&mut chainedSites, ChainedFixupSite {
+        segIdx: 0, segOff: slotOff, isBind: true, bindOrdinal: e.bindOrdinal, targetVmAddr: 0, addend: 0,
+      })
+    } else if e.defined {
+      // Local/Silk symbol (or TLS `tlv_descriptor` address for TLVP slots) -> rebase to `e.vaddr`.
+      run List<ChainedFixupSite>.append(&mut chainedSites, ChainedFixupSite {
+        segIdx: 0, segOff: slotOff, isBind: false, bindOrdinal: 0, targetVmAddr: e.vaddr, addend: 0,
+      })
+    }
+    // Undefined weak ref leaves 0 in GOT slot (no fixup).
+    i = i + usize.ONE
+  }
+
+  // Build full `__DATA` segment buffer (`__data` + `__thread_vars` + `__thread_data` + `__silk_frames` + `__silk_seen`).
+  let mut fullDataBuf = run Bytes.zeroed(u64.toUsize(dataSegSize))
+  // Copy `__data`, `__thread_data`, `__silk_frames`, `__silk_seen` into `fullDataBuf`.
+  copySliceInto(&mut fullDataBuf, u64.toUsize(dataRelOff), Bytes.asSlice(&dataSecBuf))
+  copySliceInto(&mut fullDataBuf, u64.toUsize(tdRelOff), threadDataBuf)
+  copySliceInto(&mut fullDataBuf, u64.toUsize(framesRelOff), Bytes.asSlice(&framesBuf))
+  copySliceInto(&mut fullDataBuf, u64.toUsize(seenRelOff), seenBuf)
+
+  // Write 24-byte `tlv_descriptor` entries in `__DATA,__thread_vars`:
+  // `+0`: chained bind to `__tlv_bootstrap`, `+8`: 0, `+16`: offset in `__thread_data`.
+  let tlsList = List<usize>.asSlice(&tlsSyms)
+  i = usize.ZERO
+  while i < tlsList.length {
+    let e = &List<LinkSym>.asSlice(&symtab.entries)[tlsList[i]]
+    let tvSegOff = tvRelOff + e.tlvDescOff
+    run List<ChainedFixupSite>.append(&mut chainedSites, ChainedFixupSite {
+      segIdx: 1, segOff: tvSegOff, isBind: true, bindOrdinal: tlvBootstrapBindOrd, targetVmAddr: 0, addend: 0,
+    })
+    patchU64Le(&mut fullDataBuf, u64.toUsize(tvSegOff + 16), e.offset)
+    i = i + usize.ONE
+  }
+
+  // 9. Apply all relocations in `__TEXT,__text`, `__TEXT,__const`, `__DATA,__data`, and `__DATA,__silk_frames`.
+  // Map raw Silk text offset -> padded text offset when incremental.
+  let textRelocs = List<InputReloc>.asSlice(&unitSecs[0].relocs)
+  i = usize.ZERO
+  while i < textRelocs.length {
+    let rel = &textRelocs[i]
+    let mappedOff = mapTextOff(rel.offset, silkFuncs, bodyOffsSlice, options.incremental)
+    let instrVa = textSectVmAddr + mappedOff
+    let patchAt = u64.toUsize(mappedOff)
+
+    let mut targetVa: u64 = 0
+    let mut relaxGot = false
+    if rel.targetLocal {
+      if rel.localSection == 0 {
+        targetVa = textSectVmAddr + mapTextOff(rel.localOffset, silkFuncs, bodyOffsSlice, options.incremental)
+      } else if rel.localSection == 1 {
+        targetVa = constVmAddr + rel.localOffset
+      }
+    } else {
+      let sIdx = run symTabIntern(&mut symtab, Bytes.asSlice(&rel.symbol))
+      let e = &List<LinkSym>.asSlice(&symtab.entries)[sIdx]
+      if rel.relType == MachOInput.rGotLoadPage21() || rel.relType == MachOInput.rGotLoadPageOff12() {
+        if !e.isDynamic && e.defined && e.gotSlotIdx == usize.MAX {
+          relaxGot = true
+          targetVa = e.vaddr
+        } else {
+          targetVa = dataConstVmAddr + usize.toU64(e.gotSlotIdx) * 8
+        }
+      } else if rel.relType == MachOInput.rTlvpLoadPage21() || rel.relType == MachOInput.rTlvpLoadPageOff12() {
+        targetVa = dataConstVmAddr + usize.toU64(e.tlvpSlotIdx) * 8
+      } else if rel.relType == MachOInput.rBranch26() && e.isDynamic {
+        targetVa = stubsVmAddr + usize.toU64(e.stubIdx) * 12
+      } else {
+        targetVa = u64.wrappingAdd(e.vaddr, i64.wrappingToU64(rel.addend))
+      }
+    }
+
+    if rel.relType == MachOInput.rBranch26() {
+      patchBranch26Va(&mut textBuf, patchAt, instrVa, targetVa)
+    } else if rel.relType == MachOInput.rPage21()
+      || rel.relType == MachOInput.rGotLoadPage21()
+      || rel.relType == MachOInput.rTlvpLoadPage21() {
+      AArch64Encode.patchAdrp21(&mut textBuf, patchAt, instrVa, targetVa)
+    } else if rel.relType == MachOInput.rGotLoadPageOff12() && relaxGot {
+      relaxGotLdrToAdd12(&mut textBuf, patchAt, targetVa)
+    } else if rel.relType == MachOInput.rPageOff12()
+      || rel.relType == MachOInput.rGotLoadPageOff12()
+      || rel.relType == MachOInput.rTlvpLoadPageOff12() {
+      patchPageOff12Auto(&mut textBuf, patchAt, targetVa)
+    } else if rel.relType == MachOInput.rAbs64() {
+      patchU64Le(&mut textBuf, patchAt, targetVa)
+    }
+    i = i + usize.ONE
+  }
+
+  // Apply jump-table relocations in `__TEXT,__const`: `(targetCodeVa - tableBaseVa)` as 32-bit signed offset.
+  let constRelocs = List<InputReloc>.asSlice(&unitSecs[1].relocs)
+  i = usize.ZERO
+  while i < constRelocs.length {
+    let rel = &constRelocs[i]
+    if rel.relType == MachOInput.rJumpTable32() {
+      let targetCodeOff = mapTextOff(rel.localOffset, silkFuncs, bodyOffsSlice, options.incremental)
+      let targetVa = textSectVmAddr + targetCodeOff
+      let tableVa = constVmAddr + i64.wrappingToU64(rel.addend)
+      let diff = u64.wrappingToI64(targetVa) - u64.wrappingToI64(tableVa)
+      AArch64Encode.patchU32(&mut constBuf, u64.toUsize(rel.offset), i64.wrappingToU64(diff) & 0xFFFFFFFF)
+    }
+    i = i + usize.ONE
+  }
+
+  // Apply pointer relocations in `__DATA,__data` and `__DATA,__silk_frames` via `LC_DYLD_CHAINED_FIXUPS`!
+  let dataRelocs = List<InputReloc>.asSlice(&unitSecs[2].relocs)
+  i = usize.ZERO
+  while i < dataRelocs.length {
+    let rel = &dataRelocs[i]
+    let sIdx = run symTabIntern(&mut symtab, Bytes.asSlice(&rel.symbol))
+    let e = &List<LinkSym>.asSlice(&symtab.entries)[sIdx]
+    let segOff = dataRelOff + rel.offset
+    if e.isDynamic {
+      run List<ChainedFixupSite>.append(&mut chainedSites, ChainedFixupSite {
+        segIdx: 1, segOff: segOff, isBind: true, bindOrdinal: e.bindOrdinal, targetVmAddr: 0, addend: rel.addend,
+      })
+    } else if e.defined {
+      let targetVa = u64.wrappingAdd(e.vaddr, i64.wrappingToU64(rel.addend))
+      run List<ChainedFixupSite>.append(&mut chainedSites, ChainedFixupSite {
+        segIdx: 1, segOff: segOff, isBind: false, bindOrdinal: 0, targetVmAddr: targetVa, addend: 0,
+      })
+    }
+    i = i + usize.ONE
+  }
+
+  let mut funcFrameSegOff = run List<u64>.makeWithCapacity(funcCount)
+  i = usize.ZERO
+  while i < funcCount {
+    run List<u64>.append(&mut funcFrameSegOff, 0xFFFFFFFF)
+    i = i + usize.ONE
+  }
+  let framesRelocs = List<InputReloc>.asSlice(&unitSecs[4].relocs)
+  i = usize.ZERO
+  while i < framesRelocs.length {
+    let rel = &framesRelocs[i]
+    let sIdx = run symTabIntern(&mut symtab, Bytes.asSlice(&rel.symbol))
+    let e = &List<LinkSym>.asSlice(&symtab.entries)[sIdx]
+    let segOff = framesRelOff + rel.offset
+    if e.defined {
+      // Trap-frame descriptors record the actual function body address for stack-unwind matching.
+      let targetVa = u64.wrappingAdd(if e.bodyVaddr != 0 { e.bodyVaddr } else { e.vaddr }, i64.wrappingToU64(rel.addend))
+      run List<ChainedFixupSite>.append(&mut chainedSites, ChainedFixupSite {
+        segIdx: 1, segOff: segOff, isBind: false, bindOrdinal: 0, targetVmAddr: targetVa, addend: 0,
+      })
+      if e.isFunc && e.thunkSlot < funcCount && rel.addend == 0 {
+        let ffMut = List<u64>.asMutSlice(&mut funcFrameSegOff)
+        ffMut[e.thunkSlot] = segOff
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  // 10. Build optional embedded `__DWARF` segment sections (when `--debug true`).
+  let mut dwarf = DwarfSections.empty()
+  if hasDwarf {
+    let mut spans = List<FunctionDebugSpan>.make()
+    i = usize.ZERO
+    while i < funcCount {
+      let fm = &silkFuncs[i]
+      let src = debugMap.lookup(Bytes.asSlice(&fm.symbol))
+      if src.fileIndex > usize.ZERO {
+        let lSlice = List<u64>.asSlice(&fm.locations)
+        let mut lCopy = run List<u64>.makeWithCapacity(lSlice.length)
+        let mut li = usize.ZERO
+        while li < lSlice.length {
+          run List<u64>.append(&mut lCopy, lSlice[li])
+          li = li + usize.ONE
+        }
+        run List<FunctionDebugSpan>.append(&mut spans, FunctionDebugSpan {
+          name: run Bytes.copy(Bytes.asSlice(&fm.symbol)),
+          vaddr: textSectVmAddr + bodyOffsSlice[i],
+          codeSize: fm.codeSize,
+          fileIndex: src.fileIndex,
+          origin: src.origin,
+          locations: move lCopy,
+        })
+      }
+      i = i + usize.ONE
+    }
+    dwarf = run MachODebug.encodeDwarf(debugMap.filePaths(), List<FunctionDebugSpan>.asSlice(&spans))
+  }
+
+  let dwarfFileOff = dataSegFileOff + dataSegSize
+  let dwarfVmAddr = textBaseVm() + dwarfFileOff
+  let dLineOff: u64 = 0
+  let dLineSize = usize.toU64(Bytes.length(&dwarf.debugLine))
+  let dInfoOff = alignUp(dLineOff + dLineSize, 4)
+  let dInfoSize = usize.toU64(Bytes.length(&dwarf.debugInfo))
+  let dAbbrevOff = alignUp(dInfoOff + dInfoSize, 4)
+  let dAbbrevSize = usize.toU64(Bytes.length(&dwarf.debugAbbrev))
+  let dStrOff = alignUp(dAbbrevOff + dAbbrevSize, 4)
+  let dStrSize = usize.toU64(Bytes.length(&dwarf.debugStr))
+  let dwarfSegSize = if hasDwarf { alignUp(if dStrOff + dStrSize > 0 { dStrOff + dStrSize } else { 16 }, pageSize()) } else { 0 }
+
+  // 11. Build `__LINKEDIT` payloads: chained fixups, exports trie, symtab + strtab + indirectsymtab, and ad-hoc codesign!
+  let linkeditFileOff = dwarfFileOff + dwarfSegSize
+  let linkeditVmAddr = textBaseVm() + linkeditFileOff
+
+  let chained = run buildChainedFixups(
+    numSegs, dataConstSegIdx, dataConstVmAddr, dataConstPageCount,
+    dataSegIdx, dataSegVmAddr, dataPageCount,
+    &mut dataConstBuf, &mut fullDataBuf, &mut chainedSites,
+    List<Bytes>.asSlice(&importNames), List<u8>.asSlice(&importDylibs), List<bool>.asSlice(&importWeaks),
+  )
+  let chainedOff = linkeditFileOff
+  let chainedSize = usize.toU64(Bytes.length(&chained.blob))
+
+  let exportsTrie = run encodeExportsTrie(mainVmAddr)
+  let exportsOff = alignUp(chainedOff + chainedSize, 8)
+  let exportsSize = usize.toU64(Bytes.length(&exportsTrie))
+
+  // Build `LC_SYMTAB` (defined externals first, then undefined dynamic imports) + indirect symbol table.
+  let mut symtabBuf = Bytes.make()
+  let mut strtabBuf = Bytes.make()
+  run AArch64Encode.byte(&mut strtabBuf, 0)
+  run AArch64Encode.byte(&mut strtabBuf, 32)
+  run AArch64Encode.byte(&mut strtabBuf, 0)
+
+  let symSlice = List<LinkSym>.asSlice(&symtab.entries)
+  let mut symOutIdx = run List<u32>.makeWithCapacity(symSlice.length)
+  i = usize.ZERO
+  while i < symSlice.length {
+    run List<u32>.append(&mut symOutIdx, 0)
+    i = i + usize.ONE
+  }
+  let symOutMut = List<u32>.asMutSlice(&mut symOutIdx)
+  let mut nExtDef: usize = 0
+  // Defined globals (functions + data objects).
+  i = usize.ZERO
+  while i < symSlice.length {
+    let e = &symSlice[i]
+    if e.defined && e.synth == SynthKind.None {
+      symOutMut[i] = usize.toU32(nExtDef)
+      let strx = usize.toU64(Bytes.length(&strtabBuf))
+      run Bytes.append(&mut strtabBuf, Bytes.asSlice(&e.machoName))
+      run AArch64Encode.byte(&mut strtabBuf, 0)
+      let nSect: u8 = if e.isFunc { 1 } else { 2 }
+      run AArch64Encode.u32Le(&mut symtabBuf, strx)
+      run AArch64Encode.byte(&mut symtabBuf, 0x0F) // N_SECT | N_EXT
+      run AArch64Encode.byte(&mut symtabBuf, nSect)
+      run AArch64Encode.u16Le(&mut symtabBuf, 0)
+      run AArch64Encode.u64Le(&mut symtabBuf, if e.bodyVaddr != 0 { e.bodyVaddr } else { e.vaddr })
+      nExtDef = nExtDef + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  let mut nUndef: usize = 0
+  i = usize.ZERO
+  while i < symSlice.length {
+    let e = &symSlice[i]
+    if e.isDynamic {
+      symOutMut[i] = usize.toU32(nExtDef + nUndef)
+      let strx = usize.toU64(Bytes.length(&strtabBuf))
+      run Bytes.append(&mut strtabBuf, Bytes.asSlice(&e.machoName))
+      run AArch64Encode.byte(&mut strtabBuf, 0)
+      let weakFlag: u64 = if e.weakRef { 0x0040 } else { 0 }
+      let nDesc: u64 = u64.shiftLeft(u8.toU64(e.dylibOrdinal), 8) | weakFlag
+      run AArch64Encode.u32Le(&mut symtabBuf, strx)
+      run AArch64Encode.byte(&mut symtabBuf, 0x01) // N_UNDF | N_EXT
+      run AArch64Encode.byte(&mut symtabBuf, 0)
+      run AArch64Encode.u16Le(&mut symtabBuf, nDesc)
+      run AArch64Encode.u64Le(&mut symtabBuf, 0)
+      nUndef = nUndef + usize.ONE
+    }
+    i = i + usize.ONE
+  }
+  while Bytes.length(&strtabBuf) % 8 != usize.ZERO {
+    run AArch64Encode.byte(&mut strtabBuf, 0)
+  }
+
+  // Indirect symbol table: first `stubSyms.length` entries for `__stubs`, then `gotSyms.length` for `__got`.
+  let mut indirectBuf = Bytes.make()
+  let symOutS = List<u32>.asSlice(&symOutIdx)
+  i = usize.ZERO
+  while i < stubList.length {
+    run AArch64Encode.u32Le(&mut indirectBuf, u32.toU64(symOutS[stubList[i]]))
+    i = i + usize.ONE
+  }
+  i = usize.ZERO
+  while i < gotList.length {
+    let gSym = &symSlice[gotList[i]]
+    let indVal: u64 = if gSym.isDynamic { u32.toU64(symOutS[gotList[i]]) } else { 0x80000000 } // INDIRECT_SYMBOL_LOCAL
+    run AArch64Encode.u32Le(&mut indirectBuf, indVal)
+    i = i + usize.ONE
+  }
+  let nIndirect = stubList.length + gotList.length
+
+  let symtabOff = alignUp(exportsOff + exportsSize, 8)
+  let symtabSize = usize.toU64(Bytes.length(&symtabBuf))
+  let indirectOff = alignUp(symtabOff + symtabSize, 4)
+  let indirectSize = usize.toU64(Bytes.length(&indirectBuf))
+  let strtabOff = alignUp(indirectOff + indirectSize, 8)
+  let strtabSize = usize.toU64(Bytes.length(&strtabBuf))
+
+  let csDataOff = alignUp(strtabOff + strtabSize, 16)
+  let identSlice = if Bytes.length(&options.identifier) > usize.ZERO {
+    Bytes.asSlice(&options.identifier)
+  } else {
+    b"silk-direct"
+  }
+  let csDataSize = codeSignatureSize(csDataOff, identSlice.length)
+  let linkeditFileSize = (csDataOff + csDataSize) - linkeditFileOff
+  let linkeditVmSize = alignUp(linkeditFileSize, pageSize())
+
+  // Deterministic 16-byte UUID derived from content hash of `__text`, `__const`, and `__data`.
+  let mut uuidSt = ContentHash.stream()
+  ContentHash.append(&mut uuidSt, Bytes.asSlice(&textBuf))
+  ContentHash.append(&mut uuidSt, Bytes.asSlice(&constBuf))
+  ContentHash.append(&mut uuidSt, Bytes.asSlice(&fullDataBuf))
+  let uuidHash = ContentHash.finish(move uuidSt)
+
+  // 12. Serialize the complete `MH_EXECUTE` binary up to `csDataOff`, then append ad-hoc `LC_CODE_SIGNATURE`.
+  let mut bin = run Bytes.makeWithCapacity(u64.toUsize(csDataOff + csDataSize))
+
+  // `mach_header_64` (32 bytes): MH_NOUNDEFS (0x1) | MH_DYLDLINK (0x4) | MH_TWOLEVEL (0x80) | MH_PIE (0x200000)
+  run AArch64Encode.u32Le(&mut bin, 0xFEEDFACF) // MH_MAGIC_64
+  run AArch64Encode.u32Le(&mut bin, 0x0100000C) // CPU_TYPE_ARM64
+  run AArch64Encode.u32Le(&mut bin, 0)          // CPU_SUBTYPE_ARM64_ALL
+  run AArch64Encode.u32Le(&mut bin, 2)          // MH_EXECUTE
+  run AArch64Encode.u32Le(&mut bin, usize.toU64(ncmds))
+  run AArch64Encode.u32Le(&mut bin, sizeofCmds)
+  let tlvFlag: u64 = if hasTls { 0x00800000 } else { 0 } // MH_HAS_TLV_DESCRIPTORS
+  run AArch64Encode.u32Le(&mut bin, 0x00200085 | tlvFlag) // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE [| MH_HAS_TLV_DESCRIPTORS]
+  run AArch64Encode.u32Le(&mut bin, 0)
+
+  // Segment 0: `__PAGEZERO`
+  run emitSegmentCmd(&mut bin, b"__PAGEZERO", 0, textBaseVm(), 0, 0, 0, 0, 0, 0)
+
+  // Segment 1: `__TEXT`
+  run emitSegmentCmd(&mut bin, b"__TEXT", textBaseVm(), textSegSize, 0, textSegSize, 5, 5, textSects, 0)
+  run emitExecSection64(&mut bin, b"__text", b"__TEXT", textSectVmAddr, textSectSize, textSectFileOff, 4, 0x80000400, 0, 0)
+  if hasStubs {
+    run emitExecSection64(&mut bin, b"__stubs", b"__TEXT", stubsVmAddr, stubsSize, stubsFileOff, 2, 0x80000408, 0, 12)
+  }
+  if hasConst {
+    run emitExecSection64(&mut bin, b"__const", b"__TEXT", constVmAddr, constSize, constFileOff, 4, 0, 0, 0)
+  }
+
+  // Segment 2: `__DATA_CONST`
+  run emitSegmentCmd(&mut bin, b"__DATA_CONST", dataConstVmAddr, dataConstSegSize, dataConstFileOff, dataConstSegSize, 3, 3, dataConstSects, 0x10)
+  if hasGot {
+    run emitExecSection64(&mut bin, b"__got", b"__DATA_CONST", dataConstVmAddr, gotSize, dataConstFileOff, 3, 0x06, usize.toU64(stubList.length), 0)
+  }
+
+  // Segment 3: `__DATA` (section order matches offset order: fixed sections first, `__data` last)
+  run emitSegmentCmd(&mut bin, b"__DATA", dataSegVmAddr, dataSegSize, dataSegFileOff, dataSegSize, 3, 3, dataSects, 0)
+  if hasTls {
+    run emitExecSection64(&mut bin, b"__thread_vars", b"__DATA", dataSegVmAddr + tvRelOff, tvSize, dataSegFileOff + tvRelOff, 3, 0x13, 0, 0)
+    run emitExecSection64(&mut bin, b"__thread_data", b"__DATA", dataSegVmAddr + tdRelOff, tdSize, dataSegFileOff + tdRelOff, 4, 0x11, 0, 0)
+  }
+  if hasFrames {
+    run emitExecSection64(&mut bin, b"__silk_frames", b"__DATA", dataSegVmAddr + framesRelOff, framesSize, dataSegFileOff + framesRelOff, 3, 0, 0, 0)
+  }
+  if hasSeen {
+    run emitExecSection64(&mut bin, b"__silk_seen", b"__DATA", dataSegVmAddr + seenRelOff, seenSize, dataSegFileOff + seenRelOff, 0, 0, 0, 0)
+  }
+  run emitExecSection64(&mut bin, b"__data", b"__DATA", dataSegVmAddr + dataRelOff, dataSize, dataSegFileOff + dataRelOff, 4, 0, 0, 0)
+
+  // Optional Segment 4: `__DWARF` (non-mapped `maxprot=0, initprot=0`, read by `lldb`/`atos`/`llvm-dwarfdump`).
+  if hasDwarf {
+    run emitSegmentCmd(&mut bin, b"__DWARF", dwarfVmAddr, dwarfSegSize, dwarfFileOff, dwarfSegSize, 0, 0, dwarfSects, 0)
+    run emitExecSection64(&mut bin, b"__debug_line", b"__DWARF", dwarfVmAddr + dLineOff, dLineSize, dwarfFileOff + dLineOff, 0, 0x02000000, 0, 0)
+    run emitExecSection64(&mut bin, b"__debug_info", b"__DWARF", dwarfVmAddr + dInfoOff, dInfoSize, dwarfFileOff + dInfoOff, 0, 0x02000000, 0, 0)
+    run emitExecSection64(&mut bin, b"__debug_abbrev", b"__DWARF", dwarfVmAddr + dAbbrevOff, dAbbrevSize, dwarfFileOff + dAbbrevOff, 0, 0x02000000, 0, 0)
+    run emitExecSection64(&mut bin, b"__debug_str", b"__DWARF", dwarfVmAddr + dStrOff, dStrSize, dwarfFileOff + dStrOff, 0, 0x02000000, 0, 0)
+  }
+
+  // Final Segment: `__LINKEDIT`
+  run emitSegmentCmd(&mut bin, b"__LINKEDIT", linkeditVmAddr, linkeditVmSize, linkeditFileOff, linkeditFileSize, 1, 1, 0, 0)
+
+  // `LC_DYLD_CHAINED_FIXUPS`
+  run AArch64Encode.u32Le(&mut bin, 0x80000034)
+  run AArch64Encode.u32Le(&mut bin, 16)
+  run AArch64Encode.u32Le(&mut bin, chainedOff)
+  run AArch64Encode.u32Le(&mut bin, chainedSize)
+
+  // `LC_DYLD_EXPORTS_TRIE`
+  run AArch64Encode.u32Le(&mut bin, 0x80000033)
+  run AArch64Encode.u32Le(&mut bin, 16)
+  run AArch64Encode.u32Le(&mut bin, exportsOff)
+  run AArch64Encode.u32Le(&mut bin, exportsSize)
+
+  // `LC_SYMTAB`
+  run AArch64Encode.u32Le(&mut bin, 0x02)
+  run AArch64Encode.u32Le(&mut bin, 24)
+  run AArch64Encode.u32Le(&mut bin, symtabOff)
+  run AArch64Encode.u32Le(&mut bin, usize.toU64(nExtDef + nUndef))
+  run AArch64Encode.u32Le(&mut bin, strtabOff)
+  run AArch64Encode.u32Le(&mut bin, strtabSize)
+
+  // `LC_DYSYMTAB`
+  run AArch64Encode.u32Le(&mut bin, 0x0B)
+  run AArch64Encode.u32Le(&mut bin, 80)
+  run AArch64Encode.u32Le(&mut bin, 0)                     // ilocalsym
+  run AArch64Encode.u32Le(&mut bin, 0)                     // nlocalsym
+  run AArch64Encode.u32Le(&mut bin, 0)                     // iextdefsym
+  run AArch64Encode.u32Le(&mut bin, usize.toU64(nExtDef))  // nextdefsym
+  run AArch64Encode.u32Le(&mut bin, usize.toU64(nExtDef))  // iundefsym
+  run AArch64Encode.u32Le(&mut bin, usize.toU64(nUndef))   // nundefsym
+  run AArch64Encode.u32Le(&mut bin, 0) // tocoff
+  run AArch64Encode.u32Le(&mut bin, 0) // ntoc
+  run AArch64Encode.u32Le(&mut bin, 0) // modtaboff
+  run AArch64Encode.u32Le(&mut bin, 0) // nmodtab
+  run AArch64Encode.u32Le(&mut bin, 0) // extrefsymoff
+  run AArch64Encode.u32Le(&mut bin, 0) // nextrefsyms
+  run AArch64Encode.u32Le(&mut bin, if nIndirect > usize.ZERO { indirectOff } else { 0 })
+  run AArch64Encode.u32Le(&mut bin, usize.toU64(nIndirect))
+  run AArch64Encode.u32Le(&mut bin, 0) // extreloff
+  run AArch64Encode.u32Le(&mut bin, 0) // nextrel
+  run AArch64Encode.u32Le(&mut bin, 0) // locreloff
+  run AArch64Encode.u32Le(&mut bin, 0) // nlocrel
+
+  // `LC_LOAD_DYLINKER` (32 bytes): `/usr/lib/dyld`
+  run AArch64Encode.u32Le(&mut bin, 0x0E)
+  run AArch64Encode.u32Le(&mut bin, 32)
+  run AArch64Encode.u32Le(&mut bin, 12)
+  run Bytes.append(&mut bin, b"/usr/lib/dyld")
+  let mut padD = usize.ZERO
+  while padD < 7 {
+    run AArch64Encode.byte(&mut bin, 0)
+    padD = padD + usize.ONE
+  }
+
+  // `LC_UUID` (24 bytes)
+  run AArch64Encode.u32Le(&mut bin, 0x1B)
+  run AArch64Encode.u32Le(&mut bin, 24)
+  run AArch64Encode.u64Le(&mut bin, uuidHash.high)
+  run AArch64Encode.u64Le(&mut bin, uuidHash.low)
+
+  // `LC_BUILD_VERSION` (24 bytes): macOS 12.0.0
+  run AArch64Encode.u32Le(&mut bin, 0x32)
+  run AArch64Encode.u32Le(&mut bin, 24)
+  run AArch64Encode.u32Le(&mut bin, 1)          // PLATFORM_MACOS
+  run AArch64Encode.u32Le(&mut bin, 0x000C0000) // minos 12.0.0
+  run AArch64Encode.u32Le(&mut bin, 0x000C0000) // sdk 12.0.0
+  run AArch64Encode.u32Le(&mut bin, 0)          // ntools
+
+  // `LC_SOURCE_VERSION` (16 bytes)
+  run AArch64Encode.u32Le(&mut bin, 0x2A)
+  run AArch64Encode.u32Le(&mut bin, 16)
+  run AArch64Encode.u64Le(&mut bin, 0)
+
+  // `LC_MAIN` (24 bytes)
+  run AArch64Encode.u32Le(&mut bin, 0x80000028)
+  run AArch64Encode.u32Le(&mut bin, 24)
+  run AArch64Encode.u64Le(&mut bin, mainEntryOff)
+  run AArch64Encode.u64Le(&mut bin, 0) // stacksize
+
+  // `LC_LOAD_DYLIB` entries (`/usr/lib/libSystem.B.dylib`, plus any extra TBDs).
+  let dCmdSizes = List<u64>.asSlice(&dylibCmdSizes)
+  ti = usize.ZERO
+  while ti < tbdSlice.length {
+    let instName = Bytes.asSlice(&tbdSlice[ti].installName)
+    let cmdSz = dCmdSizes[ti]
+    run AArch64Encode.u32Le(&mut bin, 0x0C) // LC_LOAD_DYLIB
+    run AArch64Encode.u32Le(&mut bin, cmdSz)
+    run AArch64Encode.u32Le(&mut bin, 24)         // name offset
+    run AArch64Encode.u32Le(&mut bin, 2)          // timestamp
+    run AArch64Encode.u32Le(&mut bin, 0x05470000) // current_version 1351.0.0
+    run AArch64Encode.u32Le(&mut bin, 0x00010000) // compatibility_version 1.0.0
+    run Bytes.append(&mut bin, instName)
+    run AArch64Encode.byte(&mut bin, 0)
+    let mut rem = u64.toUsize(cmdSz) - 24 - instName.length - usize.ONE
+    while rem > usize.ZERO {
+      run AArch64Encode.byte(&mut bin, 0)
+      rem = rem - usize.ONE
+    }
+    ti = ti + usize.ONE
+  }
+
+  // `LC_CODE_SIGNATURE` (16 bytes)
+  run AArch64Encode.u32Le(&mut bin, 0x1D)
+  run AArch64Encode.u32Le(&mut bin, 16)
+  run AArch64Encode.u32Le(&mut bin, csDataOff)
+  run AArch64Encode.u32Le(&mut bin, csDataSize)
+
+  // Emit segment contents up to `csDataOff`.
+  run appendAtOffset(&mut bin, textSectFileOff, Bytes.asSlice(&textBuf))
+  run appendAtOffset(&mut bin, stubsFileOff, Bytes.asSlice(&stubsBuf))
+  run appendAtOffset(&mut bin, constFileOff, Bytes.asSlice(&constBuf))
+  run appendAtOffset(&mut bin, dataConstFileOff, Bytes.asSlice(&dataConstBuf))
+  run appendAtOffset(&mut bin, dataSegFileOff, Bytes.asSlice(&fullDataBuf))
+  if hasDwarf {
+    run appendAtOffset(&mut bin, dwarfFileOff + dLineOff, Bytes.asSlice(&dwarf.debugLine))
+    run appendAtOffset(&mut bin, dwarfFileOff + dInfoOff, Bytes.asSlice(&dwarf.debugInfo))
+    run appendAtOffset(&mut bin, dwarfFileOff + dAbbrevOff, Bytes.asSlice(&dwarf.debugAbbrev))
+    run appendAtOffset(&mut bin, dwarfFileOff + dStrOff, Bytes.asSlice(&dwarf.debugStr))
+  }
+  run appendAtOffset(&mut bin, chainedOff, Bytes.asSlice(&chained.blob))
+  run appendAtOffset(&mut bin, exportsOff, Bytes.asSlice(&exportsTrie))
+  run appendAtOffset(&mut bin, symtabOff, Bytes.asSlice(&symtabBuf))
+  run appendAtOffset(&mut bin, indirectOff, Bytes.asSlice(&indirectBuf))
+  run appendAtOffset(&mut bin, strtabOff, Bytes.asSlice(&strtabBuf))
+  while usize.toU64(Bytes.length(&bin)) < csDataOff {
+    run AArch64Encode.byte(&mut bin, 0)
+  }
+
+  // Compute and append pure-Silk ad-hoc SHA-256 `LC_CODE_SIGNATURE`.
+  let csBlob = run encodeAdHocCodeSignature(Bytes.asSlice(&bin), textSegSize, identSlice)
+  run Bytes.append(&mut bin, Bytes.asSlice(&csBlob))
+
+  // 13. Build `IncrementalState` when `options.incremental` is enabled.
+  if !options.incremental {
+    return LinkOutput {binary: move bin, state: Option<IncrementalState>.none()}
+  }
+
+  let funcFrameSlice = List<u64>.asSlice(&funcFrameSegOff)
+  let fullDataRead = Bytes.asSlice(&fullDataBuf)
+  let mut incFuncs = run List<IncFuncRecord>.makeWithCapacity(funcCount)
+  i = usize.ZERO
+  while i < funcCount {
+    let fm = &silkFuncs[i]
+    let fSegOff = funcFrameSlice[i]
+    let mut fFileOff: u64 = 0
+    let mut fNextStride: u64 = 0
+    if fSegOff != 0xFFFFFFFF {
+      fFileOff = dataSegFileOff + fSegOff
+      let fAt = u64.toUsize(fSegOff)
+      let lo = u32.toU64(readU32Le(fullDataRead, fAt))
+      let hi = u32.toU64(readU32Le(fullDataRead, fAt + 4))
+      let word = lo | u64.shiftLeft(hi, 32)
+      fNextStride = u64.shiftRight(word, 51) & 0xFFF
+    }
+    run List<IncFuncRecord>.append(&mut incFuncs, IncFuncRecord {
+      symbol: run Bytes.copy(Bytes.asSlice(&fm.symbol)),
+      exported: run Bytes.copy(Bytes.asSlice(&fm.exported)),
+      digestHigh: fm.digestHigh,
+      digestLow: fm.digestLow,
+      bodyVaddr: textSectVmAddr + bodyOffsSlice[i],
+      bodyFileOff: textSectFileOff + bodyOffsSlice[i],
+      bodySize: fm.codeSize,
+      bodyCap: bodyCapsSlice[i],
+      thunkSlot: i,
+      rodataVaddr: if fm.rodataSize > 0 { constVmAddr + fm.rodataOff } else { 0 },
+      rodataFileOff: if fm.rodataSize > 0 { constFileOff + fm.rodataOff } else { 0 },
+      rodataSize: fm.rodataSize,
+      rodataCap: fm.rodataSize,
+      silkFrameFileOff: fFileOff,
+      silkFrameNextStride: fNextStride,
+    })
+    i = i + usize.ONE
+  }
+
+  let silkObjs = List<SilkObjMeta>.asSlice(&unit.silkObjs)
+  let mut incObjs = run List<IncObjRecord>.makeWithCapacity(silkObjs.length)
+  i = usize.ZERO
+  while i < silkObjs.length {
+    let om = &silkObjs[i]
+    let mut oVa: u64 = 0
+    let mut oFile: u64 = 0
+    if om.section == 1 {
+      oVa = constVmAddr + om.offset
+      oFile = constFileOff + om.offset
+    } else if om.section == 2 {
+      oVa = dataSegVmAddr + dataRelOff + om.offset
+      oFile = dataSegFileOff + dataRelOff + om.offset
+    } else if om.section == 3 {
+      let sIdx = run symTabIntern(&mut symtab, Bytes.asSlice(&om.symbol))
+      oVa = List<LinkSym>.asSlice(&symtab.entries)[sIdx].vaddr
+      oFile = dataSegFileOff + tdRelOff + om.offset
+    } else if om.section == 4 {
+      oVa = framesVmStart + om.offset
+      oFile = dataSegFileOff + framesRelOff + om.offset
+    } else if om.section == 5 {
+      oVa = seenVmStart + om.offset
+      oFile = dataSegFileOff + seenRelOff + om.offset
+    }
+    run List<IncObjRecord>.append(&mut incObjs, IncObjRecord {
+      symbol: run Bytes.copy(Bytes.asSlice(&om.symbol)),
+      digestHigh: om.digestHigh,
+      digestLow: om.digestLow,
+      vaddr: oVa,
+      fileOff: oFile,
+      size: om.size,
+      isTls: om.isTls,
+      isFramed: om.isFramed,
+      isSeen: om.isSeen,
+    })
+    i = i + usize.ONE
+  }
+
+  let finalSyms = List<LinkSym>.asSlice(&symtab.entries)
+  let mut incGlobals = run List<IncGlobalRecord>.makeWithCapacity(finalSyms.length)
+  i = usize.ZERO
+  while i < finalSyms.length {
+    let e = &finalSyms[i]
+    run List<IncGlobalRecord>.append(&mut incGlobals, IncGlobalRecord {
+      name: run Bytes.copy(Bytes.asSlice(&e.name)),
+      vaddr: e.vaddr,
+      gotSlotVaddr: if e.gotSlotIdx != usize.MAX { dataConstVmAddr + usize.toU64(e.gotSlotIdx) * 8 } else { 0 },
+      stubVaddr: if e.stubIdx != usize.MAX { stubsVmAddr + usize.toU64(e.stubIdx) * 12 } else { 0 },
+      tlvpSlotVaddr: if e.tlvpSlotIdx != usize.MAX { dataConstVmAddr + usize.toU64(e.tlvpSlotIdx) * 8 } else { 0 },
+      bindOrdinal: if e.isDynamic { e.bindOrdinal } else { 0xFFFFFFFF },
+      isDynamic: e.isDynamic,
+      isTls: e.isTls,
+    })
+    i = i + usize.ONE
+  }
+
+  let mut optHashSt = ContentHash.stream()
+  ContentHash.append(&mut optHashSt, identSlice)
+  let optHash = ContentHash.finish(move optHashSt)
+
+  let nCodeSlots = (csDataOff + codeSignPageSize() - 1) / codeSignPageSize()
+  let state = IncrementalState {
+    inputsHashHigh: optHash.high,
+    inputsHashLow: optHash.low,
+    binarySize: usize.toU64(Bytes.length(&bin)),
+    thunksVaddr: thunksBaseVm,
+    thunksFileOff: thunksBaseFile,
+    thunksCount: thunksCount,
+    thunksCap: thunksCap,
+    textCursorVaddr: textSectVmAddr + textHeadroomStart,
+    textCursorFileOff: textSectFileOff + textHeadroomStart,
+    textLimitVaddr: textSectVmAddr + textHeadroomEnd,
+    constCursorVaddr: constVmAddr + constHeadroomStart,
+    constCursorFileOff: constFileOff + constHeadroomStart,
+    constLimitVaddr: constVmAddr + constHeadroomEnd,
+    dataCursorVaddr: dataSegVmAddr + dataRelOff + dataHeadroomStart,
+    dataCursorFileOff: dataSegFileOff + dataRelOff + dataHeadroomStart,
+    dataLimitVaddr: dataSegVmAddr + dataRelOff + dataHeadroomEnd,
+    dataSegVmAddr: dataSegVmAddr,
+    dataSegFileOff: dataSegFileOff,
+    dataSegPageCount: usize.toU64(dataPageCount),
+    chainedDataPageStartsFileOff: if chained.dataPageStartsRelOff > 0 { chainedOff + chained.dataPageStartsRelOff } else { 0 },
+    csDataOff: csDataOff,
+    csHashTableFileOff: csDataOff + codeSignatureHashOffset(identSlice.length),
+    csPageCount: nCodeSlots,
+    funcs: move incFuncs,
+    objs: move incObjs,
+    globals: move incGlobals,
+    textFreeList: List<IncFreeBlock>.make(),
+    constFreeList: List<IncFreeBlock>.make(),
+    chunkHashHigh: move chunkHashHigh,
+    chunkHashLow: move chunkHashLow,
+    dataPageLastOff: move chained.dataPageLastOff,
+    dataPageLastWord: move chained.dataPageLastWord,
+  }
+
+  return LinkOutput {binary: move bin, state: Option<IncrementalState>.some(move state)}
+}
+
+fn mapTextOff(origOff: u64, funcs: &[SilkFuncMeta], paddedOffs: &[u64], incremental: bool) -> u64 {
+  if !incremental || funcs.length == usize.ZERO { return origOff }
+  // Binary search for the function containing `origOff` (`funcs[i].textOff <= origOff < textOff + codeSize`).
+  let mut lo = usize.ZERO
+  let mut hi = funcs.length
+  while lo + usize.ONE < hi {
+    let mid = lo + (hi - lo) / 2
+    if funcs[mid].textOff <= origOff { lo = mid } else { hi = mid }
+  }
+  return paddedOffs[lo] + (origOff - funcs[lo].textOff)
+}
+
+fn copySliceInto(dst: &mut Bytes, at: usize, src: &[u8]) -> () {
+  if src.length == usize.ZERO { return () }
+  let dstMut = Bytes.asMutSlice(&mut dst.*)
+  let mut i = usize.ZERO
+  while i < src.length {
+    dstMut[at + i] = src[i]
+    i = i + usize.ONE
+  }
+}
+
+effect fn appendAtOffset(bin: &mut Bytes, targetOff: u64, data: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if data.length == usize.ZERO { return () }
+  while usize.toU64(Bytes.length(&bin.*)) < targetOff {
+    run AArch64Encode.byte(&mut bin.*, 0)
+  }
+  return run Bytes.append(&mut bin.*, data)
+}

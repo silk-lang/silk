@@ -1,0 +1,944 @@
+//! Standard macOS ARM64 (`aarch64-apple-darwin`) relocatable Mach-O (`MH_OBJECT`, `.o`) writer.
+//!
+//! # When to use
+//! Call [`pack`] with concatenated encoded [`AArch64Object.Fragment`]s (or [`packFragment`] with
+//! one decoded fragment) to emit a standard `MH_MAGIC_64` / `CPU_TYPE_ARM64` / `MH_OBJECT` `.o`
+//! file suitable for linking by Apple `ld`, `ld64.lld`, `clang`, or inspection by `otool` and
+//! `llvm-objdump`.
+//!
+//! # Details
+//! Sections are placed in one anonymous `LC_SEGMENT_64` in fixed 1-based order:
+//! `1: __TEXT,__text`, `2: __TEXT,__const`, `3: __DATA,__data`, `4: __DATA,__thread_data`,
+//! `5: __DATA,__thread_vars`, `6: __DATA,__silk_frames`, `7: __DATA,__silk_seen`.
+//!
+//! Every Silk and C symbol receives Mach-O's leading `_` prefix unless it already carries a
+//! `\x01` raw-name escape prefix (such as `\x01section$start$__DATA$__silk_frames`). Relocations
+//! use standard `ARM64_RELOC_*` codes (`UNSIGNED`, `SUBTRACTOR`, `BRANCH26`, `PAGE21`,
+//! `PAGEOFF12`, `GOT_LOAD_PAGE21`, `GOT_LOAD_PAGEOFF12`, `TLVP_LOAD_PAGE21`,
+//! `TLVP_LOAD_PAGEOFF12`, and `ADDEND`).
+
+import backend.AArch64Encode
+import backend.AArch64Object
+import backend.AArch64Object {Fragment, Function, Object, Pointer, Relocation, RelocationKind, RodataJumpEntry, Unsupported}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.hash {Hash}
+import silk.collections.list {List}
+import silk.core.ownership {Copy}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+// Fixed 1-based Mach-O section indices inside the single `LC_SEGMENT_64`.
+fn sectText() -> u8 { return 1 }
+fn sectConst() -> u8 { return 2 }
+fn sectData() -> u8 { return 3 }
+fn sectThreadData() -> u8 { return 4 }
+fn sectThreadVars() -> u8 { return 5 }
+fn sectFrames() -> u8 { return 6 }
+fn sectSeen() -> u8 { return 7 }
+fn sectCompactUnwind() -> u8 { return 8 }
+fn sectionCount() -> usize { return 8 }
+
+// `ARM64_RELOC_*` type codes.
+fn relocUnsigned() -> u32 { return 0 }
+fn relocSubtractor() -> u32 { return 1 }
+fn relocBranch26() -> u32 { return 2 }
+fn relocPage21() -> u32 { return 3 }
+fn relocPageOff12() -> u32 { return 4 }
+fn relocGotLoadPage21() -> u32 { return 5 }
+fn relocGotLoadPageOff12() -> u32 { return 6 }
+fn relocTlvpLoadPage21() -> u32 { return 8 }
+fn relocTlvpLoadPageOff12() -> u32 { return 9 }
+fn relocAddend() -> u32 { return 10 }
+
+// Mach-O `nlist_64` type & desc constants.
+fn nUndf() -> u8 { return 0x00 }
+fn nSect() -> u8 { return 0x0E }
+fn nExt() -> u8 { return 0x01 }
+fn nWeakRef() -> u16 { return 0x0040 }
+fn nWeakDef() -> u16 { return 0x0080 }
+
+struct MachOSym {
+  rawName: Bytes,
+  machoName: Bytes,
+  strx: u64,
+  nType: u8,
+  nSect: u8,
+  nDesc: u16,
+  nValue: u64,
+  defined: bool,
+  isLocal: bool,
+  weak: bool,
+}
+
+struct MachOReloc {
+  address: u64,
+  symIdx: u32,
+  pcRel: bool,
+  lengthLog2: u32,
+  isExtern: bool,
+  relType: u32,
+}
+
+impl Copy for MachOReloc {}
+
+struct SymTable {
+  entries: List<MachOSym>,
+  buckets: List<usize>,
+  hashes: List<u64>,
+}
+
+fn hashName(name: &[u8]) -> u64 {
+  return InternIndex.hashBytes(Hash.mix(&Hash.seed(0), 0), name)
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+/// Converts a Silk/C symbol spelling into its Mach-O symbol-table spelling: strips a leading
+/// `\x01` raw escape (if present) without prepending `_`, otherwise prepends `_`.
+pub effect fn mangleMachOSymbol(raw: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if raw.length > usize.ZERO && raw[usize.ZERO] == 1 {
+    let mut out = run Bytes.makeWithCapacity(raw.length - usize.ONE)
+    let mut i = usize.ONE
+    while i < raw.length {
+      run AArch64Encode.byte(&mut out, raw[i])
+      i = i + usize.ONE
+    }
+    return move out
+  }
+  let mut out = run Bytes.makeWithCapacity(raw.length + usize.ONE)
+  run AArch64Encode.byte(&mut out, 95) // '_'
+  run Bytes.append(&mut out, raw)
+  return move out
+}
+
+effect fn symTableMake() -> SymTable ! OutOfMemoryError ? &mut Allocator {
+  let mut buckets = run List<usize>.makeWithCapacity(64)
+  let mut i = usize.ZERO
+  while i < 64 {
+    run List<usize>.append(&mut buckets, usize.MAX)
+    i = i + usize.ONE
+  }
+  return SymTable {entries: List<MachOSym>.make(), buckets: move buckets, hashes: List<u64>.make()}
+}
+
+effect fn symTableGrow(table: &mut SymTable) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nextCap = List<usize>.length(&table.buckets) * 2
+  let mut buckets = run List<usize>.makeWithCapacity(nextCap)
+  let mut i = usize.ZERO
+  while i < nextCap {
+    run List<usize>.append(&mut buckets, usize.MAX)
+    i = i + usize.ONE
+  }
+  let mask = nextCap - usize.ONE
+  let hashes = List<u64>.asSlice(&table.hashes)
+  let bMut = List<usize>.asMutSlice(&mut buckets)
+  i = usize.ZERO
+  while i < hashes.length {
+    let mut slot = u64.toUsize(hashes[i]) & mask
+    while bMut[slot] != usize.MAX { slot = (slot + usize.ONE) & mask }
+    bMut[slot] = i
+    i = i + usize.ONE
+  }
+  table.buckets = move buckets
+}
+
+effect fn symTableIntern(table: &mut SymTable, raw: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let h = hashName(raw)
+  if List<MachOSym>.length(&table.entries) * 2 >= List<usize>.length(&table.buckets) {
+    run symTableGrow(&mut table.*)
+  }
+  let mask = List<usize>.length(&table.buckets) - usize.ONE
+  let buckets = List<usize>.asSlice(&table.buckets)
+  let entries = List<MachOSym>.asSlice(&table.entries)
+  let hashes = List<u64>.asSlice(&table.hashes)
+  let mut slot = u64.toUsize(h) & mask
+  while buckets[slot] != usize.MAX {
+    let idx = buckets[slot]
+    if hashes[idx] == h && sameBytes(Bytes.asSlice(&entries[idx].rawName), raw) {
+      return idx
+    }
+    slot = (slot + usize.ONE) & mask
+  }
+  let idx = List<MachOSym>.length(&table.entries)
+  run List<MachOSym>.append(&mut table.entries, MachOSym {
+    rawName: run Bytes.copy(raw),
+    machoName: run mangleMachOSymbol(raw),
+    strx: 0,
+    nType: nUndf() | nExt(),
+    nSect: 0,
+    nDesc: 0,
+    nValue: 0,
+    defined: false,
+    isLocal: false,
+    weak: false,
+  })
+  run List<u64>.append(&mut table.hashes, h)
+  let bMut = List<usize>.asMutSlice(&mut table.buckets)
+  bMut[slot] = idx
+  return idx
+}
+
+effect fn symTableAddLocal(table: &mut SymTable, name: &[u8], sect: u8, value: u64) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let idx = List<MachOSym>.length(&table.entries)
+  run List<MachOSym>.append(&mut table.entries, MachOSym {
+    rawName: run Bytes.copy(name),
+    machoName: run Bytes.copy(name),
+    strx: 0,
+    nType: nSect(),
+    nSect: sect,
+    nDesc: 0,
+    nValue: value,
+    defined: true,
+    isLocal: true,
+    weak: false,
+  })
+  run List<u64>.append(&mut table.hashes, 0)
+  return idx
+}
+
+effect fn appendDecimal(out: &mut Bytes, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value == usize.ZERO {
+    return run AArch64Encode.byte(&mut out.*, 48)
+  }
+  let mut digits: [u8; 20] = [0; 20]
+  let mut len = usize.ZERO
+  let mut v = value
+  while v > usize.ZERO {
+    digits[len] = 48 + usize.toU8(v % 10)
+    v = v / 10
+    len = len + usize.ONE
+  }
+  while len > usize.ZERO {
+    len = len - usize.ONE
+    run AArch64Encode.byte(&mut out.*, digits[len])
+  }
+  return ()
+}
+
+effect fn alignTo(buf: &mut Bytes, align: usize, padByte: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= usize.ONE { return () }
+  while Bytes.length(&buf.*) % align != usize.ZERO {
+    run AArch64Encode.byte(&mut buf.*, padByte)
+  }
+  return ()
+}
+
+effect fn alignCodeNop(buf: &mut Bytes, align: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= 4 { return () }
+  while Bytes.length(&buf.*) % align != usize.ZERO {
+    run AArch64Encode.nop(&mut buf.*)
+  }
+  return ()
+}
+
+effect fn writeFixed16(out: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i = usize.ZERO
+  while i < 16 {
+    let b = if i < text.length { text[i] } else { 0 }
+    run AArch64Encode.byte(&mut out.*, b)
+    i = i + usize.ONE
+  }
+  return ()
+}
+
+effect fn emitRelocList(out: &mut Bytes, rels: &[MachOReloc], symMap: &[u32]) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Mach-O `ld64` prefers relocations in reverse address order or any valid order; emit in exact list order.
+  let mut i = usize.ZERO
+  while i < rels.length {
+    let r = rels[i]
+    let mappedSym = if r.relType == relocAddend() || !r.isExtern {
+      r.symIdx
+    } else {
+      symMap[u32.toUsize(r.symIdx)]
+    }
+    let pcBit: u32 = if r.pcRel { u32.shiftLeft(1, 24) } else { 0 }
+    let lenBits = u32.shiftLeft(r.lengthLog2 & 3, 25)
+    let extBit: u32 = if r.isExtern { u32.shiftLeft(1, 27) } else { 0 }
+    let typeBits = u32.shiftLeft(r.relType & 15, 28)
+    let rInfo = (mappedSym & 0x00FFFFFF) | pcBit | lenBits | extBit | typeBits
+    run AArch64Encode.u32Le(&mut out.*, r.address)
+    run AArch64Encode.u32Le(&mut out.*, u32.toU64(rInfo))
+    i = i + usize.ONE
+  }
+  return ()
+}
+
+/// Packs back-to-back encoded [`AArch64Object.Fragment`]s into a relocatable macOS ARM64
+/// `MH_OBJECT` (`.o`) byte buffer.
+pub effect fn pack(fragments: &[u8]) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let decoded = run AArch64Object.decode(fragments)
+  return run packFragment(&decoded)
+}
+
+/// Packs one decoded [`AArch64Object.Fragment`] into a relocatable macOS ARM64 `MH_OBJECT` (`.o`)
+/// byte buffer.
+pub effect fn packFragment(fragment: &Fragment) -> Bytes ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  let refused = List<Bytes>.asSlice(&fragment.refused)
+  if refused.length > usize.ZERO {
+    fail Unsupported {detail: run Bytes.copy(Bytes.asSlice(&refused[usize.ZERO]))}
+  }
+
+  let mut text = Bytes.make()
+  let mut constData = Bytes.make()
+  let mut data = Bytes.make()
+  let mut threadData = Bytes.make()
+  let mut threadVars = Bytes.make()
+  let mut frames = Bytes.make()
+  let mut seen = Bytes.make()
+  let mut compactUnwind = Bytes.make()
+
+  let mut relText = List<MachOReloc>.make()
+  let mut relConst = List<MachOReloc>.make()
+  let mut relData = List<MachOReloc>.make()
+  let mut relThreadVars = List<MachOReloc>.make()
+  let mut relFrames = List<MachOReloc>.make()
+  let mut relCompactUnwind = List<MachOReloc>.make()
+
+  let mut syms = run symTableMake()
+  let mut localCounter = usize.ZERO
+
+  // Mark declared weak functions & objects.
+  let weakFns = List<Bytes>.asSlice(&fragment.weakFunctions)
+  let mut at = usize.ZERO
+  while at < weakFns.length {
+    let idx = run symTableIntern(&mut syms, Bytes.asSlice(&weakFns[at]))
+    let e = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[idx]
+    if !e.defined {
+      e.weak = true
+      e.nDesc = nWeakRef()
+    }
+    at = at + usize.ONE
+  }
+  let weakObjs = List<Bytes>.asSlice(&fragment.weakObjects)
+  at = usize.ZERO
+  while at < weakObjs.length {
+    let idx = run symTableIntern(&mut syms, Bytes.asSlice(&weakObjs[at]))
+    let e = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[idx]
+    if !e.defined {
+      e.weak = true
+      e.nDesc = nWeakRef()
+    }
+    at = at + usize.ONE
+  }
+
+  // Emit `__silk_foreign_personality` (`brk #1`) once when functions exist so foreign C++
+  // exceptions unwinding across Silk frames terminate immediately via `__LD,__compact_unwind`.
+  let functions = List<Function>.asSlice(&fragment.functions)
+  let mut personalitySymIdx = usize.MAX
+  if functions.length > usize.ZERO {
+    let pOff = Bytes.length(&text)
+    run AArch64Encode.brk(&mut text, 1)
+    personalitySymIdx = run symTableIntern(&mut syms, b"__silk_foreign_personality")
+    let pe = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[personalitySymIdx]
+    pe.nType = nSect() | nExt()
+    pe.nSect = sectText()
+    pe.nDesc = nWeakDef()
+    pe.nValue = usize.toU64(pOff)
+    pe.defined = true
+    pe.weak = true
+  }
+  at = usize.ZERO
+  while at < functions.length {
+    let f = &functions[at]
+    let symIdx = run symTableIntern(&mut syms, Bytes.asSlice(&f.symbol))
+    if List<MachOSym>.asSlice(&syms.entries)[symIdx].defined {
+      at = at + usize.ONE
+      continue
+    }
+    run alignCodeNop(&mut text, 16)
+    let codeBase = Bytes.length(&text)
+    let codeSlice = Bytes.asSlice(&f.code)
+    run Bytes.append(&mut text, codeSlice)
+
+    // Function-local `.rodata` pool in `__TEXT,__const`, anchored by a local symbol for PAGE21/PAGEOFF12.
+    let roSlice = Bytes.asSlice(&f.rodata)
+    let mut roBase = Bytes.length(&constData)
+    let mut roSymIdx = usize.MAX
+    if roSlice.length > usize.ZERO {
+      run alignTo(&mut constData, 16, 0)
+      roBase = Bytes.length(&constData)
+      run Bytes.append(&mut constData, roSlice)
+      let mut roName = run Bytes.copy(b"l_silk_ro_")
+      run appendDecimal(&mut roName, localCounter)
+      localCounter = localCounter + usize.ONE
+      roSymIdx = run symTableAddLocal(&mut syms, Bytes.asSlice(&roName), sectConst(), usize.toU64(roBase))
+    }
+
+    // Define primary function symbol (and optional export alias).
+    let entry = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[symIdx]
+    entry.nType = nSect() | nExt()
+    entry.nSect = sectText()
+    entry.nDesc = 0
+    entry.nValue = usize.toU64(codeBase)
+    entry.defined = true
+
+    // Emit a 32-byte `__LD,__compact_unwind` record (`UNWIND_ARM64_MODE_FRAME = 0x04000000`)
+    // with `__silk_foreign_personality` so `_Unwind_Backtrace` walks frames while `_Unwind_RaiseException` traps.
+    if codeSlice.length > usize.ZERO && personalitySymIdx != usize.MAX {
+      let cuOff = Bytes.length(&compactUnwind)
+      run AArch64Encode.u64Le(&mut compactUnwind, 0)                         // functionStart (reloc)
+      run AArch64Encode.u32Le(&mut compactUnwind, usize.toU64(codeSlice.length)) // functionLength
+      run AArch64Encode.u32Le(&mut compactUnwind, 0x04000000)                // UNWIND_ARM64_MODE_FRAME
+      run AArch64Encode.u64Le(&mut compactUnwind, 0)                         // personality (reloc)
+      run AArch64Encode.u64Le(&mut compactUnwind, 0)                         // lsda = 0
+      run List<MachOReloc>.append(&mut relCompactUnwind, MachOReloc {
+        address: usize.toU64(cuOff), symIdx: usize.toU32(symIdx),
+        pcRel: false, lengthLog2: 3, isExtern: true, relType: relocUnsigned(),
+      })
+      run List<MachOReloc>.append(&mut relCompactUnwind, MachOReloc {
+        address: usize.toU64(cuOff + 16), symIdx: usize.toU32(personalitySymIdx),
+        pcRel: false, lengthLog2: 3, isExtern: true, relType: relocUnsigned(),
+      })
+    }
+
+    let exp = Bytes.asSlice(&f.exported)
+    if exp.length > usize.ZERO && !sameBytes(exp, Bytes.asSlice(&f.symbol)) {
+      let expIdx = run symTableIntern(&mut syms, exp)
+      let expEntry = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[expIdx]
+      expEntry.nType = nSect() | nExt()
+      expEntry.nSect = sectText()
+      expEntry.nDesc = 0
+      expEntry.nValue = usize.toU64(codeBase)
+      expEntry.defined = true
+    }
+
+    // Emit `__TEXT,__text` relocations.
+    let fSyms = List<Bytes>.asSlice(&f.symbols)
+    let fRelocs = List<Relocation>.asSlice(&f.relocations)
+    let mut r = usize.ZERO
+    while r < fRelocs.length {
+      let rel = fRelocs[r]
+      let patchAddr = usize.toU64(codeBase + rel.offset)
+      match rel.kind {
+        RelocationKind.LocalRodataPage21 => {
+          if rel.addend != 0 {
+            run List<MachOReloc>.append(&mut relText, MachOReloc {
+              address: patchAddr, symIdx: u64.wrappingToU32(i64.wrappingToU64(rel.addend) & 0xFFFFFF),
+              pcRel: false, lengthLog2: 2, isExtern: false, relType: relocAddend(),
+            })
+          }
+          run List<MachOReloc>.append(&mut relText, MachOReloc {
+            address: patchAddr, symIdx: usize.toU32(roSymIdx),
+            pcRel: true, lengthLog2: 2, isExtern: true, relType: relocPage21(),
+          })
+        }
+        RelocationKind.LocalRodataPageOff12 => {
+          if rel.addend != 0 {
+            run List<MachOReloc>.append(&mut relText, MachOReloc {
+              address: patchAddr, symIdx: u64.wrappingToU32(i64.wrappingToU64(rel.addend) & 0xFFFFFF),
+              pcRel: false, lengthLog2: 2, isExtern: false, relType: relocAddend(),
+            })
+          }
+          run List<MachOReloc>.append(&mut relText, MachOReloc {
+            address: patchAddr, symIdx: usize.toU32(roSymIdx),
+            pcRel: false, lengthLog2: 2, isExtern: true, relType: relocPageOff12(),
+          })
+        }
+        _ => {
+          let targetIdx = run symTableIntern(&mut syms, Bytes.asSlice(&fSyms[rel.target]))
+          match rel.kind {
+            RelocationKind.Branch26 => {
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: true, lengthLog2: 2, isExtern: true, relType: relocBranch26(),
+              })
+            }
+            RelocationKind.Page21 => {
+              if rel.addend != 0 {
+                run List<MachOReloc>.append(&mut relText, MachOReloc {
+                  address: patchAddr, symIdx: u64.wrappingToU32(i64.wrappingToU64(rel.addend) & 0xFFFFFF),
+                  pcRel: false, lengthLog2: 2, isExtern: false, relType: relocAddend(),
+                })
+              }
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: true, lengthLog2: 2, isExtern: true, relType: relocPage21(),
+              })
+            }
+            RelocationKind.PageOff12 => {
+              if rel.addend != 0 {
+                run List<MachOReloc>.append(&mut relText, MachOReloc {
+                  address: patchAddr, symIdx: u64.wrappingToU32(i64.wrappingToU64(rel.addend) & 0xFFFFFF),
+                  pcRel: false, lengthLog2: 2, isExtern: false, relType: relocAddend(),
+                })
+              }
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: false, lengthLog2: 2, isExtern: true, relType: relocPageOff12(),
+              })
+            }
+            RelocationKind.GotLoadPage21 => {
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: true, lengthLog2: 2, isExtern: true, relType: relocGotLoadPage21(),
+              })
+            }
+            RelocationKind.GotLoadPageOff12 => {
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: false, lengthLog2: 2, isExtern: true, relType: relocGotLoadPageOff12(),
+              })
+            }
+            RelocationKind.TlvpLoadPage21 => {
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: true, lengthLog2: 2, isExtern: true, relType: relocTlvpLoadPage21(),
+              })
+            }
+            RelocationKind.TlvpLoadPageOff12 => {
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: false, lengthLog2: 2, isExtern: true, relType: relocTlvpLoadPageOff12(),
+              })
+            }
+            RelocationKind.Abs64 => {
+              run List<MachOReloc>.append(&mut relText, MachOReloc {
+                address: patchAddr, symIdx: usize.toU32(targetIdx),
+                pcRel: false, lengthLog2: 3, isExtern: true, relType: relocUnsigned(),
+              })
+            }
+            _ => {}
+          }
+        }
+      }
+      r = r + usize.ONE
+    }
+
+    // Emit `__TEXT,__const` jump-table entries as paired `ARM64_RELOC_SUBTRACTOR` + `ARM64_RELOC_UNSIGNED`
+    // computing `(codeSym + targetCodeOffset) - (roSym + tableOffset)`, with inline addend
+    // `targetCodeOffset - tableOffset` stored in the 4-byte slot!
+    let fJumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+    let mut j = usize.ZERO
+    while j < fJumps.length {
+      let je = fJumps[j]
+      let slotOff = roBase + je.rodataOffset
+      let inlineDiff = usize.toI64(je.targetCodeOffset) - usize.toI64(je.tableOffset)
+      AArch64Encode.patchU32(&mut constData, slotOff, i64.wrappingToU64(inlineDiff) & 0xFFFFFFFF)
+      run List<MachOReloc>.append(&mut relConst, MachOReloc {
+        address: usize.toU64(slotOff), symIdx: usize.toU32(roSymIdx),
+        pcRel: false, lengthLog2: 2, isExtern: true, relType: relocSubtractor(),
+      })
+      run List<MachOReloc>.append(&mut relConst, MachOReloc {
+        address: usize.toU64(slotOff), symIdx: usize.toU32(symIdx),
+        pcRel: false, lengthLog2: 2, isExtern: true, relType: relocUnsigned(),
+      })
+      j = j + usize.ONE
+    }
+
+    at = at + usize.ONE
+  }
+
+  // Emit all static data objects into `__TEXT,__const`, `__DATA,__data`, `__DATA,__thread_*`,
+  // `__DATA,__silk_frames`, or `__DATA,__silk_seen`.
+  let objects = List<Object>.asSlice(&fragment.objects)
+  at = usize.ZERO
+  while at < objects.length {
+    let obj = &objects[at]
+    let mut objSymIdx = usize.MAX
+    if Bytes.length(&obj.symbol) > usize.ZERO {
+      objSymIdx = run symTableIntern(&mut syms, Bytes.asSlice(&obj.symbol))
+      if List<MachOSym>.asSlice(&syms.entries)[objSymIdx].defined {
+        at = at + usize.ONE
+        continue
+      }
+    }
+    let align = if obj.alignment == 0 { usize.ONE } else { u64.toUsize(obj.alignment) }
+    let img = Bytes.asSlice(&obj.image)
+    let ptrs = List<Pointer>.asSlice(&obj.pointers)
+
+    if obj.local {
+      // Thread-local object: payload in `__DATA,__thread_data`, 24-byte `tlv_descriptor` in
+      // `__DATA,__thread_vars`. Apple `ld` requires exactly TWO `ARM64_RELOC_UNSIGNED` fixups per
+      // `tlv_descriptor`: `+0` -> `__tlv_bootstrap` and `+16` -> `<sym>$tlv$init` in `__thread_data`.
+      run alignTo(&mut threadData, align, 0)
+      let tOff = Bytes.length(&threadData)
+      run Bytes.append(&mut threadData, img)
+      run alignTo(&mut threadVars, 8, 0)
+      let tvOff = Bytes.length(&threadVars)
+      let tlvBootIdx = run symTableIntern(&mut syms, b"_tlv_bootstrap")
+      let mut initSymName = run Bytes.copy(Bytes.asSlice(&obj.symbol))
+      run Bytes.append(&mut initSymName, b"$tlv$init")
+      let initSymIdx = run symTableIntern(&mut syms, Bytes.asSlice(&initSymName))
+      let initE = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[initSymIdx]
+      initE.nType = nSect() // local symbol in `__DATA,__thread_data`
+      initE.nSect = sectThreadData()
+      initE.nDesc = 0
+      initE.nValue = usize.toU64(tOff)
+      initE.defined = true
+      initE.isLocal = true
+      run AArch64Encode.u64Le(&mut threadVars, 0)
+      run AArch64Encode.u64Le(&mut threadVars, 0)
+      run AArch64Encode.u64Le(&mut threadVars, 0)
+      run List<MachOReloc>.append(&mut relThreadVars, MachOReloc {
+        address: usize.toU64(tvOff), symIdx: usize.toU32(tlvBootIdx),
+        pcRel: false, lengthLog2: 3, isExtern: true, relType: relocUnsigned(),
+      })
+      run List<MachOReloc>.append(&mut relThreadVars, MachOReloc {
+        address: usize.toU64(tvOff + 16), symIdx: usize.toU32(initSymIdx),
+        pcRel: false, lengthLog2: 3, isExtern: true, relType: relocUnsigned(),
+      })
+      if objSymIdx != usize.MAX {
+        let e = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[objSymIdx]
+        e.nType = nSect() | nExt()
+        e.nSect = sectThreadVars()
+        e.nDesc = 0
+        e.nValue = usize.toU64(tvOff)
+        e.defined = true
+      }
+      at = at + usize.ONE
+      continue
+    }
+
+    let mut targetSect = sectData()
+    let mut base = usize.ZERO
+    if obj.framed {
+      targetSect = sectFrames()
+      run alignTo(&mut frames, align, 0)
+      base = Bytes.length(&frames)
+      run Bytes.append(&mut frames, img)
+    } else if obj.seen {
+      targetSect = sectSeen()
+      run alignTo(&mut seen, align, 0)
+      base = Bytes.length(&seen)
+      run Bytes.append(&mut seen, img)
+    } else if obj.readonly && ptrs.length == usize.ZERO {
+      targetSect = sectConst()
+      run alignTo(&mut constData, align, 0)
+      base = Bytes.length(&constData)
+      run Bytes.append(&mut constData, img)
+    } else {
+      targetSect = sectData()
+      run alignTo(&mut data, align, 0)
+      base = Bytes.length(&data)
+      run Bytes.append(&mut data, img)
+    }
+
+    if objSymIdx != usize.MAX {
+      let e = &mut List<MachOSym>.asMutSlice(&mut syms.entries)[objSymIdx]
+      e.nType = nSect() | nExt()
+      e.nSect = targetSect
+      e.nDesc = if e.weak { nWeakDef() } else { 0 }
+      e.nValue = usize.toU64(base)
+      e.defined = true
+    }
+
+    let mut p = usize.ZERO
+    while p < ptrs.length {
+      let ptr = &ptrs[p]
+      let targetIdx = run symTableIntern(&mut syms, Bytes.asSlice(&ptr.symbol))
+      let pOff = base + ptr.offset
+      // Inline 64-bit addend in the section slot for `ARM64_RELOC_UNSIGNED`.
+      if ptr.addend != 0 {
+        if targetSect == sectFrames() {
+          AArch64Encode.patchU32(&mut frames, pOff, ptr.addend & 0xFFFFFFFF)
+          AArch64Encode.patchU32(&mut frames, pOff + 4, u64.shiftRight(ptr.addend, 32))
+        } else {
+          AArch64Encode.patchU32(&mut data, pOff, ptr.addend & 0xFFFFFFFF)
+          AArch64Encode.patchU32(&mut data, pOff + 4, u64.shiftRight(ptr.addend, 32))
+        }
+      }
+      let rel = MachOReloc {
+        address: usize.toU64(pOff),
+        symIdx: usize.toU32(targetIdx),
+        pcRel: false,
+        lengthLog2: if ptr.size == 4 { 2 } else { 3 },
+        isExtern: true,
+        relType: relocUnsigned(),
+      }
+      if targetSect == sectFrames() {
+        run List<MachOReloc>.append(&mut relFrames, rel)
+      } else {
+        run List<MachOReloc>.append(&mut relData, rel)
+      }
+      p = p + usize.ONE
+    }
+
+    at = at + usize.ONE
+  }
+
+  // Compute virtual addresses of the 8 sections inside the single anonymous `LC_SEGMENT_64`.
+  let mut sectAddrs: [u64; 9] = [0; 9]
+  let mut sectSizes: [u64; 9] = [0; 9]
+  sectSizes[1] = usize.toU64(Bytes.length(&text))
+  sectSizes[2] = usize.toU64(Bytes.length(&constData))
+  sectSizes[3] = usize.toU64(Bytes.length(&data))
+  sectSizes[4] = usize.toU64(Bytes.length(&threadData))
+  sectSizes[5] = usize.toU64(Bytes.length(&threadVars))
+  sectSizes[6] = usize.toU64(Bytes.length(&frames))
+  sectSizes[7] = usize.toU64(Bytes.length(&seen))
+  sectSizes[8] = usize.toU64(Bytes.length(&compactUnwind))
+  let sectAligns: [u64; 9] = [1, 16, 16, 8, 8, 8, 8, 1, 8]
+  let sectAlignLog2: [u64; 9] = [0, 4, 4, 3, 3, 3, 3, 0, 3]
+
+  let mut curVm: u64 = 0
+  let mut sIdx = usize.ONE
+  while sIdx <= sectionCount() {
+    let al = sectAligns[sIdx]
+    if al > 1 && (curVm % al) != 0 {
+      curVm = curVm + (al - (curVm % al))
+    }
+    sectAddrs[sIdx] = curVm
+    curVm = curVm + sectSizes[sIdx]
+    sIdx = sIdx + usize.ONE
+  }
+  let segVmSize = curVm
+
+  // Order symbols: locals first, then defined globals, then undefined externs (`LC_DYSYMTAB` order).
+  let totalSyms = List<MachOSym>.length(&syms.entries)
+  let mut orderedIdx = run List<usize>.makeWithCapacity(totalSyms)
+  let mut symMap = run List<u32>.makeWithCapacity(totalSyms)
+  let mut i = usize.ZERO
+  while i < totalSyms {
+    run List<u32>.append(&mut symMap, 0)
+    i = i + usize.ONE
+  }
+  let symSlice = List<MachOSym>.asSlice(&syms.entries)
+  let mapMut = List<u32>.asMutSlice(&mut symMap)
+  // Pass 1: locals
+  i = usize.ZERO
+  while i < totalSyms {
+    if symSlice[i].isLocal {
+      mapMut[i] = usize.toU32(List<usize>.length(&orderedIdx))
+      run List<usize>.append(&mut orderedIdx, i)
+    }
+    i = i + usize.ONE
+  }
+  let nLocals = List<usize>.length(&orderedIdx)
+  // Pass 2: defined externals
+  i = usize.ZERO
+  while i < totalSyms {
+    if !symSlice[i].isLocal && symSlice[i].defined {
+      mapMut[i] = usize.toU32(List<usize>.length(&orderedIdx))
+      run List<usize>.append(&mut orderedIdx, i)
+    }
+    i = i + usize.ONE
+  }
+  let nExtDefs = List<usize>.length(&orderedIdx) - nLocals
+  // Pass 3: undefined externals
+  i = usize.ZERO
+  while i < totalSyms {
+    if !symSlice[i].isLocal && !symSlice[i].defined {
+      mapMut[i] = usize.toU32(List<usize>.length(&orderedIdx))
+      run List<usize>.append(&mut orderedIdx, i)
+    }
+    i = i + usize.ONE
+  }
+  let nUndefs = List<usize>.length(&orderedIdx) - nLocals - nExtDefs
+
+  // Build string table (leading NUL byte).
+  let mut strtab = Bytes.make()
+  run AArch64Encode.byte(&mut strtab, 0)
+  let ordSlice = List<usize>.asSlice(&orderedIdx)
+  let mut symStrx = run List<u64>.makeWithCapacity(totalSyms)
+  i = usize.ZERO
+  while i < totalSyms {
+    let s = &symSlice[ordSlice[i]]
+    let off = Bytes.length(&strtab)
+    run List<u64>.append(&mut symStrx, usize.toU64(off))
+    run Bytes.append(&mut strtab, Bytes.asSlice(&s.machoName))
+    run AArch64Encode.byte(&mut strtab, 0)
+    i = i + usize.ONE
+  }
+  run alignTo(&mut strtab, 8, 0)
+
+  // Compute file layout.
+  // mach_header_64 (32) + LC_SEGMENT_64 (72 + 7*80 = 632) + LC_BUILD_VERSION (24) + LC_SYMTAB (24) + LC_DYSYMTAB (80)
+  let segCmdSize: u64 = 72 + usize.toU64(sectionCount()) * 80
+  let buildVerSize: u64 = 24
+  let symtabCmdSize: u64 = 24
+  let dysymtabCmdSize: u64 = 80
+  let sizeofCmds = segCmdSize + buildVerSize + symtabCmdSize + dysymtabCmdSize
+  let headerTotal = 32 + sizeofCmds
+  let segFileOff = if (headerTotal % 16) == 0 { headerTotal } else { headerTotal + (16 - (headerTotal % 16)) }
+
+  let mut sectFileOffs: [u64; 9] = [0; 9]
+  sIdx = usize.ONE
+  while sIdx <= sectionCount() {
+    sectFileOffs[sIdx] = segFileOff + sectAddrs[sIdx]
+    sIdx = sIdx + usize.ONE
+  }
+
+  let relBaseRaw = segFileOff + segVmSize
+  let relBase = if (relBaseRaw % 8) == 0 { relBaseRaw } else { relBaseRaw + (8 - (relBaseRaw % 8)) }
+  let relTextOff = relBase
+  let relTextCnt = List<MachOReloc>.length(&relText)
+  let relConstOff = relTextOff + usize.toU64(relTextCnt) * 8
+  let relConstCnt = List<MachOReloc>.length(&relConst)
+  let relDataOff = relConstOff + usize.toU64(relConstCnt) * 8
+  let relDataCnt = List<MachOReloc>.length(&relData)
+  let relTvOff = relDataOff + usize.toU64(relDataCnt) * 8
+  let relTvCnt = List<MachOReloc>.length(&relThreadVars)
+  let relFramesOff = relTvOff + usize.toU64(relTvCnt) * 8
+  let relFramesCnt = List<MachOReloc>.length(&relFrames)
+  let relCuOff = relFramesOff + usize.toU64(relFramesCnt) * 8
+  let relCuCnt = List<MachOReloc>.length(&relCompactUnwind)
+
+  let symOffRaw = relCuOff + usize.toU64(relCuCnt) * 8
+  let symOff = if (symOffRaw % 8) == 0 { symOffRaw } else { symOffRaw + (8 - (symOffRaw % 8)) }
+  let strOff = symOff + usize.toU64(totalSyms) * 16
+
+  let mut out = run Bytes.makeWithCapacity(u64.toUsize(strOff) + Bytes.length(&strtab))
+
+  // 1. `mach_header_64` (32 bytes).
+  run AArch64Encode.u32Le(&mut out, 0xFEEDFACF) // MH_MAGIC_64
+  run AArch64Encode.u32Le(&mut out, 0x0100000C) // CPU_TYPE_ARM64
+  run AArch64Encode.u32Le(&mut out, 0)          // CPU_SUBTYPE_ARM64_ALL
+  run AArch64Encode.u32Le(&mut out, 1)          // MH_OBJECT
+  run AArch64Encode.u32Le(&mut out, 4)          // ncmds
+  run AArch64Encode.u32Le(&mut out, sizeofCmds) // sizeofcmds
+  run AArch64Encode.u32Le(&mut out, 0x00002000) // MH_SUBSECTIONS_VIA_SYMBOLS
+  run AArch64Encode.u32Le(&mut out, 0)          // reserved
+
+  // 2. `LC_SEGMENT_64` (72 + 7 * 80 bytes).
+  run AArch64Encode.u32Le(&mut out, 0x19) // LC_SEGMENT_64
+  run AArch64Encode.u32Le(&mut out, segCmdSize)
+  run writeFixed16(&mut out, b"")
+  run AArch64Encode.u64Le(&mut out, 0)          // vmaddr
+  run AArch64Encode.u64Le(&mut out, segVmSize)  // vmsize
+  run AArch64Encode.u64Le(&mut out, segFileOff) // fileoff
+  run AArch64Encode.u64Le(&mut out, segVmSize)  // filesize
+  run AArch64Encode.u32Le(&mut out, 7)          // maxprot (R|W|X)
+  run AArch64Encode.u32Le(&mut out, 7)          // initprot (R|W|X)
+  run AArch64Encode.u32Le(&mut out, usize.toU64(sectionCount()))
+  run AArch64Encode.u32Le(&mut out, 0)          // flags
+
+  // 7 section_64 headers (80 bytes each).
+  run emitSection64(&mut out, b"__text", b"__TEXT", sectAddrs[1], sectSizes[1], sectFileOffs[1], sectAlignLog2[1], relTextOff, relTextCnt, 0x80000400)
+  run emitSection64(&mut out, b"__const", b"__TEXT", sectAddrs[2], sectSizes[2], sectFileOffs[2], sectAlignLog2[2], relConstOff, relConstCnt, 0)
+  run emitSection64(&mut out, b"__data", b"__DATA", sectAddrs[3], sectSizes[3], sectFileOffs[3], sectAlignLog2[3], relDataOff, relDataCnt, 0)
+  run emitSection64(&mut out, b"__thread_data", b"__DATA", sectAddrs[4], sectSizes[4], sectFileOffs[4], sectAlignLog2[4], 0, usize.ZERO, 0x11)
+  run emitSection64(&mut out, b"__thread_vars", b"__DATA", sectAddrs[5], sectSizes[5], sectFileOffs[5], sectAlignLog2[5], relTvOff, relTvCnt, 0x13)
+  run emitSection64(&mut out, b"__silk_frames", b"__DATA", sectAddrs[6], sectSizes[6], sectFileOffs[6], sectAlignLog2[6], relFramesOff, relFramesCnt, 0)
+  run emitSection64(&mut out, b"__silk_seen", b"__DATA", sectAddrs[7], sectSizes[7], sectFileOffs[7], sectAlignLog2[7], 0, usize.ZERO, 0)
+  run emitSection64(&mut out, b"__compact_unwind", b"__LD", sectAddrs[8], sectSizes[8], sectFileOffs[8], sectAlignLog2[8], relCuOff, relCuCnt, 0x02000000)
+
+  // 3. `LC_BUILD_VERSION` (24 bytes): macOS 12.0.0 (matches `DarwinLink`).
+  run AArch64Encode.u32Le(&mut out, 0x32)       // LC_BUILD_VERSION
+  run AArch64Encode.u32Le(&mut out, 24)
+  run AArch64Encode.u32Le(&mut out, 1)          // PLATFORM_MACOS
+  run AArch64Encode.u32Le(&mut out, 0x000C0000) // minos 12.0.0
+  run AArch64Encode.u32Le(&mut out, 0x000C0000) // sdk 12.0.0
+  run AArch64Encode.u32Le(&mut out, 0)          // ntools
+
+  // 4. `LC_SYMTAB` (24 bytes).
+  run AArch64Encode.u32Le(&mut out, 0x02) // LC_SYMTAB
+  run AArch64Encode.u32Le(&mut out, 24)
+  run AArch64Encode.u32Le(&mut out, symOff)
+  run AArch64Encode.u32Le(&mut out, usize.toU64(totalSyms))
+  run AArch64Encode.u32Le(&mut out, strOff)
+  run AArch64Encode.u32Le(&mut out, usize.toU64(Bytes.length(&strtab)))
+
+  // 5. `LC_DYSYMTAB` (80 bytes).
+  run AArch64Encode.u32Le(&mut out, 0x0B) // LC_DYSYMTAB
+  run AArch64Encode.u32Le(&mut out, 80)
+  run AArch64Encode.u32Le(&mut out, 0)
+  run AArch64Encode.u32Le(&mut out, usize.toU64(nLocals))
+  run AArch64Encode.u32Le(&mut out, usize.toU64(nLocals))
+  run AArch64Encode.u32Le(&mut out, usize.toU64(nExtDefs))
+  run AArch64Encode.u32Le(&mut out, usize.toU64(nLocals + nExtDefs))
+  run AArch64Encode.u32Le(&mut out, usize.toU64(nUndefs))
+  let mut z = usize.ZERO
+  while z < 12 {
+    run AArch64Encode.u32Le(&mut out, 0)
+    z = z + usize.ONE
+  }
+
+  // Pad to `segFileOff` and write section payloads.
+  while usize.toU64(Bytes.length(&out)) < segFileOff {
+    run AArch64Encode.byte(&mut out, 0)
+  }
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[1], Bytes.asSlice(&text))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[2], Bytes.asSlice(&constData))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[3], Bytes.asSlice(&data))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[4], Bytes.asSlice(&threadData))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[5], Bytes.asSlice(&threadVars))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[6], Bytes.asSlice(&frames))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[7], Bytes.asSlice(&seen))
+  run writeSectionPayload(&mut out, segFileOff + sectAddrs[8], Bytes.asSlice(&compactUnwind))
+
+  // Pad to `relBase` and write relocation tables.
+  while usize.toU64(Bytes.length(&out)) < relBase {
+    run AArch64Encode.byte(&mut out, 0)
+  }
+  let mapSlice = List<u32>.asSlice(&symMap)
+  run emitRelocList(&mut out, List<MachOReloc>.asSlice(&relText), mapSlice)
+  run emitRelocList(&mut out, List<MachOReloc>.asSlice(&relConst), mapSlice)
+  run emitRelocList(&mut out, List<MachOReloc>.asSlice(&relData), mapSlice)
+  run emitRelocList(&mut out, List<MachOReloc>.asSlice(&relThreadVars), mapSlice)
+  run emitRelocList(&mut out, List<MachOReloc>.asSlice(&relFrames), mapSlice)
+  run emitRelocList(&mut out, List<MachOReloc>.asSlice(&relCompactUnwind), mapSlice)
+
+  // Pad to `symOff` and emit `nlist_64` records.
+  while usize.toU64(Bytes.length(&out)) < symOff {
+    run AArch64Encode.byte(&mut out, 0)
+  }
+  let strxSlice = List<u64>.asSlice(&symStrx)
+  i = usize.ZERO
+  while i < totalSyms {
+    let s = &symSlice[ordSlice[i]]
+    let symAddr = if s.defined && s.nSect > 0 {
+      sectAddrs[u8.toUsize(s.nSect)] + s.nValue
+    } else {
+      0
+    }
+    run AArch64Encode.u32Le(&mut out, strxSlice[i])
+    run AArch64Encode.byte(&mut out, s.nType)
+    run AArch64Encode.byte(&mut out, s.nSect)
+    run AArch64Encode.u16Le(&mut out, u16.toU64(s.nDesc))
+    run AArch64Encode.u64Le(&mut out, symAddr)
+    i = i + usize.ONE
+  }
+
+  // Emit string table.
+  run Bytes.append(&mut out, Bytes.asSlice(&strtab))
+  return move out
+}
+
+effect fn emitSection64(
+  out: &mut Bytes,
+  sectName: &[u8],
+  segName: &[u8],
+  addr: u64,
+  size: u64,
+  offset: u64,
+  alignLog2: u64,
+  relOff: u64,
+  nReloc: usize,
+  flags: u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeFixed16(&mut out.*, sectName)
+  run writeFixed16(&mut out.*, segName)
+  run AArch64Encode.u64Le(&mut out.*, addr)
+  run AArch64Encode.u64Le(&mut out.*, size)
+  run AArch64Encode.u32Le(&mut out.*, if size > 0 { offset } else { 0 })
+  run AArch64Encode.u32Le(&mut out.*, alignLog2)
+  run AArch64Encode.u32Le(&mut out.*, if nReloc > usize.ZERO { relOff } else { 0 })
+  run AArch64Encode.u32Le(&mut out.*, usize.toU64(nReloc))
+  run AArch64Encode.u32Le(&mut out.*, flags)
+  run AArch64Encode.u32Le(&mut out.*, 0) // reserved1
+  run AArch64Encode.u32Le(&mut out.*, 0) // reserved2
+  return run AArch64Encode.u32Le(&mut out.*, 0) // reserved3
+}
+
+effect fn writeSectionPayload(out: &mut Bytes, targetOff: u64, data: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if data.length == usize.ZERO { return () }
+  while usize.toU64(Bytes.length(&out.*)) < targetOff {
+    run AArch64Encode.byte(&mut out.*, 0)
+  }
+  return run Bytes.append(&mut out.*, data)
+}

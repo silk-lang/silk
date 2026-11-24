@@ -1,0 +1,1747 @@
+//! Incremental APFS copy-on-write macOS ARM64 (`aarch64-apple-darwin`) Mach-O linker
+//! (`MachOIncremental`).
+//!
+//! # When to use
+//! Call [`linkOrPatch`] in dev and test builds of pure-Silk Apple Silicon executables (`--backend
+//! direct`, `--optimization none`). On the initial build, [`MachOLink.linkWithOptions`] emits an
+//! incremental-ready `MH_EXECUTE` binary with 12-byte fixed Silk call thunks, padded function
+//! slots, `__TEXT,__text`/`__TEXT,__const`/`__DATA,__data` headroom, pre-allocated
+//! `LC_DYLD_CHAINED_FIXUPS` page-start slots covering all `__DATA` headroom pages, pure-Silk
+//! ad-hoc SHA-256 `LC_CODE_SIGNATURE`, and a compact `<output>.machostate` v2 sidecar.
+//!
+//! # Details
+//! On subsequent rebuilds:
+//! - Raw `AArch64Object` (`\0a64`) chunks are scanned and hashed with 128-bit SipHash-1-3 without
+//!   decoding; unchanged chunks are skipped in `O(dirty)` time.
+//! - If 0 chunks and 0 options changed, linking returns [`LinkMode.Skipped`] with zero file writes.
+//! - If only Silk functions or supported static data objects changed (same-size/padded rewrites,
+//!   grown functions relocated into `__text` headroom with 12-byte thunk updates, moved private
+//!   `<fn>.constant.<N>` objects, new bump-allocated `__DATA` pointer-bearing objects threaded
+//!   into `LC_DYLD_CHAINED_FIXUPS`, removed ordinary functions, or in-place `silk_seen` updates),
+//!   [`MachOIncremental`] creates an APFS CoW clone (`clonefile`), `pwrite`s ONLY the dirty byte
+//!   ranges, recomputes ONLY the dirty 4 KB SHA-256 page hashes inside `LC_CODE_SIGNATURE`, sets
+//!   mode `0755`, and atomically renames the fresh vnode over `output`.
+//! - Never mutates an already-executed Mach-O inode in place, preventing XNU per-vnode
+//!   code-signature cache kills (`SIGKILL` / `Killed: 9`) on Apple Silicon.
+//! - Falls back transparently to a clean full [`MachOLink.linkWithOptions`] build whenever
+//!   headroom, thunk slots, TLS, dynamic imports, or debug options require layout changes.
+
+import backend.AArch64Encode
+import backend.AArch64Object
+import backend.AArch64Object {Function, Object, Pointer as ObjectPointer, RelocationKind, RodataJumpEntry}
+import driver.HostRename
+import driver.HostRename {FilePatch}
+import driver.MachODebug {DebugLineMap}
+import driver.MachOInput
+import driver.MachOInput {LinkError}
+import driver.MachOLink
+import driver.MachOLink {
+  IncFreeBlock,
+  IncFuncRecord,
+  IncGlobalRecord,
+  IncObjRecord,
+  IncrementalState,
+  LinkOptions,
+}
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.ownership {Copy}
+import silk.core.result {Result}
+import silk.crypto.sha2 {Sha256}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {DirectoryInfo, FileError, FileInfo, FileSystem, Path}
+
+/// How [`linkOrPatch`] satisfied a macOS ARM64 direct link request.
+pub enum LinkMode {
+  /// Output binary and `.machostate` sidecar were already up to date (zero bytes written).
+  Skipped,
+  /// Only dirty code/data pages and dirty 4 KB SHA-256 signature hashes were patched via APFS CoW clone + atomic rename.
+  Patched,
+  /// Performed a full [`MachOLink.linkWithOptions`] build and wrote fresh incremental layout state.
+  Full,
+}
+
+/// Summary returned by [`linkOrPatch`].
+pub struct IncrementalResult {
+  /// Which link path ran (`Skipped`, `Patched`, or `Full`).
+  pub mode: LinkMode,
+  /// Number of Silk functions patched (non-zero when `mode == LinkMode.Patched`).
+  pub patchedCount: usize,
+}
+impl Copy for IncrementalResult {}
+
+struct PendingPtrObj {
+  objInIdx: usize,
+  vaddr: u64,
+  fileOff: u64,
+}
+impl Copy for PendingPtrObj {}
+
+struct PtrFixupWork {
+  segOff: u64,
+  fileOff: u64,
+  isBind: bool,
+  bindOrdinal: u64,
+  addend: i64,
+  targetVmAddr: u64,
+}
+impl Copy for PtrFixupWork {}
+
+fn pageSize() -> u64 { return 16384 }
+
+// ---- Byte & Hash Utilities ----
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn startsWithBytes(haystack: &[u8], prefix: &[u8]) -> bool {
+  if haystack.length < prefix.length { return false }
+  let mut i = usize.ZERO
+  while i < prefix.length {
+    if haystack[i] != prefix[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn findPrivateConstantPrefix(name: &[u8]) -> Option<usize> {
+  let needle: &[u8] = b".constant."
+  if name.length <= needle.length { return Option<usize>.none() }
+  let limit = name.length - needle.length
+  let mut i = usize.ONE
+  while i <= limit {
+    let mut k = usize.ZERO
+    while k < needle.length && name[i + k] == needle[k] {
+      k = k + usize.ONE
+    }
+    if k == needle.length {
+      return Option<usize>.some(i)
+    }
+    i = i + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+fn alignUp(v: u64, align: u64) -> u64 {
+  if align <= 1 { return v }
+  let rem = v % align
+  if rem == 0 { return v }
+  return v + (align - rem)
+}
+
+fn maxU64(a: u64, b: u64) -> u64 {
+  if a > b { return a }
+  return b
+}
+
+fn chunkHashMix(high: u64, low: u64) -> u64 {
+  return high ^ u64.shiftLeft(low, 13) ^ u64.shiftRight(low, 7)
+}
+
+fn putU32Le(out: &mut Bytes, at: usize, v: u64) -> () {
+  let buf = Bytes.asMutSlice(&mut out.*)
+  buf[at] = u64.wrappingToU8(v & 255)
+  buf[at + 1] = u64.wrappingToU8(u64.shiftRight(v, 8) & 255)
+  buf[at + 2] = u64.wrappingToU8(u64.shiftRight(v, 16) & 255)
+  buf[at + 3] = u64.wrappingToU8(u64.shiftRight(v, 24) & 255)
+}
+
+fn readU32Le(data: &[u8], at: usize) -> u64 {
+  return u8.toU64(data[at])
+    | u64.shiftLeft(u8.toU64(data[at + 1]), 8)
+    | u64.shiftLeft(u8.toU64(data[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(data[at + 3]), 24)
+}
+
+fn readU64Le(data: &[u8], at: usize) -> u64 {
+  return readU32Le(data, at) | u64.shiftLeft(readU32Le(data, at + 4), 32)
+}
+
+effect fn collectChunkHashes(
+  fragments: &[u8],
+  outHigh: &mut List<u64>,
+  outLow: &mut List<u64>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at + 8 <= fragments.length {
+    if readU32Le(fragments, at) != 0x34366100 { return false }
+    let length = u64.toUsize(readU32Le(fragments, at + 4))
+    if length < 8 || at + length > fragments.length { return false }
+    let ch = ContentHash.of(Slice.view<u8>(fragments, at, length))
+    run List<u64>.append(&mut outHigh.*, ch.high)
+    run List<u64>.append(&mut outLow.*, ch.low)
+    at = at + length
+  }
+  return at == fragments.length
+}
+
+effect fn writeLenBytes(out: &mut Bytes, data: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run AArch64Encode.u32Le(&mut out.*, usize.toU64(data.length))
+  return run Bytes.append(&mut out.*, data)
+}
+
+effect fn readLenBytes(data: &[u8], pos: &mut usize) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  if pos.* + 4 > data.length { return Option<Bytes>.none() }
+  let len = u64.toUsize(readU32Le(data, pos.*))
+  pos.* = pos.* + 4
+  if pos.* + len > data.length { return Option<Bytes>.none() }
+  let out = run Bytes.copy(Slice.view<u8>(data, pos.*, len))
+  pos.* = pos.* + len
+  return Option<Bytes>.some(move out)
+}
+
+fn readU64Field(data: &[u8], pos: &mut usize) -> Option<u64> {
+  if pos.* + 8 > data.length { return Option<u64>.none() }
+  let v = readU64Le(data, pos.*)
+  pos.* = pos.* + 8
+  return Option<u64>.some(v)
+}
+
+fn sortPtrFixupWork(items: &mut [PtrFixupWork]) -> () {
+  let mut a = usize.ONE
+  while a < items.length {
+    let key = items[a]
+    let mut b = a
+    while b > usize.ZERO && items[b - usize.ONE].segOff > key.segOff {
+      items[b] = items[b - usize.ONE]
+      b = b - usize.ONE
+    }
+    items[b] = key
+    a = a + usize.ONE
+  }
+}
+
+// ---- Sidecar `<output>.machostate` v2 Path & Serialization ----
+
+/// Returns the sidecar incremental linker state path `<output>.machostate`.
+pub effect fn statePathFor(output: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut p = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut p, b".machostate")
+  return run Path.fromBytes(Bytes.asSlice(&p))
+}
+
+/// Serializes an [`IncrementalState`] to its compact binary `<output>.machostate` v2 format.
+pub effect fn encodeState(st: &IncrementalState) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  run Bytes.append(&mut out, b"SILKMCH2")
+  run AArch64Encode.u32Le(&mut out, 2) // format version 2
+  run AArch64Encode.u64Le(&mut out, st.inputsHashHigh)
+  run AArch64Encode.u64Le(&mut out, st.inputsHashLow)
+  run AArch64Encode.u64Le(&mut out, st.binarySize)
+  run AArch64Encode.u64Le(&mut out, st.thunksVaddr)
+  run AArch64Encode.u64Le(&mut out, st.thunksFileOff)
+  run AArch64Encode.u64Le(&mut out, st.thunksCount)
+  run AArch64Encode.u64Le(&mut out, st.thunksCap)
+  run AArch64Encode.u64Le(&mut out, st.textCursorVaddr)
+  run AArch64Encode.u64Le(&mut out, st.textCursorFileOff)
+  run AArch64Encode.u64Le(&mut out, st.textLimitVaddr)
+  run AArch64Encode.u64Le(&mut out, st.constCursorVaddr)
+  run AArch64Encode.u64Le(&mut out, st.constCursorFileOff)
+  run AArch64Encode.u64Le(&mut out, st.constLimitVaddr)
+  run AArch64Encode.u64Le(&mut out, st.dataCursorVaddr)
+  run AArch64Encode.u64Le(&mut out, st.dataCursorFileOff)
+  run AArch64Encode.u64Le(&mut out, st.dataLimitVaddr)
+  run AArch64Encode.u64Le(&mut out, st.dataSegVmAddr)
+  run AArch64Encode.u64Le(&mut out, st.dataSegFileOff)
+  run AArch64Encode.u64Le(&mut out, st.dataSegPageCount)
+  run AArch64Encode.u64Le(&mut out, st.chainedDataPageStartsFileOff)
+  run AArch64Encode.u64Le(&mut out, st.csDataOff)
+  run AArch64Encode.u64Le(&mut out, st.csHashTableFileOff)
+  run AArch64Encode.u64Le(&mut out, st.csPageCount)
+
+  let funcs = List<IncFuncRecord>.asSlice(&st.funcs)
+  run AArch64Encode.u64Le(&mut out, usize.toU64(funcs.length))
+  let mut i = usize.ZERO
+  while i < funcs.length {
+    let f = &funcs[i]
+    run writeLenBytes(&mut out, Bytes.asSlice(&f.symbol))
+    run writeLenBytes(&mut out, Bytes.asSlice(&f.exported))
+    run AArch64Encode.u64Le(&mut out, f.digestHigh)
+    run AArch64Encode.u64Le(&mut out, f.digestLow)
+    run AArch64Encode.u64Le(&mut out, f.bodyVaddr)
+    run AArch64Encode.u64Le(&mut out, f.bodyFileOff)
+    run AArch64Encode.u64Le(&mut out, f.bodySize)
+    run AArch64Encode.u64Le(&mut out, f.bodyCap)
+    run AArch64Encode.u64Le(&mut out, usize.toU64(f.thunkSlot))
+    run AArch64Encode.u64Le(&mut out, f.rodataVaddr)
+    run AArch64Encode.u64Le(&mut out, f.rodataFileOff)
+    run AArch64Encode.u64Le(&mut out, f.rodataSize)
+    run AArch64Encode.u64Le(&mut out, f.rodataCap)
+    run AArch64Encode.u64Le(&mut out, f.silkFrameFileOff)
+    run AArch64Encode.u64Le(&mut out, f.silkFrameNextStride)
+    i = i + usize.ONE
+  }
+
+  let objs = List<IncObjRecord>.asSlice(&st.objs)
+  run AArch64Encode.u64Le(&mut out, usize.toU64(objs.length))
+  i = usize.ZERO
+  while i < objs.length {
+    let o = &objs[i]
+    run writeLenBytes(&mut out, Bytes.asSlice(&o.symbol))
+    run AArch64Encode.u64Le(&mut out, o.digestHigh)
+    run AArch64Encode.u64Le(&mut out, o.digestLow)
+    run AArch64Encode.u64Le(&mut out, o.vaddr)
+    run AArch64Encode.u64Le(&mut out, o.fileOff)
+    run AArch64Encode.u64Le(&mut out, o.size)
+    let mut flags: u8 = 0
+    if o.isTls { flags = u8.bitOr(flags, 1) }
+    if o.isFramed { flags = u8.bitOr(flags, 2) }
+    if o.isSeen { flags = u8.bitOr(flags, 4) }
+    run AArch64Encode.byte(&mut out, flags)
+    i = i + usize.ONE
+  }
+
+  let globs = List<IncGlobalRecord>.asSlice(&st.globals)
+  run AArch64Encode.u64Le(&mut out, usize.toU64(globs.length))
+  i = usize.ZERO
+  while i < globs.length {
+    let g = &globs[i]
+    run writeLenBytes(&mut out, Bytes.asSlice(&g.name))
+    run AArch64Encode.u64Le(&mut out, g.vaddr)
+    run AArch64Encode.u64Le(&mut out, g.gotSlotVaddr)
+    run AArch64Encode.u64Le(&mut out, g.stubVaddr)
+    run AArch64Encode.u64Le(&mut out, g.tlvpSlotVaddr)
+    run AArch64Encode.u64Le(&mut out, g.bindOrdinal)
+    let mut gFlags: u8 = 0
+    if g.isDynamic { gFlags = u8.bitOr(gFlags, 1) }
+    if g.isTls { gFlags = u8.bitOr(gFlags, 2) }
+    run AArch64Encode.byte(&mut out, gFlags)
+    i = i + usize.ONE
+  }
+
+  let tf = List<IncFreeBlock>.asSlice(&st.textFreeList)
+  run AArch64Encode.u64Le(&mut out, usize.toU64(tf.length))
+  i = usize.ZERO
+  while i < tf.length {
+    run AArch64Encode.u64Le(&mut out, tf[i].vaddr)
+    run AArch64Encode.u64Le(&mut out, tf[i].fileOff)
+    run AArch64Encode.u64Le(&mut out, tf[i].cap)
+    i = i + usize.ONE
+  }
+
+  let cf = List<IncFreeBlock>.asSlice(&st.constFreeList)
+  run AArch64Encode.u64Le(&mut out, usize.toU64(cf.length))
+  i = usize.ZERO
+  while i < cf.length {
+    run AArch64Encode.u64Le(&mut out, cf[i].vaddr)
+    run AArch64Encode.u64Le(&mut out, cf[i].fileOff)
+    run AArch64Encode.u64Le(&mut out, cf[i].cap)
+    i = i + usize.ONE
+  }
+
+  let chHigh = List<u64>.asSlice(&st.chunkHashHigh)
+  let chLow = List<u64>.asSlice(&st.chunkHashLow)
+  let chCount = if chHigh.length < chLow.length { chHigh.length } else { chLow.length }
+  run AArch64Encode.u64Le(&mut out, usize.toU64(chCount))
+  i = usize.ZERO
+  while i < chCount {
+    run AArch64Encode.u64Le(&mut out, chHigh[i])
+    run AArch64Encode.u64Le(&mut out, chLow[i])
+    i = i + usize.ONE
+  }
+
+  let dpOff = List<u64>.asSlice(&st.dataPageLastOff)
+  let dpWord = List<u64>.asSlice(&st.dataPageLastWord)
+  let dpCount = if dpOff.length < dpWord.length { dpOff.length } else { dpWord.length }
+  run AArch64Encode.u64Le(&mut out, usize.toU64(dpCount))
+  i = usize.ZERO
+  while i < dpCount {
+    run AArch64Encode.u64Le(&mut out, dpOff[i])
+    run AArch64Encode.u64Le(&mut out, dpWord[i])
+    i = i + usize.ONE
+  }
+
+  return move out
+}
+
+/// Deserializes an [`IncrementalState`] from `<output>.machostate` v2 bytes; returns `None` on
+/// version mismatch or truncation so the caller safely falls back to a full link.
+pub effect fn decodeState(data: &[u8]) -> Option<IncrementalState> ! OutOfMemoryError ? &mut Allocator {
+  if data.length < 12 { return Option<IncrementalState>.none() }
+  if !sameBytes(Slice.view<u8>(data, usize.ZERO, 8), b"SILKMCH2") { return Option<IncrementalState>.none() }
+  if readU32Le(data, 8) != 2 { return Option<IncrementalState>.none() }
+  let mut pos: usize = 12
+
+  if pos + 23 * 8 > data.length { return Option<IncrementalState>.none() }
+  let inputsHashHigh = readU64Le(data, pos)
+  pos = pos + 8
+  let inputsHashLow = readU64Le(data, pos)
+  pos = pos + 8
+  let binarySize = readU64Le(data, pos)
+  pos = pos + 8
+  let thunksVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let thunksFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let thunksCount = readU64Le(data, pos)
+  pos = pos + 8
+  let thunksCap = readU64Le(data, pos)
+  pos = pos + 8
+  let textCursorVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let textCursorFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let textLimitVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let constCursorVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let constCursorFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let constLimitVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let dataCursorVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let dataCursorFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let dataLimitVaddr = readU64Le(data, pos)
+  pos = pos + 8
+  let dataSegVmAddr = readU64Le(data, pos)
+  pos = pos + 8
+  let dataSegFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let dataSegPageCount = readU64Le(data, pos)
+  pos = pos + 8
+  let chainedDataPageStartsFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let csDataOff = readU64Le(data, pos)
+  pos = pos + 8
+  let csHashTableFileOff = readU64Le(data, pos)
+  pos = pos + 8
+  let csPageCount = readU64Le(data, pos)
+  pos = pos + 8
+
+  let fnCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  let mut funcs = run List<IncFuncRecord>.makeWithCapacity(fnCount)
+  let mut i = usize.ZERO
+  while i < fnCount {
+    let sym = match move run readLenBytes(data, &mut pos) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<IncrementalState>.none() }
+    }
+    let exp = match move run readLenBytes(data, &mut pos) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<IncrementalState>.none() }
+    }
+    if pos + 13 * 8 > data.length { return Option<IncrementalState>.none() }
+    let dh = readU64Le(data, pos)
+    pos = pos + 8
+    let dl = readU64Le(data, pos)
+    pos = pos + 8
+    let bv = readU64Le(data, pos)
+    pos = pos + 8
+    let bf = readU64Le(data, pos)
+    pos = pos + 8
+    let bs = readU64Le(data, pos)
+    pos = pos + 8
+    let bc = readU64Le(data, pos)
+    pos = pos + 8
+    let ts = u64.toUsize(readU64Le(data, pos))
+    pos = pos + 8
+    let rv = readU64Le(data, pos)
+    pos = pos + 8
+    let rf = readU64Le(data, pos)
+    pos = pos + 8
+    let rs = readU64Le(data, pos)
+    pos = pos + 8
+    let rc = readU64Le(data, pos)
+    pos = pos + 8
+    let sfOff = readU64Le(data, pos)
+    pos = pos + 8
+    let sfNext = readU64Le(data, pos)
+    pos = pos + 8
+    run List<IncFuncRecord>.append(&mut funcs, IncFuncRecord {
+      symbol: move sym, exported: move exp, digestHigh: dh, digestLow: dl,
+      bodyVaddr: bv, bodyFileOff: bf, bodySize: bs, bodyCap: bc, thunkSlot: ts,
+      rodataVaddr: rv, rodataFileOff: rf, rodataSize: rs, rodataCap: rc,
+      silkFrameFileOff: sfOff, silkFrameNextStride: sfNext,
+    })
+    i = i + usize.ONE
+  }
+
+  let objCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  let mut objs = run List<IncObjRecord>.makeWithCapacity(objCount)
+  i = usize.ZERO
+  while i < objCount {
+    let sym = match move run readLenBytes(data, &mut pos) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<IncrementalState>.none() }
+    }
+    if pos + 5 * 8 + 1 > data.length { return Option<IncrementalState>.none() }
+    let dh = readU64Le(data, pos)
+    pos = pos + 8
+    let dl = readU64Le(data, pos)
+    pos = pos + 8
+    let v = readU64Le(data, pos)
+    pos = pos + 8
+    let fo = readU64Le(data, pos)
+    pos = pos + 8
+    let sz = readU64Le(data, pos)
+    pos = pos + 8
+    let fl = data[pos]
+    pos = pos + usize.ONE
+    run List<IncObjRecord>.append(&mut objs, IncObjRecord {
+      symbol: move sym, digestHigh: dh, digestLow: dl, vaddr: v, fileOff: fo, size: sz,
+      isTls: u8.bitAnd(fl, 1) != 0, isFramed: u8.bitAnd(fl, 2) != 0, isSeen: u8.bitAnd(fl, 4) != 0,
+    })
+    i = i + usize.ONE
+  }
+
+  let globCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  let mut globals = run List<IncGlobalRecord>.makeWithCapacity(globCount)
+  i = usize.ZERO
+  while i < globCount {
+    let name = match move run readLenBytes(data, &mut pos) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { return Option<IncrementalState>.none() }
+    }
+    if pos + 5 * 8 + 1 > data.length { return Option<IncrementalState>.none() }
+    let v = readU64Le(data, pos)
+    pos = pos + 8
+    let gv = readU64Le(data, pos)
+    pos = pos + 8
+    let sv = readU64Le(data, pos)
+    pos = pos + 8
+    let tv = readU64Le(data, pos)
+    pos = pos + 8
+    let bo = readU64Le(data, pos)
+    pos = pos + 8
+    let fl = data[pos]
+    pos = pos + usize.ONE
+    run List<IncGlobalRecord>.append(&mut globals, IncGlobalRecord {
+      name: move name, vaddr: v, gotSlotVaddr: gv, stubVaddr: sv, tlvpSlotVaddr: tv,
+      bindOrdinal: bo, isDynamic: u8.bitAnd(fl, 1) != 0, isTls: u8.bitAnd(fl, 2) != 0,
+    })
+    i = i + usize.ONE
+  }
+
+  let tfCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  if pos + tfCount * 24 > data.length { return Option<IncrementalState>.none() }
+  let mut textFree = run List<IncFreeBlock>.makeWithCapacity(tfCount)
+  i = usize.ZERO
+  while i < tfCount {
+    let v = readU64Le(data, pos)
+    pos = pos + 8
+    let fo = readU64Le(data, pos)
+    pos = pos + 8
+    let cp = readU64Le(data, pos)
+    pos = pos + 8
+    run List<IncFreeBlock>.append(&mut textFree, IncFreeBlock {vaddr: v, fileOff: fo, cap: cp})
+    i = i + usize.ONE
+  }
+
+  let cfCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  if pos + cfCount * 24 > data.length { return Option<IncrementalState>.none() }
+  let mut constFree = run List<IncFreeBlock>.makeWithCapacity(cfCount)
+  i = usize.ZERO
+  while i < cfCount {
+    let v = readU64Le(data, pos)
+    pos = pos + 8
+    let fo = readU64Le(data, pos)
+    pos = pos + 8
+    let cp = readU64Le(data, pos)
+    pos = pos + 8
+    run List<IncFreeBlock>.append(&mut constFree, IncFreeBlock {vaddr: v, fileOff: fo, cap: cp})
+    i = i + usize.ONE
+  }
+
+  let chCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  if pos + chCount * 16 > data.length { return Option<IncrementalState>.none() }
+  let mut chHigh = run List<u64>.makeWithCapacity(chCount)
+  let mut chLow = run List<u64>.makeWithCapacity(chCount)
+  i = usize.ZERO
+  while i < chCount {
+    let hi = readU64Le(data, pos)
+    pos = pos + 8
+    let lo = readU64Le(data, pos)
+    pos = pos + 8
+    run List<u64>.append(&mut chHigh, hi)
+    run List<u64>.append(&mut chLow, lo)
+    i = i + usize.ONE
+  }
+
+  let dpCount = match readU64Field(data, &mut pos) {
+    Option<u64>.Some {value} => u64.toUsize(value)
+    Option<u64>.None => { return Option<IncrementalState>.none() }
+  }
+  if pos + dpCount * 16 > data.length { return Option<IncrementalState>.none() }
+  let mut dpOff = run List<u64>.makeWithCapacity(dpCount)
+  let mut dpWord = run List<u64>.makeWithCapacity(dpCount)
+  i = usize.ZERO
+  while i < dpCount {
+    let o = readU64Le(data, pos)
+    pos = pos + 8
+    let w = readU64Le(data, pos)
+    pos = pos + 8
+    run List<u64>.append(&mut dpOff, o)
+    run List<u64>.append(&mut dpWord, w)
+    i = i + usize.ONE
+  }
+
+  return Option<IncrementalState>.some(IncrementalState {
+    inputsHashHigh: inputsHashHigh,
+    inputsHashLow: inputsHashLow,
+    binarySize: binarySize,
+    thunksVaddr: thunksVaddr,
+    thunksFileOff: thunksFileOff,
+    thunksCount: thunksCount,
+    thunksCap: thunksCap,
+    textCursorVaddr: textCursorVaddr,
+    textCursorFileOff: textCursorFileOff,
+    textLimitVaddr: textLimitVaddr,
+    constCursorVaddr: constCursorVaddr,
+    constCursorFileOff: constCursorFileOff,
+    constLimitVaddr: constLimitVaddr,
+    dataCursorVaddr: dataCursorVaddr,
+    dataCursorFileOff: dataCursorFileOff,
+    dataLimitVaddr: dataLimitVaddr,
+    dataSegVmAddr: dataSegVmAddr,
+    dataSegFileOff: dataSegFileOff,
+    dataSegPageCount: dataSegPageCount,
+    chainedDataPageStartsFileOff: chainedDataPageStartsFileOff,
+    csDataOff: csDataOff,
+    csHashTableFileOff: csHashTableFileOff,
+    csPageCount: csPageCount,
+    funcs: move funcs,
+    objs: move objs,
+    globals: move globals,
+    textFreeList: move textFree,
+    constFreeList: move constFree,
+    chunkHashHigh: move chHigh,
+    chunkHashLow: move chLow,
+    dataPageLastOff: move dpOff,
+    dataPageLastWord: move dpWord,
+  })
+}
+
+// ---- Option Fingerprinting ----
+
+fn fingerprintOptions(options: &LinkOptions, hasDebug: bool) -> ContentHash {
+  let mut st = ContentHash.stream()
+  let mut flags: u64 = 0
+  if options.incremental { flags = flags | 1 }
+  if hasDebug { flags = flags | 2 }
+  ContentHash.appendWord(&mut st, flags, 1)
+  let ident = Bytes.asSlice(&options.identifier)
+  if ident.length > usize.ZERO {
+    ContentHash.append(&mut st, ident)
+  } else {
+    ContentHash.append(&mut st, b"silk-direct")
+  }
+  ContentHash.appendWord(&mut st, 0, 1)
+  let tbds = List<Bytes>.asSlice(&options.extraTbdTexts)
+  ContentHash.appendWord(&mut st, usize.toU64(tbds.length), 8)
+  let mut i = usize.ZERO
+  while i < tbds.length {
+    ContentHash.append(&mut st, Bytes.asSlice(&tbds[i]))
+    ContentHash.appendWord(&mut st, 0, 1)
+    i = i + usize.ONE
+  }
+  return ContentHash.finish(move st)
+}
+
+// ---- Headroom & Free-List Allocators ----
+
+fn allocFromPool(
+  freeList: &mut List<IncFreeBlock>,
+  cursorVaddr: &mut u64,
+  cursorFileOff: &mut u64,
+  limitVaddr: u64,
+  needSize: u64,
+) -> Option<IncFreeBlock> {
+  let aligned = alignUp(if needSize == 0 { 16 } else { needSize }, 16)
+  let count = List<IncFreeBlock>.length(&freeList.*)
+  let mut i = usize.ZERO
+  while i < count {
+    let blk = List<IncFreeBlock>.get(&freeList.*, i)
+    if blk.cap >= aligned {
+      drop List<IncFreeBlock>.remove(&mut freeList.*, i)
+      return Option<IncFreeBlock>.some(blk)
+    }
+    i = i + usize.ONE
+  }
+  let startV = alignUp(cursorVaddr.*, 16)
+  let delta = startV - cursorVaddr.*
+  let startF = cursorFileOff.* + delta
+  if startV + aligned > limitVaddr {
+    return Option<IncFreeBlock>.none()
+  }
+  cursorVaddr.* = startV + aligned
+  cursorFileOff.* = startF + aligned
+  return Option<IncFreeBlock>.some(IncFreeBlock {vaddr: startV, fileOff: startF, cap: aligned})
+}
+
+fn allocFromDataBump(
+  cursorVaddr: &mut u64,
+  cursorFileOff: &mut u64,
+  limitVaddr: u64,
+  needSize: u64,
+  alignment: u64,
+) -> Option<IncFreeBlock> {
+  let align = maxU64(16, alignment)
+  let aligned = alignUp(if needSize == 0 { 16 } else { needSize }, 16)
+  let startV = alignUp(cursorVaddr.*, align)
+  let delta = startV - cursorVaddr.*
+  let startF = cursorFileOff.* + delta
+  if startV + aligned > limitVaddr {
+    return Option<IncFreeBlock>.none()
+  }
+  cursorVaddr.* = startV + aligned
+  cursorFileOff.* = startF + aligned
+  return Option<IncFreeBlock>.some(IncFreeBlock {vaddr: startV, fileOff: startF, cap: aligned})
+}
+
+// ---- Portable Copy-Patch-Resign Fallback (Non-APFS or Non-macOS Hosts) ----
+
+effect fn applyPatchesFallbackAtomicSigned(
+  output: &Path,
+  patches: &[FilePatch],
+  csDataOff: u64,
+  csHashTableFileOff: u64,
+) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut img = run FileSystem.readFile(output)
+  let mut dirtyPages = List<u64>.make()
+  let mut pi = usize.ZERO
+  while pi < patches.length {
+    let off0 = patches[pi].offset
+    let src = Bytes.asSlice(&patches[pi].bytes)
+    let buf = Bytes.asMutSlice(&mut img)
+    let offU = u64.toUsize(off0)
+    let mut k = usize.ZERO
+    while k < src.length {
+      buf[offU + k] = src[k]
+      k = k + usize.ONE
+    }
+    if src.length > usize.ZERO && off0 < csDataOff {
+      let endExcl = off0 + usize.toU64(src.length)
+      let clampedEnd = if endExcl > csDataOff { csDataOff } else { endExcl }
+      let mut pg = off0 / 4096
+      let lastPg = (clampedEnd - 1) / 4096
+      while pg <= lastPg {
+        let existing = List<u64>.asSlice(&dirtyPages)
+        let mut seen = false
+        let mut di = usize.ZERO
+        while di < existing.length {
+          if existing[di] == pg {
+            seen = true
+            break
+          }
+          di = di + usize.ONE
+        }
+        if !seen {
+          run List<u64>.append(&mut dirtyPages, pg)
+        }
+        pg = pg + 1
+      }
+    }
+    pi = pi + usize.ONE
+  }
+
+  let dirtySlice = List<u64>.asSlice(&dirtyPages)
+  let mut dpi = usize.ZERO
+  while dpi < dirtySlice.length {
+    let pg = dirtySlice[dpi]
+    let pgOff = pg * 4096
+    let rem = csDataOff - pgOff
+    let pgLen = if rem < 4096 { u64.toUsize(rem) } else { 4096 }
+    let digest = Sha256.hash(Slice.view<u8>(Bytes.asSlice(&img), u64.toUsize(pgOff), pgLen))
+    let buf = Bytes.asMutSlice(&mut img)
+    let hOff = u64.toUsize(csHashTableFileOff + pg * 32)
+    let mut b = usize.ZERO
+    while b < 32 {
+      buf[hOff + b] = digest[b]
+      b = b + usize.ONE
+    }
+    dpi = dpi + usize.ONE
+  }
+
+  let mut pendingBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut pendingBytes, b".macho-partial")
+  let pendingPath = run Path.fromBytes(Bytes.asSlice(&pendingBytes))
+  run FileSystem.writeFile(&pendingPath, Bytes.asSlice(&img))
+  drop run HostRename.makeExecutable(&pendingPath)
+  if !run HostRename.replaceFile(&pendingPath, output) {
+    run FileSystem.writeFile(output, Bytes.asSlice(&img))
+    drop run HostRename.makeExecutable(output)
+  }
+}
+
+// ---- Core O(dirty) Incremental Patch Engine ----
+
+effect fn tryPatchIncremental(
+  output: &Path,
+  statePath: &Path,
+  state: &mut IncrementalState,
+  inputsHash: ContentHash,
+  fragments: &[u8],
+) -> Option<IncrementalResult> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  // 1. Validate option fingerprint and existing binary byte size.
+  if state.inputsHashHigh != inputsHash.high || state.inputsHashLow != inputsHash.low {
+    return Option<IncrementalResult>.none()
+  }
+  let fileLen = match move run Effect.result(FileSystem.stat(output)) {
+    Result<FileInfo | DirectoryInfo, FileError>.Success {value} => match move value {
+      FileInfo file => usize.toU64(file.byteLength)
+      DirectoryInfo dir => {
+        drop dir
+        return Option<IncrementalResult>.none()
+      }
+    }
+    Result<FileInfo | DirectoryInfo, FileError>.Failure {error} => {
+      drop error
+      return Option<IncrementalResult>.none()
+    }
+  }
+  if fileLen != state.binarySize {
+    return Option<IncrementalResult>.none()
+  }
+
+  // 2. O(dirty) raw chunk filter: scan `\0a64` (`0x34366100`) chunks without decoding.
+  let oldChHigh = List<u64>.asSlice(&state.chunkHashHigh)
+  let oldChLow = List<u64>.asSlice(&state.chunkHashLow)
+  let oldChLen = if oldChHigh.length < oldChLow.length { oldChHigh.length } else { oldChLow.length }
+  let mut oldChunkIdx = InternIndex.make()
+  let mut ci0 = usize.ZERO
+  while ci0 < oldChLen {
+    run InternIndex.record(&mut oldChunkIdx, chunkHashMix(oldChHigh[ci0], oldChLow[ci0]))
+    ci0 = ci0 + usize.ONE
+  }
+
+  let mut newChunkHigh = run List<u64>.makeWithCapacity(oldChLen)
+  let mut newChunkLow = run List<u64>.makeWithCapacity(oldChLen)
+  let mut dirtyBytes = Bytes.make()
+  let mut at = usize.ZERO
+  while at + 8 <= fragments.length {
+    if readU32Le(fragments, at) != 0x34366100 {
+      return Option<IncrementalResult>.none()
+    }
+    let length = u64.toUsize(readU32Le(fragments, at + 4))
+    if length < 8 || at + length > fragments.length {
+      return Option<IncrementalResult>.none()
+    }
+    let chunk = Slice.view<u8>(fragments, at, length)
+    let ch = ContentHash.of(chunk)
+    run List<u64>.append(&mut newChunkHigh, ch.high)
+    run List<u64>.append(&mut newChunkLow, ch.low)
+    let mut matchedChunk = false
+    let mut cSlot = InternIndex.first(&oldChunkIdx, chunkHashMix(ch.high, ch.low))
+    while cSlot != usize.MAX {
+      if oldChHigh[cSlot] == ch.high && oldChLow[cSlot] == ch.low {
+        matchedChunk = true
+        break
+      }
+      cSlot = InternIndex.after(&oldChunkIdx, cSlot)
+    }
+    if !matchedChunk {
+      run Bytes.append(&mut dirtyBytes, chunk)
+    }
+    at = at + length
+  }
+  if at != fragments.length {
+    return Option<IncrementalResult>.none()
+  }
+  if Bytes.length(&dirtyBytes) == usize.ZERO {
+    return Option<IncrementalResult>.some(IncrementalResult {
+      mode: LinkMode.Skipped,
+      patchedCount: usize.ZERO,
+    })
+  }
+
+  // 3. Decode ONLY the dirty `AArch64Object` chunks!
+  let decoded = run AArch64Object.decode(Bytes.asSlice(&dirtyBytes))
+  if List<Bytes>.length(&decoded.refused) > usize.ZERO {
+    return Option<IncrementalResult>.none()
+  }
+
+  // 4. Build O(1) lookup indices over `state.funcs`, `state.objs`, and `state.globals`.
+  let mut fnIdx = InternIndex.make()
+  let mut i = usize.ZERO
+  let existingFuncLen = List<IncFuncRecord>.length(&state.funcs)
+  while i < existingFuncLen {
+    let fSlice = List<IncFuncRecord>.asSlice(&state.funcs)
+    run InternIndex.record(&mut fnIdx, InternIndex.hashBytes(0, Bytes.asSlice(&fSlice[i].symbol)))
+    i = i + usize.ONE
+  }
+
+  let mut objIdx = InternIndex.make()
+  let existingObjLen = List<IncObjRecord>.length(&state.objs)
+  i = usize.ZERO
+  while i < existingObjLen {
+    let oSlice = List<IncObjRecord>.asSlice(&state.objs)
+    run InternIndex.record(&mut objIdx, InternIndex.hashBytes(0, Bytes.asSlice(&oSlice[i].symbol)))
+    i = i + usize.ONE
+  }
+
+  let mut globIdx = InternIndex.make()
+  let existingGlobLen = List<IncGlobalRecord>.length(&state.globals)
+  i = usize.ZERO
+  while i < existingGlobLen {
+    let gSlice = List<IncGlobalRecord>.asSlice(&state.globals)
+    run InternIndex.record(&mut globIdx, InternIndex.hashBytes(0, Bytes.asSlice(&gSlice[i].name)))
+    i = i + usize.ONE
+  }
+
+  // 5. Diff dirty Silk functions & pre-assign 12-byte thunk slots for any brand-new functions.
+  let inFuncs = List<Function>.asSlice(&decoded.functions)
+  let mut seenFnNames = List<Bytes>.make()
+  let mut seenFnIdx = InternIndex.make()
+  let mut changedInIdx = List<usize>.make()
+  let mut changedStateIdx = List<usize>.make()
+  let mut changedHashHigh = List<u64>.make()
+  let mut changedHashLow = List<u64>.make()
+
+  i = usize.ZERO
+  while i < inFuncs.length {
+    let f = &inFuncs[i]
+    let fName = Bytes.asSlice(&f.symbol)
+    let h = InternIndex.hashBytes(0, fName)
+    let mut dup = false
+    let mut s = InternIndex.first(&seenFnIdx, h)
+    let seenS = List<Bytes>.asSlice(&seenFnNames)
+    while s != usize.MAX {
+      if sameBytes(Bytes.asSlice(&seenS[s]), fName) {
+        dup = true
+        break
+      }
+      s = InternIndex.after(&seenFnIdx, s)
+    }
+    if !dup {
+      run List<Bytes>.append(&mut seenFnNames, run Bytes.copy(fName))
+      run InternIndex.record(&mut seenFnIdx, h)
+      let fh = MachOInput.hashFunction(f)
+      let fSlice = List<IncFuncRecord>.asSlice(&state.funcs)
+      let mut found = InternIndex.first(&fnIdx, h)
+      while found != usize.MAX && !sameBytes(Bytes.asSlice(&fSlice[found].symbol), fName) {
+        found = InternIndex.after(&fnIdx, found)
+      }
+      if found != usize.MAX {
+        if fSlice[found].digestHigh != fh.high || fSlice[found].digestLow != fh.low {
+          run List<usize>.append(&mut changedInIdx, i)
+          run List<usize>.append(&mut changedStateIdx, found)
+          run List<u64>.append(&mut changedHashHigh, fh.high)
+          run List<u64>.append(&mut changedHashLow, fh.low)
+        }
+      } else {
+        // Brand-new Silk function: pre-assign its 12-byte thunk slot and register in `state.globals`.
+        if state.thunksCount >= state.thunksCap {
+          return Option<IncrementalResult>.none()
+        }
+        let slot = u64.toUsize(state.thunksCount)
+        state.thunksCount = state.thunksCount + 1
+        let thunkVaddr = state.thunksVaddr + usize.toU64(slot) * 12
+        let newStateIdx = List<IncFuncRecord>.length(&state.funcs)
+        let expName = Bytes.asSlice(&f.exported)
+        let mut expCopy = Bytes.make()
+        if expName.length > usize.ZERO && !sameBytes(expName, fName) {
+          expCopy = run Bytes.copy(expName)
+        }
+        run List<IncFuncRecord>.append(&mut state.funcs, IncFuncRecord {
+          symbol: run Bytes.copy(fName),
+          exported: move expCopy,
+          digestHigh: fh.high,
+          digestLow: fh.low,
+          bodyVaddr: 0, bodyFileOff: 0, bodySize: 0, bodyCap: 0,
+          thunkSlot: slot,
+          rodataVaddr: 0, rodataFileOff: 0, rodataSize: 0, rodataCap: 0,
+          silkFrameFileOff: 0, silkFrameNextStride: 0,
+        })
+        run InternIndex.record(&mut fnIdx, h)
+        run List<IncGlobalRecord>.append(&mut state.globals, IncGlobalRecord {
+          name: run Bytes.copy(fName),
+          vaddr: thunkVaddr,
+          gotSlotVaddr: 0, stubVaddr: 0, tlvpSlotVaddr: 0,
+          bindOrdinal: 0xFFFFFFFF, isDynamic: false, isTls: false,
+        })
+        run InternIndex.record(&mut globIdx, h)
+        if expName.length > usize.ZERO && !sameBytes(expName, fName) {
+          run List<IncGlobalRecord>.append(&mut state.globals, IncGlobalRecord {
+            name: run Bytes.copy(expName),
+            vaddr: thunkVaddr,
+            gotSlotVaddr: 0, stubVaddr: 0, tlvpSlotVaddr: 0,
+            bindOrdinal: 0xFFFFFFFF, isDynamic: false, isTls: false,
+          })
+          run InternIndex.record(&mut globIdx, InternIndex.hashBytes(0, expName))
+        }
+        run List<usize>.append(&mut changedInIdx, i)
+        run List<usize>.append(&mut changedStateIdx, newStateIdx)
+        run List<u64>.append(&mut changedHashHigh, fh.high)
+        run List<u64>.append(&mut changedHashLow, fh.low)
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  // 6. Diff dirty Silk data objects:
+  //    - Pointer-free readonly objects use `__TEXT,__const` headroom.
+  //    - Existing 17-byte `silk_seen` records are patched in place.
+  //    - Mutable or pointer-bearing objects use bump-only `__DATA` headroom and thread new
+  //      pointer fixups into `LC_DYLD_CHAINED_FIXUPS` in O(1) via `dataPageLastOff`.
+  //    - Moved function-private `<fn>.constant.<N>` objects re-patch their owning function.
+  let mut patches = List<FilePatch>.make()
+  let mut changedObjs = usize.ZERO
+  let inObjs = List<Object>.asSlice(&decoded.objects)
+  let mut seenObjNames = List<Bytes>.make()
+  let mut seenObjIdx = InternIndex.make()
+  let mut pendingPtrObjs = List<PendingPtrObj>.make()
+  let mut movedConstPrefixes = List<Bytes>.make()
+
+  i = usize.ZERO
+  while i < inObjs.length {
+    let o = &inObjs[i]
+    let oName = Bytes.asSlice(&o.symbol)
+    let h = InternIndex.hashBytes(0, oName)
+    let mut dup = false
+    let mut s = InternIndex.first(&seenObjIdx, h)
+    let seenS = List<Bytes>.asSlice(&seenObjNames)
+    while s != usize.MAX {
+      if sameBytes(Bytes.asSlice(&seenS[s]), oName) {
+        dup = true
+        break
+      }
+      s = InternIndex.after(&seenObjIdx, s)
+    }
+    if !dup {
+      run List<Bytes>.append(&mut seenObjNames, run Bytes.copy(oName))
+      run InternIndex.record(&mut seenObjIdx, h)
+      let oh = MachOInput.hashObject(o)
+      let ptrCount = List<ObjectPointer>.length(&o.pointers)
+      let imgSlice = Bytes.asSlice(&o.image)
+      let imgSz = usize.toU64(imgSlice.length)
+      let mut found = InternIndex.first(&objIdx, h)
+      while found != usize.MAX {
+        let oSlice = List<IncObjRecord>.asSlice(&state.objs)
+        if sameBytes(Bytes.asSlice(&oSlice[found].symbol), oName) { break }
+        found = InternIndex.after(&objIdx, found)
+      }
+      if found == usize.MAX {
+        if o.local || o.framed || o.seen {
+          return Option<IncrementalResult>.none()
+        }
+        if o.readonly && ptrCount == usize.ZERO {
+          let blk = match allocFromPool(
+            &mut state.constFreeList,
+            &mut state.constCursorVaddr,
+            &mut state.constCursorFileOff,
+            state.constLimitVaddr,
+            imgSz,
+          ) {
+            Option<IncFreeBlock>.Some {value} => value
+            Option<IncFreeBlock>.None => { return Option<IncrementalResult>.none() }
+          }
+          if imgSlice.length > usize.ZERO {
+            run List<FilePatch>.append(&mut patches, FilePatch {
+              offset: blk.fileOff,
+              bytes: run Bytes.copy(imgSlice),
+            })
+          }
+          run List<IncObjRecord>.append(&mut state.objs, IncObjRecord {
+            symbol: run Bytes.copy(oName),
+            digestHigh: oh.high, digestLow: oh.low,
+            vaddr: blk.vaddr, fileOff: blk.fileOff, size: blk.cap,
+            isTls: false, isFramed: false, isSeen: false,
+          })
+          run InternIndex.record(&mut objIdx, h)
+          run List<IncGlobalRecord>.append(&mut state.globals, IncGlobalRecord {
+            name: run Bytes.copy(oName),
+            vaddr: blk.vaddr, gotSlotVaddr: 0, stubVaddr: 0, tlvpSlotVaddr: 0,
+            bindOrdinal: 0xFFFFFFFF, isDynamic: false, isTls: false,
+          })
+          run InternIndex.record(&mut globIdx, h)
+          changedObjs = changedObjs + usize.ONE
+        } else {
+          let blk = match allocFromDataBump(
+            &mut state.dataCursorVaddr,
+            &mut state.dataCursorFileOff,
+            state.dataLimitVaddr,
+            imgSz,
+            o.alignment,
+          ) {
+            Option<IncFreeBlock>.Some {value} => value
+            Option<IncFreeBlock>.None => { return Option<IncrementalResult>.none() }
+          }
+          run List<IncObjRecord>.append(&mut state.objs, IncObjRecord {
+            symbol: run Bytes.copy(oName),
+            digestHigh: oh.high, digestLow: oh.low,
+            vaddr: blk.vaddr, fileOff: blk.fileOff, size: blk.cap,
+            isTls: false, isFramed: false, isSeen: false,
+          })
+          run InternIndex.record(&mut objIdx, h)
+          run List<IncGlobalRecord>.append(&mut state.globals, IncGlobalRecord {
+            name: run Bytes.copy(oName),
+            vaddr: blk.vaddr, gotSlotVaddr: 0, stubVaddr: 0, tlvpSlotVaddr: 0,
+            bindOrdinal: 0xFFFFFFFF, isDynamic: false, isTls: false,
+          })
+          run InternIndex.record(&mut globIdx, h)
+          run List<PendingPtrObj>.append(&mut pendingPtrObjs, PendingPtrObj {
+            objInIdx: i, vaddr: blk.vaddr, fileOff: blk.fileOff,
+          })
+          changedObjs = changedObjs + usize.ONE
+        }
+      } else {
+        let oldIsTls = List<IncObjRecord>.asSlice(&state.objs)[found].isTls
+        let oldIsFramed = List<IncObjRecord>.asSlice(&state.objs)[found].isFramed
+        let oldIsSeen = List<IncObjRecord>.asSlice(&state.objs)[found].isSeen
+        let oldDh = List<IncObjRecord>.asSlice(&state.objs)[found].digestHigh
+        let oldDl = List<IncObjRecord>.asSlice(&state.objs)[found].digestLow
+        let oldSz = List<IncObjRecord>.asSlice(&state.objs)[found].size
+        let oldOff = List<IncObjRecord>.asSlice(&state.objs)[found].fileOff
+        if oldDh != oh.high || oldDl != oh.low {
+          if o.local || o.framed || oldIsTls || oldIsFramed {
+            return Option<IncrementalResult>.none()
+          }
+          if o.seen || oldIsSeen {
+            if !o.seen || !oldIsSeen || ptrCount != usize.ZERO || imgSz > oldSz {
+              return Option<IncrementalResult>.none()
+            }
+            if imgSlice.length > usize.ZERO {
+              run List<FilePatch>.append(&mut patches, FilePatch {
+                offset: oldOff,
+                bytes: run Bytes.copy(imgSlice),
+              })
+            }
+            let oMut = List<IncObjRecord>.asMutSlice(&mut state.objs)
+            oMut[found].digestHigh = oh.high
+            oMut[found].digestLow = oh.low
+            changedObjs = changedObjs + usize.ONE
+          } else if ptrCount == usize.ZERO && imgSz <= oldSz {
+            if imgSlice.length > usize.ZERO {
+              run List<FilePatch>.append(&mut patches, FilePatch {
+                offset: oldOff,
+                bytes: run Bytes.copy(imgSlice),
+              })
+            }
+            let oMut = List<IncObjRecord>.asMutSlice(&mut state.objs)
+            oMut[found].digestHigh = oh.high
+            oMut[found].digestLow = oh.low
+            changedObjs = changedObjs + usize.ONE
+          } else {
+            let prefLen = match findPrivateConstantPrefix(oName) {
+              Option<usize>.Some {value} => value
+              Option<usize>.None => { return Option<IncrementalResult>.none() }
+            }
+            let prefix = Slice.view<u8>(oName, usize.ZERO, prefLen)
+            let mut ownerPresent = false
+            let mut fi = usize.ZERO
+            while fi < inFuncs.length {
+              if startsWithBytes(Bytes.asSlice(&inFuncs[fi].symbol), prefix) {
+                ownerPresent = true
+                break
+              }
+              fi = fi + usize.ONE
+            }
+            if !ownerPresent {
+              return Option<IncrementalResult>.none()
+            }
+            let blk = if o.readonly && ptrCount == usize.ZERO {
+              match allocFromPool(
+                &mut state.constFreeList,
+                &mut state.constCursorVaddr,
+                &mut state.constCursorFileOff,
+                state.constLimitVaddr,
+                imgSz,
+              ) {
+                Option<IncFreeBlock>.Some {value} => value
+                Option<IncFreeBlock>.None => { return Option<IncrementalResult>.none() }
+              }
+            } else {
+              match allocFromDataBump(
+                &mut state.dataCursorVaddr,
+                &mut state.dataCursorFileOff,
+                state.dataLimitVaddr,
+                imgSz,
+                o.alignment,
+              ) {
+                Option<IncFreeBlock>.Some {value} => value
+                Option<IncFreeBlock>.None => { return Option<IncrementalResult>.none() }
+              }
+            }
+            if o.readonly && ptrCount == usize.ZERO {
+              if imgSlice.length > usize.ZERO {
+                run List<FilePatch>.append(&mut patches, FilePatch {
+                  offset: blk.fileOff,
+                  bytes: run Bytes.copy(imgSlice),
+                })
+              }
+            } else {
+              run List<PendingPtrObj>.append(&mut pendingPtrObjs, PendingPtrObj {
+                objInIdx: i, vaddr: blk.vaddr, fileOff: blk.fileOff,
+              })
+            }
+            let oMut = List<IncObjRecord>.asMutSlice(&mut state.objs)
+            oMut[found].digestHigh = oh.high
+            oMut[found].digestLow = oh.low
+            oMut[found].vaddr = blk.vaddr
+            oMut[found].fileOff = blk.fileOff
+            oMut[found].size = blk.cap
+            let gMut = List<IncGlobalRecord>.asMutSlice(&mut state.globals)
+            let mut gi = InternIndex.first(&globIdx, h)
+            while gi != usize.MAX && !sameBytes(Bytes.asSlice(&gMut[gi].name), oName) {
+              gi = InternIndex.after(&globIdx, gi)
+            }
+            if gi == usize.MAX {
+              return Option<IncrementalResult>.none()
+            }
+            gMut[gi].vaddr = blk.vaddr
+            run List<Bytes>.append(&mut movedConstPrefixes, run Bytes.copy(prefix))
+            changedObjs = changedObjs + usize.ONE
+          }
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  // Ensure any dirty function owning a moved `.constant.<N>` object is re-patched so its
+  // ADRP/PAGEOFF12 targets the new constant address even if its code bytes didn't change.
+  let movedPfx = List<Bytes>.asSlice(&movedConstPrefixes)
+  if movedPfx.length > usize.ZERO {
+    let mut fi = usize.ZERO
+    while fi < inFuncs.length {
+      let fSym = Bytes.asSlice(&inFuncs[fi].symbol)
+      let mut needsRepatch = false
+      let mut mi = usize.ZERO
+      while mi < movedPfx.length {
+        if startsWithBytes(fSym, Bytes.asSlice(&movedPfx[mi])) {
+          needsRepatch = true
+          break
+        }
+        mi = mi + usize.ONE
+      }
+      if needsRepatch {
+        let mut already = false
+        let chExisting = List<usize>.asSlice(&changedInIdx)
+        let mut ciCheck = usize.ZERO
+        while ciCheck < chExisting.length {
+          if chExisting[ciCheck] == fi {
+            already = true
+            break
+          }
+          ciCheck = ciCheck + usize.ONE
+        }
+        if !already {
+          let fh = MachOInput.hashFunction(&inFuncs[fi])
+          let fSlice = List<IncFuncRecord>.asSlice(&state.funcs)
+          let mut found = InternIndex.first(&fnIdx, InternIndex.hashBytes(0, fSym))
+          while found != usize.MAX && !sameBytes(Bytes.asSlice(&fSlice[found].symbol), fSym) {
+            found = InternIndex.after(&fnIdx, found)
+          }
+          if found != usize.MAX {
+            run List<usize>.append(&mut changedInIdx, fi)
+            run List<usize>.append(&mut changedStateIdx, found)
+            run List<u64>.append(&mut changedHashHigh, fh.high)
+            run List<u64>.append(&mut changedHashLow, fh.low)
+          }
+        }
+      }
+      fi = fi + usize.ONE
+    }
+  }
+
+  // Resolve newly allocated / moved `__DATA` objects and thread their pointer fixups into
+  // `LC_DYLD_CHAINED_FIXUPS` in strictly ascending segment offset order!
+  let pendSlice = List<PendingPtrObj>.asSlice(&pendingPtrObjs)
+  let globsForObjs = List<IncGlobalRecord>.asSlice(&state.globals)
+  let mut newFixups = List<PtrFixupWork>.make()
+  let mut pi = usize.ZERO
+  while pi < pendSlice.length {
+    let p = pendSlice[pi]
+    let o = &inObjs[p.objInIdx]
+    let mut patchedImg = run Bytes.copy(Bytes.asSlice(&o.image))
+    let ptrs = List<ObjectPointer>.asSlice(&o.pointers)
+    let mut ri = usize.ZERO
+    while ri < ptrs.length {
+      let ptr = &ptrs[ri]
+      if ptr.size != 8 || ptr.offset + 8 > Bytes.length(&patchedImg) || (ptr.offset % 4) != usize.ZERO {
+        return Option<IncrementalResult>.none()
+      }
+      let tName = Bytes.asSlice(&ptr.symbol)
+      let th = InternIndex.hashBytes(0, tName)
+      let mut gIdx = InternIndex.first(&globIdx, th)
+      while gIdx != usize.MAX && !sameBytes(Bytes.asSlice(&globsForObjs[gIdx].name), tName) {
+        gIdx = InternIndex.after(&globIdx, gIdx)
+      }
+      if gIdx == usize.MAX {
+        return Option<IncrementalResult>.none()
+      }
+      let g = &globsForObjs[gIdx]
+      if g.isTls {
+        return Option<IncrementalResult>.none()
+      }
+      let fOff = p.fileOff + usize.toU64(ptr.offset)
+      let segOff = fOff - state.dataSegFileOff
+      if g.isDynamic {
+        if g.bindOrdinal == 0xFFFFFFFF || ptr.addend > 255 {
+          return Option<IncrementalResult>.none()
+        }
+        run List<PtrFixupWork>.append(&mut newFixups, PtrFixupWork {
+          segOff: segOff, fileOff: fOff, isBind: true, bindOrdinal: g.bindOrdinal,
+          addend: u64.wrappingToI64(ptr.addend), targetVmAddr: 0,
+        })
+      } else {
+        if g.vaddr == 0 {
+          return Option<IncrementalResult>.none()
+        }
+        run List<PtrFixupWork>.append(&mut newFixups, PtrFixupWork {
+          segOff: segOff, fileOff: fOff, isBind: false, bindOrdinal: 0,
+          addend: 0, targetVmAddr: u64.wrappingAdd(g.vaddr, ptr.addend),
+        })
+      }
+      ri = ri + usize.ONE
+    }
+    if Bytes.length(&patchedImg) > usize.ZERO {
+      run List<FilePatch>.append(&mut patches, FilePatch {
+        offset: p.fileOff,
+        bytes: move patchedImg,
+      })
+    }
+    pi = pi + usize.ONE
+  }
+
+  // Thread every new `__DATA` pointer fixup into its 16 KB page's chained-fixup list.
+  if List<PtrFixupWork>.length(&newFixups) > usize.ZERO {
+    if state.chainedDataPageStartsFileOff == 0 {
+      return Option<IncrementalResult>.none()
+    }
+    sortPtrFixupWork(List<PtrFixupWork>.asMutSlice(&mut newFixups))
+    let fWork = List<PtrFixupWork>.asSlice(&newFixups)
+    let dpOffMut = List<u64>.asMutSlice(&mut state.dataPageLastOff)
+    let dpWordMut = List<u64>.asMutSlice(&mut state.dataPageLastWord)
+    let mut wi = usize.ZERO
+    while wi < fWork.length {
+      let cur = fWork[wi]
+      let pageIdx = u64.toUsize(cur.segOff / pageSize())
+      if pageIdx >= dpOffMut.length || pageIdx >= dpWordMut.length {
+        return Option<IncrementalResult>.none()
+      }
+      let pageOff = cur.segOff % pageSize()
+      let newWord = if cur.isBind {
+        MachOLink.encodeChainedBind(cur.bindOrdinal, cur.addend, 0)
+      } else {
+        MachOLink.encodeChainedRebase(cur.targetVmAddr, 0)
+      }
+      let prevOff = dpOffMut[pageIdx]
+      if prevOff == 0xFFFFFFFF {
+        // First fixup on this 16 KB `__DATA` page -> patch `page_start[pageIdx]`.
+        let mut psPatch = Bytes.make()
+        run AArch64Encode.u16Le(&mut psPatch, pageOff)
+        run List<FilePatch>.append(&mut patches, FilePatch {
+          offset: state.chainedDataPageStartsFileOff + usize.toU64(pageIdx) * 2,
+          bytes: move psPatch,
+        })
+      } else {
+        // Tail-append onto existing chain on this page (guaranteed `cur.segOff > prevOff`).
+        if cur.segOff <= prevOff || ((cur.segOff - prevOff) % 4) != 0 {
+          return Option<IncrementalResult>.none()
+        }
+        let nextStride = (cur.segOff - prevOff) / 4
+        if nextStride >= 4096 {
+          return Option<IncrementalResult>.none()
+        }
+        let prevUpdated = dpWordMut[pageIdx] | u64.shiftLeft(nextStride, 51)
+        let mut prevPatch = Bytes.make()
+        run AArch64Encode.u64Le(&mut prevPatch, prevUpdated)
+        run List<FilePatch>.append(&mut patches, FilePatch {
+          offset: state.dataSegFileOff + prevOff,
+          bytes: move prevPatch,
+        })
+      }
+      let mut curPatch = Bytes.make()
+      run AArch64Encode.u64Le(&mut curPatch, newWord)
+      run List<FilePatch>.append(&mut patches, FilePatch {
+        offset: cur.fileOff,
+        bytes: move curPatch,
+      })
+      dpOffMut[pageIdx] = cur.segOff
+      dpWordMut[pageIdx] = newWord
+      wi = wi + usize.ONE
+    }
+  }
+
+  let chCount = List<usize>.length(&changedInIdx)
+  if chCount == usize.ZERO && changedObjs == usize.ZERO {
+    // Only removed dead functions or chunk-boundary repackings -> update chunk hashes & skip binary rewrite!
+    state.chunkHashHigh = move newChunkHigh
+    state.chunkHashLow = move newChunkLow
+    let encodedState = run encodeState(&state.*)
+    run FileSystem.writeFile(statePath, Bytes.asSlice(&encodedState))
+    return Option<IncrementalResult>.some(IncrementalResult {
+      mode: LinkMode.Skipped,
+      patchedCount: usize.ZERO,
+    })
+  }
+
+  // 7. Allocate blocks, relocate AArch64 machine code + local `.rodata`, and emit thunk/frame patches.
+  let chInSlice = List<usize>.asSlice(&changedInIdx)
+  let chStSlice = List<usize>.asSlice(&changedStateIdx)
+  let chHighSlice = List<u64>.asSlice(&changedHashHigh)
+  let chLowSlice = List<u64>.asSlice(&changedHashLow)
+  let mut ci = usize.ZERO
+  while ci < chCount {
+    let globsNow = List<IncGlobalRecord>.asSlice(&state.globals)
+    let f = &inFuncs[chInSlice[ci]]
+    let stIdx = chStSlice[ci]
+    let fSyms = List<Bytes>.asSlice(&f.symbols)
+    let rels = List<AArch64Object.Relocation>.asSlice(&f.relocations)
+
+    // Pre-check that every referenced symbol and required GOT/stub/TLVP slot exists.
+    let mut ri = usize.ZERO
+    while ri < rels.length {
+      let r = rels[ri]
+      match r.kind {
+        RelocationKind.LocalRodataPage21 => {}
+        RelocationKind.LocalRodataPageOff12 => {}
+        RelocationKind.Abs64 => { return Option<IncrementalResult>.none() }
+        _ => {
+          if r.target >= fSyms.length { return Option<IncrementalResult>.none() }
+          let tName = Bytes.asSlice(&fSyms[r.target])
+          let th = InternIndex.hashBytes(0, tName)
+          let mut gIdx = InternIndex.first(&globIdx, th)
+          while gIdx != usize.MAX && !sameBytes(Bytes.asSlice(&globsNow[gIdx].name), tName) {
+            gIdx = InternIndex.after(&globIdx, gIdx)
+          }
+          if gIdx == usize.MAX { return Option<IncrementalResult>.none() }
+          let g = &globsNow[gIdx]
+          match r.kind {
+            RelocationKind.GotLoadPage21 => {
+              if g.gotSlotVaddr == 0 && (g.isDynamic || g.vaddr == 0) { return Option<IncrementalResult>.none() }
+            }
+            RelocationKind.GotLoadPageOff12 => {
+              if g.gotSlotVaddr == 0 && (g.isDynamic || g.vaddr == 0) { return Option<IncrementalResult>.none() }
+            }
+            RelocationKind.TlvpLoadPage21 => { if g.tlvpSlotVaddr == 0 { return Option<IncrementalResult>.none() } }
+            RelocationKind.TlvpLoadPageOff12 => { if g.tlvpSlotVaddr == 0 { return Option<IncrementalResult>.none() } }
+            RelocationKind.Branch26 => {
+              if g.isDynamic {
+                if g.stubVaddr == 0 { return Option<IncrementalResult>.none() }
+              } else if g.vaddr == 0 {
+                return Option<IncrementalResult>.none()
+              }
+            }
+            _ => {
+              if g.isDynamic || g.vaddr == 0 { return Option<IncrementalResult>.none() }
+            }
+          }
+        }
+      }
+      ri = ri + usize.ONE
+    }
+
+    let oldBodyVaddr = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].bodyVaddr
+    let oldBodyFileOff = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].bodyFileOff
+    let oldBodySize = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].bodySize
+    let oldBodyCap = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].bodyCap
+    let thunkSlot = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].thunkSlot
+    let oldRoVaddr = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].rodataVaddr
+    let oldRoFileOff = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].rodataFileOff
+    let oldRoCap = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].rodataCap
+    let silkFrameFileOff = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].silkFrameFileOff
+    let silkFrameNextStride = List<IncFuncRecord>.asSlice(&state.funcs)[stIdx].silkFrameNextStride
+
+    let codeSlice = Bytes.asSlice(&f.code)
+    let newCodeSize = usize.toU64(codeSlice.length)
+    let mut newBodyVaddr = oldBodyVaddr
+    let mut newBodyFileOff = oldBodyFileOff
+    let mut newBodyCap = oldBodyCap
+
+    if oldBodyVaddr == 0 || newCodeSize > oldBodyCap {
+      if oldBodyVaddr != 0 && oldBodyCap >= 16 {
+        run List<IncFreeBlock>.append(&mut state.textFreeList, IncFreeBlock {
+          vaddr: oldBodyVaddr, fileOff: oldBodyFileOff, cap: oldBodyCap,
+        })
+      }
+      let blk = match allocFromPool(
+        &mut state.textFreeList,
+        &mut state.textCursorVaddr,
+        &mut state.textCursorFileOff,
+        state.textLimitVaddr,
+        newCodeSize,
+      ) {
+        Option<IncFreeBlock>.Some {value} => value
+        Option<IncFreeBlock>.None => { return Option<IncrementalResult>.none() }
+      }
+      newBodyVaddr = blk.vaddr
+      newBodyFileOff = blk.fileOff
+      newBodyCap = blk.cap
+    }
+
+    let roSlice = Bytes.asSlice(&f.rodata)
+    let newRoSize = usize.toU64(roSlice.length)
+    let mut newRoVaddr = oldRoVaddr
+    let mut newRoFileOff = oldRoFileOff
+    let mut newRoCap = oldRoCap
+    if newRoSize > 0 {
+      if oldRoVaddr == 0 || newRoSize > oldRoCap {
+        if oldRoVaddr != 0 && oldRoCap >= 16 {
+          run List<IncFreeBlock>.append(&mut state.constFreeList, IncFreeBlock {
+            vaddr: oldRoVaddr, fileOff: oldRoFileOff, cap: oldRoCap,
+          })
+        }
+        let blk = match allocFromPool(
+          &mut state.constFreeList,
+          &mut state.constCursorVaddr,
+          &mut state.constCursorFileOff,
+          state.constLimitVaddr,
+          newRoSize,
+        ) {
+          Option<IncFreeBlock>.Some {value} => value
+          Option<IncFreeBlock>.None => { return Option<IncrementalResult>.none() }
+        }
+        newRoVaddr = blk.vaddr
+        newRoFileOff = blk.fileOff
+        newRoCap = blk.cap
+      }
+    }
+
+    // Relocate ARM64 instructions.
+    let mut patchedCode = run Bytes.copy(codeSlice)
+    ri = usize.ZERO
+    while ri < rels.length {
+      let r = rels[ri]
+      let instrVa = newBodyVaddr + usize.toU64(r.offset)
+      match r.kind {
+        RelocationKind.LocalRodataPage21 => {
+          let targetVa = u64.wrappingAdd(newRoVaddr, i64.wrappingToU64(r.addend))
+          AArch64Encode.patchAdrp21(&mut patchedCode, r.offset, instrVa, targetVa)
+        }
+        RelocationKind.LocalRodataPageOff12 => {
+          let targetVa = u64.wrappingAdd(newRoVaddr, i64.wrappingToU64(r.addend))
+          MachOLink.patchPageOff12Auto(&mut patchedCode, r.offset, targetVa)
+        }
+        _ => {
+          let tName = Bytes.asSlice(&fSyms[r.target])
+          let th = InternIndex.hashBytes(0, tName)
+          let mut gIdx = InternIndex.first(&globIdx, th)
+          while gIdx != usize.MAX && !sameBytes(Bytes.asSlice(&globsNow[gIdx].name), tName) {
+            gIdx = InternIndex.after(&globIdx, gIdx)
+          }
+          let g = &globsNow[gIdx]
+          match r.kind {
+            RelocationKind.Branch26 => {
+              let targetVa = if g.isDynamic { g.stubVaddr } else { u64.wrappingAdd(g.vaddr, i64.wrappingToU64(r.addend)) }
+              MachOLink.patchBranch26Va(&mut patchedCode, r.offset, instrVa, targetVa)
+            }
+            RelocationKind.Page21 => {
+              let targetVa = u64.wrappingAdd(g.vaddr, i64.wrappingToU64(r.addend))
+              AArch64Encode.patchAdrp21(&mut patchedCode, r.offset, instrVa, targetVa)
+            }
+            RelocationKind.PageOff12 => {
+              let targetVa = u64.wrappingAdd(g.vaddr, i64.wrappingToU64(r.addend))
+              MachOLink.patchPageOff12Auto(&mut patchedCode, r.offset, targetVa)
+            }
+            RelocationKind.GotLoadPage21 => {
+              if g.gotSlotVaddr != 0 {
+                AArch64Encode.patchAdrp21(&mut patchedCode, r.offset, instrVa, g.gotSlotVaddr)
+              } else {
+                AArch64Encode.patchAdrp21(&mut patchedCode, r.offset, instrVa, g.vaddr)
+              }
+            }
+            RelocationKind.GotLoadPageOff12 => {
+              if g.gotSlotVaddr != 0 {
+                MachOLink.patchPageOff12Auto(&mut patchedCode, r.offset, g.gotSlotVaddr)
+              } else {
+                MachOLink.relaxGotLdrToAdd12(&mut patchedCode, r.offset, g.vaddr)
+              }
+            }
+            RelocationKind.TlvpLoadPage21 => {
+              AArch64Encode.patchAdrp21(&mut patchedCode, r.offset, instrVa, g.tlvpSlotVaddr)
+            }
+            RelocationKind.TlvpLoadPageOff12 => {
+              MachOLink.patchPageOff12Auto(&mut patchedCode, r.offset, g.tlvpSlotVaddr)
+            }
+            _ => {}
+          }
+        }
+      }
+      ri = ri + usize.ONE
+    }
+
+    // Overwrite stale trailing code words with `brk #0` when shrinking in place.
+    if newBodyVaddr == oldBodyVaddr && newCodeSize < oldBodySize {
+      let padEnd = u64.toUsize(if oldBodySize < newBodyCap { oldBodySize } else { newBodyCap })
+      while Bytes.length(&patchedCode) + 4 <= padEnd {
+        run AArch64Encode.brk(&mut patchedCode, 0)
+      }
+    }
+    run List<FilePatch>.append(&mut patches, FilePatch {offset: newBodyFileOff, bytes: move patchedCode})
+
+    // Patch local `.rodata` + PIC switch jump-table entries if present.
+    if newRoSize > 0 {
+      let mut patchedRo = run Bytes.copy(roSlice)
+      let jumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+      let mut ji = usize.ZERO
+      while ji < jumps.length {
+        let je = jumps[ji]
+        let targetVaddr = newBodyVaddr + usize.toU64(je.targetCodeOffset)
+        let tableVaddr = newRoVaddr + usize.toU64(je.tableOffset)
+        let delta = u64.wrappingToI64(targetVaddr) - u64.wrappingToI64(tableVaddr)
+        putU32Le(&mut patchedRo, je.rodataOffset, i64.wrappingToU64(delta))
+        ji = ji + usize.ONE
+      }
+      run List<FilePatch>.append(&mut patches, FilePatch {offset: newRoFileOff, bytes: move patchedRo})
+    }
+
+    // Update fixed 12-byte ARM64 thunk slot + `silk_frames` chained rebase whenever body moved or is new.
+    if newBodyVaddr != oldBodyVaddr {
+      let thunkVaddr = state.thunksVaddr + usize.toU64(thunkSlot) * 12
+      let thunkFileOff = state.thunksFileOff + usize.toU64(thunkSlot) * 12
+      let mut thunkPatch = Bytes.make()
+      run MachOLink.emitThunk12(&mut thunkPatch, thunkVaddr, newBodyVaddr)
+      run List<FilePatch>.append(&mut patches, FilePatch {offset: thunkFileOff, bytes: move thunkPatch})
+
+      if silkFrameFileOff != 0 {
+        let newFrameWord = MachOLink.encodeChainedRebase(newBodyVaddr, silkFrameNextStride)
+        let mut framePatch = Bytes.make()
+        run AArch64Encode.u64Le(&mut framePatch, newFrameWord)
+        run List<FilePatch>.append(&mut patches, FilePatch {offset: silkFrameFileOff, bytes: move framePatch})
+        // Keep `dataPageLastWord` consistent if this frame slot was the tail fixup of its 16 KB page.
+        let fSegOff = silkFrameFileOff - state.dataSegFileOff
+        let fPage = u64.toUsize(fSegOff / pageSize())
+        if fPage < List<u64>.length(&state.dataPageLastOff) {
+          let dpOffS = List<u64>.asSlice(&state.dataPageLastOff)
+          if dpOffS[fPage] == fSegOff {
+            let dpWordMut = List<u64>.asMutSlice(&mut state.dataPageLastWord)
+            dpWordMut[fPage] = newFrameWord
+          }
+        }
+      }
+    }
+
+    // Update in-memory `IncFuncRecord`.
+    let funcsMut = List<IncFuncRecord>.asMutSlice(&mut state.funcs)
+    funcsMut[stIdx].digestHigh = chHighSlice[ci]
+    funcsMut[stIdx].digestLow = chLowSlice[ci]
+    funcsMut[stIdx].bodyVaddr = newBodyVaddr
+    funcsMut[stIdx].bodyFileOff = newBodyFileOff
+    funcsMut[stIdx].bodySize = newCodeSize
+    funcsMut[stIdx].bodyCap = newBodyCap
+    funcsMut[stIdx].rodataVaddr = newRoVaddr
+    funcsMut[stIdx].rodataFileOff = newRoFileOff
+    funcsMut[stIdx].rodataSize = newRoSize
+    funcsMut[stIdx].rodataCap = newRoCap
+
+    ci = ci + usize.ONE
+  }
+
+  // 8. Apply patches via APFS CoW `clonefile` -> `pwrite` dirty bytes -> recompute ONLY dirty 4 KB
+  //    SHA-256 hashes inside `LC_CODE_SIGNATURE` -> `chmod 0755` -> atomic `rename` (fresh vnode!).
+  //    Falls back cleanly to portable copy-patch-resign on non-APFS / non-macOS hosts.
+  let patchSlice = List<FilePatch>.asSlice(&patches)
+  if !run HostRename.cloneAndPatchSigned(output, patchSlice, state.csDataOff, state.csHashTableFileOff) {
+    run applyPatchesFallbackAtomicSigned(output, patchSlice, state.csDataOff, state.csHashTableFileOff)
+  }
+
+  // 9. Persist updated `<output>.machostate` v2 sidecar.
+  state.chunkHashHigh = move newChunkHigh
+  state.chunkHashLow = move newChunkLow
+  let encodedState = run encodeState(&state.*)
+  run FileSystem.writeFile(statePath, Bytes.asSlice(&encodedState))
+
+  return Option<IncrementalResult>.some(IncrementalResult {
+    mode: LinkMode.Patched,
+    patchedCount: chCount,
+  })
+}
+
+/// Top-level incremental macOS ARM64 direct-link entry point: attempts `O(dirty)` APFS CoW
+/// patching + partial 4 KB SHA-256 re-signing against an existing incremental-ready `MH_EXECUTE`
+/// binary and its `<output>.machostate` v2 sidecar, transparently falling back to a full
+/// [`MachOLink.linkWithOptions`] build whenever layout changes require it.
+pub effect fn linkOrPatch(
+  output: &Path,
+  fragments: &[u8],
+  options: &LinkOptions,
+  debugMap: &DebugLineMap,
+) -> IncrementalResult ! LinkError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let hasDebug = !debugMap.isEmpty()
+  let inputsHash = fingerprintOptions(options, hasDebug)
+  let statePath = run statePathFor(output)
+
+  if options.incremental {
+    let rawState = match move run Effect.result(FileSystem.readFile(&statePath)) {
+      Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+      Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError ignored => {
+          drop ignored
+          Option<Bytes>.none()
+        }
+        OutOfMemoryError oom => { fail move oom }
+      }
+    }
+    if let Option<Bytes>.Some {value: stateBytes} = move rawState {
+      if let Option<IncrementalState>.Some {value: decodedSt} = move run decodeState(Bytes.asSlice(&stateBytes)) {
+        let mut st = move decodedSt
+        if let Option<IncrementalResult>.Some {value: patched} = run tryPatchIncremental(
+          output,
+          &statePath,
+          &mut st,
+          inputsHash,
+          fragments,
+        ) {
+          return patched
+        }
+      }
+    }
+  }
+
+  // Full link fallback (with incremental 2x headroom + thunks + pre-allocated chained-fixup pages
+  // when `options.incremental == true`).
+  let linked = run MachOLink.linkWithOptions(fragments, options, debugMap)
+  if let Option<Path>.Some {value: parent} = move run Path.parent(output) {
+    run FileSystem.createDirectoriesRecursively(&parent)
+  }
+  let mut pendingBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut pendingBytes, b".macho-partial")
+  let pendingPath = run Path.fromBytes(Bytes.asSlice(&pendingBytes))
+  run FileSystem.writeFile(&pendingPath, Bytes.asSlice(&linked.binary))
+  drop run HostRename.makeExecutable(&pendingPath)
+  if !run HostRename.replaceFile(&pendingPath, output) {
+    run FileSystem.writeFile(output, Bytes.asSlice(&linked.binary))
+    drop run HostRename.makeExecutable(output)
+  }
+
+  if let Option<IncrementalState>.Some {value: freshSt} = move linked.state {
+    let mut st = move freshSt
+    st.inputsHashHigh = inputsHash.high
+    st.inputsHashLow = inputsHash.low
+    if List<u64>.length(&st.chunkHashHigh) == usize.ZERO {
+      drop run collectChunkHashes(fragments, &mut st.chunkHashHigh, &mut st.chunkHashLow)
+    }
+    let encoded = run encodeState(&st)
+    run FileSystem.writeFile(&statePath, Bytes.asSlice(&encoded))
+  }
+
+  return IncrementalResult {mode: LinkMode.Full, patchedCount: usize.ZERO}
+}

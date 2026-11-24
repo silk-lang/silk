@@ -8,6 +8,25 @@ import silk.num.isize
 import silk.num.u64
 import silk.num.usize
 import silk.collections.slice { Slice }
+static if Intrinsic.targetOperatingSystem() == "macos" {
+  import silk.collections.list { List }
+  import silk.crypto.sha2 { Sha256 }
+  @foreign(noCapture: ("src", "dst"))
+  unsafe extern "C" fn clonefile(
+    src: ?[*]const u8,
+    dst: ?[*]const u8,
+    flags: u32
+  ) -> i32
+  @foreign(noCapture: ("path"))
+  unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+  @foreign(noCapture: ("buf"))
+  unsafe extern "C" fn pread(
+    fd: i32,
+    buf: ?[*]mut u8,
+    count: usize,
+    offset: i64
+  ) -> isize
+}
 static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.platform.windows.host_path as WindowsHostPath
   import silk.core.option { Option }
@@ -130,6 +149,141 @@ pub effect fn pwritePatches(path: &Path, patches: &[FilePatch]) -> PatchOutcome
       return PatchOutcome.Busy
     }
     return PatchOutcome.Applied
+  }
+}
+
+/// On macOS, creates an APFS copy-on-write clone (`clonefile`) of `output`, applies every patch
+/// span in `patches` via POSIX `pwrite`, recomputes ONLY the dirty 4 KB SHA-256 page hashes inside
+/// `LC_CODE_SIGNATURE` (at `csHashTableFileOff`), marks the clone executable (`0755`), and
+/// atomically renames it over `output`. Using a fresh vnode guarantees XNU's per-vnode code-sign
+/// cache never rejects the patched binary with `SIGKILL`. Returns `false` on non-macOS hosts or if
+/// `clonefile` is unsupported on the target filesystem so the caller can fall back cleanly.
+pub effect fn cloneAndPatchSigned(
+  output: &Path,
+  patches: &[FilePatch],
+  csDataOff: u64,
+  csHashTableFileOff: u64,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "macos" {
+    let src = run host(output)
+    let mut dstText = run Bytes.copy(Path.rawBytes(output))
+    run Bytes.append(&mut dstText, b".macho-partial")
+    let nul: [u8; 1] = [0]
+    run Bytes.append(&mut dstText, &nul)
+
+    let srcPtr = Pointer.fromSlice<u8>(Bytes.asSlice(&src))
+    let dstPtr = Pointer.fromSlice<u8>(Bytes.asSlice(&dstText))
+    drop unsafe unlink(dstPtr)
+    if unsafe clonefile(srcPtr, dstPtr, 0) != 0 {
+      return false
+    }
+
+    // `O_RDWR == 2` on macOS.
+    let fd = unsafe open(dstPtr, 2)
+    if fd < 0 {
+      drop unsafe unlink(dstPtr)
+      return false
+    }
+
+    let mut dirtyPages = List<u64>.make()
+    let mut pi = usize.ZERO
+    while pi < patches.length {
+      let off0 = patches[pi].offset
+      let data = Bytes.asSlice(&patches[pi].bytes)
+      let mut written = usize.ZERO
+      while written < data.length {
+        let rem = Slice.view<u8>(data, written, data.length - written)
+        let off = u64.toI64(off0 + usize.toU64(written))
+        let n = unsafe pwrite(fd, Pointer.fromSlice<u8>(rem), rem.length, off)
+        if n <= 0 {
+          drop unsafe close(fd)
+          drop unsafe unlink(dstPtr)
+          return false
+        }
+        written = written + isize.toUsize(n)
+      }
+      if data.length > usize.ZERO && off0 < csDataOff {
+        let endExcl = off0 + usize.toU64(data.length)
+        let clampedEnd = if endExcl > csDataOff { csDataOff } else { endExcl }
+        let mut pg = off0 / 4096
+        let lastPg = (clampedEnd - 1) / 4096
+        while pg <= lastPg {
+          let existing = List<u64>.asSlice(&dirtyPages)
+          let mut seen = false
+          let mut di = usize.ZERO
+          while di < existing.length {
+            if existing[di] == pg {
+              seen = true
+              break
+            }
+            di = di + usize.ONE
+          }
+          if !seen {
+            run List<u64>.append(&mut dirtyPages, pg)
+          }
+          pg = pg + 1
+        }
+      }
+      pi = pi + usize.ONE
+    }
+
+    // Recompute ONLY the dirty 4 KB SHA-256 slots inside `LC_CODE_SIGNATURE`.
+    let dirtySlice = List<u64>.asSlice(&dirtyPages)
+    let mut pageBuf = run Bytes.zeroed(4096)
+    let mut dpi = usize.ZERO
+    while dpi < dirtySlice.length {
+      let pg = dirtySlice[dpi]
+      let pgOff = pg * 4096
+      let rem = csDataOff - pgOff
+      let pgLen = if rem < 4096 { u64.toUsize(rem) } else { 4096 }
+      let mut got = usize.ZERO
+      while got < pgLen {
+        let dstSlice = Slice.viewMut<u8>(Bytes.asMutSlice(&mut pageBuf), got, pgLen - got)
+        let n = unsafe pread(fd, Pointer.fromMutSlice<u8>(dstSlice), dstSlice.length, u64.toI64(pgOff + usize.toU64(got)))
+        if n <= 0 {
+          drop unsafe close(fd)
+          drop unsafe unlink(dstPtr)
+          return false
+        }
+        got = got + isize.toUsize(n)
+      }
+      let digest = Sha256.hash(Slice.view<u8>(Bytes.asSlice(&pageBuf), usize.ZERO, pgLen))
+      let mut dWritten = usize.ZERO
+      while dWritten < 32 {
+        let dRem = Slice.view<u8>(&digest, dWritten, 32 - dWritten)
+        let hOff = u64.toI64(csHashTableFileOff + pg * 32 + usize.toU64(dWritten))
+        let wn = unsafe pwrite(fd, Pointer.fromSlice<u8>(dRem), dRem.length, hOff)
+        if wn <= 0 {
+          drop unsafe close(fd)
+          drop unsafe unlink(dstPtr)
+          return false
+        }
+        dWritten = dWritten + isize.toUsize(wn)
+      }
+      dpi = dpi + usize.ONE
+    }
+
+    if unsafe close(fd) != 0 {
+      drop unsafe unlink(dstPtr)
+      return false
+    }
+    if unsafe chmod(dstPtr, 493) != 0 {
+      drop unsafe unlink(dstPtr)
+      return false
+    }
+    if unsafe rename(dstPtr, srcPtr) != 0 {
+      drop unsafe unlink(dstPtr)
+      return false
+    }
+    return true
+  } else {
+    drop output
+    drop patches
+    drop csDataOff
+    drop csHashTableFileOff
+    return false
   }
 }
 

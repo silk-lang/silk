@@ -137,6 +137,8 @@ import driver.LinuxLink
 import driver.CodegenCache
 import driver.DetachedWriter
 import backend.Bitcode
+import backend.AArch64MachOObject
+import backend.AArch64Object { Unsupported as AArch64Unsupported }
 import backend.BitcodeText
 import backend.LlvmCode
 import backend.WasmText
@@ -149,6 +151,11 @@ import driver.ElfIncremental
 import driver.ElfIncremental { IncrementalResult as ElfIncrementalResult, LinkMode as ElfLinkMode }
 import driver.ElfInput { LinkError as ElfLinkError }
 import driver.ElfLink { LinkOptions as ElfLinkOptions }
+import driver.MachODebug { DebugLineMap as MachODebugLineMap }
+import driver.MachOIncremental
+import driver.MachOIncremental { IncrementalResult as MachOIncrementalResult, LinkMode as MachOLinkMode }
+import driver.MachOInput { LinkError as MachOLinkError }
+import driver.MachOLink { LinkOptions as MachOLinkOptions }
 import driver.WasmLink as WasmLink { Linked }
 import backend.Bitcode {
   DebugFunction,
@@ -3170,7 +3177,11 @@ effect fn compileIrIn(
     }
   }
   if hasPrecompiled {
-    run Bytes.append(&mut command, b" direct-x86")
+    if Target.id(target) == TargetId.Aarch64AppleDarwin {
+      run Bytes.append(&mut command, b" direct-aarch64")
+    } else {
+      run Bytes.append(&mut command, b" direct-x86")
+    }
   }
   if units.length == usize.ZERO {
     run appendDigest(&mut command, irDigest)
@@ -5180,6 +5191,64 @@ effect fn buildElfDebugLines(
   return move map
 }
 
+// Builds the DWARF file and declaration-origin map for a macOS ARM64 direct Mach-O link.
+effect fn buildMachODebugLines(
+  plan: &EmissionPlan,
+  sources: &ModuleSources,
+) -> MachODebugLineMap
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut map = MachODebugLineMap.make()
+  let mut modules = List<ModuleId>.make()
+  let mut fileIndices = List<usize>.make()
+  let count = EmissionPlan.symbolCount(plan)
+  let mut at = usize.ZERO
+  while at < count {
+    let origin = EmissionPlan.identityOrigin(plan, at)
+    let owner = DeclarationId.moduleId(EmissionPlan.identityDeclaration(plan, at))
+    let known = List<ModuleId>.asSlice(&modules)
+    let mut fi = usize.ZERO
+    while fi < known.length && !ModuleId.equals(&known[fi], owner) {
+      fi = fi + usize.ONE
+    }
+    if fi == known.length {
+      let location = run ModuleSourceFiles.sourceLocation(sources, owner)
+      let mut path = Bytes.make()
+      if let Option<Path>.Some { value: found } = &location.path {
+        path = run Bytes.copy(Path.rawBytes(&found))
+      }
+      run List<ModuleId>.append(&mut modules, ModuleId.copy(owner))
+      run List<usize>.append(
+        &mut fileIndices,
+        run map.addFile(Bytes.asSlice(&path)),
+      )
+    }
+    let dwarfFile = List<usize>.get(&fileIndices, fi)
+    run map.addSymbol(
+      EmissionPlan.identitySymbol(plan, at),
+      dwarfFile,
+      origin,
+    )
+    at = at + usize.ONE
+  }
+  return move map
+}
+
+fn pathBasenameBytes(raw: &[u8]) -> &[u8] {
+  let mut lastSlash = usize.MAX
+  let mut i = usize.ZERO
+  while i < raw.length {
+    if raw[i] == 47 || raw[i] == 92 {
+      lastSlash = i
+    }
+    i = i + usize.ONE
+  }
+  if lastSlash == usize.MAX || lastSlash + usize.ONE >= raw.length {
+    return raw
+  }
+  return Slice.view<u8>(raw, lastSlash + usize.ONE, raw.length - lastSlash - usize.ONE)
+}
+
 // Gives up `value` without dropping it, for a process about to exit: what it owns is left for the
 // exit to return.
 effect fn abandonValue<T>(value: T) -> ()
@@ -6024,6 +6093,135 @@ effect fn build(
           }
           return Compiled.Finished { status: directStatus }
         }
+        if Target.id(&target) == TargetId.Aarch64AppleDarwin {
+          if stage != Stage.Final && stage != Stage.Object {
+            run writeHeaded(
+              heading,
+              &mut headed,
+              b"silk: --backend direct on macOS ARM64 only emits final artifacts or object files\n",
+              &mut progress.*,
+            )
+            return Compiled.Finished { status: 2 }
+          }
+          if stage == Stage.Object {
+            let packed = run Effect.result(AArch64MachOObject.pack(Bytes.asSlice(&text)))
+            let objectBytes = match move packed {
+              Result<Bytes, AArch64Unsupported | OutOfMemoryError>.Success { value } => move value
+              Result<Bytes, AArch64Unsupported | OutOfMemoryError>.Failure { error } => match move error {
+                AArch64Unsupported failed => {
+                  let mut message = run Bytes.copy(b"silk: direct macOS ARM64 backend unsupported: ")
+                  run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
+                  run Bytes.append(&mut message, b"\n")
+                  run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+                  return Compiled.Finished { status: 2 }
+                }
+                OutOfMemoryError exhausted => {
+                  fail move exhausted
+                }
+              }
+            }
+            run FileSystem.writeFile(output, Bytes.asSlice(&objectBytes))
+            if receipts {
+              run reportCompiled(
+                display,
+                sourcePath,
+                output,
+                &target,
+                EmissionPlan.symbolCount(&plan),
+                b"direct",
+              )
+            }
+            return Compiled.Finished { status: 0 }
+          }
+          // Pure-Silk macOS ARM64 executables link directly in-process via `MachOIncremental` /
+          // `MachOLink` (zero `clang`/`ld`/`codesign` subprocesses). Foreign C/ObjC inputs, extra
+          // frameworks/libraries, or shared libraries automatically pack `MH_OBJECT` and hand off
+          // to `DarwinLink` + `clang`/`ld`.
+          let linkInputs = ModuleSourceFiles.nativeLinkInputs(&sources)
+          let canDirectMachO = form == Form.Executable && linkInputs.length == usize.ZERO
+          if canDirectMachO {
+            let _traced = Trace.span("link.macho")
+            run Progress.begin(&mut progress.*, ProgressPhase.Link, usize.ZERO)
+            run Progress.show(&mut progress.*, b"macho-link")
+            let mut machoOpts = MachOLinkOptions.executable()
+            machoOpts.incremental = same(Bytes.asSlice(&optimization), b"none")
+            machoOpts.identifier = run Bytes.copy(pathBasenameBytes(Path.rawBytes(output)))
+            let machoDebug = if debug {
+              run buildMachODebugLines(&plan, &sources)
+            } else {
+              MachODebugLineMap.make()
+            }
+            let linkedMachO = run Effect.result(
+              MachOIncremental.linkOrPatch(
+                output,
+                Bytes.asSlice(&text),
+                &machoOpts,
+                &machoDebug,
+              ),
+            )
+            let linkResult = match move linkedMachO {
+              Result<MachOIncrementalResult, MachOLinkError | FileError | OutOfMemoryError>.Success { value } => value
+              Result<MachOIncrementalResult, MachOLinkError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+                MachOLinkError failed => {
+                  run Progress.refuse(&mut progress.*, usize.ZERO)
+                  let mut message = run Bytes.copy(b"silk: direct mach-o link failed: ")
+                  run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
+                  run Bytes.append(&mut message, b"\n")
+                  run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+                  return Compiled.Finished { status: 1 }
+                }
+                FileError failed => {
+                  fail move failed
+                }
+                OutOfMemoryError exhausted => {
+                  fail move exhausted
+                }
+              }
+            }
+            let symbolMap = run EmissionPlan.symbolMap(&plan)
+            let mapFile = run symbolMapFor(output)
+            if !run holds(&mapFile, Bytes.asSlice(&symbolMap)) {
+              run FileSystem.writeFile(&mapFile, Bytes.asSlice(&symbolMap))
+            }
+            let unitDirectory = run CodegenCache.directoryFor(output)
+            run CodegenCache.recordLink(&unitDirectory, b"direct-macho", output)
+            let linkLabel = match linkResult.mode {
+              MachOLinkMode.Skipped => b"macho-cached"
+              MachOLinkMode.Patched => b"macho-patch"
+              MachOLinkMode.Full => b"macho-link"
+            }
+            run Progress.end(&mut progress.*, linkLabel)
+            if receipts {
+              run reportCompiled(
+                display,
+                sourcePath,
+                output,
+                &target,
+                EmissionPlan.symbolCount(&plan),
+                b"direct",
+              )
+            }
+            status = 0
+          } else {
+            let packed = run Effect.result(AArch64MachOObject.pack(Bytes.asSlice(&text)))
+            let objectBytes = match move packed {
+              Result<Bytes, AArch64Unsupported | OutOfMemoryError>.Success { value } => move value
+              Result<Bytes, AArch64Unsupported | OutOfMemoryError>.Failure { error } => match move error {
+                AArch64Unsupported failed => {
+                  let mut message = run Bytes.copy(b"silk: direct macOS ARM64 backend unsupported: ")
+                  run Bytes.append(&mut message, Bytes.asSlice(&failed.detail))
+                  run Bytes.append(&mut message, b"\n")
+                  run writeHeaded(heading, &mut headed, Bytes.asSlice(&message), &mut progress.*)
+                  return Compiled.Finished { status: 2 }
+                }
+                OutOfMemoryError exhausted => {
+                  fail move exhausted
+                }
+              }
+            }
+            directObject = Option<Bytes>.some(move objectBytes)
+          }
+        } else {
         if stage != Stage.Final && stage != Stage.Object {
           run writeHeaded(
             heading,
@@ -6174,6 +6372,7 @@ effect fn build(
             }
           }
           directObject = Option<Bytes>.some(move objectBytes)
+        }
         }
       }
       let skipClangLink = direct && match &directObject {
@@ -7963,7 +8162,7 @@ effect fn test(
 
     // The runner's exchange files and records change each run; a C source beside them would have
     // the build read them, and their digests would change the tests key every time.
-    let sidecars = [".plan", ".receipt", ".progress", ".tests", ".tests.key", ".inputs"]
+    let sidecars = [".plan", ".receipt", ".progress", ".tests", ".tests.key", ".inputs", ".elfstate", ".machostate"]
     let mut sidecar = usize.ZERO
     while sidecar < sidecars.length {
       let mut named = run Bytes.copy(Path.rawBytes(output))
@@ -9228,6 +9427,8 @@ effect fn buildProjectTarget(
     run BuildInputs.exclude(&mut recorder, &path)
     run BuildInputs.exclude(&mut recorder, &run symbolMapFor(&path))
     run BuildInputs.exclude(&mut recorder, &run debugBundleFor(&path))
+    run BuildInputs.exclude(&mut recorder, &run ElfIncremental.statePathFor(&path))
+    run BuildInputs.exclude(&mut recorder, &run MachOIncremental.statePathFor(&path))
     run BuildInputs.exclude(&mut recorder, &record)
     let mut semanticCache = borrowedPath(&cacheHome)
     if costing {
