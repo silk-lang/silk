@@ -1,0 +1,199 @@
+//! Built-in native AArch64 runtime helper functions emitted alongside macOS ARM64 direct builds.
+//!
+//! # When to use
+//! `AArch64Lower.declarations` appends these helpers into the shared declarations fragment so
+//! 128-bit integer division and remainder (`__silk_udivti3`, `__silk_umodti3`, `__silk_divti3`,
+//! `__silk_modti3`) work with zero dependency on `libgcc` or `compiler-rt`.
+//!
+//! # Details
+//! Every helper follows the AAPCS64 calling convention for `(u128, u128) -> u128` (and
+//! `(i128, i128) -> i128`): dividend `(lo=x0, hi=x1)`, divisor `(lo=x2, hi=x3)`, result
+//! `(lo=x0, hi=x1)`. Only caller-saved temporaries `x9..x14` and the `(x29, x30)` frame chain are
+//! used, strictly avoiding Darwin's reserved `x18` and callee-saved `x19..x28`/`d8..d15`.
+
+import backend.AArch64Encode
+import backend.AArch64Encode {PairMode, ShiftKind}
+import backend.AArch64Object {Function, Relocation, RelocationKind, RodataJumpEntry, UnwindInfo}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// Appends `__silk_udivti3`, `__silk_umodti3`, `__silk_divti3`, and `__silk_modti3` to `out`.
+pub effect fn appendAll(out: &mut List<Function>) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<Function>.append(&mut out.*, run buildUdivmod(b"__silk_udivti3", false))
+  run List<Function>.append(&mut out.*, run buildUdivmod(b"__silk_umodti3", true))
+  run List<Function>.append(&mut out.*, run buildSdivmod(b"__silk_divti3", false))
+  run List<Function>.append(&mut out.*, run buildSdivmod(b"__silk_modti3", true))
+  return ()
+}
+
+// Emits a self-contained 128-bit unsigned restoring shift-subtract division with a 64-bit `udiv`
+// fast path and divide-by-zero `brk #1` trap:
+//   input:  (x0=numLo, x1=numHi), (x2=denLo, x3=denHi)
+//   output: quotient in (x0, x1) when `!wantRem`, else remainder in (x0, x1).
+effect fn buildUdivmod(name: &[u8], wantRem: bool) -> Function ! OutOfMemoryError ? &mut Allocator {
+  let mut code = Bytes.make()
+  let fp = AArch64Encode.fp()
+  let lr = AArch64Encode.lr()
+  let sp = AArch64Encode.sp()
+  let x0 = AArch64Encode.x0()
+  let x1 = AArch64Encode.x1()
+  let x2 = AArch64Encode.x2()
+  let x3 = AArch64Encode.x3()
+  let x9 = AArch64Encode.x9()
+  let x10 = AArch64Encode.x10()
+  let x11 = AArch64Encode.x11()
+  let x12 = AArch64Encode.x12()
+  let x13 = AArch64Encode.x13()
+  let x14 = AArch64Encode.x14()
+
+  // Prologue: stp x29, x30, [sp, #-16]!; mov x29, sp
+  run AArch64Encode.stpGp(&mut code, true, PairMode.PreIndex, fp, lr, sp, -16)
+  run AArch64Encode.movSp64(&mut code, fp, sp)
+
+  // Divide-by-zero guard: orr x9, x2, x3; cbnz x9, nonzero; brk #1
+  run AArch64Encode.orrReg(&mut code, true, x9, x2, x3, ShiftKind.Lsl, 0)
+  let nzAt = run AArch64Encode.cbnz(&mut code, true, x9)
+  run AArch64Encode.brk(&mut code, 1)
+  let nzTarget = Bytes.length(&code)
+  AArch64Encode.patchCbz19(&mut code, nzAt, nzTarget)
+
+  // 64-bit fast path when both high halves are zero: orr x9, x1, x3; cbnz x9, slow
+  run AArch64Encode.orrReg(&mut code, true, x9, x1, x3, ShiftKind.Lsl, 0)
+  let slowAt = run AArch64Encode.cbnz(&mut code, true, x9)
+  if !wantRem {
+    run AArch64Encode.udiv(&mut code, true, x0, x0, x2)
+  } else {
+    run AArch64Encode.udiv(&mut code, true, x9, x0, x2)
+    run AArch64Encode.msub(&mut code, true, x0, x9, x2, x0)
+  }
+  run AArch64Encode.ldpGp(&mut code, true, PairMode.PostIndex, fp, lr, sp, 16)
+  run AArch64Encode.ret(&mut code)
+
+  // 128-bit restoring division loop (`slow:`): x10 = remLo = 0, x11 = remHi = 0, x14 = 128.
+  let slowTarget = Bytes.length(&code)
+  AArch64Encode.patchCbz19(&mut code, slowAt, slowTarget)
+  run AArch64Encode.movz(&mut code, true, x10, 0, 0)
+  run AArch64Encode.movz(&mut code, true, x11, 0, 0)
+  run AArch64Encode.movz(&mut code, true, x14, 128, 0)
+
+  let loopHead = Bytes.length(&code)
+  // Shift 256-bit (x11:x10:x1:x0) left by 1 bit.
+  run AArch64Encode.addsReg(&mut code, true, x0, x0, x0, ShiftKind.Lsl, 0)
+  run AArch64Encode.adcs(&mut code, true, x1, x1, x1)
+  run AArch64Encode.adcs(&mut code, true, x10, x10, x10)
+  run AArch64Encode.adc(&mut code, true, x11, x11, x11)
+
+  // Branchless compare & conditional subtract: (x13:x12) = (x11:x10) - (x3:x2), C=1 iff >=.
+  run AArch64Encode.subsReg(&mut code, true, x12, x10, x2, ShiftKind.Lsl, 0)
+  run AArch64Encode.sbcs(&mut code, true, x13, x11, x3)
+  run AArch64Encode.csel(&mut code, true, x10, x12, x10, AArch64Encode.ccHs())
+  run AArch64Encode.csel(&mut code, true, x11, x13, x11, AArch64Encode.ccHs())
+  run AArch64Encode.csinc(&mut code, true, x0, x0, x0, AArch64Encode.ccLo())
+
+  run AArch64Encode.subsImm(&mut code, true, x14, x14, 1, false)
+  let backAt = run AArch64Encode.bCond(&mut code, AArch64Encode.ccNe())
+  AArch64Encode.patchBCond19(&mut code, backAt, loopHead)
+
+  if wantRem {
+    run AArch64Encode.movRr64(&mut code, x0, x10)
+    run AArch64Encode.movRr64(&mut code, x1, x11)
+  }
+  run AArch64Encode.ldpGp(&mut code, true, PairMode.PostIndex, fp, lr, sp, 16)
+  run AArch64Encode.ret(&mut code)
+
+  return Function {
+    symbol: run Bytes.copy(name),
+    exported: Bytes.make(),
+    code: move code,
+    relocations: List<Relocation>.make(),
+    symbols: List<Bytes>.make(),
+    rodata: Bytes.make(),
+    rodataJumps: List<RodataJumpEntry>.make(),
+    unwind: UnwindInfo.frameOnly(),
+    locations: List<u64>.make(),
+  }
+}
+
+// Emits a 128-bit signed division or remainder by spilling the result sign bit, taking absolute
+// values, calling the unsigned helper (`__silk_udivti3` or `__silk_umodti3`), and negating the
+// result when the sign bit requires it.
+effect fn buildSdivmod(name: &[u8], wantRem: bool) -> Function ! OutOfMemoryError ? &mut Allocator {
+  let mut code = Bytes.make()
+  let fp = AArch64Encode.fp()
+  let lr = AArch64Encode.lr()
+  let sp = AArch64Encode.sp()
+  let xzr = AArch64Encode.xzr()
+  let x0 = AArch64Encode.x0()
+  let x1 = AArch64Encode.x1()
+  let x2 = AArch64Encode.x2()
+  let x3 = AArch64Encode.x3()
+  let x9 = AArch64Encode.x9()
+
+  // Prologue: stp x29, x30, [sp, #-32]!; mov x29, sp (16B aligned; [sp, #16] stores sign).
+  run AArch64Encode.stpGp(&mut code, true, PairMode.PreIndex, fp, lr, sp, -32)
+  run AArch64Encode.movSp64(&mut code, fp, sp)
+
+  // Result sign in x9 bit 63: numHi for rem, numHi ^ denHi for div.
+  if wantRem {
+    run AArch64Encode.movRr64(&mut code, x9, x1)
+  } else {
+    run AArch64Encode.eorReg(&mut code, true, x9, x1, x3, ShiftKind.Lsl, 0)
+  }
+  run AArch64Encode.str64Imm(&mut code, x9, sp, 16)
+
+  // If dividend (x0:x1) < 0, negate: subs x0, xzr, x0; sbc x1, xzr, x1.
+  let numPosAt = run AArch64Encode.tbz(&mut code, x1, 63)
+  run AArch64Encode.subsReg(&mut code, true, x0, xzr, x0, ShiftKind.Lsl, 0)
+  run AArch64Encode.sbc(&mut code, true, x1, xzr, x1)
+  let afterNum = Bytes.length(&code)
+  AArch64Encode.patchTbz14(&mut code, numPosAt, afterNum)
+
+  // If divisor (x2:x3) < 0, negate: subs x2, xzr, x2; sbc x3, xzr, x3.
+  let denPosAt = run AArch64Encode.tbz(&mut code, x3, 63)
+  run AArch64Encode.subsReg(&mut code, true, x2, xzr, x2, ShiftKind.Lsl, 0)
+  run AArch64Encode.sbc(&mut code, true, x3, xzr, x3)
+  let afterDen = Bytes.length(&code)
+  AArch64Encode.patchTbz14(&mut code, denPosAt, afterDen)
+
+  // Call unsigned helper `__silk_udivti3` or `__silk_umodti3`.
+  let callAt = run AArch64Encode.bl(&mut code)
+  let mut relocs = List<Relocation>.make()
+  run List<Relocation>.append(&mut relocs, Relocation {
+    offset: callAt, kind: RelocationKind.Branch26, target: usize.ZERO, addend: 0,
+  })
+  let mut syms = List<Bytes>.make()
+  run List<Bytes>.append(&mut syms, run Bytes.copy(if wantRem { b"__silk_umodti3" } else { b"__silk_udivti3" }))
+
+  // Restore sign flag and negate (x0:x1) if bit 63 is set.
+  run AArch64Encode.ldr64Imm(&mut code, x9, sp, 16)
+  let resPosAt = run AArch64Encode.tbz(&mut code, x9, 63)
+  run AArch64Encode.subsReg(&mut code, true, x0, xzr, x0, ShiftKind.Lsl, 0)
+  run AArch64Encode.sbc(&mut code, true, x1, xzr, x1)
+  let afterRes = Bytes.length(&code)
+  AArch64Encode.patchTbz14(&mut code, resPosAt, afterRes)
+
+  run AArch64Encode.ldpGp(&mut code, true, PairMode.PostIndex, fp, lr, sp, 32)
+  run AArch64Encode.ret(&mut code)
+
+  return Function {
+    symbol: run Bytes.copy(name),
+    exported: Bytes.make(),
+    code: move code,
+    relocations: move relocs,
+    symbols: move syms,
+    rodata: Bytes.make(),
+    rodataJumps: List<RodataJumpEntry>.make(),
+    unwind: UnwindInfo {
+      hasFramePointer: true,
+      prologueEnd: 8,
+      savesEnd: 8,
+      savedGpMask: 0,
+      savedFpMask: 0,
+      frameBytes: 32,
+    },
+    locations: List<u64>.make(),
+  }
+}

@@ -1,0 +1,268 @@
+//! Unit checks for `MachOIncremental` (`O(dirty)` `.machostate` v2 sidecar, APFS `clonefile`
+//! CoW patching, incremental 4 KB SHA-256 code-signature updates, 12-byte ARM64 thunk updates,
+//! bump-only `__DATA` headroom + `LC_DYLD_CHAINED_FIXUPS` threading, `silk_seen` in-place
+//! patching, and CS-cache-safe repeated native execution on Apple Silicon).
+
+import backend.AArch64Emit
+import backend.AArch64Object {Fragment, Function, Object, Pointer as ObjectPointer, Unsupported as AArch64Unsupported}
+import backend.SsaFunction {AbiExtension, Binary, CallingConvention, Kind, SsaFunction}
+import driver.MachODebug {DebugLineMap}
+import driver.MachOIncremental
+import driver.MachOIncremental {LinkMode}
+import driver.MachOInput {LinkError}
+import driver.MachOLink {IncrementalState, LinkOptions}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {FileError, FileSystem, Path}
+import silk.system.filesystem_native {OsFileSystem}
+import silk.testing.testing {AssertionError, Testing}
+static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+  import silk.core.result {Result}
+  import silk.system.child_process {ChildProcess, ProcessError}
+  import silk.system.child_process_native {OsChildProcess}
+}
+
+effect fn emitHelperFn(sym: &[u8], baseVal: u64, extraAdds: usize) -> Function
+! AArch64Unsupported | OutOfMemoryError ? &mut Allocator {
+  let i32K = Kind.integer(32)
+  let mut f = run SsaFunction.make(sym, 64)
+  f.setCallingConvention(CallingConvention.C, false, AbiExtension.None)
+  f.setResult(i32K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+  let mut acc = run f.integer(32, baseVal)
+  let one = run f.integer(32, 1)
+  let mut k = usize.ZERO
+  while k < extraAdds {
+    acc = run f.binary(Binary.Add, acc, one)
+    k = k + usize.ONE
+  }
+  run f.ret(acc)
+  run f.finish()
+  return run AArch64Emit.emit(&f, sym, b"")
+}
+
+effect fn emitMainCallingHelperAndPtr(helperSym: &[u8], ptrSym: &[u8], seenSym: &[u8]) -> Function
+! AArch64Unsupported | OutOfMemoryError ? &mut Allocator {
+  let i32K = Kind.integer(32)
+  let ptrK = Kind.address(64)
+  let mut f = run SsaFunction.make(b"silk_inc_main", 64)
+  f.setCallingConvention(CallingConvention.C, false, AbiExtension.None)
+  f.setResult(i32K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+  let hVal = run f.call(helperSym, &[], i32K)
+  let pAddr = run f.symbolAddress(ptrSym, 0, false)
+  let targetPtr = run f.load(ptrK, pAddr, 0, 8)
+  let pVal = run f.load(i32K, targetPtr, 0, 4)
+  let sum = run f.binary(Binary.Add, hVal, pVal)
+  run f.ret(sum)
+  run f.finish()
+  return run AArch64Emit.emitWithSeen(&f, b"silk_inc_main", b"main", seenSym)
+}
+
+effect fn makeValObj(sym: &[u8], val: u8, readonly: bool) -> Object ! OutOfMemoryError ? &mut Allocator {
+  let mut img = run Bytes.zeroed(8)
+  let imgMut = Bytes.asMutSlice(&mut img)
+  imgMut[0] = val
+  return Object {
+    symbol: run Bytes.copy(sym),
+    alignment: 8,
+    image: move img,
+    pointers: List<ObjectPointer>.make(),
+    framed: false,
+    local: false,
+    readonly: readonly,
+    seen: false,
+  }
+}
+
+effect fn makePtrObj(sym: &[u8], targetSym: &[u8]) -> Object ! OutOfMemoryError ? &mut Allocator {
+  let mut ptrs = List<ObjectPointer>.make()
+  run List<ObjectPointer>.append(&mut ptrs, ObjectPointer {
+    offset: 0,
+    symbol: run Bytes.copy(targetSym),
+    addend: 0,
+    size: 8,
+  })
+  return Object {
+    symbol: run Bytes.copy(sym),
+    alignment: 8,
+    image: run Bytes.zeroed(8),
+    pointers: move ptrs,
+    framed: false,
+    local: false,
+    readonly: false,
+    seen: false,
+  }
+}
+
+effect fn makeSeenObj(sym: &[u8], tag: u8) -> Object ! OutOfMemoryError ? &mut Allocator {
+  let mut img = run Bytes.zeroed(17)
+  let imgMut = Bytes.asMutSlice(&mut img)
+  imgMut[1] = tag
+  return Object {
+    symbol: run Bytes.copy(sym),
+    alignment: 1,
+    image: move img,
+    pointers: List<ObjectPointer>.make(),
+    framed: false,
+    local: false,
+    readonly: false,
+    seen: true,
+  }
+}
+
+static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+  effect fn expectNativeExitAndCodesign(binPath: &Path, expectedCode: i32) -> ()
+  ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+    let mut proc = OsChildProcess.make()
+    let ok = match move run Effect.result(runAndCheckCodesign(binPath, expectedCode))
+      |> Effect.provideMut<ChildProcess>(&mut proc) {
+      Result<bool, ProcessError | OutOfMemoryError>.Success {value} => value
+      Result<bool, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+        OutOfMemoryError oom => { fail move oom }
+        ProcessError e => {
+          drop e
+          false
+        }
+      }
+    }
+    run Testing.expect(ok, "patched Apple Silicon Mach-O executes with expected code (no CS-cache SIGKILL) and passes codesign")
+  }
+
+  effect fn runAndCheckCodesign(binPath: &Path, expectedCode: i32) -> bool
+  ! ProcessError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+    let runReq = run ChildProcess.requestBytes(Path.rawBytes(binPath))
+    let runRes = run ChildProcess.submit(move runReq)
+    let code = Option<i32>.unwrapOr(ChildProcess.exitCode(&runRes), -1)
+    if code != expectedCode { return false }
+
+    let mut csReq = run ChildProcess.request("/usr/bin/codesign")
+    run ChildProcess.addArgument(&mut csReq, "--verify")
+    run ChildProcess.addArgument(&mut csReq, "--strict")
+    run ChildProcess.addArgumentBytes(&mut csReq, Path.rawBytes(binPath))
+    let csRes = run ChildProcess.submit(move csReq)
+    return Option<i32>.unwrapOr(ChildProcess.exitCode(&csRes), -1) == 0
+  }
+}
+
+test effect fn patchesIncrementalMachOEndToEndWithCowCodesignAndChainedFixups() -> ()
+! LinkError | AArch64Unsupported | FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut fs = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)
+  return run machoIncClaims()
+    |> Effect.provideMut<FileSystem>(&mut fs)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn machoIncClaims() -> ()
+! LinkError | AArch64Unsupported | FileError | OutOfMemoryError | AssertionError<'static>
+? &mut FileSystem | &mut Allocator {
+  let outPath = run Path.make("/tmp/silk_macho_incremental_unit_test_bin")
+  let statePath = run MachOIncremental.statePathFor(&outPath)
+  drop run Effect.result(FileSystem.removeFile(&outPath))
+  drop run Effect.result(FileSystem.removeFile(&statePath))
+
+  // Chunk 1: `main` + `silk_target_0` + `silk_ptr_0` + `silk_seen`
+  let mut fMain1 = Fragment.make()
+  run List<Function>.append(&mut fMain1.functions, run emitMainCallingHelperAndPtr(b"silk_helper", b"silk_ptr_0", b"silk_inc_main.silk_seen"))
+  run List<Object>.append(&mut fMain1.objects, run makeValObj(b"silk_target_0", 2, true))
+  run List<Object>.append(&mut fMain1.objects, run makePtrObj(b"silk_ptr_0", b"silk_target_0"))
+  run List<Object>.append(&mut fMain1.objects, run makeSeenObj(b"silk_inc_main.silk_seen", 0x11))
+  let chunkMain1 = run fMain1.encode()
+
+  // Chunk 2: `silk_helper` returning 40 + an unused ordinary function `silk_dead_fn`
+  let mut fHelper1 = Fragment.make()
+  run List<Function>.append(&mut fHelper1.functions, run emitHelperFn(b"silk_helper", 40, usize.ZERO))
+  run List<Function>.append(&mut fHelper1.functions, run emitHelperFn(b"silk_dead_fn", 9, usize.ZERO))
+  let chunkHelper1 = run fHelper1.encode()
+
+  let mut prog1 = run Bytes.copy(Bytes.asSlice(&chunkMain1))
+  run Bytes.append(&mut prog1, Bytes.asSlice(&chunkHelper1))
+
+  let mut opts = LinkOptions.executable()
+  opts.incremental = true
+  opts.identifier = run Bytes.copy(b"macho_inc_case")
+  let emptyDbg = DebugLineMap.make()
+
+  // 1. Initial Full build (returns 40 + 2 = 42).
+  let rFull = run MachOIncremental.linkOrPatch(&outPath, Bytes.asSlice(&prog1), &opts, &emptyDbg)
+  run Testing.expect(rFull.mode == LinkMode.Full, "initial incremental Mach-O build performs Full link")
+
+  // Verify `.machostate` v2 sidecar round-trips losslessly.
+  let rawSt = run FileSystem.readFile(&statePath)
+  let stRoundTripOk = match move run MachOIncremental.decodeState(Bytes.asSlice(&rawSt)) {
+    Option<IncrementalState>.Some {value: st} => st.thunksCount == 3
+      && List<u64>.length(&st.chunkHashHigh) == 2
+      && List<u64>.length(&st.dataPageLastOff) == u64.toUsize(st.dataSegPageCount)
+    Option<IncrementalState>.None => false
+  }
+  run Testing.expect(stRoundTripOk, ".machostate v2 sidecar round-trips chunk hashes and chained-fixup tails")
+
+  static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+    run expectNativeExitAndCodesign(&outPath, 42)
+  }
+
+  // 2. Zero-edit rebuild -> Skipped!
+  let rSkip = run MachOIncremental.linkOrPatch(&outPath, Bytes.asSlice(&prog1), &opts, &emptyDbg)
+  run Testing.expect(rSkip.mode == LinkMode.Skipped && rSkip.patchedCount == usize.ZERO,
+    "unchanged rebuild takes zero-write Skipped fast path")
+
+  // 3. Same-size edit: `silk_helper` returns 50, `silk_seen` updated in-place, `silk_dead_fn` removed!
+  let mut fMain2 = Fragment.make()
+  run List<Function>.append(&mut fMain2.functions, run emitMainCallingHelperAndPtr(b"silk_helper", b"silk_ptr_0", b"silk_inc_main.silk_seen"))
+  run List<Object>.append(&mut fMain2.objects, run makeValObj(b"silk_target_0", 2, true))
+  run List<Object>.append(&mut fMain2.objects, run makePtrObj(b"silk_ptr_0", b"silk_target_0"))
+  run List<Object>.append(&mut fMain2.objects, run makeSeenObj(b"silk_inc_main.silk_seen", 0x22))
+  let chunkMain2 = run fMain2.encode()
+
+  let mut fHelper2 = Fragment.make()
+  run List<Function>.append(&mut fHelper2.functions, run emitHelperFn(b"silk_helper", 50, usize.ZERO))
+  let chunkHelper2 = run fHelper2.encode()
+
+  let mut prog2 = run Bytes.copy(Bytes.asSlice(&chunkMain2))
+  run Bytes.append(&mut prog2, Bytes.asSlice(&chunkHelper2))
+  let rPatch1 = run MachOIncremental.linkOrPatch(&outPath, Bytes.asSlice(&prog2), &opts, &emptyDbg)
+  run Testing.expect(rPatch1.mode == LinkMode.Patched && rPatch1.patchedCount == usize.ONE,
+    "same-size helper edit + in-place silk_seen update + removed dead function patches incrementally")
+
+  static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+    run expectNativeExitAndCodesign(&outPath, 52)
+  }
+
+  // 4. Grow `silk_helper` past `bodyCap` (cold-append + 12-byte ARM64 thunk update) AND add a
+  //    brand-new pointer-bearing `__DATA` global `silk_ptr_1 = &silk_target_1` (threaded into
+  //    `LC_DYLD_CHAINED_FIXUPS`!) -> returns (50 + 40) + 7 = 97!
+  let mut fMain3 = Fragment.make()
+  run List<Function>.append(&mut fMain3.functions, run emitMainCallingHelperAndPtr(b"silk_helper", b"silk_ptr_1", b"silk_inc_main.silk_seen"))
+  run List<Object>.append(&mut fMain3.objects, run makeValObj(b"silk_target_0", 2, true))
+  run List<Object>.append(&mut fMain3.objects, run makePtrObj(b"silk_ptr_0", b"silk_target_0"))
+  run List<Object>.append(&mut fMain3.objects, run makeValObj(b"silk_target_1", 7, true))
+  run List<Object>.append(&mut fMain3.objects, run makePtrObj(b"silk_ptr_1", b"silk_target_1"))
+  run List<Object>.append(&mut fMain3.objects, run makeSeenObj(b"silk_inc_main.silk_seen", 0x33))
+  let chunkMain3 = run fMain3.encode()
+
+  let mut fHelper3 = Fragment.make()
+  run List<Function>.append(&mut fHelper3.functions, run emitHelperFn(b"silk_helper", 50, 40))
+  let chunkHelper3 = run fHelper3.encode()
+
+  let mut prog3 = run Bytes.copy(Bytes.asSlice(&chunkMain3))
+  run Bytes.append(&mut prog3, Bytes.asSlice(&chunkHelper3))
+  let rPatch2 = run MachOIncremental.linkOrPatch(&outPath, Bytes.asSlice(&prog3), &opts, &emptyDbg)
+  run Testing.expect(rPatch2.mode == LinkMode.Patched && rPatch2.patchedCount == 2,
+    "grown function relocation + thunk update + new chained-fixup __DATA pointer patches incrementally")
+
+  static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+    run expectNativeExitAndCodesign(&outPath, 97)
+  }
+
+  drop run Effect.result(FileSystem.removeFile(&outPath))
+  drop run Effect.result(FileSystem.removeFile(&statePath))
+}

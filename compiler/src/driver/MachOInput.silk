@@ -1,0 +1,828 @@
+//! Unified Mach-O ARM64 (`aarch64-apple-darwin`) linker input model and parsers for the direct
+//! Mach-O linker (`MachOLink`) and incremental patcher (`MachOIncremental`).
+//!
+//! # When to use
+//! `MachOLink` consumes Silk [`AArch64Object.Fragment`] streams directly from memory alongside
+//! built-in `DarwinLink.libSystem()` and macOS SDK TAPI v4 `.tbd` stubs for external dynamic
+//! symbol resolution.
+
+import backend.AArch64Encode
+import backend.AArch64MachOObject
+import backend.AArch64Object
+import backend.AArch64Object {Function, Object, Pointer as ObjectPointer, RelocationKind, RodataJumpEntry}
+import driver.DarwinLink
+import semantic.ContentHash {ContentHash}
+import semantic.InternIndex {InternIndex}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// A link-time input or resolution error raised by the direct Mach-O linker.
+pub struct LinkError {
+  /// Human-readable description of the link failure.
+  pub detail: Bytes,
+}
+
+/// Fails with a [`LinkError`] containing `detail`.
+pub effect fn linkError(detail: &[u8]) -> never ! LinkError | OutOfMemoryError ? &mut Allocator {
+  fail LinkError {detail: run Bytes.copy(detail)}
+}
+
+/// Fails with a [`LinkError`] concatenating `prefix` and `suffix`.
+pub effect fn linkError2(prefix: &[u8], suffix: &[u8]) -> never ! LinkError | OutOfMemoryError ? &mut Allocator {
+  let mut msg = run Bytes.copy(prefix)
+  run Bytes.append(&mut msg, suffix)
+  fail LinkError {detail: move msg}
+}
+
+/// Output section classification for one Mach-O input section.
+pub enum SectionKind {
+  /// `__TEXT,__text` executable machine code.
+  Text,
+  /// `__TEXT,__const` read-only data and jump tables.
+  Const,
+  /// `__DATA,__data` writable initialized data.
+  Data,
+  /// `__DATA,__bss` zero-filled writable data.
+  Bss,
+  /// `__DATA,__thread_data` initialized thread-local data payload.
+  ThreadData,
+  /// `__DATA,__silk_frames` trap-frame metadata.
+  SilkFrames,
+  /// `__DATA,__silk_seen` test-coverage probe records.
+  SilkSeen,
+}
+
+/// Relocation kinds inside a Mach-O [`InputSection`].
+pub fn rBranch26() -> u64 { return 0 }
+/// `ARM64_RELOC_PAGE21` 4 KB page delta for `adrp`.
+pub fn rPage21() -> u64 { return 1 }
+/// `ARM64_RELOC_PAGEOFF12` 12-bit page offset for `add` or scaled `ldr`/`str`.
+pub fn rPageOff12() -> u64 { return 2 }
+/// `ARM64_RELOC_GOT_LOAD_PAGE21` 4 KB page delta to a GOT slot.
+pub fn rGotLoadPage21() -> u64 { return 3 }
+/// `ARM64_RELOC_GOT_LOAD_PAGEOFF12` 12-bit page offset to a GOT slot.
+pub fn rGotLoadPageOff12() -> u64 { return 4 }
+/// `ARM64_RELOC_UNSIGNED` 64-bit absolute pointer in `__DATA`.
+pub fn rAbs64() -> u64 { return 5 }
+/// `ARM64_RELOC_TLVP_LOAD_PAGE21` 4 KB page delta to a TLV pointer slot.
+pub fn rTlvpLoadPage21() -> u64 { return 6 }
+/// `ARM64_RELOC_TLVP_LOAD_PAGEOFF12` 12-bit page offset to a TLV pointer slot.
+pub fn rTlvpLoadPageOff12() -> u64 { return 7 }
+/// 32-bit jump-table displacement `(targetText - tableRodata)` stored inside `__TEXT,__const`.
+pub fn rJumpTable32() -> u64 { return 8 }
+
+/// One relocation inside an [`InputSection`].
+pub struct InputReloc {
+  /// Byte offset inside the containing section's data.
+  pub offset: u64,
+  /// Relocation kind (`rBranch26()`, `rPage21()`, etc.).
+  pub relType: u64,
+  /// Signed byte addend (for `rJumpTable32`, the table base offset inside the const section).
+  pub addend: i64,
+  /// When true, targets `(localSection, localOffset)` inside the same [`InputUnit`].
+  pub targetLocal: bool,
+  /// Local target section index when `targetLocal` is true.
+  pub localSection: usize,
+  /// Local target byte offset when `targetLocal` is true.
+  pub localOffset: u64,
+  /// Global symbol name (raw un-prefixed Silk/C spelling) when `!targetLocal`.
+  pub symbol: Bytes,
+}
+
+/// One loadable section contributed by an [`InputUnit`].
+pub struct InputSection {
+  /// Target output section classification.
+  pub kind: SectionKind,
+  /// Minimum byte alignment.
+  pub alignment: u64,
+  /// Initialized byte image.
+  pub data: Bytes,
+  /// Total memory size (`>= data.length` for `.bss`).
+  pub memSize: u64,
+  /// Relocations targeting bytes inside `data`.
+  pub relocs: List<InputReloc>,
+}
+
+/// One defined symbol exported by an [`InputUnit`].
+pub struct InputSymbol {
+  /// Raw un-prefixed Silk/C symbol name.
+  pub name: Bytes,
+  /// Section index inside `InputUnit.sections`.
+  pub section: usize,
+  /// Byte offset inside `section`.
+  pub offset: u64,
+  /// Symbol byte length.
+  pub size: u64,
+  /// Minimum byte alignment.
+  pub alignment: u64,
+  /// True when defining a function in `__TEXT,__text`.
+  pub isFunc: bool,
+  /// True when defining a thread-local object in `__DATA,__thread_data`.
+  pub isTls: bool,
+  /// True for weak definitions.
+  pub weak: bool,
+}
+
+/// Per-function metadata retained from `AArch64Object.Fragment` for DWARF and incremental Mach-O patching.
+pub struct SilkFuncMeta {
+  /// Primary Silk symbol name.
+  pub symbol: Bytes,
+  /// Optional exported C alias (empty if none or identical to `symbol`).
+  pub exported: Bytes,
+  /// High 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestHigh: u64,
+  /// Low 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestLow: u64,
+  /// Byte offset of the function body inside the Silk unit's `__text` section.
+  pub textOff: u64,
+  /// Byte length of the function's machine code.
+  pub codeSize: u64,
+  /// Byte offset of the function's local `.rodata` slice inside the Silk unit's `__const` section.
+  pub rodataOff: u64,
+  /// Byte length of the function's local `.rodata` slice (`0` if none).
+  pub rodataSize: u64,
+  /// `(codeOffset, relativePlace)` pairs recorded by `AArch64Emit` for `__DWARF,__debug_line`.
+  pub locations: List<u64>,
+}
+
+/// Per-data-object metadata retained from `AArch64Object.Fragment` for incremental Mach-O patching.
+pub struct SilkObjMeta {
+  /// Object symbol name.
+  pub symbol: Bytes,
+  /// High 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestHigh: u64,
+  /// Low 64 bits of the 128-bit SipHash-1-3 content digest.
+  pub digestLow: u64,
+  /// Output section index inside the Silk [`InputUnit`].
+  pub section: usize,
+  /// Byte offset inside that section.
+  pub offset: u64,
+  /// Byte length of the object's image.
+  pub size: u64,
+  /// True for thread-local objects.
+  pub isTls: bool,
+  /// True for `silk_frames` descriptors.
+  pub isFramed: bool,
+  /// True for `silk_seen` test-coverage records.
+  pub isSeen: bool,
+}
+
+/// One parsed linker input unit (from Silk fragments).
+pub struct InputUnit {
+  /// Sections contributed by this unit.
+  pub sections: List<InputSection>,
+  /// Symbols defined by this unit.
+  pub symbols: List<InputSymbol>,
+  /// Weakly referenced undefined symbols (resolve to 0 if absent).
+  pub weakRefs: List<Bytes>,
+  /// Per-function metadata for DWARF and incremental patching.
+  pub silkFuncs: List<SilkFuncMeta>,
+  /// Per-object metadata for incremental patching.
+  pub silkObjs: List<SilkObjMeta>,
+}
+
+/// One dynamic library stub parsed from TAPI v4 `.tbd` (such as `/usr/lib/libSystem.B.dylib`).
+pub struct TbdLibrary {
+  /// Mach-O dylib install name (e.g. `/usr/lib/libSystem.B.dylib`).
+  pub installName: Bytes,
+  /// Exported Mach-O symbol names (`_`-prefixed) available for `arm64-macos`.
+  pub exports: List<Bytes>,
+  /// Hash index over `exports` for O(1) lookup.
+  index: InternIndex,
+}
+
+impl TbdLibrary {
+  /// Returns true if `machoSymbol` (`_`-prefixed) is exported by this library.
+  pub fn contains(self: &Self, machoSymbol: &[u8]) -> bool {
+    let h = InternIndex.hashBytes(0, machoSymbol)
+    let syms = List<Bytes>.asSlice(&self.exports)
+    let mut at = InternIndex.first(&self.index, h)
+    while at != usize.MAX {
+      if sameBytes(Bytes.asSlice(&syms[at]), machoSymbol) { return true }
+      at = InternIndex.after(&self.index, at)
+    }
+    return false
+  }
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i = usize.ZERO
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn startsWith(haystack: &[u8], offset: usize, needle: &[u8]) -> bool {
+  if offset + needle.length > haystack.length { return false }
+  let mut i = usize.ZERO
+  while i < needle.length {
+    if haystack[offset + i] != needle[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn containsSub(haystack: &[u8], needle: &[u8]) -> bool {
+  if needle.length == usize.ZERO { return true }
+  if needle.length > haystack.length { return false }
+  let limit = haystack.length - needle.length
+  let mut i = usize.ZERO
+  while i <= limit {
+    if startsWith(haystack, i, needle) { return true }
+    i = i + usize.ONE
+  }
+  return false
+}
+
+fn isSpace(b: u8) -> bool {
+  return b == 32 || b == 9 || b == 10 || b == 13
+}
+
+/// Converts a raw Silk/C symbol name into its Mach-O symbol-table spelling (`_`-prefixed unless
+/// escaped by leading `\x01`).
+pub effect fn toMachOSymbol(raw: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  return run AArch64MachOObject.mangleMachOSymbol(raw)
+}
+
+/// Computes a deterministic 128-bit SipHash-1-3 digest of one emitted AArch64 function.
+pub fn hashFunction(f: &Function) -> ContentHash {
+  let mut st = ContentHash.stream()
+  ContentHash.append(&mut st, Bytes.asSlice(&f.symbol))
+  ContentHash.appendWord(&mut st, 0, 1)
+  ContentHash.append(&mut st, Bytes.asSlice(&f.exported))
+  ContentHash.appendWord(&mut st, usize.toU64(Bytes.length(&f.code)), 8)
+  ContentHash.append(&mut st, Bytes.asSlice(&f.code))
+  ContentHash.appendWord(&mut st, usize.toU64(Bytes.length(&f.rodata)), 8)
+  ContentHash.append(&mut st, Bytes.asSlice(&f.rodata))
+  let rels = List<AArch64Object.Relocation>.asSlice(&f.relocations)
+  let syms = List<Bytes>.asSlice(&f.symbols)
+  ContentHash.appendWord(&mut st, usize.toU64(rels.length), 8)
+  let mut i = usize.ZERO
+  while i < rels.length {
+    let r = rels[i]
+    ContentHash.appendWord(&mut st, usize.toU64(r.offset), 8)
+    let rk: u64 = match r.kind {
+      RelocationKind.Branch26 => 0
+      RelocationKind.Page21 => 1
+      RelocationKind.PageOff12 => 2
+      RelocationKind.GotLoadPage21 => 3
+      RelocationKind.GotLoadPageOff12 => 4
+      RelocationKind.Abs64 => 5
+      RelocationKind.LocalRodataPage21 => 6
+      RelocationKind.LocalRodataPageOff12 => 7
+      RelocationKind.TlvpLoadPage21 => 8
+      RelocationKind.TlvpLoadPageOff12 => 9
+    }
+    ContentHash.appendWord(&mut st, rk, 1)
+    ContentHash.appendWord(&mut st, i64.wrappingToU64(r.addend), 8)
+    if r.target < syms.length {
+      ContentHash.append(&mut st, Bytes.asSlice(&syms[r.target]))
+    }
+    ContentHash.appendWord(&mut st, 0, 1)
+    i = i + usize.ONE
+  }
+  let jumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+  ContentHash.appendWord(&mut st, usize.toU64(jumps.length), 8)
+  i = usize.ZERO
+  while i < jumps.length {
+    ContentHash.appendWord(&mut st, usize.toU64(jumps[i].rodataOffset), 8)
+    ContentHash.appendWord(&mut st, usize.toU64(jumps[i].tableOffset), 8)
+    ContentHash.appendWord(&mut st, usize.toU64(jumps[i].targetCodeOffset), 8)
+    i = i + usize.ONE
+  }
+  return ContentHash.finish(move st)
+}
+
+/// Computes a deterministic 128-bit SipHash-1-3 digest of one emitted static data object.
+pub fn hashObject(o: &Object) -> ContentHash {
+  let mut st = ContentHash.stream()
+  ContentHash.append(&mut st, Bytes.asSlice(&o.symbol))
+  ContentHash.appendWord(&mut st, o.alignment, 8)
+  let f0: u64 = if o.framed { 1 } else { 0 }
+  let f1: u64 = if o.local { 2 } else { 0 }
+  let f2: u64 = if o.readonly { 4 } else { 0 }
+  let f3: u64 = if o.seen { 8 } else { 0 }
+  let flags: u64 = f0 | f1 | f2 | f3
+  ContentHash.appendWord(&mut st, flags, 1)
+  ContentHash.appendWord(&mut st, usize.toU64(Bytes.length(&o.image)), 8)
+  ContentHash.append(&mut st, Bytes.asSlice(&o.image))
+  let ptrs = List<ObjectPointer>.asSlice(&o.pointers)
+  ContentHash.appendWord(&mut st, usize.toU64(ptrs.length), 8)
+  let mut i = usize.ZERO
+  while i < ptrs.length {
+    let p = &ptrs[i]
+    ContentHash.appendWord(&mut st, usize.toU64(p.offset), 8)
+    ContentHash.appendWord(&mut st, p.addend, 8)
+    ContentHash.appendWord(&mut st, usize.toU64(p.size), 8)
+    ContentHash.append(&mut st, Bytes.asSlice(&p.symbol))
+    ContentHash.appendWord(&mut st, 0, 1)
+    i = i + usize.ONE
+  }
+  return ContentHash.finish(move st)
+}
+
+/// Computes a deterministic 128-bit SipHash-1-3 digest of one raw encoded `AArch64Object` chunk.
+pub fn hashRawChunk(chunk: &[u8]) -> ContentHash {
+  let mut st = ContentHash.stream()
+  ContentHash.append(&mut st, chunk)
+  return ContentHash.finish(move st)
+}
+
+effect fn alignBuf(buf: &mut Bytes, align: usize, padByte: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= usize.ONE { return () }
+  while Bytes.length(&buf.*) % align != usize.ZERO {
+    run AArch64Encode.byte(&mut buf.*, padByte)
+  }
+  return ()
+}
+
+effect fn alignCodeNop(buf: &mut Bytes, align: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if align <= 4 { return () }
+  while Bytes.length(&buf.*) % align != usize.ZERO {
+    run AArch64Encode.nop(&mut buf.*)
+  }
+  return ()
+}
+
+/// Converts back-to-back encoded [`AArch64Object.Fragment`]s into one unified [`InputUnit`].
+///
+/// Section indices inside the returned `InputUnit`:
+/// - `0`: `__TEXT,__text`
+/// - `1`: `__TEXT,__const`
+/// - `2`: `__DATA,__data`
+/// - `3`: `__DATA,__thread_data`
+/// - `4`: `__DATA,__silk_frames`
+/// - `5`: `__DATA,__silk_seen`
+pub effect fn fromAArch64Fragments(fragments: &[u8]) -> InputUnit ! LinkError | OutOfMemoryError ? &mut Allocator {
+  let decoded = run AArch64Object.decode(fragments)
+  return run fromAArch64Fragment(&decoded)
+}
+
+/// Converts one decoded [`AArch64Object.Fragment`] into one unified [`InputUnit`].
+pub effect fn fromAArch64Fragment(fragment: &AArch64Object.Fragment) -> InputUnit
+! LinkError | OutOfMemoryError ? &mut Allocator {
+  let refused = List<Bytes>.asSlice(&fragment.refused)
+  if refused.length > usize.ZERO {
+    return run linkError2(b"AArch64 direct backend refused construct: ", Bytes.asSlice(&refused[usize.ZERO]))
+  }
+
+  let mut textData = Bytes.make()
+  let mut constData = Bytes.make()
+  let mut dataBytes = Bytes.make()
+  let mut threadData = Bytes.make()
+  let mut framesData = Bytes.make()
+  let mut seenData = Bytes.make()
+
+  let mut textRelocs = List<InputReloc>.make()
+  let mut constRelocs = List<InputReloc>.make()
+  let mut dataRelocs = List<InputReloc>.make()
+  let mut framesRelocs = List<InputReloc>.make()
+
+  let mut symbols = List<InputSymbol>.make()
+  let mut weakRefs = List<Bytes>.make()
+  let mut silkFuncs = List<SilkFuncMeta>.make()
+  let mut silkObjs = List<SilkObjMeta>.make()
+
+  // Deduplicate symbols across fragments by name.
+  let mut definedNames = List<Bytes>.make()
+  let mut definedIdx = InternIndex.make()
+
+  let functions = List<Function>.asSlice(&fragment.functions)
+  let mut at = usize.ZERO
+  while at < functions.length {
+    let f = &functions[at]
+    let fSym = Bytes.asSlice(&f.symbol)
+    let h = InternIndex.hashBytes(0, fSym)
+    let mut dup = false
+    let mut probe = InternIndex.first(&definedIdx, h)
+    let defSlice = List<Bytes>.asSlice(&definedNames)
+    while probe != usize.MAX {
+      if sameBytes(Bytes.asSlice(&defSlice[probe]), fSym) {
+        dup = true
+        break
+      }
+      probe = InternIndex.after(&definedIdx, probe)
+    }
+    if dup {
+      at = at + usize.ONE
+      continue
+    }
+    run List<Bytes>.append(&mut definedNames, run Bytes.copy(fSym))
+    run InternIndex.record(&mut definedIdx, h)
+
+    run alignCodeNop(&mut textData, 16)
+    let codeBase = Bytes.length(&textData)
+    let codeSlice = Bytes.asSlice(&f.code)
+    run Bytes.append(&mut textData, codeSlice)
+
+    let roSlice = Bytes.asSlice(&f.rodata)
+    let mut roBase = Bytes.length(&constData)
+    if roSlice.length > usize.ZERO {
+      run alignBuf(&mut constData, 16, 0)
+      roBase = Bytes.length(&constData)
+      run Bytes.append(&mut constData, roSlice)
+    }
+
+    run List<InputSymbol>.append(&mut symbols, InputSymbol {
+      name: run Bytes.copy(fSym),
+      section: 0,
+      offset: usize.toU64(codeBase),
+      size: usize.toU64(codeSlice.length),
+      alignment: 16,
+      isFunc: true,
+      isTls: false,
+      weak: false,
+    })
+
+    let exp = Bytes.asSlice(&f.exported)
+    if exp.length > usize.ZERO && !sameBytes(exp, fSym) {
+      let eh = InternIndex.hashBytes(0, exp)
+      run List<Bytes>.append(&mut definedNames, run Bytes.copy(exp))
+      run InternIndex.record(&mut definedIdx, eh)
+      run List<InputSymbol>.append(&mut symbols, InputSymbol {
+        name: run Bytes.copy(exp),
+        section: 0,
+        offset: usize.toU64(codeBase),
+        size: usize.toU64(codeSlice.length),
+        alignment: 16,
+        isFunc: true,
+        isTls: false,
+        weak: false,
+      })
+    }
+
+    let fDigest = hashFunction(f)
+    let locsSlice = List<u64>.asSlice(&f.locations)
+    let mut locsCopy = run List<u64>.makeWithCapacity(locsSlice.length)
+    let mut li = usize.ZERO
+    while li < locsSlice.length {
+      run List<u64>.append(&mut locsCopy, locsSlice[li])
+      li = li + usize.ONE
+    }
+    run List<SilkFuncMeta>.append(&mut silkFuncs, SilkFuncMeta {
+      symbol: run Bytes.copy(fSym),
+      exported: run Bytes.copy(exp),
+      digestHigh: fDigest.high,
+      digestLow: fDigest.low,
+      textOff: usize.toU64(codeBase),
+      codeSize: usize.toU64(codeSlice.length),
+      rodataOff: usize.toU64(roBase),
+      rodataSize: usize.toU64(roSlice.length),
+      locations: move locsCopy,
+    })
+
+    // Function code relocations.
+    let fSyms = List<Bytes>.asSlice(&f.symbols)
+    let fRelocs = List<AArch64Object.Relocation>.asSlice(&f.relocations)
+    let mut r = usize.ZERO
+    while r < fRelocs.length {
+      let rel = fRelocs[r]
+      let patchOff = usize.toU64(codeBase + rel.offset)
+      match rel.kind {
+        RelocationKind.LocalRodataPage21 => {
+          run List<InputReloc>.append(&mut textRelocs, InputReloc {
+            offset: patchOff, relType: rPage21(), addend: 0,
+            targetLocal: true, localSection: 1,
+            localOffset: usize.toU64(roBase) + i64.wrappingToU64(rel.addend),
+            symbol: Bytes.make(),
+          })
+        }
+        RelocationKind.LocalRodataPageOff12 => {
+          run List<InputReloc>.append(&mut textRelocs, InputReloc {
+            offset: patchOff, relType: rPageOff12(), addend: 0,
+            targetLocal: true, localSection: 1,
+            localOffset: usize.toU64(roBase) + i64.wrappingToU64(rel.addend),
+            symbol: Bytes.make(),
+          })
+        }
+        _ => {
+          let rType = match rel.kind {
+            RelocationKind.Branch26 => rBranch26()
+            RelocationKind.Page21 => rPage21()
+            RelocationKind.PageOff12 => rPageOff12()
+            RelocationKind.GotLoadPage21 => rGotLoadPage21()
+            RelocationKind.GotLoadPageOff12 => rGotLoadPageOff12()
+            RelocationKind.Abs64 => rAbs64()
+            RelocationKind.TlvpLoadPage21 => rTlvpLoadPage21()
+            RelocationKind.TlvpLoadPageOff12 => rTlvpLoadPageOff12()
+            _ => rBranch26()
+          }
+          run List<InputReloc>.append(&mut textRelocs, InputReloc {
+            offset: patchOff, relType: rType, addend: rel.addend,
+            targetLocal: false, localSection: usize.ZERO, localOffset: 0,
+            symbol: run Bytes.copy(Bytes.asSlice(&fSyms[rel.target])),
+          })
+        }
+      }
+      r = r + usize.ONE
+    }
+
+    // Jump-table entries in `__TEXT,__const`: `(text + codeBase + targetCodeOffset) - (const + roBase + tableOffset)`.
+    let fJumps = List<RodataJumpEntry>.asSlice(&f.rodataJumps)
+    let mut j = usize.ZERO
+    while j < fJumps.length {
+      let je = fJumps[j]
+      run List<InputReloc>.append(&mut constRelocs, InputReloc {
+        offset: usize.toU64(roBase + je.rodataOffset),
+        relType: rJumpTable32(),
+        addend: usize.toI64(roBase + je.tableOffset),
+        targetLocal: true,
+        localSection: 0,
+        localOffset: usize.toU64(codeBase + je.targetCodeOffset),
+        symbol: Bytes.make(),
+      })
+      j = j + usize.ONE
+    }
+
+    at = at + usize.ONE
+  }
+
+  // Static data objects.
+  let objects = List<Object>.asSlice(&fragment.objects)
+  at = usize.ZERO
+  while at < objects.length {
+    let obj = &objects[at]
+    let oSym = Bytes.asSlice(&obj.symbol)
+    if oSym.length > usize.ZERO {
+      let h = InternIndex.hashBytes(0, oSym)
+      let mut dup = false
+      let mut probe = InternIndex.first(&definedIdx, h)
+      let defSlice = List<Bytes>.asSlice(&definedNames)
+      while probe != usize.MAX {
+        if sameBytes(Bytes.asSlice(&defSlice[probe]), oSym) {
+          dup = true
+          break
+        }
+        probe = InternIndex.after(&definedIdx, probe)
+      }
+      if dup {
+        at = at + usize.ONE
+        continue
+      }
+      run List<Bytes>.append(&mut definedNames, run Bytes.copy(oSym))
+      run InternIndex.record(&mut definedIdx, h)
+    }
+
+    let align = if obj.alignment == 0 { usize.ONE } else { u64.toUsize(obj.alignment) }
+    let img = Bytes.asSlice(&obj.image)
+    let ptrs = List<ObjectPointer>.asSlice(&obj.pointers)
+
+    let mut secIdx: usize = 2
+    let mut base = usize.ZERO
+    if obj.framed {
+      secIdx = 4
+      run alignBuf(&mut framesData, align, 0)
+      base = Bytes.length(&framesData)
+      run Bytes.append(&mut framesData, img)
+    } else if obj.seen {
+      secIdx = 5
+      run alignBuf(&mut seenData, align, 0)
+      base = Bytes.length(&seenData)
+      run Bytes.append(&mut seenData, img)
+    } else if obj.local {
+      secIdx = 3
+      run alignBuf(&mut threadData, align, 0)
+      base = Bytes.length(&threadData)
+      run Bytes.append(&mut threadData, img)
+    } else if obj.readonly && ptrs.length == usize.ZERO {
+      secIdx = 1
+      run alignBuf(&mut constData, align, 0)
+      base = Bytes.length(&constData)
+      run Bytes.append(&mut constData, img)
+    } else {
+      secIdx = 2
+      run alignBuf(&mut dataBytes, align, 0)
+      base = Bytes.length(&dataBytes)
+      run Bytes.append(&mut dataBytes, img)
+    }
+
+    if oSym.length > usize.ZERO {
+      run List<InputSymbol>.append(&mut symbols, InputSymbol {
+        name: run Bytes.copy(oSym),
+        section: secIdx,
+        offset: usize.toU64(base),
+        size: usize.toU64(img.length),
+        alignment: if obj.alignment == 0 { 1 } else { obj.alignment },
+        isFunc: false,
+        isTls: obj.local,
+        weak: false,
+      })
+      let oDigest = hashObject(obj)
+      run List<SilkObjMeta>.append(&mut silkObjs, SilkObjMeta {
+        symbol: run Bytes.copy(oSym),
+        digestHigh: oDigest.high,
+        digestLow: oDigest.low,
+        section: secIdx,
+        offset: usize.toU64(base),
+        size: usize.toU64(img.length),
+        isTls: obj.local,
+        isFramed: obj.framed,
+        isSeen: obj.seen,
+      })
+    }
+
+    let mut p = usize.ZERO
+    while p < ptrs.length {
+      let ptr = &ptrs[p]
+      let rel = InputReloc {
+        offset: usize.toU64(base + ptr.offset),
+        relType: rAbs64(),
+        addend: u64.wrappingToI64(ptr.addend),
+        targetLocal: false,
+        localSection: usize.ZERO,
+        localOffset: 0,
+        symbol: run Bytes.copy(Bytes.asSlice(&ptr.symbol)),
+      }
+      if secIdx == 4 {
+        run List<InputReloc>.append(&mut framesRelocs, move rel)
+      } else {
+        run List<InputReloc>.append(&mut dataRelocs, move rel)
+      }
+      p = p + usize.ONE
+    }
+
+    at = at + usize.ONE
+  }
+
+  // Record weak references.
+  let wf = List<Bytes>.asSlice(&fragment.weakFunctions)
+  at = usize.ZERO
+  while at < wf.length {
+    run List<Bytes>.append(&mut weakRefs, run Bytes.copy(Bytes.asSlice(&wf[at])))
+    at = at + usize.ONE
+  }
+  let wo = List<Bytes>.asSlice(&fragment.weakObjects)
+  at = usize.ZERO
+  while at < wo.length {
+    run List<Bytes>.append(&mut weakRefs, run Bytes.copy(Bytes.asSlice(&wo[at])))
+    at = at + usize.ONE
+  }
+
+  let mut sections = run List<InputSection>.makeWithCapacity(6)
+  let textLen = usize.toU64(Bytes.length(&textData))
+  let constLen = usize.toU64(Bytes.length(&constData))
+  let dataLen = usize.toU64(Bytes.length(&dataBytes))
+  let threadLen = usize.toU64(Bytes.length(&threadData))
+  let framesLen = usize.toU64(Bytes.length(&framesData))
+  let seenLen = usize.toU64(Bytes.length(&seenData))
+  run List<InputSection>.append(&mut sections, InputSection {kind: SectionKind.Text, alignment: 16, data: move textData, memSize: textLen, relocs: move textRelocs})
+  run List<InputSection>.append(&mut sections, InputSection {kind: SectionKind.Const, alignment: 16, data: move constData, memSize: constLen, relocs: move constRelocs})
+  run List<InputSection>.append(&mut sections, InputSection {kind: SectionKind.Data, alignment: 8, data: move dataBytes, memSize: dataLen, relocs: move dataRelocs})
+  run List<InputSection>.append(&mut sections, InputSection {kind: SectionKind.ThreadData, alignment: 8, data: move threadData, memSize: threadLen, relocs: List<InputReloc>.make()})
+  run List<InputSection>.append(&mut sections, InputSection {kind: SectionKind.SilkFrames, alignment: 8, data: move framesData, memSize: framesLen, relocs: move framesRelocs})
+  run List<InputSection>.append(&mut sections, InputSection {kind: SectionKind.SilkSeen, alignment: 1, data: move seenData, memSize: seenLen, relocs: List<InputReloc>.make()})
+
+  return InputUnit {
+    sections: move sections,
+    symbols: move symbols,
+    weakRefs: move weakRefs,
+    silkFuncs: move silkFuncs,
+    silkObjs: move silkObjs,
+  }
+}
+
+/// Parses a TAPI v4 `.tbd` stub (such as `DarwinLink.libSystem()` or a macOS SDK `.tbd` file),
+/// extracting its `install-name` and every exported symbol targeting `arm64-macos` (or `arm64e-macos`).
+pub effect fn parseTbdV4(text: &[u8]) -> TbdLibrary ! OutOfMemoryError ? &mut Allocator {
+  let mut installName = Bytes.make()
+  let mut exports = List<Bytes>.make()
+  let mut index = InternIndex.make()
+
+  let mut inExports = false
+  let mut blockApplies = false
+  let mut pos = usize.ZERO
+  while pos < text.length {
+    // Read one line `[lineStart, lineEnd)`.
+    let lineStart = pos
+    while pos < text.length && text[pos] != 10 { pos = pos + usize.ONE }
+    let mut lineEnd = pos
+    if lineEnd > lineStart && text[lineEnd - usize.ONE] == 13 { lineEnd = lineEnd - usize.ONE }
+    if pos < text.length && text[pos] == 10 { pos = pos + usize.ONE }
+
+    // Skip leading spaces.
+    let mut s = lineStart
+    while s < lineEnd && (text[s] == 32 || text[s] == 9) { s = s + usize.ONE }
+    if s >= lineEnd { continue }
+    let line = Slice.view<u8>(text, s, lineEnd - s)
+
+    if startsWith(line, 0, b"install-name:") {
+      let mut p: usize = 13
+      while p < line.length && (line[p] == 32 || line[p] == 39 || line[p] == 34) { p = p + usize.ONE }
+      let mut e = line.length
+      while e > p && (line[e - usize.ONE] == 32 || line[e - usize.ONE] == 39 || line[e - usize.ONE] == 34) { e = e - usize.ONE }
+      if Bytes.length(&installName) == usize.ZERO && e > p {
+        installName = run Bytes.copy(Slice.view<u8>(line, p, e - p))
+      }
+    } else if startsWith(line, 0, b"exports:") {
+      inExports = true
+      blockApplies = false
+    } else if startsWith(line, 0, b"reexports:") || startsWith(line, 0, b"...") || startsWith(line, 0, b"---") {
+      if startsWith(line, 0, b"...") || startsWith(line, 0, b"---") {
+        inExports = false
+        blockApplies = false
+      }
+    } else if inExports && startsWith(line, 0, b"- targets:") {
+      blockApplies = containsSub(line, b"arm64-macos")
+    } else if inExports && blockApplies && startsWith(line, 0, b"symbols:") {
+      // Collect `[ ... ]` across one or multiple lines until `]`.
+      let mut scan = s + 8
+      while scan < text.length && text[scan] != 91 { scan = scan + usize.ONE } // '['
+      if scan < text.length && text[scan] == 91 {
+        scan = scan + usize.ONE
+        while scan < text.length && text[scan] != 93 { // ']'
+          while scan < text.length && (isSpace(text[scan]) || text[scan] == 44) { scan = scan + usize.ONE } // comma/space
+          if scan >= text.length || text[scan] == 93 { break }
+          let quoted = text[scan] == 39 || text[scan] == 34
+          let quoteChar = text[scan]
+          if quoted { scan = scan + usize.ONE }
+          let tokStart = scan
+          while scan < text.length {
+            let c = text[scan]
+            if quoted {
+              if c == quoteChar { break }
+            } else {
+              if isSpace(c) || c == 44 || c == 93 { break }
+            }
+            scan = scan + usize.ONE
+          }
+          if scan > tokStart {
+            let symSlice = Slice.view<u8>(text, tokStart, scan - tokStart)
+            let h = InternIndex.hashBytes(0, symSlice)
+            let mut exists = false
+            let exSlice = List<Bytes>.asSlice(&exports)
+            let mut pr = InternIndex.first(&index, h)
+            while pr != usize.MAX {
+              if sameBytes(Bytes.asSlice(&exSlice[pr]), symSlice) {
+                exists = true
+                break
+              }
+              pr = InternIndex.after(&index, pr)
+            }
+            if !exists {
+              run List<Bytes>.append(&mut exports, run Bytes.copy(symSlice))
+              run InternIndex.record(&mut index, h)
+            }
+          }
+          if quoted && scan < text.length && text[scan] == quoteChar { scan = scan + usize.ONE }
+        }
+        if scan > pos { pos = scan }
+      }
+    }
+  }
+
+  if Bytes.length(&installName) == usize.ZERO {
+    installName = run Bytes.copy(b"/usr/lib/libSystem.B.dylib")
+  }
+  return TbdLibrary {
+    installName: move installName,
+    exports: move exports,
+    index: move index,
+  }
+}
+
+/// Returns the built-in `/usr/lib/libSystem.B.dylib` [`TbdLibrary`] parsed from
+/// [`DarwinLink.libSystem`] augmented with standard POSIX/Darwin `libSystem.B.dylib` exports used
+/// across the Silk standard library (zero external SDK files required).
+pub effect fn builtinLibSystem() -> TbdLibrary ! OutOfMemoryError ? &mut Allocator {
+  let mut lib = run parseTbdV4(Bytes.asSlice(&run DarwinLink.libSystem()))
+  let extras: [&[u8]; 94] = [
+    b"_getsid", b"_setsid", b"_getpgid", b"_setpgid", b"_getuid", b"_geteuid", b"_getgid", b"_getegid",
+    b"_getppid", b"_getgroups", b"_setgroups", b"_setuid", b"_setgid", b"_seteuid", b"_setegid",
+    b"_getpriority", b"_setpriority", b"_gethostname", b"_uname", b"_getloadavg", b"_getpwuid_r",
+    b"_getifaddrs", b"_freeifaddrs", b"_host_processor_info", b"_host_statistics64", b"_mach_host_self",
+    b"_mach_port_deallocate", b"_mach_task_self_", b"_mach_thread_self", b"_mach_absolute_time",
+    b"_mach_timebase_info", b"_vm_deallocate", b"_task_info", b"_thread_info", b"_syscall", b"_time",
+    b"_posix_openpt", b"_grantpt", b"_unlockpt", b"_ptsname", b"_ptsname_r", b"_cfmakeraw",
+    b"_cfgetispeed", b"_cfgetospeed", b"_cfsetispeed", b"_cfsetospeed", b"_tcdrain", b"_tcflush",
+    b"_tcflow", b"_tcsendbreak", b"_tcgetpgrp", b"_tcsetpgrp", b"_tcgetattr", b"_tcsetattr",
+    b"_pthread_sigmask", b"_pthread_kill", b"_pthread_self", b"_pthread_equal", b"_pthread_once",
+    b"_pthread_key_create", b"_pthread_key_delete", b"_pthread_getspecific", b"_pthread_setspecific",
+    b"_pthread_mutex_init", b"_pthread_mutex_destroy", b"_pthread_mutex_lock", b"_pthread_mutex_trylock",
+    b"_pthread_mutex_unlock", b"_pthread_cond_init", b"_pthread_cond_destroy", b"_pthread_cond_wait",
+    b"_pthread_cond_timedwait", b"_pthread_cond_signal", b"_pthread_cond_broadcast",
+    b"_os_unfair_lock_lock", b"_os_unfair_lock_trylock", b"_os_unfair_lock_unlock",
+    b"_dlopen", b"_dlsym", b"_dlclose", b"_dlerror", b"_dladdr",
+    b"_backtrace", b"_backtrace_symbols", b"_sysctl", b"_sysctlbyname", b"_sysctlnametomib",
+    b"_confstr", b"_pathconf", b"_fpathconf", b"_umask", b"_killpg", b"_raise", b"_vfork",
+  ]
+  let mut i = usize.ZERO
+  while i < extras.length {
+    let sym = extras[i]
+    if !lib.contains(sym) {
+      let h = InternIndex.hashBytes(0, sym)
+      run List<Bytes>.append(&mut lib.exports, run Bytes.copy(sym))
+      run InternIndex.record(&mut lib.index, h)
+    }
+    i = i + usize.ONE
+  }
+  return move lib
+}

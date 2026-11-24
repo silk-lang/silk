@@ -1,0 +1,302 @@
+//! macOS ARM64 (`aarch64-apple-darwin`) adapter over target-neutral SSA lowering (`SsaLower`):
+//! translates each lowered unit with `AArch64Emit` and encodes it as an [`AArch64Object.Fragment`].
+//!
+//! # When to use
+//! Use [`emit`] to lower one MIR definition to an encoded [`AArch64Object.Fragment`],
+//! [`declarations`] for the shared runtime helpers (`silk.diagnostic.fatal`,
+//! `__silk_guarded_reclaim`, `silk.diagnostic.frame`, and 128-bit division helpers),
+//! [`exportedObject`] for an exported C scalar static, and [`foreignDeclarations`] for C symbol
+//! declarations.
+
+import backend.AArch64Emit
+import backend.AArch64Helpers
+import backend.AArch64Object {
+  Fragment,
+  Function as AArch64Function,
+  Object,
+  Pointer as ObjectPointer,
+  Unsupported as AArch64Unsupported,
+}
+import backend.CAbi
+import backend.Coroutine {Facts}
+import backend.Gap {Gap}
+import backend.InstanceIdentity {InstanceIdentity}
+import backend.Layout {TypeLayout}
+import backend.Mir {MirFunction}
+import backend.SsaDeadCode
+import backend.SsaLower
+import backend.SsaLower {
+  DataObject,
+  DataPointer,
+  Lowered,
+  LoweredFunction,
+  ObjectConstant as SsaObjectConstant,
+  Unsupported as LowerUnsupported,
+}
+import backend.SsaPipeline {Level}
+import backend.SsaPromotion
+import backend.SsaVerification
+import semantic.ContentHash {ContentHash}
+import semantic.Target {Target}
+import semantic.Types {Types}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+/// One deduplicated declaration candidate owned by an instance answer; `text` is its fragment.
+pub struct Declaration {
+  /// Stable deduplication key combining the symbol name and kind (`:fn` or `:obj`).
+  pub contract: Bytes,
+  /// Link symbol name without a Mach-O leading underscore.
+  pub symbol: Bytes,
+  /// Encoded [`AArch64Object.Fragment`] carrying the declaration metadata.
+  pub text: Bytes,
+}
+
+/// One statically evaluated C scalar that initializes an exported C object.
+pub union ObjectConstant {
+  /// Signed or unsigned integer scalar initializer.
+  Integer {pub negative: bool, pub magnitude: u64},
+  /// Binary32 bits when `single`, otherwise binary64 bits.
+  Float {pub bits: u64, pub single: bool},
+}
+
+effect fn refusedFragment(detail: Bytes) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut fragment = Fragment.make()
+  run List<Bytes>.append(&mut fragment.refused, move detail)
+  return run fragment.encode()
+}
+
+effect fn appendSeenRecord(fragment: &mut Fragment, fnSymbol: &[u8], digest: &ContentHash) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let mut sym = run Bytes.copy(fnSymbol)
+  run Bytes.append(&mut sym, b".silk_seen")
+  let mut img = run Bytes.makeWithCapacity(17)
+  run Bytes.append(&mut img, &[0])
+  let words = [digest.high, digest.low]
+  let mut wi = usize.ZERO
+  while wi < 2 {
+    let w = words[wi]
+    let mut b = usize.ZERO
+    while b < 8 {
+      let shift = usize.toU64((7 - b) * 8)
+      let byteVal = u64.wrappingToU8(u64.shiftRight(w, shift) & 0xFF)
+      run Bytes.append(&mut img, &[byteVal])
+      b = b + usize.ONE
+    }
+    wi = wi + usize.ONE
+  }
+  run List<Object>.append(
+    &mut fragment.objects,
+    Object {
+      symbol: run Bytes.copy(Bytes.asSlice(&sym)),
+      alignment: 1,
+      image: move img,
+      pointers: List<ObjectPointer>.make(),
+      framed: false,
+      local: false,
+      readonly: false,
+      seen: true,
+    },
+  )
+  return move sym
+}
+
+effect fn encodeLowered(lowered: &Lowered, includeHelpers: bool, seen: &Option<ContentHash>) -> Bytes
+! AArch64Unsupported | OutOfMemoryError ? &mut Allocator {
+  let mut fragment = Fragment.make()
+  let functions = List<LoweredFunction>.asSlice(&lowered.functions)
+  let mut at = usize.ZERO
+  while at < functions.length {
+    let f = &functions[at]
+    let mut seenSym = Bytes.make()
+    if at == usize.ZERO {
+      if let Option<ContentHash>.Some {value: digest} = &seen.* {
+        seenSym = run appendSeenRecord(&mut fragment, f.function.name(), &digest)
+      }
+    }
+    let emitted = run AArch64Emit.emitWithSeen(&f.function, f.function.name(), Bytes.asSlice(&f.exported), Bytes.asSlice(&seenSym))
+    run List<AArch64Function>.append(&mut fragment.functions, move emitted)
+    at = at + usize.ONE
+  }
+  if includeHelpers {
+    run AArch64Helpers.appendAll(&mut fragment.functions)
+  }
+  let objects = List<DataObject>.asSlice(&lowered.objects)
+  at = usize.ZERO
+  while at < objects.length {
+    let source = &objects[at]
+    let sourcePointers = List<DataPointer>.asSlice(&source.pointers)
+    let mut pointers = run List<ObjectPointer>.makeWithCapacity(sourcePointers.length)
+    let mut ptrAt = usize.ZERO
+    while ptrAt < sourcePointers.length {
+      run List<ObjectPointer>.append(
+        &mut pointers,
+        ObjectPointer {
+          offset: sourcePointers[ptrAt].offset,
+          symbol: run Bytes.copy(Bytes.asSlice(&sourcePointers[ptrAt].symbol)),
+          addend: sourcePointers[ptrAt].addend,
+          size: sourcePointers[ptrAt].size,
+        },
+      )
+      ptrAt = ptrAt + usize.ONE
+    }
+    run List<Object>.append(
+      &mut fragment.objects,
+      Object {
+        symbol: run Bytes.copy(Bytes.asSlice(&source.symbol)),
+        alignment: source.alignment,
+        image: run Bytes.copy(Bytes.asSlice(&source.image)),
+        pointers: move pointers,
+        framed: source.framed,
+        local: source.local,
+        readonly: source.readonly && !source.framed && !source.local && sourcePointers.length == usize.ZERO,
+        seen: false,
+      },
+    )
+    at = at + usize.ONE
+  }
+  let weak = List<Bytes>.asSlice(&lowered.weakObjects)
+  at = usize.ZERO
+  while at < weak.length {
+    run List<Bytes>.append(&mut fragment.weakObjects, run Bytes.copy(Bytes.asSlice(&weak[at])))
+    at = at + usize.ONE
+  }
+  return run fragment.encode()
+}
+
+/// Emits one MIR definition as an encoded [`AArch64Object.Fragment`] of AArch64 functions and data
+/// objects. A construct the macOS ARM64 direct backend cannot express leaves a fragment recording
+/// the refusal (`AArch64Object.Fragment.refused`).
+pub effect fn emit(
+  function: &MirFunction,
+  target: &Target,
+  supplied: &[TypeLayout],
+  foreign: &[CAbi.Signature],
+  identities: &[InstanceIdentity],
+  suspension: &Option<Facts>,
+  shared: bool,
+  hostExport: bool,
+  level: Level,
+  verify: bool,
+  seen: &Option<ContentHash>,
+) -> Bytes ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  match move run Effect.result(emitChecked(function, target, supplied, foreign, identities, suspension, shared, hostExport, level, verify, seen)) {
+    Result<Bytes, Gap | LowerUnsupported | AArch64Unsupported | OutOfMemoryError>.Success {value} => { return move value }
+    Result<Bytes, Gap | LowerUnsupported | AArch64Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      LowerUnsupported refused => { return run refusedFragment(move refused.detail) }
+      AArch64Unsupported refused => { return run refusedFragment(move refused.detail) }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn emitChecked(
+  function: &MirFunction,
+  target: &Target,
+  supplied: &[TypeLayout],
+  foreign: &[CAbi.Signature],
+  identities: &[InstanceIdentity],
+  suspension: &Option<Facts>,
+  _shared: bool,
+  hostExport: bool,
+  level: Level,
+  verify: bool,
+  seen: &Option<ContentHash>,
+) -> Bytes ! Gap | LowerUnsupported | AArch64Unsupported | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut lowered = run SsaLower.lower(function, target, supplied, foreign, identities, suspension, true, hostExport, level, verify)
+  // In dev mode (`Level.None`), promote non-escaping scalar MIR slots into SSA registers and drop
+  // the dead slot-address chains they leave behind. This keeps compile time fast (smaller IR for
+  // regalloc and emission) while beating LLVM `-O0` runtime and binary size cleanly.
+  if level == Level.None {
+    let fns = List<LoweredFunction>.asMutSlice(&mut lowered.functions)
+    let mut i = usize.ZERO
+    while i < fns.length {
+      run SsaPromotion.promote(&mut fns[i].function, true)
+      drop run SsaDeadCode.eliminate(&mut fns[i].function)
+      if verify { run SsaVerification.verify(&fns[i].function, b"dev scalar promotion") }
+      i = i + usize.ONE
+    }
+  }
+  return run encodeLowered(&lowered, false, seen)
+}
+
+/// Shared macOS ARM64 runtime helper definitions (`silk.diagnostic.fatal`,
+/// `__silk_guarded_reclaim`, `_Unwind_Backtrace` callback `silk.diagnostic.frame`, and 128-bit
+/// division helpers), encoded as an [`AArch64Object.Fragment`].
+pub effect fn declarations(target: &Target, shared: bool, frames: bool, verify: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  match move run Effect.result(declarationsChecked(target, shared, frames, verify)) {
+    Result<Bytes, LowerUnsupported | AArch64Unsupported | OutOfMemoryError>.Success {value} => { return move value }
+    Result<Bytes, LowerUnsupported | AArch64Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      LowerUnsupported refused => { return run refusedFragment(move refused.detail) }
+      AArch64Unsupported refused => { return run refusedFragment(move refused.detail) }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn declarationsChecked(target: &Target, _shared: bool, frames: bool, verify: bool) -> Bytes
+! LowerUnsupported | AArch64Unsupported | OutOfMemoryError ? &mut Allocator {
+  let lowered = run SsaLower.declarations(target, true, frames, verify)
+  return run encodeLowered(&lowered, true, &Option<ContentHash>.none())
+}
+
+/// Defines one exported C scalar object as an encoded [`AArch64Object.Fragment`].
+pub effect fn exportedObject(target: &Target, signature: &CAbi.Signature, constant: &ObjectConstant) -> Bytes
+! Gap | OutOfMemoryError ? &mut Allocator {
+  let converted = match &constant.* {
+    ObjectConstant.Integer {negative, magnitude} => SsaObjectConstant.Integer {negative: negative, magnitude: magnitude}
+    ObjectConstant.Float {bits, single} => SsaObjectConstant.Float {bits: bits, single: single}
+  }
+  match move run Effect.result(exportedObjectChecked(target, signature, &converted)) {
+    Result<Bytes, Gap | LowerUnsupported | AArch64Unsupported | OutOfMemoryError>.Success {value} => { return move value }
+    Result<Bytes, Gap | LowerUnsupported | AArch64Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      LowerUnsupported refused => { return run refusedFragment(move refused.detail) }
+      AArch64Unsupported refused => { return run refusedFragment(move refused.detail) }
+      Gap gap => { fail move gap }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn exportedObjectChecked(target: &Target, signature: &CAbi.Signature, constant: &SsaObjectConstant) -> Bytes
+! Gap | LowerUnsupported | AArch64Unsupported | OutOfMemoryError ? &mut Allocator {
+  let lowered = run SsaLower.exportedObject(target, signature, constant)
+  return run encodeLowered(&lowered, false, &Option<ContentHash>.none())
+}
+
+/// Declares foreign C symbols for macOS ARM64 linking: C data objects are recorded in
+/// `AArch64Object.Fragment.declaredObjects`, while external C functions resolve through the Mach-O
+/// linker's undefined symbol table.
+pub effect fn foreignDeclarations(foreign: &[CAbi.Signature]) -> List<Declaration>
+! OutOfMemoryError ? &mut Allocator {
+  let mut output = List<Declaration>.make()
+  let mut at = usize.ZERO
+  while at < foreign.length {
+    let signature = &foreign[at]
+    let mut fragment = Fragment.make()
+    if signature.global {
+      run List<Bytes>.append(&mut fragment.declaredObjects, run Bytes.copy(Bytes.asSlice(&signature.symbol)))
+    }
+    let text = run fragment.encode()
+    let mut contract = run Bytes.copy(Bytes.asSlice(&signature.symbol))
+    if signature.global {
+      run Bytes.append(&mut contract, b":obj")
+    } else {
+      run Bytes.append(&mut contract, b":fn")
+    }
+    run List<Declaration>.append(&mut output, Declaration {
+      contract: move contract,
+      symbol: run Bytes.copy(Bytes.asSlice(&signature.symbol)),
+      text: move text,
+    })
+    at = at + usize.ONE
+  }
+  return move output
+}

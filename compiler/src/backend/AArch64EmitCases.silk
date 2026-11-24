@@ -1,0 +1,2046 @@
+//! Unit checks for `AArch64Frame` Darwin ARM64 frame layout and `AArch64Emit` scalar/ABI machine-code emission.
+
+import backend.AArch64Emit
+import backend.AArch64Encode
+import backend.AArch64Frame
+import backend.AArch64Object {Function, Relocation, RelocationKind, RodataJumpEntry, Unsupported}
+import backend.SsaFunction {
+  AbiExtension,
+  ArchOperation,
+  Binary,
+  CallingConvention,
+  Cast,
+  Count,
+  Extreme,
+  Kind,
+  MemoryEffect,
+  Modify,
+  Operation,
+  ParameterAbi,
+  Predicate,
+  Reduction,
+  SsaFunction,
+  none,
+}
+import backend.SsaVerification
+import backend.SsaVerification {Violation}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.i64
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+
+effect fn expectValidSsa(function: &SsaFunction) -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let violation = run SsaVerification.check(function)
+  run Testing.expect(!Option<Violation>.isSome(&violation), "constructed SsaFunction passes SsaVerification.check")
+}
+
+fn isValidGprHome(reg: u8) -> bool {
+  if reg == AArch64Frame.regNone() { return true }
+  return reg <= 14 || (reg >= 19 && reg <= 28)
+}
+
+fn isValidVecHome(reg: u8) -> bool {
+  if reg == AArch64Frame.regNone() { return true }
+  return reg <= 27
+}
+
+test effect fn reservesX18AndScratchesUnderHighGprPressure() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run highGprPressureClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn highGprPressureClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // >26 simultaneously live GPRs saturate all 15 caller-saved and 10 callee-saved GPRs and force
+  // spills without ever assigning x18, x29, x30, sp, or scratch x15..x17.
+  let i64K = Kind.integer(64)
+  let mut f = run SsaFunction.make(b"gpr_pressure", 64)
+  let base = run f.argument(i64K)
+  let step = run f.argument(i64K)
+  f.setResult(i64K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+
+  let mut live = List<u64>.make()
+  let mut k = usize.ZERO
+  while k < 30 {
+    let c = run f.integer(64, usize.toU64(k + usize.ONE))
+    let v = run f.binary(Binary.Add, base, c)
+    run List<u64>.append(&mut live, v)
+    k = k + usize.ONE
+  }
+  let liveSlice = List<u64>.asSlice(&live)
+  let mut acc = step
+  k = usize.ZERO
+  while k < liveSlice.length {
+    acc = run f.binary(Binary.Add, acc, liveSlice[k])
+    acc = run f.binary(Binary.Xor, acc, liveSlice[k])
+    acc = run f.binary(Binary.Add, acc, liveSlice[k])
+    k = k + usize.ONE
+  }
+  run f.ret(acc)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let frame = run AArch64Frame.plan(&f)
+  let regs = List<u8>.asSlice(&frame.valueRegs)
+  let offs = List<i64>.asSlice(&frame.valueOffsets)
+
+  let mut vIdx = usize.ZERO
+  let mut callerMask: u64 = 0
+  while vIdx < regs.length {
+    let reg = regs[vIdx]
+    run Testing.expect(reg != AArch64Encode.x18(), "Darwin platform register x18 is never allocated")
+    run Testing.expect(reg != AArch64Encode.fp() && reg != AArch64Encode.lr() && reg != AArch64Encode.sp(),
+      "frame pointer, link register, and sp are never allocated")
+    run Testing.expect(
+      reg != AArch64Frame.scratchGpVal() && reg != AArch64Frame.scratchGpCycle() && reg != AArch64Frame.scratchGpAddr(),
+      "emitter scratch GPRs x15..x17 are never allocated")
+    run Testing.expect(isValidGprHome(reg), "all GPR assignments lie within caller 0..14 or callee 19..28")
+    if reg <= 14 {
+      callerMask = callerMask | u64.shiftLeft(1, u8.toU64(reg))
+    }
+    vIdx = vIdx + usize.ONE
+  }
+
+  let mut calleeAssigned = usize.ZERO
+  let mut spilled = usize.ZERO
+  k = usize.ZERO
+  while k < liveSlice.length {
+    let idx = u64.toUsize(liveSlice[k])
+    let r = regs[idx]
+    if r == AArch64Frame.regNone() {
+      if offs[idx] < 0 { spilled = spilled + usize.ONE }
+    } else if r >= 19 && r <= 28 {
+      calleeAssigned = calleeAssigned + usize.ONE
+    }
+    k = k + usize.ONE
+  }
+  run Testing.expect(callerMask == 0x7FFF, "all 15 caller-saved GPRs x0..x14 are utilized under pressure")
+  run Testing.expect(calleeAssigned >= 1 && frame.savedCalleeMask != 0 && frame.savedCount >= usize.ONE,
+    "callee-saved GPRs x19..x28 are utilized and recorded in savedCalleeMask")
+  run Testing.expect(spilled >= 5, "excess live GPRs beyond the 25-register pool spill to stack offsets")
+  run Testing.expect(frame.subSpBytes % 16 == 0, "subSpBytes remains 16-byte aligned after GPR spills")
+}
+
+test effect fn separatesCallerCalleeGprsRespectsInlineAsmAndFusesBranch() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run callerCalleeAndAsmClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn callerCalleeAndAsmClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+
+  // 1. Call-free leaf loop allocates loop-carried GPRs into caller-saved x0..x14 with zero callee saves.
+  let mut leaf = run SsaFunction.make(b"leaf_gpr_loop", 64)
+  let nArg = run leaf.argument(i64K)
+  leaf.setResult(i64K)
+  let lb0 = run leaf.newBlock()
+  let lb1 = run leaf.newBlock()
+  let lb2 = run leaf.newBlock()
+  let lb3 = run leaf.newBlock()
+  let lpI = run leaf.addParameter(lb1, i64K)
+  let lpAcc = run leaf.addParameter(lb1, i64K)
+  leaf.startBlock(lb0)
+  let zero = run leaf.integer(64, 0)
+  let one = run leaf.integer(64, 1)
+  let initArgs = [zero, zero]
+  run leaf.jumpWith(lb1, &initArgs)
+  leaf.startBlock(lb1)
+  let cond = run leaf.compare(Predicate.Ult, lpI, nArg)
+  run leaf.branchIf(cond, lb2, lb3)
+  leaf.startBlock(lb2)
+  let acc2 = run leaf.binary(Binary.Add, lpAcc, lpI)
+  let i2 = run leaf.binary(Binary.Add, lpI, one)
+  let nextArgs = [i2, acc2]
+  run leaf.jumpWith(lb1, &nextArgs)
+  leaf.startBlock(lb3)
+  run leaf.ret(lpAcc)
+  run leaf.finish()
+  run expectValidSsa(&leaf)
+
+  let leafFrame = run AArch64Frame.plan(&leaf)
+  let leafRegs = List<u8>.asSlice(&leafFrame.valueRegs)
+  run Testing.expect(leafFrame.savedCalleeMask == 0 && leafFrame.savedCount == usize.ZERO,
+    "call-free leaf loop emits zero callee-saved GPRs")
+  run Testing.expect(leafRegs[u64.toUsize(lpI)] <= 14 && leafRegs[u64.toUsize(lpAcc)] <= 14,
+    "loop-carried GPRs in a leaf loop receive caller-saved x0..x14")
+  run Testing.expect(leafRegs[u64.toUsize(nArg)] >= 9 && leafRegs[u64.toUsize(nArg)] <= 14,
+    "incoming argument nArg in a leaf loop uses non-ABI x9..x14 instead of x0..x8")
+  run Testing.expect(leafRegs[u64.toUsize(cond)] == AArch64Frame.regNone(),
+    "single-use scalar compare before Exit.Branch is fused without consuming a GPR")
+
+  // 2. Value live across Call inside a loop uses callee-saved x19..x28, while a pre-call value uses x0..x14.
+  let mut callFn = run SsaFunction.make(b"call_crossing_gpr", 64)
+  let cArg = run callFn.argument(i64K)
+  callFn.setResult(i64K)
+  let cb0 = run callFn.newBlock()
+  let cb1 = run callFn.newBlock()
+  let cb2 = run callFn.newBlock()
+  let cb3 = run callFn.newBlock()
+  let cpI = run callFn.addParameter(cb1, i64K)
+  let cpAcc = run callFn.addParameter(cb1, i64K)
+  callFn.startBlock(cb0)
+  let cZero = run callFn.integer(64, 0)
+  let cOne = run callFn.integer(64, 1)
+  let preCall = run callFn.binary(Binary.Add, cArg, cOne)
+  let preUse = run callFn.binary(Binary.Xor, preCall, cArg)
+  let cInit = [cZero, preUse]
+  run callFn.jumpWith(cb1, &cInit)
+  callFn.startBlock(cb1)
+  let cCond = run callFn.compare(Predicate.Ult, cpI, cArg)
+  run callFn.branchIf(cCond, cb2, cb3)
+  callFn.startBlock(cb2)
+  let callArgs = [cpI]
+  let callRes = run callFn.call(b"ext_step", &callArgs, i64K)
+  let cAcc2 = run callFn.binary(Binary.Add, cpAcc, callRes)
+  let cI2 = run callFn.binary(Binary.Add, cpI, cOne)
+  let cNext = [cI2, cAcc2]
+  run callFn.jumpWith(cb1, &cNext)
+  callFn.startBlock(cb3)
+  run callFn.ret(cpAcc)
+  run callFn.finish()
+  run expectValidSsa(&callFn)
+
+  let callFrame = run AArch64Frame.plan(&callFn)
+  let callRegs = List<u8>.asSlice(&callFrame.valueRegs)
+  let rCpI = callRegs[u64.toUsize(cpI)]
+  let rCpAcc = callRegs[u64.toUsize(cpAcc)]
+  let rPreCall = callRegs[u64.toUsize(preCall)]
+  run Testing.expect(rPreCall <= 14, "non-call-crossing preCall uses caller-saved GPR x0..x14")
+  run Testing.expect(rCpI >= 19 && rCpI <= 28 && rCpAcc >= 19 && rCpAcc <= 28,
+    "values live across Call in loop use callee-saved x19..x28")
+  run Testing.expect(
+    (callFrame.savedCalleeMask & u64.shiftLeft(1, u8.toU64(rCpI))) != 0
+      && (callFrame.savedCalleeMask & u64.shiftLeft(1, u8.toU64(rCpAcc))) != 0
+      && callFrame.savedCount >= 2,
+    "savedCalleeMask and savedCount record every assigned x19..x28 register")
+
+  // 3. InlineAsm marks hasInlineAsm and excludes caller-saved x0..x14 across the asm point.
+  let mut asmFn = run SsaFunction.make(b"inline_asm_clobber", 64)
+  let a0 = run asmFn.argument(i64K)
+  asmFn.setResult(i64K)
+  let ab0 = run asmFn.newBlock()
+  asmFn.startBlock(ab0)
+  let aOne = run asmFn.integer(64, 1)
+  let liveAcross = run asmFn.binary(Binary.Add, a0, aOne)
+  let asmIn = [a0]
+  let echoed = run asmFn.inlineAsm(b"mov $0, $1", b"={x0},r", b"~{x9},~{x10}", MemoryEffect.None, false, false, &asmIn, i64K)
+  let s1 = run asmFn.binary(Binary.Add, liveAcross, echoed)
+  let s2 = run asmFn.binary(Binary.Add, s1, liveAcross)
+  let s3 = run asmFn.binary(Binary.Add, s2, liveAcross)
+  run asmFn.ret(s3)
+  run asmFn.finish()
+  run expectValidSsa(&asmFn)
+
+  let asmFrame = run AArch64Frame.plan(&asmFn)
+  let asmRegs = List<u8>.asSlice(&asmFrame.valueRegs)
+  let rAcross = asmRegs[u64.toUsize(liveAcross)]
+  run Testing.expect(asmFrame.hasInlineAsm, "InlineAsm sets hasInlineAsm")
+  run Testing.expect(rAcross >= 19 && rAcross <= 28,
+    "value live across InlineAsm clobbering caller GPRs is placed in callee-saved x19..x28 rather than x0..x14")
+}
+
+test effect fn keepsNeon128BitResidentAcrossBitcastsAndArchOps() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run neonResidencyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn neonResidencyClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let ptrK = Kind.address(64)
+  let i8K = Kind.integer(8)
+  let i32K = Kind.integer(32)
+  let i64K = Kind.integer(64)
+  let i128K = Kind.integer(128)
+  let v16i8 = Kind.vector(i8K, 16)
+  let v8i16 = Kind.vector(Kind.integer(16), 8)
+  let v4i32 = Kind.vector(i32K, 4)
+  let v2i64 = Kind.vector(i64K, 2)
+  let v4f32 = Kind.vector(Kind.float(32), 4)
+
+  // 1. Core NEON pipeline: Load, Splat, Compare, Select, Binary, Rotate, Shuffle,
+  //    16B<->16B Bitcast, isVec128 <-> i128 Bitcast, ArchIntrinsic, Reduce, and Store.
+  let mut f = run SsaFunction.make(b"neon_residency", 64)
+  let pIn = run f.argument(ptrK)
+  let pOut = run f.argument(ptrK)
+  f.setResult(i8K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+
+  let raw = run f.load(v16i8, pIn, 0, 16)
+  let c65 = run f.integer(8, 65)
+  let c9 = run f.integer(8, 9)
+  let sp65 = run f.splat(c65, 16)
+  let sp9 = run f.splat(c9, 16)
+  let mask = run f.compare(Predicate.Uge, raw, sp65)
+  let sel = run f.select(mask, sp9, raw)
+  let sum8 = run f.binary(Binary.Add, raw, sel)
+  let asV4 = run f.cast(Cast.Bitcast, sum8, v4i32)
+  let c16 = run f.integer(32, 16)
+  let sp16 = run f.splat(c16, 4)
+  let rotV4 = run f.rotate(true, asV4, sp16)
+  let shufMask: [u64; 4] = [3, 2, 1, 0]
+  let shufV4 = run f.shuffle(rotV4, rotV4, &shufMask)
+  let asV2 = run f.cast(Cast.Bitcast, shufV4, v2i64)
+  let asI128 = run f.cast(Cast.Bitcast, asV2, i128K)
+  let backV16 = run f.cast(Cast.Bitcast, asI128, v16i8)
+  let tblOps = [backV16, sp9]
+  let tblRes = run f.archIntrinsic(ArchOperation.Aarch64TableLookup, 0, &tblOps, v16i8)
+  run f.store(tblRes, pOut, 0, 16)
+  let red = run f.reduce(Reduction.Add, tblRes, none())
+  run f.ret(red)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let frame = run AArch64Frame.plan(&f)
+  let vecs = List<u8>.asSlice(&frame.valueVecs)
+  let regs = List<u8>.asSlice(&frame.valueRegs)
+  let offs = List<i64>.asSlice(&frame.valueOffsets)
+
+  let residentVals = [raw, sp65, sp9, sel, sum8, asV4, sp16, rotV4, shufV4, asV2, backV16, tblRes]
+  let mut k = usize.ZERO
+  while k < residentVals.length {
+    let idx = u64.toUsize(residentVals[k])
+    run Testing.expect(vecs[idx] != AArch64Frame.regNone() && isValidVecHome(vecs[idx]),
+      "every 128-bit NEON value (including bitcasts and Shuffle/Rotate/Tbl) stays in v0..v27")
+    run Testing.expect(offs[idx] == 0,
+      "resident 128-bit NEON values are never evicted to stack offsets")
+    k = k + usize.ONE
+  }
+  let i128Idx = u64.toUsize(asI128)
+  run Testing.expect(vecs[i128Idx] == AArch64Frame.regNone() && regs[i128Idx] == AArch64Frame.regNone(),
+    "i128 bitcast intermediate is not assigned a GPR or NEON register")
+  run Testing.expect(offs[i128Idx] != 0 && (0 - offs[i128Idx]) % 16 == 0,
+    "i128 bitcast intermediate takes a 16-byte-aligned stack slot")
+
+  // 2. Verify all 14 AArch64 ArchOperation variants + float/int 128-bit ops stay resident in NEON.
+  let mut archFn = run SsaFunction.make(b"neon_all_14_arch_ops", 64)
+  let ap = run archFn.argument(ptrK)
+  archFn.setResult(i64K)
+  let ab = run archFn.newBlock()
+  archFn.startBlock(ab)
+  let a16 = run archFn.load(v16i8, ap, 0, 16)
+  let b16 = run archFn.load(v16i8, ap, 16, 16)
+  let a8_16 = run archFn.cast(Cast.Bitcast, a16, v8i16)
+  let a32 = run archFn.load(v4i32, ap, 32, 16)
+  let b32 = run archFn.load(v4i32, ap, 48, 16)
+  let a64 = run archFn.load(v2i64, ap, 64, 16)
+  let af32 = run archFn.load(v4f32, ap, 80, 16)
+  let negF = run archFn.negate(af32)
+  let sqrtF = run archFn.squareRoot(negF)
+  let fmaF = run archFn.fusedMultiplyAdd(sqrtF, af32, af32)
+  let sat16 = run archFn.saturating(Binary.Add, true, a8_16, a8_16)
+  let min16 = run archFn.extreme(Extreme.SignedMinimum, sat16, a8_16)
+  let red64 = run archFn.reduce(Reduction.Add, a64, none())
+
+  let udotOps = [a32, a16, b16]
+  let o1 = run archFn.archIntrinsic(ArchOperation.Aarch64TableLookup, 0, &[a16, b16], v16i8)
+  let o2 = run archFn.archIntrinsic(ArchOperation.Aarch64UnsignedDotProduct, 0, &udotOps, v4i32)
+  let o3 = run archFn.archIntrinsic(ArchOperation.Aarch64SignedDotProduct, 0, &[o2, o1, b16], v4i32)
+  let o4 = run archFn.archIntrinsic(ArchOperation.Aarch64PairwiseAdd, 0, &[o3, b32], v4i32)
+  let o5 = run archFn.archIntrinsic(ArchOperation.Aarch64AesEncrypt, 0, &[o1, b16], v16i8)
+  let o6 = run archFn.archIntrinsic(ArchOperation.Aarch64AesDecrypt, 0, &[o5, a16], v16i8)
+  let o7 = run archFn.archIntrinsic(ArchOperation.Aarch64AesMixColumns, 0, &[o6], v16i8)
+  let o8 = run archFn.archIntrinsic(ArchOperation.Aarch64AesInverseMixColumns, 0, &[o7], v16i8)
+  let o9 = run archFn.archIntrinsic(ArchOperation.Aarch64PolynomialMultiply, 0, &[a64, a64], v2i64)
+  let o10 = run archFn.archIntrinsic(ArchOperation.Aarch64PolynomialMultiplyHigh, 0, &[o9, a64], v2i64)
+  let o11 = run archFn.archIntrinsic(ArchOperation.Aarch64Sha256Hash, 0, &[o4, a32, b32], v4i32)
+  let o12 = run archFn.archIntrinsic(ArchOperation.Aarch64Sha256Hash2, 0, &[o11, o4, b32], v4i32)
+  let o13 = run archFn.archIntrinsic(ArchOperation.Aarch64Sha256ScheduleUpdate0, 0, &[o12, a32], v4i32)
+  let o14 = run archFn.archIntrinsic(ArchOperation.Aarch64Sha256ScheduleUpdate1, 0, &[o13, o12, b32], v4i32)
+
+  let o8_64 = run archFn.cast(Cast.Bitcast, o8, v2i64)
+  let o10_32 = run archFn.cast(Cast.Bitcast, o10, v4i32)
+  let fma_32 = run archFn.cast(Cast.Bitcast, fmaF, v4i32)
+  let min_32 = run archFn.cast(Cast.Bitcast, min16, v4i32)
+  let mix1 = run archFn.binary(Binary.Xor, o14, o10_32)
+  let mix2 = run archFn.binary(Binary.Xor, mix1, fma_32)
+  let mix3 = run archFn.binary(Binary.Xor, mix2, min_32)
+  let mix3_64 = run archFn.cast(Cast.Bitcast, mix3, v2i64)
+  let mix4_64 = run archFn.binary(Binary.Add, mix3_64, o8_64)
+  run archFn.store(mix4_64, ap, 96, 16)
+  run archFn.ret(red64)
+  run archFn.finish()
+  run expectValidSsa(&archFn)
+
+  let archFrame = run AArch64Frame.plan(&archFn)
+  let archVecs = List<u8>.asSlice(&archFrame.valueVecs)
+  let archOffs = List<i64>.asSlice(&archFrame.valueOffsets)
+  let archCheck = [o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14, negF, sqrtF, fmaF, sat16, min16]
+  k = usize.ZERO
+  while k < archCheck.length {
+    let idx = u64.toUsize(archCheck[k])
+    run Testing.expect(archVecs[idx] != AArch64Frame.regNone() && isValidVecHome(archVecs[idx]),
+      "all 14 AArch64 ArchOperation results and float/int 128-bit NEON ops stay in v0..v27")
+    run Testing.expect(archOffs[idx] == 0,
+      "all 14 AArch64 ArchOperation results have zero stack spill offset")
+    k = k + usize.ONE
+  }
+}
+
+test effect fn separatesScalarFpCalleeSavesFromCallCrossingVectors() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run fpAndVecCallRules() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn fpAndVecCallRules() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let f32K = Kind.float(32)
+  let f64K = Kind.float(64)
+  let ptrK = Kind.address(64)
+  let v4i32 = Kind.vector(Kind.integer(32), 4)
+  let v2f64 = Kind.vector(f64K, 2)
+
+  // 1. Call-free scalar f32/f64 uses caller-saved v0..v7 or v16..v27 with savedFpMask == 0.
+  let mut leafFp = run SsaFunction.make(b"leaf_scalar_fp", 64)
+  let fa0 = run leafFp.argument(f64K)
+  let fa1 = run leafFp.argument(f64K)
+  leafFp.setResult(f64K)
+  let fb0 = run leafFp.newBlock()
+  leafFp.startBlock(fb0)
+  let fsum = run leafFp.binary(Binary.Add, fa0, fa1)
+  let fprod = run leafFp.binary(Binary.Mul, fsum, fa0)
+  run leafFp.ret(fprod)
+  run leafFp.finish()
+  run expectValidSsa(&leafFp)
+
+  let leafFpFrame = run AArch64Frame.plan(&leafFp)
+  let leafVecs = List<u8>.asSlice(&leafFpFrame.valueVecs)
+  run Testing.expect(leafFpFrame.savedFpMask == 0 && leafFpFrame.savedFpCount == usize.ZERO,
+    "call-free scalar FP function does not save d8..d15")
+  run Testing.expect(leafVecs[u64.toUsize(fa0)] >= 16 && leafVecs[u64.toUsize(fa0)] <= 27,
+    "incoming scalar float argument uses non-ABI v16..v27 when call-free")
+  run Testing.expect(leafVecs[u64.toUsize(fsum)] <= 27 && (leafVecs[u64.toUsize(fsum)] < 8 || leafVecs[u64.toUsize(fsum)] >= 16),
+    "call-free scalar float temporary uses caller-saved v0..v7 or v16..v27")
+
+  // 2. Call-crossing scalar f32 and f64 values use callee-saved d8..d15 (savedFpMask bits 8..15).
+  let mut callFp = run SsaFunction.make(b"call_scalar_fp", 64)
+  let cf64 = run callFp.argument(f64K)
+  let cf32 = run callFp.argument(f32K)
+  callFp.setResult(f64K)
+  let cb0 = run callFp.newBlock()
+  callFp.startBlock(cb0)
+  let keep64 = run callFp.binary(Binary.Add, cf64, cf64)
+  let keep32 = run callFp.binary(Binary.Add, cf32, cf32)
+  drop run callFp.call(b"ext_fp_tick", &[], Kind.unit())
+  let k64a = run callFp.binary(Binary.Add, keep64, cf64)
+  let k64b = run callFp.binary(Binary.Mul, k64a, keep64)
+  let k64c = run callFp.binary(Binary.Add, k64b, keep64)
+  let k32a = run callFp.binary(Binary.Add, keep32, cf32)
+  let k32b = run callFp.binary(Binary.Mul, k32a, keep32)
+  let k32c = run callFp.binary(Binary.Add, k32b, keep32)
+  let k32ext = run callFp.cast(Cast.FPExt, k32c, f64K)
+  let totalF = run callFp.binary(Binary.Add, k64c, k32ext)
+  run callFp.ret(totalF)
+  run callFp.finish()
+  run expectValidSsa(&callFp)
+
+  let callFpFrame = run AArch64Frame.plan(&callFp)
+  let callVecs = List<u8>.asSlice(&callFpFrame.valueVecs)
+  let rKeep64 = callVecs[u64.toUsize(keep64)]
+  let rKeep32 = callVecs[u64.toUsize(keep32)]
+  run Testing.expect(rKeep64 >= 8 && rKeep64 <= 15 && rKeep32 >= 8 && rKeep32 <= 15,
+    "call-crossing scalar f64 and f32 values are assigned callee-saved d8..d15")
+  run Testing.expect(
+    (callFpFrame.savedFpMask & u64.shiftLeft(1, u8.toU64(rKeep64))) != 0
+      && (callFpFrame.savedFpMask & u64.shiftLeft(1, u8.toU64(rKeep32))) != 0
+      && callFpFrame.savedFpCount >= 2,
+    "savedFpMask and savedFpCount record assigned d8..d15 registers")
+
+  // 3. Call-crossing 128-bit NEON vectors MUST NEVER enter v8..v15 (must spill to 16B stack slots).
+  let mut callVec = run SsaFunction.make(b"call_crossing_vec128", 64)
+  let vpIn = run callVec.argument(ptrK)
+  let vpOut = run callVec.argument(ptrK)
+  let vb0 = run callVec.newBlock()
+  callVec.startBlock(vb0)
+  let vecA = run callVec.load(v4i32, vpIn, 0, 16)
+  let vecB = run callVec.load(v2f64, vpIn, 16, 16)
+  drop run callVec.call(b"ext_vec_tick", &[], Kind.unit())
+  let vecA2 = run callVec.binary(Binary.Add, vecA, vecA)
+  let vecA3 = run callVec.binary(Binary.Xor, vecA2, vecA)
+  let vecB2 = run callVec.binary(Binary.Add, vecB, vecB)
+  let vecB3 = run callVec.binary(Binary.Mul, vecB2, vecB)
+  run callVec.store(vecA3, vpOut, 0, 16)
+  run callVec.store(vecB3, vpOut, 16, 16)
+  run callVec.ret(none())
+  run callVec.finish()
+  run expectValidSsa(&callVec)
+
+  let callVecFrame = run AArch64Frame.plan(&callVec)
+  let cvVecs = List<u8>.asSlice(&callVecFrame.valueVecs)
+  let cvOffs = List<i64>.asSlice(&callVecFrame.valueOffsets)
+  let iA = u64.toUsize(vecA)
+  let iB = u64.toUsize(vecB)
+  run Testing.expect(cvVecs[iA] == AArch64Frame.regNone() && cvVecs[iB] == AArch64Frame.regNone(),
+    "call-crossing 128-bit vectors NEVER enter v8..v15 (spill instead)")
+  run Testing.expect(cvOffs[iA] < 0 && (0 - cvOffs[iA]) % 16 == 0 && cvOffs[iB] < 0 && (0 - cvOffs[iB]) % 16 == 0,
+    "call-crossing 128-bit vectors spill to 16-byte-aligned stack offsets")
+  run Testing.expect(callVecFrame.savedFpMask == 0 && callVecFrame.savedFpCount == usize.ZERO,
+    "call-crossing 128-bit vectors do not trigger d8..d15 callee saves")
+}
+
+test effect fn enforcesDarwinAlignmentSlotReuseRpoFoldingAndVariadics() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run frameLayoutClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn frameLayoutClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let f64K = Kind.float(64)
+
+  // 1. Odd callee-saved GP + odd callee-saved FP pairing keeps subSpBytes and frame 16B-aligned.
+  let mut oddFn = run SsaFunction.make(b"odd_callee_pairing", 64)
+  let oa = run oddFn.argument(i64K)
+  let ofa = run oddFn.argument(f64K)
+  oddFn.setResult(f64K)
+  let ob0 = run oddFn.newBlock()
+  oddFn.startBlock(ob0)
+  let oSlot = run oddFn.slotOf(8, 8)
+  let oSlot16 = run oddFn.slotOf(16, 16)
+  let oKeepG = run oddFn.binary(Binary.Add, oa, oa)
+  let oKeepF = run oddFn.binary(Binary.Add, ofa, ofa)
+  drop run oddFn.call(b"ext_odd", &[], Kind.unit())
+  let og1 = run oddFn.binary(Binary.Add, oKeepG, oKeepG)
+  let og2 = run oddFn.binary(Binary.Add, og1, oKeepG)
+  let og3 = run oddFn.binary(Binary.Add, og2, oKeepG)
+  run oddFn.store(og3, oSlot, 0, 8)
+  let ogLoaded = run oddFn.load(i64K, oSlot, 0, 8)
+  let ogFlt = run oddFn.cast(Cast.SIToFP, ogLoaded, f64K)
+  let of1 = run oddFn.binary(Binary.Add, oKeepF, oKeepF)
+  let of2 = run oddFn.binary(Binary.Add, of1, oKeepF)
+  let of3 = run oddFn.binary(Binary.Add, of2, oKeepF)
+  let ofSum = run oddFn.binary(Binary.Add, of3, ogFlt)
+  let v2f = run oddFn.splat(ofSum, 2)
+  run oddFn.store(v2f, oSlot16, 0, 16)
+  let v2l = run oddFn.load(Kind.vector(f64K, 2), oSlot16, 0, 16)
+  let zeroIdx = run oddFn.integer(64, 0)
+  let outF = run oddFn.extractElement(v2l, zeroIdx)
+  run oddFn.ret(outF)
+  run oddFn.finish()
+  run expectValidSsa(&oddFn)
+
+  let oddFrame = run AArch64Frame.plan(&oddFn)
+  let oddSlots = List<i64>.asSlice(&oddFrame.slotOffsets)
+  let savedGpBytes = usize.toU64(((oddFrame.savedCount + usize.ONE) / 2) * 16)
+  let savedFpBytes = usize.toU64(((oddFrame.savedFpCount + usize.ONE) / 2) * 16)
+  run Testing.expect(oddFrame.savedCount == usize.ONE && oddFrame.savedFpCount == usize.ONE,
+    "odd callee-saved counts exercise unpaired stp padding on both GP and FP banks")
+  run Testing.expect(oddFrame.subSpBytes % 16 == 0, "subSpBytes is a multiple of 16")
+  run Testing.expect((16 + savedGpBytes + savedFpBytes + oddFrame.subSpBytes) % 16 == 0,
+    "total frame size including paired fp/lr and callee saves is 16-byte aligned")
+  run Testing.expect((0 - oddSlots[1]) % 16 == 0, "16-byte aligned slot offset is 16-byte aligned")
+
+  // 2. StackLifetimes disjoint slot reuse vs overlapping distinct slots.
+  let mut slotFn = run SsaFunction.make(b"slot_lifetimes", 64)
+  slotFn.setResult(i64K)
+  let sb0 = run slotFn.newBlock()
+  slotFn.startBlock(sb0)
+  run slotFn.slotStart(0)
+  let s0 = run slotFn.slotOf(64, 16)
+  let sc1 = run slotFn.integer(64, 1)
+  run slotFn.store(sc1, s0, 0, 8)
+  let sv0 = run slotFn.load(i64K, s0, 0, 8)
+  run slotFn.slotEnd(0)
+
+  run slotFn.slotStart(1)
+  let s1 = run slotFn.slotOf(64, 16)
+  run slotFn.store(sv0, s1, 0, 8)
+  let sv1 = run slotFn.load(i64K, s1, 0, 8)
+  run slotFn.slotEnd(1)
+
+  run slotFn.slotStart(2)
+  let s2 = run slotFn.slotOf(32, 16)
+  run slotFn.slotStart(3)
+  let s3 = run slotFn.slotOf(32, 16)
+  run slotFn.store(sv1, s2, 0, 8)
+  run slotFn.store(sv1, s3, 0, 8)
+  let sv2 = run slotFn.load(i64K, s2, 0, 8)
+  let sv3 = run slotFn.load(i64K, s3, 0, 8)
+  run slotFn.slotEnd(2)
+  run slotFn.slotEnd(3)
+  let sOut = run slotFn.binary(Binary.Add, sv2, sv3)
+  run slotFn.ret(sOut)
+  run slotFn.finish()
+  run expectValidSsa(&slotFn)
+
+  let slotFrame = run AArch64Frame.plan(&slotFn)
+  let sOffs = List<i64>.asSlice(&slotFrame.slotOffsets)
+  run Testing.expect(sOffs[0] == sOffs[1] && (0 - sOffs[0]) % 16 == 0,
+    "disjoint lifetime-marked slots reuse the same 16-byte-aligned offset")
+  run Testing.expect(sOffs[2] != sOffs[3],
+    "overlapping lifetime-marked slots receive distinct frame offsets")
+
+  // 3. RPO blockOrder (b0 -> b2 -> b3 -> b1) and cold Exit.Trap sinking.
+  let mut rpoFn = run SsaFunction.make(b"rpo_and_trap", 64)
+  let rArg = run rpoFn.argument(i64K)
+  rpoFn.setResult(i64K)
+  let rb0 = run rpoFn.newBlock()
+  let rb1 = run rpoFn.newBlock()
+  let rb2 = run rpoFn.newBlock()
+  let rb3 = run rpoFn.newBlock()
+  let rbTrap = run rpoFn.newBlock()
+  let p1 = run rpoFn.addParameter(rb1, i64K)
+  rpoFn.startBlock(rb0)
+  let rZero = run rpoFn.integer(64, 0)
+  let rIsZero = run rpoFn.compare(Predicate.Eq, rArg, rZero)
+  run rpoFn.branchIf(rIsZero, rbTrap, rb2)
+  rpoFn.startBlock(rb1)
+  run rpoFn.ret(p1)
+  rpoFn.startBlock(rb2)
+  let rOne = run rpoFn.integer(64, 1)
+  let rx = run rpoFn.binary(Binary.Add, rArg, rOne)
+  run rpoFn.jump(rb3)
+  rpoFn.startBlock(rb3)
+  let rTwo = run rpoFn.integer(64, 2)
+  let rTmp = run rpoFn.binary(Binary.Mul, rArg, rTwo)
+  let rTmp2 = run rpoFn.binary(Binary.Add, rTmp, rTwo)
+  let rxEdgeArgs = [rx]
+  run rpoFn.jumpWith(rb1, &rxEdgeArgs)
+  rpoFn.startBlock(rbTrap)
+  run rpoFn.trap()
+  run rpoFn.finish()
+  run expectValidSsa(&rpoFn)
+
+  let rpoFrame = run AArch64Frame.plan(&rpoFn)
+  let order = List<usize>.asSlice(&rpoFrame.blockOrder)
+  run Testing.expect(
+    order.length == 5
+      && order[0] == rb0
+      && order[1] == rb2
+      && order[2] == rb3
+      && order[3] == rb1
+      && order[4] == rbTrap,
+    "blockOrder orders hot blocks in RPO and sinks cold Exit.Trap to the end")
+  let rRegs = List<u8>.asSlice(&rpoFrame.valueRegs)
+  let rxReg = rRegs[u64.toUsize(rx)]
+  run Testing.expect(rxReg != rRegs[u64.toUsize(rTmp)] && rxReg != rRegs[u64.toUsize(rTmp2)],
+    "RPO interval keeps producer rx disjoint from intermediate-block values")
+
+  // 4. SlotAddress + constant Offset/Index folding into valueSlotBase vs dynamic Index negative control.
+  let mut foldFn = run SsaFunction.make(b"slot_base_fold", 64)
+  let dynIdx = run foldFn.argument(i64K)
+  foldFn.setResult(i64K)
+  let fb = run foldFn.newBlock()
+  foldFn.startBlock(fb)
+  let baseAddr = run foldFn.slotOf(64, 16)
+  let off16 = run foldFn.offset(baseAddr, 16)
+  let off24 = run foldFn.offset(off16, 8)
+  let c32 = run foldFn.integer(64, 32)
+  let idx32 = run foldFn.indexed(baseAddr, c32)
+  let dynAddr = run foldFn.indexed(baseAddr, dynIdx)
+  let lv1 = run foldFn.load(i64K, off24, 0, 8)
+  let lv2 = run foldFn.load(i64K, idx32, 0, 8)
+  let lv3 = run foldFn.load(i64K, dynAddr, 0, 8)
+  let lSum = run foldFn.binary(Binary.Add, lv1, lv2)
+  let lTotal = run foldFn.binary(Binary.Add, lSum, lv3)
+  run foldFn.ret(lTotal)
+  run foldFn.finish()
+  run expectValidSsa(&foldFn)
+
+  let foldFrame = run AArch64Frame.plan(&foldFn)
+  let slotBase = List<i64>.asSlice(&foldFrame.valueSlotBase)
+  let foldOffs = List<i64>.asSlice(&foldFrame.valueOffsets)
+  let foldRegs = List<u8>.asSlice(&foldFrame.valueRegs)
+  let baseFpOff = List<i64>.asSlice(&foldFrame.slotOffsets)[0]
+  run Testing.expect(slotBase[u64.toUsize(baseAddr)] == baseFpOff, "SlotAddress folds into valueSlotBase")
+  run Testing.expect(slotBase[u64.toUsize(off16)] == baseFpOff + 16, "Offset accumulates into valueSlotBase")
+  run Testing.expect(slotBase[u64.toUsize(off24)] == baseFpOff + 24, "chained Offset accumulates into valueSlotBase")
+  run Testing.expect(slotBase[u64.toUsize(idx32)] == baseFpOff + 32, "constant Index folds into valueSlotBase")
+  run Testing.expect(slotBase[u64.toUsize(dynAddr)] == 0, "dynamic Index does not fold into valueSlotBase")
+  run Testing.expect(
+    foldRegs[u64.toUsize(off24)] == AArch64Frame.regNone() && foldOffs[u64.toUsize(off24)] == 0,
+    "folded slot bases consume neither a GPR nor a spill slot")
+
+  // 5. Darwin variadic function sets hasVaStart without allocating a 176-byte SysV reg-save area.
+  let mut vaFn = run SsaFunction.make(b"darwin_va", 64)
+  vaFn.setCallingConvention(CallingConvention.C, true, AbiExtension.None)
+  let vaFixed = run vaFn.argument(i64K)
+  vaFn.setResult(i64K)
+  let vab = run vaFn.newBlock()
+  vaFn.startBlock(vab)
+  let vaSlot = run vaFn.slotOf(8, 8)
+  run vaFn.vaStart(vaSlot)
+  run vaFn.vaEnd(vaSlot)
+  run vaFn.ret(vaFixed)
+  run vaFn.finish()
+  run expectValidSsa(&vaFn)
+
+  let vaFrame = run AArch64Frame.plan(&vaFn)
+  run Testing.expect(vaFrame.hasVaStart, "Operation.VaStart sets hasVaStart")
+  run Testing.expect(vaFrame.subSpBytes == 16,
+    "Darwin VaStart allocates only the 8-byte va_list slot aligned to 16 bytes with no 176-byte SysV reg-save area")
+}
+
+test effect fn handlesOverflowingSlotFoldingChainsAndI32MinSlotOffsets() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run slotOverflowRegressionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn slotOverflowRegressionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+
+  // 1. Chained Operation.Offset whose signed i64 displacement overflows i64.MIN must not trap.
+  let mut offOvfFn = run SsaFunction.make(b"offset_i64_ovf", 64)
+  offOvfFn.setResult(i64K)
+  let ob = run offOvfFn.newBlock()
+  offOvfFn.startBlock(ob)
+  let os0 = run offOvfFn.slotOf(16, 16)
+  let op1 = run offOvfFn.offset(os0, i64.wrappingToU64(-1073741824))
+  let op2 = run offOvfFn.offset(op1, 0x8000000000000000)
+  let ov = run offOvfFn.load(i64K, op2, 0, 8)
+  run offOvfFn.ret(ov)
+  run offOvfFn.finish()
+  run expectValidSsa(&offOvfFn)
+
+  let offOvfFrame = run AArch64Frame.plan(&offOvfFn)
+  let offOvfBase = List<i64>.asSlice(&offOvfFrame.valueSlotBase)
+  let offOvfRegs = List<u8>.asSlice(&offOvfFrame.valueRegs)
+  let offOvfOffs = List<i64>.asSlice(&offOvfFrame.valueOffsets)
+  let op2Idx = u64.toUsize(op2)
+  run Testing.expect(offOvfBase[u64.toUsize(op1)] == List<i64>.asSlice(&offOvfFrame.slotOffsets)[0] - 1073741824,
+    "in-range negative Offset folds into valueSlotBase")
+  run Testing.expect(offOvfBase[op2Idx] == 0,
+    "chained Offset causing signed i64.MIN overflow does not trap and leaves valueSlotBase == 0")
+  run Testing.expect(offOvfRegs[op2Idx] != AArch64Frame.regNone() || offOvfOffs[op2Idx] < 0,
+    "unfolded overflowing Offset receives a GPR or stack spill home")
+
+  // 2. Chained Operation.Index with i64.MAX must not trap on signed i64 addition.
+  let mut idxOvfFn = run SsaFunction.make(b"index_i64_ovf", 64)
+  idxOvfFn.setResult(i64K)
+  let ib = run idxOvfFn.newBlock()
+  idxOvfFn.startBlock(ib)
+  let is0 = run idxOvfFn.slotOf(16, 16)
+  let ip1 = run idxOvfFn.offset(is0, 1073741824)
+  let cMax = run idxOvfFn.integer(64, 0x7FFFFFFFFFFFFFFF)
+  let ip2 = run idxOvfFn.indexed(ip1, cMax)
+  let iv = run idxOvfFn.load(i64K, ip2, 0, 8)
+  run idxOvfFn.ret(iv)
+  run idxOvfFn.finish()
+  run expectValidSsa(&idxOvfFn)
+
+  let idxOvfFrame = run AArch64Frame.plan(&idxOvfFn)
+  let idxOvfBase = List<i64>.asSlice(&idxOvfFrame.valueSlotBase)
+  let idxOvfRegs = List<u8>.asSlice(&idxOvfFrame.valueRegs)
+  let idxOvfOffs = List<i64>.asSlice(&idxOvfFrame.valueOffsets)
+  let ip2Idx = u64.toUsize(ip2)
+  run Testing.expect(idxOvfBase[ip2Idx] == 0,
+    "chained Index with i64.MAX does not trap and leaves valueSlotBase == 0")
+  run Testing.expect(idxOvfRegs[ip2Idx] != AArch64Frame.regNone() || idxOvfOffs[ip2Idx] < 0,
+    "unfolded overflowing Index receives a GPR or stack spill home")
+
+  // 3. slotOf(2147483648, 16) must yield slotOffsets[0] == -2147483648 without trapping on 0 - i32.MIN.
+  let mut i32MinSlotFn = run SsaFunction.make(b"slot_i32_min", 64)
+  i32MinSlotFn.setResult(i64K)
+  let mb = run i32MinSlotFn.newBlock()
+  i32MinSlotFn.startBlock(mb)
+  let ms0 = run i32MinSlotFn.slotOf(2147483648, 16)
+  let mv = run i32MinSlotFn.load(i64K, ms0, 0, 8)
+  run i32MinSlotFn.ret(mv)
+  run i32MinSlotFn.finish()
+  run expectValidSsa(&i32MinSlotFn)
+
+  let i32MinFrame = run AArch64Frame.plan(&i32MinSlotFn)
+  let i32MinSlots = List<i64>.asSlice(&i32MinFrame.slotOffsets)
+  run Testing.expect(!i32MinFrame.frameOverflow && i32MinSlots[0] == -2147483648,
+    "slotOf(2147483648, 16) yields slotOffsets[0] == -2147483648 without 0 - i32.MIN trap")
+  run Testing.expect(i32MinFrame.subSpBytes == 2147483648 && i32MinFrame.subSpBytes % 16 == 0,
+    "subSpBytes stays exact and 16-byte aligned for 2 GiB stack slot")
+}
+
+test effect fn spillsExcessNonCallCrossingVec128ToStackWithoutEnteringD8D15() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run vec128SpillPressureClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vec128SpillPressureClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let ptrK = Kind.address(64)
+  let v4i32 = Kind.vector(Kind.integer(32), 4)
+  let v2i64 = Kind.vector(Kind.integer(64), 2)
+
+  // >20 simultaneously live non-call-crossing isVec128 values saturate caller NEON v0..v7, v16..v27
+  // and spill excess values to 16-byte-aligned stack slots rather than entering v8..v15.
+  let mut f = run SsaFunction.make(b"vec128_spill_pressure", 64)
+  let pIn = run f.argument(ptrK)
+  let pOut = run f.argument(ptrK)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+
+  let mut vecs = List<u64>.make()
+  let mut k = usize.ZERO
+  while k < 24 {
+    let v = run f.load(v4i32, pIn, usize.toU64(k) * 16, 16)
+    run List<u64>.append(&mut vecs, v)
+    k = k + usize.ONE
+  }
+  let vecSlice = List<u64>.asSlice(&vecs)
+  let mut acc = vecSlice[0]
+  k = usize.ONE
+  while k < vecSlice.length {
+    acc = run f.binary(Binary.Add, acc, vecSlice[k])
+    acc = run f.binary(Binary.Xor, acc, vecSlice[k])
+    k = k + usize.ONE
+  }
+  run f.store(acc, pOut, 0, 16)
+  // Also verify uniformVecConst rejects 128-bit constants with nonzero high 64 bits.
+  let wideShift = run f.exactConstant(v2i64, 5, 1)
+  let zeroShift = run f.constant(v2i64, 5)
+  run f.ret(none())
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let frame = run AArch64Frame.plan(&f)
+  let vecRegs = List<u8>.asSlice(&frame.valueVecs)
+  let offs = List<i64>.asSlice(&frame.valueOffsets)
+  let mut callerMask: u64 = 0
+  let mut spilled = usize.ZERO
+  k = usize.ZERO
+  while k < vecSlice.length {
+    let idx = u64.toUsize(vecSlice[k])
+    let r = vecRegs[idx]
+    run Testing.expect(r < 8 || r > 15, "isVec128 never enters callee-saved d8..d15 (v8..v15)")
+    run Testing.expect(isValidVecHome(r), "isVec128 never enters scratch v28..v31")
+    if r == AArch64Frame.regNone() {
+      run Testing.expect(offs[idx] < 0 && (0 - offs[idx]) % 16 == 0,
+        "spilled isVec128 value receives a 16-byte-aligned negative stack offset")
+      spilled = spilled + usize.ONE
+    } else {
+      callerMask = callerMask | u64.shiftLeft(1, u8.toU64(r))
+    }
+    k = k + usize.ONE
+  }
+  run Testing.expect(frame.savedFpMask == 0 && frame.savedFpCount == usize.ZERO,
+    "excess non-call-crossing isVec128 pressure sets savedFpMask == 0")
+  run Testing.expect(callerMask == 0x0FFF00FF && spilled >= 4,
+    "all 20 caller NEON registers v0..v7 and v16..v27 are utilized and excess values spill")
+  run Testing.expect(frame.subSpBytes % 16 == 0,
+    "subSpBytes remains 16-byte aligned after 128-bit NEON spills")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, zeroShift) == 5,
+    "uniformVecConst accepts constant with high == 0 and low < 64")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, wideShift) == u64.MAX,
+    "uniformVecConst rejects constant with nonzero high half even when low < 64")
+}
+
+test effect fn rejectsNonIntegerAndNonZeroHighUniformVecConstants() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run uniformVecConstRegressionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn uniformVecConstRegressionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let f64K = Kind.float(64)
+  let v2i64 = Kind.vector(i64K, 2)
+  let ptrK = Kind.address(64)
+
+  let mut f = run SsaFunction.make(b"uniform_vec_const_regression", 64)
+  let pIn = run f.argument(ptrK)
+  let pOut = run f.argument(ptrK)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+
+  let wideI128 = run f.wideConstant(5, 1)
+  let splatWideI128 = run f.splat(wideI128, 2)
+  let exactI64 = run f.exactConstant(i64K, 5, 1)
+  let splatExactI64 = run f.splat(exactI64, 2)
+  let symExt = run f.symbolAddress(b"ext_sym", 8, false)
+  let splatSymExt = run f.splat(symExt, 2)
+  let symTls = run f.symbolAddress(b"tls_sym", 4, true)
+  let linkConst = run f.linkConstant(b"__tls_size")
+  let floatZero = run f.constant(f64K, 0)
+  let splatFloatZero = run f.splat(floatZero, 2)
+  let goodScalar = run f.constant(i64K, 5)
+  let splatGood = run f.splat(goodScalar, 2)
+
+  let vecInGood = run f.load(v2i64, pIn, 0, 16)
+  let shlGood = run f.binary(Binary.Shl, vecInGood, splatGood)
+  run f.store(shlGood, pOut, 0, 16)
+
+  let vecInBad = run f.load(v2i64, pIn, 16, 16)
+  let shlBad = run f.binary(Binary.Shl, vecInBad, splatExactI64)
+  run f.store(shlBad, pOut, 16, 16)
+
+  run f.ret(none())
+  run f.finish()
+  run expectValidSsa(&f)
+
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, splatWideI128) == u64.MAX,
+    "uniformVecConst rejects Splat of i128 wideConstant with nonzero high half")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, splatExactI64) == u64.MAX,
+    "uniformVecConst rejects Splat of exactConstant with nonzero high half")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, symExt) == u64.MAX,
+    "uniformVecConst rejects ConstantForm.Symbol with small addend")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, splatSymExt) == u64.MAX,
+    "uniformVecConst rejects Splat of ConstantForm.Symbol")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, symTls) == u64.MAX,
+    "uniformVecConst rejects ConstantForm.ThreadLocal with small addend")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, linkConst) == u64.MAX,
+    "uniformVecConst rejects ConstantForm.Link integer constant")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, floatZero) == u64.MAX,
+    "uniformVecConst rejects float 0.0 constant")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, splatFloatZero) == u64.MAX,
+    "uniformVecConst rejects Splat of float 0.0 constant")
+  run Testing.expect(AArch64Frame.uniformVecConst(&f, splatGood) == 5,
+    "uniformVecConst returns 5 for Splat(constant(i64, 5), 2)")
+
+  let frame = run AArch64Frame.plan(&f)
+  let vecRegs = List<u8>.asSlice(&frame.valueVecs)
+  let offs = List<i64>.asSlice(&frame.valueOffsets)
+  let shlGoodIdx = u64.toUsize(shlGood)
+  let shlBadIdx = u64.toUsize(shlBad)
+  run Testing.expect(isValidVecHome(vecRegs[shlGoodIdx]) && vecRegs[shlGoodIdx] != AArch64Frame.regNone() && offs[shlGoodIdx] == 0,
+    "v2i64 Binary.Shl with Splat(constant(i64, 5), 2) stays resident in NEON")
+  run Testing.expect(vecRegs[shlBadIdx] == AArch64Frame.regNone() && offs[shlBadIdx] < 0 && (0 - offs[shlBadIdx]) % 16 == 0,
+    "v2i64 Binary.Shl with Splat(exactConstant(i64, 5, 1), 2) is rejected as non-uniform and spills")
+}
+
+test effect fn handlesLargeAndOverflowingFrameLayoutsWithoutWraparoundOrTrap() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run frameOverflowRegressionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn frameOverflowRegressionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let i128K = Kind.integer(128)
+
+  // 1. slotOf(2147483648, 16) + slotOf(16, 16) gets exact non-colliding negative i64 offsets.
+  let mut twoGigPlus16 = run SsaFunction.make(b"slot_2g_plus_16", 64)
+  twoGigPlus16.setResult(i64K)
+  let b1 = run twoGigPlus16.newBlock()
+  twoGigPlus16.startBlock(b1)
+  let s2g = run twoGigPlus16.slotOf(2147483648, 16)
+  let s16 = run twoGigPlus16.slotOf(16, 16)
+  let c42 = run twoGigPlus16.integer(64, 42)
+  run twoGigPlus16.store(c42, s16, 0, 8)
+  let v2g = run twoGigPlus16.load(i64K, s2g, 0, 8)
+  let v16 = run twoGigPlus16.load(i64K, s16, 0, 8)
+  let sum1 = run twoGigPlus16.binary(Binary.Add, v2g, v16)
+  run twoGigPlus16.ret(sum1)
+  run twoGigPlus16.finish()
+  run expectValidSsa(&twoGigPlus16)
+
+  let f1 = run AArch64Frame.plan(&twoGigPlus16)
+  let s1Offs = List<i64>.asSlice(&f1.slotOffsets)
+  run Testing.expect(!f1.frameOverflow, "2 GiB + 16 B frame fits within i64 offsets")
+  run Testing.expect(s1Offs[0] == -2147483648 && s1Offs[1] == -2147483664,
+    "2 GiB + 16 B slots receive exact non-colliding negative i64 offsets")
+  run Testing.expect(f1.subSpBytes == 2147483664 && f1.subSpBytes % 16 == 0,
+    "2 GiB + 16 B subSpBytes is exact and 16-byte aligned")
+
+  // 2. slotOf(2147483648, 16) + spilled i128 values receive exact negative i64 valueOffsets.
+  let mut twoGigSpill = run SsaFunction.make(b"slot_2g_spilled_i128", 64)
+  let a0 = run twoGigSpill.argument(i128K)
+  twoGigSpill.setResult(i64K)
+  let b2 = run twoGigSpill.newBlock()
+  twoGigSpill.startBlock(b2)
+  let ss0 = run twoGigSpill.slotOf(2147483648, 16)
+  let w1 = run twoGigSpill.binary(Binary.Add, a0, a0)
+  run twoGigSpill.store(w1, ss0, 0, 16)
+  let sv = run twoGigSpill.load(i64K, ss0, 0, 8)
+  run twoGigSpill.ret(sv)
+  run twoGigSpill.finish()
+  run expectValidSsa(&twoGigSpill)
+
+  let f2 = run AArch64Frame.plan(&twoGigSpill)
+  let f2Slots = List<i64>.asSlice(&f2.slotOffsets)
+  let f2Vals = List<i64>.asSlice(&f2.valueOffsets)
+  let a0Off = f2Vals[u64.toUsize(a0)]
+  let w1Off = f2Vals[u64.toUsize(w1)]
+  run Testing.expect(!f2.frameOverflow && f2Slots[0] == -2147483648,
+    "2 GiB slot + spilled i128 stays within i64 frame range")
+  run Testing.expect(a0Off == -2147483664 && w1Off == -2147483680 && a0Off != w1Off,
+    "spilled i128 argument and result receive distinct negative i64 offsets below 2 GiB slot")
+  run Testing.expect(f2.subSpBytes == 2147483680 && f2.subSpBytes % 16 == 0,
+    "subSpBytes accounts for 2 GiB slot plus spilled i128 slots")
+
+  // 3. Single 2^63 slot sets frameOverflow without wrapping to 0 or positive.
+  let mut pow63 = run SsaFunction.make(b"slot_2pow63", 64)
+  pow63.setResult(i64K)
+  let b3 = run pow63.newBlock()
+  pow63.startBlock(b3)
+  let sp63 = run pow63.slotOf(9223372036854775808, 16)
+  let vp63 = run pow63.load(i64K, sp63, 0, 8)
+  run pow63.ret(vp63)
+  run pow63.finish()
+  run expectValidSsa(&pow63)
+
+  let f3 = run AArch64Frame.plan(&pow63)
+  let f3Slots = List<i64>.asSlice(&f3.slotOffsets)
+  run Testing.expect(f3.frameOverflow, "2^63 slot sets frameOverflow")
+  run Testing.expect(f3Slots[0] == 0 && f3.subSpBytes % 16 == 0,
+    "2^63 slot leaves offset unallocated at 0 without trapping or wrapping")
+
+  // 4. 16 B + 2^63 slots set frameOverflow without aliasing slot 0 and slot 1.
+  let mut smallPlusPow63 = run SsaFunction.make(b"slot_16_plus_2pow63", 64)
+  smallPlusPow63.setResult(i64K)
+  let b4 = run smallPlusPow63.newBlock()
+  smallPlusPow63.startBlock(b4)
+  let s4a = run smallPlusPow63.slotOf(16, 16)
+  let s4b = run smallPlusPow63.slotOf(9223372036854775808, 16)
+  let v4a = run smallPlusPow63.load(i64K, s4a, 0, 8)
+  let v4b = run smallPlusPow63.load(i64K, s4b, 0, 8)
+  let sum4 = run smallPlusPow63.binary(Binary.Add, v4a, v4b)
+  run smallPlusPow63.ret(sum4)
+  run smallPlusPow63.finish()
+  run expectValidSsa(&smallPlusPow63)
+
+  let f4 = run AArch64Frame.plan(&smallPlusPow63)
+  let f4Slots = List<i64>.asSlice(&f4.slotOffsets)
+  run Testing.expect(f4.frameOverflow, "16 B + 2^63 sets frameOverflow")
+  run Testing.expect(f4Slots[0] == -16 && f4Slots[1] == 0 && f4Slots[0] != f4Slots[1],
+    "16 B slot keeps -16 and overflowing 2^63 slot does not collide or wrap positive")
+  run Testing.expect(f4.subSpBytes == 16 && f4.subSpBytes % 16 == 0,
+    "subSpBytes stays 16-byte aligned after overflow")
+
+  // 5. Two 2^63 slots and a near-u64.MAX slot set frameOverflow without arithmetic overflow traps.
+  let mut twoPow63 = run SsaFunction.make(b"slot_2pow63_x2", 64)
+  twoPow63.setResult(i64K)
+  let b5 = run twoPow63.newBlock()
+  twoPow63.startBlock(b5)
+  let s5a = run twoPow63.slotOf(9223372036854775808, 16)
+  let s5b = run twoPow63.slotOf(9223372036854775808, 16)
+  let v5a = run twoPow63.load(i64K, s5a, 0, 8)
+  let v5b = run twoPow63.load(i64K, s5b, 0, 8)
+  let sum5 = run twoPow63.binary(Binary.Add, v5a, v5b)
+  run twoPow63.ret(sum5)
+  run twoPow63.finish()
+  run expectValidSsa(&twoPow63)
+
+  let f5 = run AArch64Frame.plan(&twoPow63)
+  let f5Slots = List<i64>.asSlice(&f5.slotOffsets)
+  run Testing.expect(f5.frameOverflow && f5Slots[0] <= 0 && f5Slots[1] <= 0 && f5.subSpBytes % 16 == 0,
+    "two 2^63 slots set frameOverflow without u64 arithmetic overflow trap")
+
+  let mut nearU64Max = run SsaFunction.make(b"slot_near_u64_max", 64)
+  nearU64Max.setResult(i64K)
+  let b6 = run nearU64Max.newBlock()
+  nearU64Max.startBlock(b6)
+  let s6 = run nearU64Max.slotOf(0xFFFFFFFFFFFFFFF0, 16)
+  let v6 = run nearU64Max.load(i64K, s6, 0, 8)
+  run nearU64Max.ret(v6)
+  run nearU64Max.finish()
+  run expectValidSsa(&nearU64Max)
+
+  let f6 = run AArch64Frame.plan(&nearU64Max)
+  let f6Slots = List<i64>.asSlice(&f6.slotOffsets)
+  run Testing.expect(f6.frameOverflow && f6Slots[0] <= 0 && f6.subSpBytes % 16 == 0,
+    "0xFFFFFFFFFFFFFFF0 slot sets frameOverflow without u64 arithmetic overflow trap")
+
+  // 6. Marked slotPool and huge alignment overflow cleanly without trapping, and i64 valueSlotBase
+  //    folding guards i64.MIN underflow via checkedAdd.
+  let mut markedAndAlignOvf = run SsaFunction.make(b"slot_pool_and_align_ovf", 64)
+  markedAndAlignOvf.setResult(i64K)
+  let b7 = run markedAndAlignOvf.newBlock()
+  markedAndAlignOvf.startBlock(b7)
+  run markedAndAlignOvf.slotStart(0)
+  let s7a = run markedAndAlignOvf.slotOf(9223372036854775808, 16)
+  let v7a = run markedAndAlignOvf.load(i64K, s7a, 0, 8)
+  run markedAndAlignOvf.slotEnd(0)
+  let s7b = run markedAndAlignOvf.slotOf(8, 9223372036854775808)
+  let v7b = run markedAndAlignOvf.load(i64K, s7b, 0, 8)
+  let sum7 = run markedAndAlignOvf.binary(Binary.Add, v7a, v7b)
+  run markedAndAlignOvf.ret(sum7)
+  run markedAndAlignOvf.finish()
+  run expectValidSsa(&markedAndAlignOvf)
+
+  let f7 = run AArch64Frame.plan(&markedAndAlignOvf)
+  let f7Slots = List<i64>.asSlice(&f7.slotOffsets)
+  run Testing.expect(f7.frameOverflow && f7Slots[0] <= 0 && f7Slots[1] <= 0 && f7.subSpBytes % 16 == 0,
+    "marked 2^63 slot and 2^63 alignment set frameOverflow cleanly")
+
+  let mut baseFoldI64Ovf = run SsaFunction.make(b"slot_base_i64_min_guard", 64)
+  baseFoldI64Ovf.setResult(i64K)
+  let b8 = run baseFoldI64Ovf.newBlock()
+  baseFoldI64Ovf.startBlock(b8)
+  let s8 = run baseFoldI64Ovf.slotOf(0x7FFFFFFFFFFFFFE0, 16)
+  let off8 = run baseFoldI64Ovf.offset(s8, i64.wrappingToU64(-1073741824))
+  let v8 = run baseFoldI64Ovf.load(i64K, off8, 0, 8)
+  run baseFoldI64Ovf.ret(v8)
+  run baseFoldI64Ovf.finish()
+  run expectValidSsa(&baseFoldI64Ovf)
+
+  let f8 = run AArch64Frame.plan(&baseFoldI64Ovf)
+  let f8Slots = List<i64>.asSlice(&f8.slotOffsets)
+  let f8Bases = List<i64>.asSlice(&f8.valueSlotBase)
+  let f8Offs = List<i64>.asSlice(&f8.valueOffsets)
+  let off8Idx = u64.toUsize(off8)
+  run Testing.expect(!f8.frameOverflow && f8Slots[0] == -9223372036854775776,
+    "0x7FFFFFFFFFFFFFE0 slot stays within representable negative i64 range")
+  run Testing.expect(f8Bases[off8Idx] == 0 && f8Offs[off8Idx] == -9223372036854775784,
+    "i64.MIN-overflowing valueSlotBase fold leaves valueSlotBase == 0 and spills cleanly")
+  run Testing.expect(f8.subSpBytes == 0x7FFFFFFFFFFFFFF0 && f8.subSpBytes % 16 == 0,
+    "subSpBytes rounds 0x7FFFFFFFFFFFFFE8 up to 0x7FFFFFFFFFFFFFF0 without overflowing i64")
+}
+
+test effect fn excludesFloatAndVec128ConstantsFromVecAllocation() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run constantVecExclusionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn constantVecExclusionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let f64K = Kind.float(64)
+  let ptrK = Kind.address(64)
+  let v4i32 = Kind.vector(Kind.integer(32), 4)
+
+  // 1. const_steals_d8: an f64 Definition.Constant used before and 4 times after a Call
+  //    (with zero computed f64 values live across the Call) must not be assigned d8..d15
+  //    or inflate savedFpMask/savedFpCount.
+  let mut cfFn = run SsaFunction.make(b"const_steals_d8", 64)
+  let x = run cfFn.argument(f64K)
+  cfFn.setResult(f64K)
+  let cb0 = run cfFn.newBlock()
+  cfFn.startBlock(cb0)
+  let cfConst = run cfFn.constant(f64K, 0x3FF0000000000000)
+  let pre = run cfFn.binary(Binary.Add, x, cfConst)
+  let callArgs = [pre]
+  let post0 = run cfFn.call(b"ext_fp_const_tick", &callArgs, f64K)
+  let post1 = run cfFn.binary(Binary.Add, post0, cfConst)
+  let post2 = run cfFn.binary(Binary.Mul, post1, cfConst)
+  let post3 = run cfFn.binary(Binary.Add, post2, cfConst)
+  let post4 = run cfFn.binary(Binary.Sub, post3, cfConst)
+  run cfFn.ret(post4)
+  run cfFn.finish()
+  run expectValidSsa(&cfFn)
+
+  let cfFrame = run AArch64Frame.plan(&cfFn)
+  let cfVecs = List<u8>.asSlice(&cfFrame.valueVecs)
+  let cfOffs = List<i64>.asSlice(&cfFrame.valueOffsets)
+  let cfConstIdx = u64.toUsize(cfConst)
+  run Testing.expect(cfVecs[cfConstIdx] == AArch64Frame.regNone() && cfOffs[cfConstIdx] == 0,
+    "f64 Definition.Constant receives neither a NEON/FP register nor a stack offset")
+  run Testing.expect(cfFrame.savedFpMask == 0 && cfFrame.savedFpCount == usize.ZERO,
+    "f64 Definition.Constant live across a Call does not trigger d8..d15 callee saves")
+
+  // 2. const_evicts_vec128: a v4i32 Definition.Constant used alongside 20 live computed
+  //    v4i32 loads must receive regNone() and must not evict any of the 20 loads to stack.
+  let mut cvFn = run SsaFunction.make(b"const_evicts_vec128", 64)
+  let pIn = run cvFn.argument(ptrK)
+  let pOut = run cvFn.argument(ptrK)
+  let vb0 = run cvFn.newBlock()
+  cvFn.startBlock(vb0)
+  let vConst = run cvFn.constant(v4i32, 0x01020304)
+  run cvFn.store(vConst, pOut, 320, 16)
+  let mut loads = List<u64>.make()
+  let mut k = usize.ZERO
+  while k < 20 {
+    let loaded = run cvFn.load(v4i32, pIn, usize.toU64(k) * 16, 16)
+    run List<u64>.append(&mut loads, loaded)
+    k = k + usize.ONE
+  }
+  let loadSlice = List<u64>.asSlice(&loads)
+  k = usize.ZERO
+  while k < loadSlice.length {
+    run cvFn.store(loadSlice[k], pOut, usize.toU64(k) * 16, 16)
+    k = k + usize.ONE
+  }
+  run cvFn.store(vConst, pOut, 336, 16)
+  run cvFn.store(vConst, pOut, 352, 16)
+  run cvFn.ret(none())
+  run cvFn.finish()
+  run expectValidSsa(&cvFn)
+
+  let cvFrame = run AArch64Frame.plan(&cvFn)
+  let cvVecs = List<u8>.asSlice(&cvFrame.valueVecs)
+  let cvOffs = List<i64>.asSlice(&cvFrame.valueOffsets)
+  let vConstIdx = u64.toUsize(vConst)
+  run Testing.expect(cvVecs[vConstIdx] == AArch64Frame.regNone() && cvOffs[vConstIdx] == 0,
+    "v4i32 Definition.Constant receives neither a NEON register nor a stack offset")
+  run Testing.expect(cvFrame.savedFpMask == 0 && cvFrame.savedFpCount == usize.ZERO,
+    "v4i32 leaf function with Definition.Constant does not trigger d8..d15 callee saves")
+  k = usize.ZERO
+  while k < loadSlice.length {
+    let idx = u64.toUsize(loadSlice[k])
+    let r = cvVecs[idx]
+    run Testing.expect(r != AArch64Frame.regNone() && isValidVecHome(r) && (r < 8 || r > 15),
+      "all 20 live computed v4i32 values receive caller-saved NEON homes without eviction")
+    run Testing.expect(cvOffs[idx] == 0,
+      "none of the 20 live computed v4i32 values spill to stack offsets")
+    k = k + usize.ONE
+  }
+}
+
+// ---- M2c AArch64Emit Tests ----
+
+fn readU32Le(bytes: &[u8], at: usize) -> u64 {
+  return u8.toU64(bytes[at])
+    | u64.shiftLeft(u8.toU64(bytes[at + usize.ONE]), 8)
+    | u64.shiftLeft(u8.toU64(bytes[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(bytes[at + 3]), 24)
+}
+
+fn containsWord(code: &[u8], targetWord: u64) -> bool {
+  let mut at = usize.ZERO
+  while at + 4 <= code.length {
+    if readU32Le(code, at) == targetWord { return true }
+    at = at + 4
+  }
+  return false
+}
+
+fn containsWordMasked(code: &[u8], mask: u64, value: u64) -> bool {
+  let mut at = usize.ZERO
+  while at + 4 <= code.length {
+    if (readU32Le(code, at) & mask) == value { return true }
+    at = at + 4
+  }
+  return false
+}
+
+fn wordOffset(code: &[u8], targetWord: u64) -> usize {
+  let mut at = usize.ZERO
+  while at + 4 <= code.length {
+    if readU32Le(code, at) == targetWord { return at }
+    at = at + 4
+  }
+  return usize.MAX
+}
+
+fn sameSlice(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i = usize.ZERO
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn hasReloc(fnOut: &Function, kind: RelocationKind, sym: &[u8]) -> bool {
+  let rels = List<Relocation>.asSlice(&fnOut.relocations)
+  let syms = List<Bytes>.asSlice(&fnOut.symbols)
+  let mut i = usize.ZERO
+  while i < rels.length {
+    if rels[i].kind == kind {
+      if sym.length == usize.ZERO { return true }
+      if rels[i].target < syms.length && sameSlice(Bytes.asSlice(&syms[rels[i].target]), sym) {
+        return true
+      }
+    }
+    i = i + usize.ONE
+  }
+  return false
+}
+
+fn countRelocsOfKind(fnOut: &Function, kind: RelocationKind) -> usize {
+  let rels = List<Relocation>.asSlice(&fnOut.relocations)
+  let mut count = usize.ZERO
+  let mut i = usize.ZERO
+  while i < rels.length {
+    if rels[i].kind == kind { count = count + usize.ONE }
+    i = i + usize.ONE
+  }
+  return count
+}
+
+effect fn expectEmitUnsupported(function: &SsaFunction, symbol: &[u8]) -> ()
+! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let res = move run Effect.result(AArch64Emit.emit(function, symbol, b""))
+  let isUnsupported = match move res {
+    Result<Function, Unsupported | OutOfMemoryError>.Success {..} => false
+    Result<Function, Unsupported | OutOfMemoryError>.Failure {error} => match move error {
+      Unsupported _ => true
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  return run Testing.expect(isUnsupported, "AArch64Emit.emit fails with Unsupported as required")
+}
+
+test effect fn emitsDarwinPrologueEpilogueAndSilkSeenProbe() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run prologueSeenClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn prologueSeenClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let f64K = Kind.float(64)
+
+  // 1. Non-leaf with callee-saved GP + odd callee-saved FP (`d8`), DynamicSlot, locations, and `silk_seen`.
+  let mut f = run SsaFunction.make(b"pro_seen_fn", 64)
+  let x = run f.argument(i64K)
+  let y = run f.argument(f64K)
+  f.setResult(i64K)
+  let b0 = run f.newBlock()
+  f.locate(0x00000010000001)
+  f.startBlock(b0)
+  f.locate(0x00000020000004)
+  let dynSize = run f.integer(64, 48)
+  let dynPtr = run f.dynamicSlot(dynSize, 32)
+  let cOne = run f.integer(64, 1)
+  let keepGp = run f.binary(Binary.Add, x, cOne)
+  let callArgs = [keepGp]
+  let extRes = run f.call(b"ext_tick", &callArgs, i64K)
+  let fOne = run f.constant(f64K, 0x3FF0000000000000)
+  let keepFp = run f.binary(Binary.Add, y, fOne)
+  let extFpArgs = [keepFp]
+  let extFpRes = run f.call(b"ext_fp_tick", &extFpArgs, f64K)
+  let sumFp0 = run f.binary(Binary.Add, keepFp, extFpRes)
+  let sumFp1 = run f.binary(Binary.Add, sumFp0, keepFp)
+  let sumFp2 = run f.binary(Binary.Add, sumFp1, keepFp)
+  let sumFp = run f.binary(Binary.Add, sumFp2, keepFp)
+  let fpAsInt = run f.cast(Cast.FPToSI, sumFp, i64K)
+  run f.store(fpAsInt, dynPtr, 0, 8)
+  let out0 = run f.binary(Binary.Add, keepGp, extRes)
+  let out0b = run f.binary(Binary.Add, out0, keepGp)
+  let out0c = run f.binary(Binary.Add, out0b, keepGp)
+  let out1 = run f.binary(Binary.Add, out0c, fpAsInt)
+  f.locate(0x00000030000008)
+  run f.ret(out1)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let emitted = run AArch64Emit.emitWithSeen(&f, b"pro_seen_fn", b"pro_seen_export", b"pro_seen_fn.silk_seen")
+  let code = Bytes.asSlice(&emitted.code)
+  run Testing.expect(emitted.unwind.hasFramePointer && emitted.unwind.prologueEnd == 8,
+    "non-naked prologue sets x29/x30 frame chain with prologueEnd == 8")
+  run Testing.expect(emitted.unwind.savesEnd > 8 && emitted.unwind.savedGpMask != 0 && emitted.unwind.savedFpMask != 0,
+    "callee-saved GP and FP masks and savesEnd are recorded in UnwindInfo")
+  run Testing.expect(emitted.unwind.frameBytes % 16 == 0 && emitted.unwind.frameBytes >= 48,
+    "UnwindInfo.frameBytes stays 16-byte aligned")
+  // `stp x29, x30, [sp, #-16]!` = 0xA9BF7BFD, `mov x29, sp` = 0x910003FD.
+  run Testing.expect(readU32Le(code, 0) == 0xA9BF7BFD && readU32Le(code, 4) == 0x910003FD,
+    "prologue starts with stp x29, x30, [sp, #-16]! and mov x29, sp")
+  // Epilogue uses `ldp x29, x30, [sp], #16` (0xA8C17BFD) and `ret` (0xD65F03C0), never `ldp r, xzr`.
+  run Testing.expect(containsWord(code, 0xA8C17BFD) && containsWord(code, 0xD65F03C0),
+    "epilogue restores fp/lr via post-index ldp and returns")
+  run Testing.expect(!containsWordMasked(code, 0xFFC07C00, 0xA8C07C00),
+    "epilogue never emits UNPREDICTABLE ldp reg, xzr")
+  run Testing.expect(hasReloc(&emitted, RelocationKind.Page21, b"pro_seen_fn.silk_seen")
+    && hasReloc(&emitted, RelocationKind.PageOff12, b"pro_seen_fn.silk_seen"),
+    "silk_seen probe emits Page21 adrp + PageOff12 strb relocations")
+  run Testing.expect(List<u64>.length(&emitted.locations) >= 4,
+    "source locations pairs are recorded")
+
+  // 2. Naked function skips prologue and silk_seen probe.
+  let mut nakedFn = run SsaFunction.make(b"naked_exit_fn", 64)
+  let nb0 = run nakedFn.newBlock()
+  nakedFn.startBlock(nb0)
+  drop run nakedFn.inlineAsm(b"brk #0", b"", b"", MemoryEffect.None, false, true, &[], Kind.unit())
+  run nakedFn.unreachable()
+  run nakedFn.finish()
+  run expectValidSsa(&nakedFn)
+
+  let nakedOut = run AArch64Emit.emitWithSeen(&nakedFn, b"naked_exit_fn", b"", b"naked.silk_seen")
+  run Testing.expect(!nakedOut.unwind.hasFramePointer && nakedOut.unwind.prologueEnd == 0 && nakedOut.unwind.frameBytes == 0,
+    "naked function produces UnwindInfo.naked()")
+  run Testing.expect(!hasReloc(&nakedOut, RelocationKind.Page21, b"naked.silk_seen"),
+    "naked function omits silk_seen entry probe")
+
+  // 3. `FramePlan.frameOverflow` produces clean `Unsupported`.
+  let mut ovfFn = run SsaFunction.make(b"ovf_emit_fn", 64)
+  let ob0 = run ovfFn.newBlock()
+  ovfFn.startBlock(ob0)
+  drop run ovfFn.slotOf(0x7FFFFFFFFFFFFFF0, 16)
+  drop run ovfFn.slotOf(16, 16)
+  run ovfFn.ret(none())
+  run ovfFn.finish()
+  run expectValidSsa(&ovfFn)
+  run expectEmitUnsupported(&ovfFn, b"ovf_emit_fn")
+}
+
+test effect fn emitsDarwinAbiSretHfaVariadicsAndOddWidths() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run darwinAbiAndOddWidthClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn darwinAbiAndOddWidthClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i8K = Kind.integer(8)
+  let i16K = Kind.integer(16)
+  let i24K = Kind.integer(24)
+  let i40K = Kind.integer(40)
+  let i48K = Kind.integer(48)
+  let i56K = Kind.integer(56)
+  let i64K = Kind.integer(64)
+  let i128K = Kind.integer(128)
+  let f32K = Kind.float(32)
+  let f64K = Kind.float(64)
+  let ptrK = Kind.address(64)
+
+  // 1. Darwin variadic C function: `sret` (x8), `i128` in `x1:x2`, 7x `f32` + HFA3 spill (`v0..v6`,
+  //    spill HFA3 to stack & exhaust FP), tight `i8`+`i16` fixed stack args, and `VaStart`.
+  let mut cal = run SsaFunction.make(b"darwin_va_callee", 64)
+  cal.setCallingConvention(CallingConvention.C, true, AbiExtension.None)
+  let sretP = run cal.argument(ptrK)
+  let g0 = run cal.argument(i64K)
+  let g128 = run cal.argument(i128K)
+  let g3 = run cal.argument(i64K)
+  let g4 = run cal.argument(i64K)
+  let g5 = run cal.argument(i64K)
+  let g6 = run cal.argument(i64K)
+  let g7 = run cal.argument(i64K)
+  let stByte = run cal.argument(i8K)
+  let stHalf = run cal.argument(i16K)
+  let mut fArgs = List<u64>.make()
+  let mut fi = usize.ZERO
+  while fi < 7 {
+    run List<u64>.append(&mut fArgs, run cal.argument(f32K))
+    fi = fi + usize.ONE
+  }
+  let h0 = run cal.argument(f32K)
+  let h1 = run cal.argument(f32K)
+  let h2 = run cal.argument(f32K)
+
+  let sretAbi = ParameterAbi {extension: AbiExtension.None, byvalSize: 0, byvalAlignment: 0, sret: true, groupRemaining: 0, stackAlignment: 0}
+  cal.setArgumentAbi(sretP, sretAbi)
+  cal.setArgumentAbi(h0, ParameterAbi {extension: AbiExtension.None, byvalSize: 0, byvalAlignment: 0, sret: false, groupRemaining: 3, stackAlignment: 0})
+  cal.setArgumentAbi(h1, ParameterAbi {extension: AbiExtension.None, byvalSize: 0, byvalAlignment: 0, sret: false, groupRemaining: 2, stackAlignment: 0})
+  cal.setArgumentAbi(h2, ParameterAbi {extension: AbiExtension.None, byvalSize: 0, byvalAlignment: 0, sret: false, groupRemaining: 1, stackAlignment: 0})
+  let fArgSlice = List<u64>.asSlice(&fArgs)
+
+  cal.setResult(i64K)
+  let cb0 = run cal.newBlock()
+  cal.startBlock(cb0)
+  let vaSlot = run cal.slotOf(8, 8)
+  run cal.vaStart(vaSlot)
+  let vaPtr = run cal.load(i64K, vaSlot, 0, 8)
+  run cal.vaEnd(vaSlot)
+  let stByteW = run cal.cast(Cast.ZExt, stByte, i64K)
+  let stHalfW = run cal.cast(Cast.ZExt, stHalf, i64K)
+  let g128Lo = run cal.cast(Cast.Trunc, g128, i64K)
+  let mut acc = run cal.binary(Binary.Add, g0, g128Lo)
+  acc = run cal.binary(Binary.Add, acc, g3)
+  acc = run cal.binary(Binary.Add, acc, g4)
+  acc = run cal.binary(Binary.Add, acc, g5)
+  acc = run cal.binary(Binary.Add, acc, g6)
+  acc = run cal.binary(Binary.Add, acc, g7)
+  acc = run cal.binary(Binary.Add, acc, stByteW)
+  acc = run cal.binary(Binary.Add, acc, stHalfW)
+  acc = run cal.binary(Binary.Add, acc, vaPtr)
+  let hSum0 = run cal.binary(Binary.Add, h0, h1)
+  let hSum1 = run cal.binary(Binary.Add, hSum0, h2)
+  let hSum2 = run cal.binary(Binary.Add, hSum1, fArgSlice[0])
+  let hInt = run cal.cast(Cast.FPToSI, hSum2, i64K)
+  acc = run cal.binary(Binary.Add, acc, hInt)
+  run cal.store(acc, sretP, 0, 8)
+  run cal.ret(acc)
+  run cal.finish()
+  run expectValidSsa(&cal)
+
+  let calOut = run AArch64Emit.emit(&cal, b"darwin_va_callee", b"")
+  let calCode = Bytes.asSlice(&calOut.code)
+  // `fixedStackBytes`: `stByte` (1B at +0) + `stHalf` (2B at +2) + `HFA3` (3*4B at +4..+16) = 16 -> vaOff = 16 + 16 = 32 (`add x15, x29, #32` = 0x910083AF).
+  run Testing.expect(containsWord(calCode, 0x910083AF),
+    "Darwin VaStart computes fp + 16 + alignUp(fixedStackBytes, 8) == fp + 32 after packed subwords and spilled HFA3")
+
+  // 2. Odd-width `i24`, `i40`, `i48`, `i56` Load/Store + `Symbol` GOT + `ThreadLocal` TLV + variadic C `Call`.
+  let mut oddFn = run SsaFunction.make(b"odd_abi_tls_caller", 64)
+  let pIn = run oddFn.argument(ptrK)
+  let pOut = run oddFn.argument(ptrK)
+  let keepX0 = run oddFn.argument(i64K)
+  oddFn.setResult(i64K)
+  let ob0 = run oddFn.newBlock()
+  oddFn.startBlock(ob0)
+
+  let v24 = run oddFn.load(i24K, pIn, 0, 1)
+  run oddFn.store(v24, pOut, 0, 1)
+  let v40 = run oddFn.load(i40K, pIn, 8, 1)
+  run oddFn.store(v40, pOut, 8, 1)
+  let v48 = run oddFn.load(i48K, pIn, 16, 1)
+  run oddFn.store(v48, pOut, 16, 1)
+  let v56 = run oddFn.load(i56K, pIn, 24, 1)
+  run oddFn.store(v56, pOut, 24, 1)
+
+  let symAddr = run oddFn.symbolAddress(b"ext_global", 16, false)
+  let tlsAddr = run oddFn.symbolAddress(b"ext_tls", 8, true)
+  let symVal = run oddFn.load(i64K, symAddr, 0, 8)
+  let tlsVal = run oddFn.load(i64K, tlsAddr, 0, 8)
+
+  let cArg0 = run oddFn.integer(8, 0xAB)
+  let cArg1 = run oddFn.integer(16, 0x1234)
+  let cVar = run oddFn.integer(64, 99)
+  let pAbis = [
+    ParameterAbi {extension: AbiExtension.Signed, byvalSize: 0, byvalAlignment: 0, sret: false, groupRemaining: 0, stackAlignment: 0},
+    ParameterAbi {extension: AbiExtension.Unsigned, byvalSize: 0, byvalAlignment: 0, sret: false, groupRemaining: 0, stackAlignment: 0},
+  ]
+  let cAbi = run oddFn.addCallAbi(CallingConvention.C, AbiExtension.None, &pAbis)
+  let fixedA = [cArg0, cArg1]
+  let tailA = [cVar]
+  let cRes = run oddFn.callVariadicWithAbi(b"ext_var_c", &fixedA, &tailA, i64K, Kind.unit(), cAbi)
+
+  let w24 = run oddFn.cast(Cast.ZExt, v24, i64K)
+  let w56 = run oddFn.cast(Cast.ZExt, v56, i64K)
+  let s0 = run oddFn.binary(Binary.Add, keepX0, symVal)
+  let s1 = run oddFn.binary(Binary.Add, s0, tlsVal)
+  let s2 = run oddFn.binary(Binary.Add, s1, cRes)
+  let s3 = run oddFn.binary(Binary.Add, s2, w24)
+  let s4 = run oddFn.binary(Binary.Add, s3, w56)
+  run oddFn.ret(s4)
+  run oddFn.finish()
+  run expectValidSsa(&oddFn)
+
+  let oddOut = run AArch64Emit.emit(&oddFn, b"odd_abi_tls_caller", b"")
+  let oddCode = Bytes.asSlice(&oddOut.code)
+  run Testing.expect(hasReloc(&oddOut, RelocationKind.GotLoadPage21, b"ext_global")
+    && hasReloc(&oddOut, RelocationKind.GotLoadPageOff12, b"ext_global"),
+    "ConstantForm.Symbol emits GotLoadPage21 + GotLoadPageOff12 relocations")
+  run Testing.expect(hasReloc(&oddOut, RelocationKind.TlvpLoadPage21, b"ext_tls")
+    && hasReloc(&oddOut, RelocationKind.TlvpLoadPageOff12, b"ext_tls"),
+    "ConstantForm.ThreadLocal emits TlvpLoadPage21 + TlvpLoadPageOff12 relocations")
+  run Testing.expect(hasReloc(&oddOut, RelocationKind.Branch26, b"ext_var_c"),
+    "variadic C call emits Branch26 relocation")
+  // `blr x17` = 0xD63F0220 for TLV thunk call, and `sxtb x0, w0` (`0x93401C00`) for signed i8 ABI ext.
+  run Testing.expect(containsWord(oddCode, 0xD63F0220) && containsWord(oddCode, 0x93401C00),
+    "TLV emits blr x17 and C call applies sxtb extension on i8 register arg")
+  // `ubfm xDst, xSrc, #0, #23` (imms=23 -> 0xD3405C00 mask over bits 31..10 = 0xFFC0FC00 -> 0xD3405C00).
+  run Testing.expect(containsWordMasked(oddCode, 0xFFFFFC00, 0xD3405C00),
+    "i24 ZExt/Load normalizes via ubfm ..., #0, #23")
+  drop f64K
+  drop v40
+  drop v48
+}
+
+test effect fn emitsScalarIntI128AndFloatOperations() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run scalarI128FloatClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn scalarI128FloatClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i1K = Kind.flag()
+  let i16K = Kind.integer(16)
+  let i64K = Kind.integer(64)
+  let i128K = Kind.integer(128)
+  let f32K = Kind.float(32)
+  let f64K = Kind.float(64)
+
+  let mut f = run SsaFunction.make(b"scalar_i128_fp", 64)
+  let a64 = run f.argument(i64K)
+  let b64 = run f.argument(i64K)
+  let x128 = run f.argument(i128K)
+  let y128 = run f.argument(i128K)
+  let fa = run f.argument(f64K)
+  let fb = run f.argument(f64K)
+  let fc = run f.argument(f64K)
+  f.setResult(i64K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+
+  // Scalar int ops: div/rem traps, overflow, saturate, rotate, count, extreme.
+  let qS = run f.binary(Binary.SDiv, a64, b64)
+  let rU = run f.binary(Binary.URem, a64, b64)
+  let ovf = run f.addInstruction(Operation.Overflow {operation: Binary.Sub, signed: false}, i64K, &[a64, b64])
+  let a16 = run f.cast(Cast.Trunc, a64, i16K)
+  let b16 = run f.cast(Cast.Trunc, b64, i16K)
+  let sat = run f.addInstruction(Operation.Saturate {operation: Binary.Add, signed: true}, i16K, &[a16, b16])
+  let rot = run f.addInstruction(Operation.Rotate {left: true}, i64K, &[a64, b64])
+  let ones = run f.addInstruction(Operation.Count {which: Count.Ones}, i64K, &[a64])
+  let clz = run f.addInstruction(Operation.Count {which: Count.LeadingZeros}, i64K, &[b64])
+  let ctz = run f.addInstruction(Operation.Count {which: Count.TrailingZeros}, i64K, &[a64])
+  let exS = run f.addInstruction(Operation.Extreme {which: Extreme.SignedMinimum}, i64K, &[a64, b64])
+
+  // `i128` ops: mul, shl, sdiv, srem, overflow mul, float conversions.
+  let mul128 = run f.binary(Binary.Mul, x128, y128)
+  let b128 = run f.cast(Cast.ZExt, b64, i128K)
+  let sh128 = run f.binary(Binary.Shl, mul128, b128)
+  let div128 = run f.binary(Binary.SDiv, sh128, y128)
+  let rem128 = run f.binary(Binary.URem, x128, y128)
+  let ovf128 = run f.addInstruction(Operation.Overflow {operation: Binary.Mul, signed: true}, i128K, &[x128, y128])
+  let fFrom128 = run f.cast(Cast.SIToFP, rem128, f64K)
+  let i128FromF = run f.cast(Cast.FPToSI, fa, i128K)
+
+  // Scalar float: fma, fmin/fmax, all 14 predicates (focus on One & Ueq), saturating casts, ucvtf.
+  let fmaV = run f.addInstruction(Operation.FusedMultiplyAdd, f64K, &[fa, fb, fc])
+  let fMin = run f.addInstruction(Operation.Extreme {which: Extreme.FloatMinimum}, f64K, &[fmaV, fFrom128])
+  let fMax = run f.addInstruction(Operation.Extreme {which: Extreme.FloatMaximum}, f64K, &[fMin, fb])
+  let cmpOne = run f.compare(Predicate.One, fMax, fc)
+  let cmpUeq = run f.compare(Predicate.Ueq, fMax, fa)
+  let cmpOlt = run f.compare(Predicate.Olt, fMax, fb)
+  let cmpUgtf = run f.compare(Predicate.Ugtf, fMax, fc)
+  let f32V = run f.cast(Cast.FPTrunc, fMax, f32K)
+  let f64Back = run f.cast(Cast.FPExt, f32V, f64K)
+  let u64ToF = run f.cast(Cast.UIToFP, a64, f64K)
+  let fToU16 = run f.cast(Cast.FPToUI, f64Back, i16K)
+  let fToI64 = run f.cast(Cast.FPToSI, u64ToF, i64K)
+
+  let satW = run f.cast(Cast.ZExt, sat, i64K)
+  let div128Lo = run f.cast(Cast.Trunc, div128, i64K)
+  let ovf128Lo = run f.cast(Cast.Trunc, ovf128, i64K)
+  let i128FromFLo = run f.cast(Cast.Trunc, i128FromF, i64K)
+  let cmpOneW = run f.cast(Cast.ZExt, cmpOne, i64K)
+  let cmpUeqW = run f.cast(Cast.ZExt, cmpUeq, i64K)
+  let cmpOltW = run f.cast(Cast.ZExt, cmpOlt, i64K)
+  let cmpUgtfW = run f.cast(Cast.ZExt, cmpUgtf, i64K)
+  let fToU16W = run f.cast(Cast.ZExt, fToU16, i64K)
+  let mut sum = run f.binary(Binary.Add, qS, rU)
+  sum = run f.binary(Binary.Add, sum, ovf)
+  sum = run f.binary(Binary.Add, sum, satW)
+  sum = run f.binary(Binary.Add, sum, rot)
+  sum = run f.binary(Binary.Add, sum, ones)
+  sum = run f.binary(Binary.Add, sum, clz)
+  sum = run f.binary(Binary.Add, sum, ctz)
+  sum = run f.binary(Binary.Add, sum, exS)
+  sum = run f.binary(Binary.Add, sum, div128Lo)
+  sum = run f.binary(Binary.Add, sum, ovf128Lo)
+  sum = run f.binary(Binary.Add, sum, i128FromFLo)
+  sum = run f.binary(Binary.Add, sum, cmpOneW)
+  sum = run f.binary(Binary.Add, sum, cmpUeqW)
+  sum = run f.binary(Binary.Add, sum, cmpOltW)
+  sum = run f.binary(Binary.Add, sum, cmpUgtfW)
+  sum = run f.binary(Binary.Add, sum, fToU16W)
+  sum = run f.binary(Binary.Add, sum, fToI64)
+  run f.ret(sum)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let out = run AArch64Emit.emit(&f, b"scalar_i128_fp", b"")
+  let code = Bytes.asSlice(&out.code)
+  // `brk #1` = 0xD4200020 for div-by-zero/overflow traps.
+  run Testing.expect(containsWord(code, 0xD4200020), "scalar and i128 div/rem emit brk #1 trap guards")
+  run Testing.expect(hasReloc(&out, RelocationKind.Branch26, b"__silk_divti3")
+    && hasReloc(&out, RelocationKind.Branch26, b"__silk_umodti3"),
+    "i128 div/rem emit Branch26 calls to __silk_divti3 and __silk_umodti3")
+  run Testing.expect(!hasReloc(&out, RelocationKind.Branch26, b"fma"),
+    "scalar FusedMultiplyAdd uses native fmadd instruction instead of external fma call")
+  // Verify `fmadd` (`0x1F400000` mask `0xFF000000` for f64), `fmin` (`0x1E605800` mask `0xFFE0FC00`),
+  // `cnt` (`0x4E205800` mask `0xFFFFFC00` for `v31` = `0x4E205BFF`), and `ucvtf` (`0x9E630000` mask `0xFFFFFC00`).
+  run Testing.expect(containsWordMasked(code, 0xFF000000, 0x1F000000),
+    "scalar FMA emits native fmadd")
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0x1E605800),
+    "FloatMinimum emits native IEEE fmin")
+  run Testing.expect(containsWord(code, 0x4E205BFF),
+    "Count.Ones uses NEON cnt v31.16b, v31.16b without caller FP clobber")
+  drop i1K
+}
+
+test effect fn fusesMaddMsubCselCbzTbzAndScaledMemory() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run fusionAndControlClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn fusionAndControlClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let ptrK = Kind.address(64)
+
+  // 1. `madd`, `msub`, `csel`, scaled `ldr [base, idx, lsl #3]`, `tbz`, `cbz`, dense `Switch` jump table.
+  let mut f = run SsaFunction.make(b"fusion_switch_fn", 64)
+  let base = run f.argument(ptrK)
+  let idx = run f.argument(i64K)
+  let a = run f.argument(i64K)
+  let b = run f.argument(i64K)
+  let c = run f.argument(i64K)
+  f.setResult(i64K)
+
+  let b0 = run f.newBlock()
+  let b1 = run f.newBlock()
+  let b2 = run f.newBlock()
+  let b3 = run f.newBlock()
+  let b4 = run f.newBlock()
+  let b5 = run f.newBlock()
+  let bDef = run f.newBlock()
+
+  f.startBlock(b0)
+  let c3 = run f.integer(64, 3)
+  let scaledIdx = run f.binary(Binary.Shl, idx, c3)
+  let elemAddr = run f.indexed(base, scaledIdx)
+  let loaded = run f.load(i64K, elemAddr, 0, 8)
+  let prod1 = run f.binary(Binary.Mul, a, b)
+  let maddVal = run f.binary(Binary.Add, prod1, c)
+  let prod2 = run f.binary(Binary.Mul, b, c)
+  let msubVal = run f.binary(Binary.Sub, maddVal, prod2)
+  let cmpSel = run f.compare(Predicate.Slt, msubVal, loaded)
+  let selVal = run f.select(cmpSel, a, b)
+  let c16 = run f.integer(64, 16)
+  let maskBit = run f.binary(Binary.And, selVal, c16)
+  let c0 = run f.integer(64, 0)
+  let bitZero = run f.compare(Predicate.Eq, maskBit, c0)
+  run f.branchIf(bitZero, b1, bDef)
+
+  f.startBlock(b1)
+  let cases: [u64; 10] = [0, usize.toU64(b2), 1, usize.toU64(b3), 2, usize.toU64(b4), 3, usize.toU64(b5), 4, usize.toU64(bDef)]
+  run f.switch(selVal, &cases, bDef)
+
+  f.startBlock(b2)
+  let r10 = run f.integer(64, 10)
+  run f.ret(r10)
+  f.startBlock(b3)
+  let r20 = run f.integer(64, 20)
+  run f.ret(r20)
+  f.startBlock(b4)
+  let r30 = run f.integer(64, 30)
+  run f.ret(r30)
+  f.startBlock(b5)
+  let r40 = run f.integer(64, 40)
+  run f.ret(r40)
+  f.startBlock(bDef)
+  run f.ret(selVal)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let out = run AArch64Emit.emit(&f, b"fusion_switch_fn", b"")
+  let code = Bytes.asSlice(&out.code)
+  // Scaled load `[base, idx, lsl #3]`: `0xF8607800` masked with `0xFFE0FC00`.
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0xF8607800),
+    "Shl(3)+Index+Load fuses into scaled ldr xD, [xBase, xIdx, lsl #3]")
+  // `madd` 64-bit (`0x9B000000`, `o0=0`, `Ra!=31`): mask `0xFFE08000` == `0x9B000000`, and `msub` (`0x9B008000`).
+  run Testing.expect(containsWordMasked(code, 0xFFE08000, 0x9B000000)
+    && containsWordMasked(code, 0xFFE08000, 0x9B008000),
+    "Mul+Add and Mul+Sub fuse into madd and msub")
+  // `csel` 64-bit: mask `0xFFE00C00` == `0x9A800000`.
+  run Testing.expect(containsWordMasked(code, 0xFFE00C00, 0x9A800000),
+    "Compare+Select fuses into csel")
+  // `tbz` / `tbnz` on bit 4 (`imm = 4` -> `(0x36000000 | (4 << 19))` or `0x37000000 | (4 << 19)`):
+  run Testing.expect(containsWordMasked(code, 0xFEFFF000, 0x36200000),
+    "And(x, 1<<4)+Eq(0)+Branch fuses into tbz/tbnz bit #4")
+  // Dense `.rodata` jump table: `LocalRodataPage21`, `LocalRodataPageOff12`, scaled `ldrsw` (`0xB8A07800` / mask `0xFFE0FC00`), and 5 `RodataJumpEntry`s.
+  run Testing.expect(hasReloc(&out, RelocationKind.LocalRodataPage21, b"")
+    && hasReloc(&out, RelocationKind.LocalRodataPageOff12, b""),
+    "dense Switch emits LocalRodataPage21 and LocalRodataPageOff12 relocations")
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0xB8A07800),
+    "dense Switch emits scaled ldrsw [tbl, idx, lsl #2]")
+  run Testing.expect(List<RodataJumpEntry>.length(&out.rodataJumps) == 5,
+    "dense 5-case Switch emits 5 RodataJumpEntry records")
+
+  // 1b. Dense Switch with a gap case and a default edge that carries block arguments:
+  //     gap slots must target the default edge-copy stub (not `defaultBlk` directly).
+  let mut gapSw = run SsaFunction.make(b"gap_switch_default_args", 64)
+  let gArg = run gapSw.argument(i64K)
+  gapSw.setResult(i64K)
+  let gb0 = run gapSw.newBlock()
+  let gc0 = run gapSw.newBlock()
+  let gc1 = run gapSw.newBlock()
+  let gc3 = run gapSw.newBlock()
+  let gc4 = run gapSw.newBlock()
+  let gDef = run gapSw.newBlock()
+  let gDefParam = run gapSw.addParameter(gDef, i64K)
+  gapSw.startBlock(gb0)
+  let gConst99 = run gapSw.integer(64, 99)
+  let gCases: [u64; 8] = [0, usize.toU64(gc0), 1, usize.toU64(gc1), 3, usize.toU64(gc3), 4, usize.toU64(gc4)]
+  run gapSw.switch(gArg, &gCases, gDef)
+  run gapSw.appendArgument(gb0, usize.ZERO, gConst99)
+  gapSw.startBlock(gc0)
+  let gv0 = run gapSw.integer(64, 10)
+  run gapSw.ret(gv0)
+  gapSw.startBlock(gc1)
+  let gv1 = run gapSw.integer(64, 11)
+  run gapSw.ret(gv1)
+  gapSw.startBlock(gc3)
+  let gv3 = run gapSw.integer(64, 13)
+  run gapSw.ret(gv3)
+  gapSw.startBlock(gc4)
+  let gv4 = run gapSw.integer(64, 14)
+  run gapSw.ret(gv4)
+  gapSw.startBlock(gDef)
+  run gapSw.ret(gDefParam)
+  run gapSw.finish()
+  run expectValidSsa(&gapSw)
+  let gapOut = run AArch64Emit.emit(&gapSw, b"gap_switch_default_args", b"")
+  let gapJumps = List<RodataJumpEntry>.asSlice(&gapOut.rodataJumps)
+  run Testing.expect(gapJumps.length == 5,
+    "dense Switch with 1 gap emits 5 RodataJumpEntry records")
+  run Testing.expect(gapJumps[2].targetCodeOffset < gapJumps[0].targetCodeOffset,
+    "gap slot targets default edge-copy stub emitted before case blocks")
+
+  // 2. Two-value `Exit.Return` where `secondValue` starts in `x0` (swapped safely into `x1`).
+  let mut retPairFn = run SsaFunction.make(b"ret_pair_swap", 64)
+  let rArg = run retPairFn.argument(i64K)
+  retPairFn.setResults(i64K, i64K)
+  let rb0 = run retPairFn.newBlock()
+  retPairFn.startBlock(rb0)
+  let rCall = run retPairFn.call(b"ext_make_second", &[rArg], i64K)
+  let rFirst = run retPairFn.integer(64, 777)
+  run retPairFn.retPair(rFirst, rCall)
+  run retPairFn.finish()
+  run expectValidSsa(&retPairFn)
+  let pairOut = run AArch64Emit.emit(&retPairFn, b"ret_pair_swap", b"")
+  run Testing.expect(containsWord(Bytes.asSlice(&pairOut.code), 0xD65F03C0),
+    "two-value Exit.Return emits valid epilogue return")
+}
+
+test effect fn relaxesBranchesDeterministicallyAndRemapsOffsets() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run relaxationAndParallelMoveClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn relaxationAndParallelMoveClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+
+  // 1. Force a `tbz` (`±32 KB`) branch across an `InlineAsm` `nop` spacer > 32768 bytes,
+  //    followed by a `bl ext_after_spacer` relocation and located return, verifying Tier-1
+  //    expansion (`tbnz +8; b target`) and relocation/location +4 offset remapping.
+  let mut nops = Bytes.make()
+  let mut k = usize.ZERO
+  while k < 8250 {
+    run Bytes.append(&mut nops, b"nop;")
+    k = k + usize.ONE
+  }
+
+  let mut rf = run SsaFunction.make(b"relax_tbz_fn", 64)
+  let rArg = run rf.argument(i64K)
+  rf.setResult(i64K)
+  let rb0 = run rf.newBlock()
+  let rb1 = run rf.newBlock()
+  let rb2 = run rf.newBlock()
+  rf.startBlock(rb0)
+  let r1 = run rf.integer(64, 1)
+  let bitAnd = run rf.binary(Binary.And, rArg, r1)
+  let r0 = run rf.integer(64, 0)
+  let isZ = run rf.compare(Predicate.Eq, bitAnd, r0)
+  run rf.branchIf(isZ, rb1, rb2)
+  rf.startBlock(rb1)
+  drop run rf.inlineAsm(Bytes.asSlice(&nops), b"", b"", MemoryEffect.None, true, false, &[], Kind.unit())
+  drop run rf.call(b"ext_after_spacer", &[rArg], i64K)
+  rf.locate(0x00000042000001)
+  run rf.jump(rb2)
+  rf.startBlock(rb2)
+  run rf.ret(rArg)
+  run rf.finish()
+  run expectValidSsa(&rf)
+
+  let relaxed = run AArch64Emit.emit(&rf, b"relax_tbz_fn", b"")
+  let rCode = Bytes.asSlice(&relaxed.code)
+  // RPO places `rb0, rb1 (33 KB spacer), rb2`, so the `rb0 -> rb2` branch crosses > 32 KB and expands to Tier-1 (`tbz/tbnz +8; b rb2`).
+  run Testing.expect(containsWordMasked(rCode, 0xFE07FFE0, 0x36000040),
+    "overflowing ±32 KB tbz/tbnz expands to Tier-1 inverted skip +8 + unconditional b")
+  // Verify `ext_after_spacer` Branch26 relocation points to an actual `bl` (`0x94000000`) in remapped code.
+  let rels = List<Relocation>.asSlice(&relaxed.relocations)
+  run Testing.expect(rels.length == usize.ONE && readU32Le(rCode, rels[0].offset) == 0x94000000,
+    "remapped Branch26 relocation offset still points directly at bl instruction after relaxation")
+  // Verify recorded `locations` offset after spacer points to valid instruction boundary and follows remapping.
+  let locs = List<u64>.asSlice(&relaxed.locations)
+  run Testing.expect(locs.length >= 2 && u64.toUsize(locs[0]) > 32768 && (locs[0] % 4) == 0,
+    "remapped debug location offset stays 4-byte aligned past expanded branch and spacer")
+
+  // 2. Parallel GP swap cycle `(a, b) -> (b, a)` alongside a `ThreadLocal` edge move.
+  let mut pf = run SsaFunction.make(b"parallel_cycle_tls", 64)
+  let p0 = run pf.argument(i64K)
+  let p1 = run pf.argument(i64K)
+  pf.setResult(i64K)
+  let pb0 = run pf.newBlock()
+  let pb1 = run pf.newBlock()
+  let pb2 = run pf.newBlock()
+  let lp0 = run pf.addParameter(pb1, i64K)
+  let lp1 = run pf.addParameter(pb1, i64K)
+  let lpTls = run pf.addParameter(pb1, Kind.address(64))
+
+  pf.startBlock(pb0)
+  let tlsInit = run pf.symbolAddress(b"loop_tls_var", 0, true)
+  run pf.jumpWith(pb1, &[p0, p1, tlsInit])
+  pf.startBlock(pb1)
+  let pZero = run pf.integer(64, 0)
+  let loopCond = run pf.compare(Predicate.Ugt, lp0, pZero)
+  let tlsNext = run pf.symbolAddress(b"loop_tls_next", 0, true)
+  let nextArgs = [lp1, lp0, tlsNext]
+  run pf.branchWith(loopCond, pb1, &nextArgs, pb2, &[])
+  pf.startBlock(pb2)
+  let loadedTls = run pf.load(i64K, lpTls, 0, 8)
+  let pSum = run pf.binary(Binary.Add, lp0, loadedTls)
+  run pf.ret(pSum)
+  run pf.finish()
+  run expectValidSsa(&pf)
+
+  let cycOut = run AArch64Emit.emit(&pf, b"parallel_cycle_tls", b"")
+  run Testing.expect(hasReloc(&cycOut, RelocationKind.TlvpLoadPage21, b"loop_tls_next")
+    && hasReloc(&cycOut, RelocationKind.TlvpLoadPageOff12, b"loop_tls_next"),
+    "parallel GP swap cycle safely emits ThreadLocal edge moves without clobbering x16")
+}
+
+test effect fn emitsAtomicsBulkMemoryAndCleanM2dRefusals() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run atomicsAsmRefusalClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn atomicsAsmRefusalClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let i128K = Kind.integer(128)
+  let ptrK = Kind.address(64)
+  let v4i32 = Kind.vector(Kind.integer(32), 4)
+
+  // 1. Fence, 64-bit & 128-bit atomics, bulk copy/fill, and valid `InlineAsm`.
+  let mut af = run SsaFunction.make(b"atomics_bulk_asm", 64)
+  let ptr = run af.argument(ptrK)
+  let srcPtr = run af.argument(ptrK)
+  let val64 = run af.argument(i64K)
+  let val128 = run af.argument(i128K)
+  let cnt = run af.argument(i64K)
+  af.setResult(i64K)
+  let ab0 = run af.newBlock()
+  af.startBlock(ab0)
+
+  drop run af.addInstruction(Operation.Fence, Kind.unit(), &[])
+  let al64 = run af.addInstruction(Operation.AtomicLoad, i64K, &[ptr])
+  drop run af.addInstruction(Operation.AtomicStore, Kind.unit(), &[al64, ptr])
+  let amAdd = run af.addInstruction(Operation.AtomicModify {which: Modify.Add}, i64K, &[ptr, val64])
+  let amMin = run af.addInstruction(Operation.AtomicModify {which: Modify.SignedMinimum}, i64K, &[ptr, val64])
+  let cas64 = run af.addInstruction(Operation.CompareExchange, i64K, &[ptr, al64, amAdd])
+
+  let al128 = run af.addInstruction(Operation.AtomicLoad, i128K, &[ptr])
+  drop run af.addInstruction(Operation.AtomicStore, Kind.unit(), &[val128, ptr])
+  let am128 = run af.addInstruction(Operation.AtomicModify {which: Modify.Xor}, i128K, &[ptr, al128])
+  let cas128 = run af.addInstruction(Operation.CompareExchange, i128K, &[ptr, am128, val128])
+
+  run af.copyBytes(ptr, srcPtr, 32)
+  run af.fill(ptr, 0x5A, 64)
+  run af.copyCounted(ptr, srcPtr, cnt)
+
+  let asmOut = run af.inlineAsm(b"add $0, $1, $2; bl ext_asm_hook", b"={x0},r,{x17}", b"x10,flags", MemoryEffect.ReadWrite, true, false, &[cas64, amMin], i64K)
+  let cas128Lo = run af.cast(Cast.Trunc, cas128, i64K)
+  let total = run af.binary(Binary.Add, asmOut, cas128Lo)
+  run af.ret(total)
+  run af.finish()
+  run expectValidSsa(&af)
+
+  let out = run AArch64Emit.emit(&af, b"atomics_bulk_asm", b"")
+  let code = Bytes.asSlice(&out.code)
+  // `dmb ish` = 0xD5033BBF, `clrex` = 0xD5033F5F.
+  run Testing.expect(containsWord(code, 0xD5033BBF) && containsWord(code, 0xD5033F5F),
+    "Fence emits dmb ish and 128-bit CompareExchange emits clrex")
+  // `ldar` 64-bit (`0xC8DFFC00` mask `0xFFFFFC00`), `casal` 64-bit (`0xC8E0FC00` mask `0xFFE0FC00`),
+  // `ldaxp` (`0xC87F8000` mask `0xFFFF8000`), `stlxp` (`0xC8208000` mask `0xFFE08000`).
+  run Testing.expect(containsWordMasked(code, 0xFFFFFC00, 0xC8DFFC00)
+    && containsWordMasked(code, 0xFFE0FC00, 0xC8E0FC00),
+    "64-bit AtomicLoad emits ldar and CompareExchange emits casal")
+  run Testing.expect(containsWordMasked(code, 0xFFFF8000, 0xC87F8000)
+    && containsWordMasked(code, 0xFFE08000, 0xC8208000),
+    "128-bit atomics emit ldaxp and stlxp via AArch64Encode.u32Le")
+  run Testing.expect(hasReloc(&out, RelocationKind.Branch26, b"memmove")
+    && hasReloc(&out, RelocationKind.Branch26, b"ext_asm_hook"),
+    "CopyCounted emits memmove Branch26 and InlineAsm emits bl Branch26")
+
+  // 2. Clean `Unsupported` refusals: `={x18}` inline asm, `ArchOperation.X86*`,
+  //    `Operation.WasmMemorySize`, and `ConstantForm.Link`.
+  let mut badAsmFn = run SsaFunction.make(b"bad_x18_asm", 64)
+  let bx0 = run badAsmFn.newBlock()
+  badAsmFn.startBlock(bx0)
+  drop run badAsmFn.inlineAsm(b"mov $0, #1", b"={x18}", b"", MemoryEffect.None, true, false, &[], i64K)
+  run badAsmFn.ret(none())
+  run badAsmFn.finish()
+  run expectValidSsa(&badAsmFn)
+  run expectEmitUnsupported(&badAsmFn, b"bad_x18_asm")
+
+  let mut x86ArchFn = run SsaFunction.make(b"x86_arch_refused", 64)
+  let ab1 = run x86ArchFn.newBlock()
+  x86ArchFn.startBlock(ab1)
+  let vc = run x86ArchFn.constant(Kind.vector(Kind.integer(8), 16), 0x01)
+  drop run x86ArchFn.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.X86ShuffleBytes, immediate: 0},
+    Kind.vector(Kind.integer(8), 16), &[vc, vc])
+  run x86ArchFn.ret(none())
+  run x86ArchFn.finish()
+  run expectValidSsa(&x86ArchFn)
+  run expectEmitUnsupported(&x86ArchFn, b"x86_arch_refused")
+  drop v4i32
+
+  let mut wasmFn = run SsaFunction.make(b"wasm_op_refused", 64)
+  let wb0 = run wasmFn.newBlock()
+  wasmFn.startBlock(wb0)
+  drop run wasmFn.addInstruction(Operation.WasmMemorySize, i64K, &[])
+  run wasmFn.ret(none())
+  run wasmFn.finish()
+  run expectValidSsa(&wasmFn)
+  run expectEmitUnsupported(&wasmFn, b"wasm_op_refused")
+
+  let mut linkFn = run SsaFunction.make(b"link_const_refused", 64)
+  linkFn.setResult(Kind.integer(32))
+  let lb0 = run linkFn.newBlock()
+  linkFn.startBlock(lb0)
+  let lc = run linkFn.linkConstant(b"__tls_size")
+  run linkFn.ret(lc)
+  run linkFn.finish()
+  run expectValidSsa(&linkFn)
+  run expectEmitUnsupported(&linkFn, b"link_const_refused")
+}
+
+test effect fn emitsNeonSimdComparesSelectShuffleReduceAndArchIntrinsics() -> ()
+! Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run neonAndArchClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn neonAndArchClaims() -> () ! Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let v16i8 = Kind.vector(Kind.integer(8), 16)
+  let v4i32 = Kind.vector(Kind.integer(32), 4)
+  let v4f32 = Kind.vector(Kind.float(32), 4)
+  let i8K = Kind.integer(8)
+  let i32K = Kind.integer(32)
+  let i64K = Kind.integer(64)
+
+  let mut f = run SsaFunction.make(b"neon_simd_pipeline", 64)
+  let a = run f.argument(v16i8)
+  let b = run f.argument(v16i8)
+  let fva = run f.argument(v4f32)
+  let fvb = run f.argument(v4f32)
+  f.setResult(i64K)
+  let b0 = run f.newBlock()
+  f.startBlock(b0)
+
+  // Compare (`cmeq`/`cmgt`/`cmhi`/`cmge`/`cmhs`), mask select (`bsl`), 16B shuffle (`tbl`),
+  // horizontal reductions (`addv`/`umaxv`/`uminv`), 16B<->16B NEON bitcast, and all 14 Aarch64* arch ops.
+  let eqM = run f.compare(Predicate.Eq, a, b)
+  let gtM = run f.compare(Predicate.Sgt, a, b)
+  let hiM = run f.compare(Predicate.Ugt, a, b)
+  let geM = run f.compare(Predicate.Sge, a, b)
+  let hsM = run f.compare(Predicate.Uge, a, b)
+  let m0 = run f.binary(Binary.Or, eqM, gtM)
+  let m1 = run f.binary(Binary.And, hiM, geM)
+  let m2 = run f.binary(Binary.Xor, m0, m1)
+  let m3 = run f.binary(Binary.Or, m2, hsM)
+  let sel = run f.select(m3, a, b)
+  let shufMask: [u64; 16] = [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+  let shuf = run f.shuffle(sel, b, &shufMask)
+  let as32 = run f.cast(Cast.Bitcast, shuf, v4i32)
+  let back8 = run f.cast(Cast.Bitcast, as32, v16i8)
+
+  let tbl = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64TableLookup, immediate: 0}, v16i8, &[back8, b])
+  let udot = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64UnsignedDotProduct, immediate: 0}, v4i32, &[as32, tbl, b])
+  let sdot = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64SignedDotProduct, immediate: 0}, v4i32, &[udot, tbl, a])
+  let addp = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64PairwiseAdd, immediate: 0}, v4i32, &[sdot, as32])
+  let ae0 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64AesEncrypt, immediate: 0}, v16i8, &[tbl, b])
+  let ae1 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64AesMixColumns, immediate: 0}, v16i8, &[ae0])
+  let ad0 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64AesDecrypt, immediate: 0}, v16i8, &[ae1, b])
+  let ad1 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64AesInverseMixColumns, immediate: 0}, v16i8, &[ad0])
+  let v2i64 = Kind.vector(Kind.integer(64), 2)
+  let ad1_64 = run f.cast(Cast.Bitcast, ad1, v2i64)
+  let a_64 = run f.cast(Cast.Bitcast, a, v2i64)
+  let b_64 = run f.cast(Cast.Bitcast, b, v2i64)
+  let pm0 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64PolynomialMultiply, immediate: 0}, v2i64, &[ad1_64, a_64])
+  let pm1 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64PolynomialMultiplyHigh, immediate: 0}, v2i64, &[pm0, b_64])
+  let pm32 = run f.cast(Cast.Bitcast, pm1, v4i32)
+  let sh0 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64Sha256Hash, immediate: 0}, v4i32, &[addp, pm32, as32])
+  let sh1 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64Sha256Hash2, immediate: 0}, v4i32, &[sh0, pm32, as32])
+  let su0 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64Sha256ScheduleUpdate0, immediate: 0}, v4i32, &[sh1, pm32])
+  let su1 = run f.addInstruction(Operation.ArchIntrinsic {operation: ArchOperation.Aarch64Sha256ScheduleUpdate1, immediate: 0}, v4i32, &[su0, pm32, as32])
+
+  let fSum = run f.binary(Binary.Add, fva, fvb)
+  let fAs32 = run f.cast(Cast.Bitcast, fSum, v4i32)
+  let combined = run f.binary(Binary.Xor, su1, fAs32)
+  let combinedBytes = run f.cast(Cast.Bitcast, combined, v16i8)
+  let rAdd = run f.addInstruction(Operation.Reduce {which: Reduction.Add}, i32K, &[combined])
+  let rUmax = run f.addInstruction(Operation.Reduce {which: Reduction.UnsignedMaximum}, i8K, &[combinedBytes])
+  let rUmin = run f.addInstruction(Operation.Reduce {which: Reduction.UnsignedMinimum}, i8K, &[combinedBytes])
+  let rAdd64 = run f.cast(Cast.ZExt, rAdd, i64K)
+  let rUmax64 = run f.cast(Cast.ZExt, rUmax, i64K)
+  let rUmin64 = run f.cast(Cast.ZExt, rUmin, i64K)
+  let t0 = run f.binary(Binary.Add, rAdd64, rUmax64)
+  let t1 = run f.binary(Binary.Add, t0, rUmin64)
+  run f.ret(t1)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let out = run AArch64Emit.emit(&f, b"neon_simd_pipeline", b"")
+  let code = Bytes.asSlice(&out.code)
+  // Verify native NEON instructions were emitted:
+  // `cmeq` (`0x6E208C00` mask `0xFF20FC00`), `cmgt` (`0x4E203400`), `cmhi` (`0x6E203400`),
+  // `cmge` (`0x4E203C00`), `cmhs` (`0x6E203C00`), `bsl` (`0x6E601C00`), `tbl` (`0x4E000000`),
+  // `addv` (`0x4E31B800`), `umaxv` (`0x6E30A800`), `uminv` (`0x6E31A800`), `udot` (`0x6E809400`),
+  // `sdot` (`0x4E809400`), `aese` (`0x4E284800`), `sha256h` (`0x5E004000`).
+  run Testing.expect(containsWordMasked(code, 0xFF20FC00, 0x6E208C00), "emits NEON cmeq")
+  run Testing.expect(containsWordMasked(code, 0xFF20FC00, 0x4E203400), "emits NEON cmgt")
+  run Testing.expect(containsWordMasked(code, 0xFF20FC00, 0x6E203400), "emits NEON cmhi")
+  run Testing.expect(containsWordMasked(code, 0xFF20FC00, 0x4E203C00), "emits NEON cmge")
+  run Testing.expect(containsWordMasked(code, 0xFF20FC00, 0x6E203C00), "emits NEON cmhs")
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0x6E601C00), "emits NEON bsl")
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0x4E000000), "emits NEON tbl")
+  run Testing.expect(containsWordMasked(code, 0xFF3FFC00, 0x4E31B800), "emits NEON addv")
+  run Testing.expect(containsWordMasked(code, 0xFF3FFC00, 0x6E30A800), "emits NEON umaxv")
+  run Testing.expect(containsWordMasked(code, 0xFF3FFC00, 0x6E31A800), "emits NEON uminv")
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0x6E809400)
+    && containsWordMasked(code, 0xFFE0FC00, 0x4E809400), "emits NEON udot and sdot")
+  run Testing.expect(containsWordMasked(code, 0xFFFFFC00, 0x4E284800)
+    && containsWordMasked(code, 0xFFE0FC00, 0x5E004000), "emits ARMv8 crypto aese and sha256h")
+}

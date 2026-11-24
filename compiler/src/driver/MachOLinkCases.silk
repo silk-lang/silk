@@ -1,0 +1,310 @@
+//! Unit checks for `AArch64MachOObject`, `MachOInput`, `MachOLink`, and `MachODebug` (macOS ARM64
+//! direct Mach-O `.o` emitter, direct `MH_EXECUTE` linker, pure-Silk SHA-256 ad-hoc code signing,
+//! and embedded `__DWARF` debug sections).
+
+import backend.AArch64Emit
+import backend.AArch64MachOObject
+import backend.AArch64Object {Fragment, Function, Object, Pointer as ObjectPointer, Unsupported as AArch64Unsupported}
+import backend.SsaFunction {Binary, CallingConvention, Kind, SsaFunction, AbiExtension}
+import driver.MachODebug {DebugLineMap}
+import driver.MachOInput
+import driver.MachOInput {LinkError}
+import driver.MachOLink
+import driver.MachOLink {LinkOptions}
+import silk.collections.bytes {Bytes}
+import silk.collections.list {List}
+import silk.core.effect {Effect}
+import silk.core.option {Option}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.testing.testing {AssertionError, Testing}
+static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+  import driver.HostRename
+  import silk.core.result {Result}
+  import silk.system.child_process {ChildProcess, ProcessError}
+  import silk.system.child_process_native {OsChildProcess}
+  import silk.system.filesystem {FileError, FileSystem, Path}
+  import silk.system.filesystem_native {OsFileSystem}
+}
+
+fn readU32Le(b: &[u8], at: usize) -> u64 {
+  return u8.toU64(b[at])
+    | u64.shiftLeft(u8.toU64(b[at + 1]), 8)
+    | u64.shiftLeft(u8.toU64(b[at + 2]), 16)
+    | u64.shiftLeft(u8.toU64(b[at + 3]), 24)
+}
+
+fn readU32Be(b: &[u8], at: usize) -> u64 {
+  return u64.shiftLeft(u8.toU64(b[at]), 24)
+    | u64.shiftLeft(u8.toU64(b[at + 1]), 16)
+    | u64.shiftLeft(u8.toU64(b[at + 2]), 8)
+    | u8.toU64(b[at + 3])
+}
+
+fn hasLoadCommand(bin: &[u8], cmd: u64) -> bool {
+  let ncmds = readU32Le(bin, 16)
+  let mut off: usize = 32
+  let mut i: u64 = 0
+  while i < ncmds && off + 8 <= bin.length {
+    let c = readU32Le(bin, off)
+    let sz = u64.toUsize(readU32Le(bin, off + 4))
+    if c == cmd { return true }
+    if sz < 8 { return false }
+    off = off + sz
+    i = i + 1
+  }
+  return false
+}
+
+fn findLoadCommandOff(bin: &[u8], cmd: u64) -> usize {
+  let ncmds = readU32Le(bin, 16)
+  let mut off: usize = 32
+  let mut i: u64 = 0
+  while i < ncmds && off + 8 <= bin.length {
+    let c = readU32Le(bin, off)
+    let sz = u64.toUsize(readU32Le(bin, off + 4))
+    if c == cmd { return off }
+    if sz < 8 { return usize.MAX }
+    off = off + sz
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+test effect fn parsesTbdEmitsMachOObjectAndLinksSignedArm64Executable() -> ()
+! LinkError | AArch64Unsupported | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run machoLinkClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn machoLinkClaims() -> () ! LinkError | AArch64Unsupported | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // 1. Built-in TAPI v4 libSystem.B.dylib stub parsing.
+  let libSys = run MachOInput.builtinLibSystem()
+  run Testing.expect(libSys.contains(b"_write") && libSys.contains(b"_malloc")
+    && libSys.contains(b"_clonefile") && libSys.contains(b"_stat")
+    && libSys.contains(b"__tlv_bootstrap"),
+    "builtin libSystem.tbd resolves Apple Silicon libSystem symbols")
+  run Testing.expect(!libSys.contains(b"_stat$INODE64"),
+    "Apple Silicon TAPI v4 parser skips Intel-only $INODE64 symbols")
+
+  // 2. Build a real Silk SSA `main` referencing a global pointer, a TLS object, a libSystem call,
+  //    a `silk_seen` record, and source locations.
+  let i32K = Kind.integer(32)
+  let ptrK = Kind.address(64)
+
+  let mut fnMain = run SsaFunction.make(b"silk_main_arm64", 64)
+  fnMain.setCallingConvention(CallingConvention.C, false, AbiExtension.None)
+  fnMain.setResult(i32K)
+  let b0 = run fnMain.newBlock()
+  fnMain.startBlock(b0)
+  fnMain.locate(0x0000000A000001)
+  let ptrAddr = run fnMain.symbolAddress(b"silk_global_ptr", 0, false)
+  let valPtr = run fnMain.load(ptrK, ptrAddr, 0, 8)
+  let loaded = run fnMain.load(i32K, valPtr, 0, 4)
+  let tlsAddr = run fnMain.symbolAddress(b"silk_tls_var", 0, true)
+  let tlsVal = run fnMain.load(i32K, tlsAddr, 0, 4)
+  let pid = run fnMain.call(b"getpid", &[], i32K)
+  let zero = run fnMain.integer(32, 0)
+  let maskedPid = run fnMain.binary(Binary.And, pid, zero)
+  let s0 = run fnMain.binary(Binary.Add, loaded, tlsVal)
+  let s1 = run fnMain.binary(Binary.Add, s0, maskedPid)
+  fnMain.locate(0x0000000F000003)
+  run fnMain.ret(s1)
+  run fnMain.finish()
+
+  let emittedMain = run AArch64Emit.emitWithSeen(&fnMain, b"silk_main_arm64", b"main", b"silk_main_arm64.silk_seen")
+  let mut frag = Fragment.make()
+  run List<Function>.append(&mut frag.functions, move emittedMain)
+
+  // Global target `silk_target_val = 40` in `__TEXT,__const`.
+  let mut targetImg = run Bytes.zeroed(8)
+  let targetMut = Bytes.asMutSlice(&mut targetImg)
+  targetMut[0] = 40
+  run List<Object>.append(&mut frag.objects, Object {
+    symbol: run Bytes.copy(b"silk_target_val"),
+    alignment: 8,
+    image: move targetImg,
+    pointers: List<ObjectPointer>.make(),
+    framed: false,
+    local: false,
+    readonly: true,
+    seen: false,
+  })
+
+  // Pointer-bearing global `silk_global_ptr = &silk_target_val` in `__DATA,__data`.
+  let mut ptrs = List<ObjectPointer>.make()
+  run List<ObjectPointer>.append(&mut ptrs, ObjectPointer {
+    offset: 0,
+    symbol: run Bytes.copy(b"silk_target_val"),
+    addend: 0,
+    size: 8,
+  })
+  run List<Object>.append(&mut frag.objects, Object {
+    symbol: run Bytes.copy(b"silk_global_ptr"),
+    alignment: 8,
+    image: run Bytes.zeroed(8),
+    pointers: move ptrs,
+    framed: false,
+    local: false,
+    readonly: false,
+    seen: false,
+  })
+
+  // Thread-local `silk_tls_var = 2` in `__DATA,__thread_data` + `__DATA,__thread_vars`.
+  let mut tlsImg = run Bytes.zeroed(8)
+  let tlsMut = Bytes.asMutSlice(&mut tlsImg)
+  tlsMut[0] = 2
+  run List<Object>.append(&mut frag.objects, Object {
+    symbol: run Bytes.copy(b"silk_tls_var"),
+    alignment: 8,
+    image: move tlsImg,
+    pointers: List<ObjectPointer>.make(),
+    framed: false,
+    local: true,
+    readonly: false,
+    seen: false,
+  })
+
+  // 17-byte `silk_seen` record.
+  let mut seenImg = run Bytes.zeroed(17)
+  let seenMut = Bytes.asMutSlice(&mut seenImg)
+  seenMut[1] = 0xAB
+  run List<Object>.append(&mut frag.objects, Object {
+    symbol: run Bytes.copy(b"silk_main_arm64.silk_seen"),
+    alignment: 1,
+    image: move seenImg,
+    pointers: List<ObjectPointer>.make(),
+    framed: false,
+    local: false,
+    readonly: false,
+    seen: true,
+  })
+
+  let encoded = run frag.encode()
+
+  // 3. Verify relocatable Mach-O `.o` (`MH_OBJECT`) emission.
+  let objBytes = run AArch64MachOObject.pack(Bytes.asSlice(&encoded))
+  let objSlice = Bytes.asSlice(&objBytes)
+  run Testing.expect(objSlice.length >= 32
+    && readU32Le(objSlice, 0) == 0xFEEDFACF
+    && readU32Le(objSlice, 4) == 0x0100000C
+    && readU32Le(objSlice, 12) == 1,
+    "AArch64MachOObject emits valid ARM64 MH_OBJECT header")
+  run Testing.expect(hasLoadCommand(objSlice, 0x19) && hasLoadCommand(objSlice, 0x32) && hasLoadCommand(objSlice, 0x02),
+    "MH_OBJECT carries LC_SEGMENT_64, LC_BUILD_VERSION, and LC_SYMTAB")
+
+  // 4. Verify direct `MH_EXECUTE` linking with embedded `__DWARF`, chained fixups, and ad-hoc SHA-256 signature.
+  let mut debugMap = DebugLineMap.make()
+  let fileIdx = run debugMap.addFile(b"/src/main.silk")
+  run debugMap.addSymbol(b"silk_main_arm64", fileIdx, 0x00000005000001)
+  let mut opts = LinkOptions.executable()
+  opts.incremental = true
+  opts.identifier = run Bytes.copy(b"macho_link_case")
+
+  let linked = run MachOLink.linkWithOptions(Bytes.asSlice(&encoded), &opts, &debugMap)
+  let bin = Bytes.asSlice(&linked.binary)
+  run Testing.expect(bin.length >= 16384
+    && readU32Le(bin, 0) == 0xFEEDFACF
+    && readU32Le(bin, 4) == 0x0100000C
+    && readU32Le(bin, 12) == 2
+    && (readU32Le(bin, 24) & 0x00200000) != 0,
+    "MachOLink emits valid ARM64 PIE MH_EXECUTE")
+
+  // Verify every required Apple Silicon load command is present.
+  run Testing.expect(hasLoadCommand(bin, 0x80000034) && hasLoadCommand(bin, 0x80000033)
+    && hasLoadCommand(bin, 0x02) && hasLoadCommand(bin, 0x0B)
+    && hasLoadCommand(bin, 0x0E) && hasLoadCommand(bin, 0x32)
+    && hasLoadCommand(bin, 0x80000028) && hasLoadCommand(bin, 0x0C)
+    && hasLoadCommand(bin, 0x1D),
+    "MH_EXECUTE includes chained fixups, exports trie, symtab, dysymtab, dylinker, build version, LC_MAIN, dylib, and code signature")
+
+  // Verify embedded pure-Silk ad-hoc SHA-256 `LC_CODE_SIGNATURE` SuperBlob & CodeDirectory.
+  let csCmdOff = findLoadCommandOff(bin, 0x1D)
+  run Testing.expect(csCmdOff != usize.MAX, "LC_CODE_SIGNATURE found")
+  let csOff = u64.toUsize(readU32Le(bin, csCmdOff + 8))
+  let csSize = u64.toUsize(readU32Le(bin, csCmdOff + 12))
+  run Testing.expect(csOff + csSize == bin.length, "LC_CODE_SIGNATURE reaches exact EOF")
+  run Testing.expect(readU32Be(bin, csOff) == 0xFADE0CC0 && readU32Be(bin, csOff + 20) == 0xFADE0C02,
+    "Code signature carries CSMAGIC_EMBEDDED_SIGNATURE and CSMAGIC_CODEDIRECTORY")
+  run Testing.expect(readU32Be(bin, csOff + 28) == 0x00020400 && readU32Be(bin, csOff + 32) == 0x00020002,
+    "CodeDirectory v0x20400 marks CS_ADHOC | CS_LINKER_SIGNED")
+
+  // Verify incremental state was produced with headroom and CS hash table offsets.
+  let hasState = match &linked.state {
+    Option<MachOLink.IncrementalState>.Some {value: st} => st.thunksCount == 1
+      && st.textLimitVaddr > st.textCursorVaddr
+      && st.dataLimitVaddr > st.dataCursorVaddr
+      && st.chainedDataPageStartsFileOff > 0
+      && st.csHashTableFileOff > st.csDataOff
+      && st.csPageCount > 0
+    Option<MachOLink.IncrementalState>.None => false
+  }
+  run Testing.expect(hasState, "incremental MachOLink emits complete headroom, chained-fixup, and code-sign state")
+
+  // 5. On native macOS ARM64, write the direct binary to disk, run it natively under AMFI,
+  //    verify exit code 42 (global pointer + TLS + libSystem getpid), and validate with `codesign`.
+  static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+    run verifyNativeExecution(objSlice, bin)
+  }
+}
+
+static if Intrinsic.targetOperatingSystem() == "macos" && Intrinsic.targetArchitecture() == "aarch64" {
+  effect fn verifyNativeExecution(objSlice: &[u8], bin: &[u8]) -> ()
+  ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+    let mut fs = match move run Effect.result(OsFileSystem.make("/")) {
+      Result<OsFileSystem, FileError | OutOfMemoryError>.Success {value} => move value
+      Result<OsFileSystem, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError e => {
+          drop e
+          run Testing.expect(false, "OsFileSystem.make failed")
+          return ()
+        }
+        OutOfMemoryError oom => { fail move oom }
+      }
+    }
+    let mut proc = OsChildProcess.make()
+    let runOk = match move run Effect.result(verifyNativeExecutionWithEnv(objSlice, bin))
+      |> Effect.provideMut<ChildProcess>(&mut proc)
+      |> Effect.provideMut<FileSystem>(&mut fs) {
+      Result<(), FileError | ProcessError | OutOfMemoryError | AssertionError<'static>>.Success {..} => true
+      Result<(), FileError | ProcessError | OutOfMemoryError | AssertionError<'static>>.Failure {error} => match move error {
+        OutOfMemoryError oom => { fail move oom }
+        AssertionError<'static> a => { fail a }
+        _ => false
+      }
+    }
+    run Testing.expect(runOk, "native Apple Silicon Mach-O execution and codesign verification succeeded")
+  }
+
+  effect fn verifyNativeExecutionWithEnv(objSlice: &[u8], bin: &[u8]) -> ()
+  ! FileError | ProcessError | OutOfMemoryError | AssertionError<'static>
+  ? &mut ChildProcess | &mut FileSystem | &mut Allocator {
+    let binPath = run Path.make("/tmp/silk_macho_link_unit_test_bin")
+    let objPath = run Path.make("/tmp/silk_macho_link_unit_test_obj.o")
+    drop run Effect.result(FileSystem.removeFile(&binPath))
+    drop run Effect.result(FileSystem.removeFile(&objPath))
+    run FileSystem.writeFile(&objPath, objSlice)
+    run FileSystem.writeFile(&binPath, bin)
+    let madeExec = run HostRename.makeExecutable(&binPath)
+    run Testing.expect(madeExec, "chmod 0755 on direct-linked Mach-O executable succeeds")
+
+    let runReq = run ChildProcess.requestBytes(Path.rawBytes(&binPath))
+    let runRes = run ChildProcess.submit(move runReq)
+    let exitCode = Option<i32>.unwrapOr(ChildProcess.exitCode(&runRes), -1)
+    run Testing.expect(exitCode == 42,
+      "direct-linked Apple Silicon Mach-O executable runs natively under AMFI and returns 42")
+
+    let mut csReq = run ChildProcess.request("/usr/bin/codesign")
+    run ChildProcess.addArgument(&mut csReq, "--verify")
+    run ChildProcess.addArgument(&mut csReq, "--strict")
+    run ChildProcess.addArgumentBytes(&mut csReq, Path.rawBytes(&binPath))
+    let csRes = run ChildProcess.submit(move csReq)
+    let csCode = Option<i32>.unwrapOr(ChildProcess.exitCode(&csRes), -1)
+    run Testing.expect(csCode == 0, "codesign --verify --strict accepts pure-Silk ad-hoc SHA-256 signature")
+
+    drop run Effect.result(FileSystem.removeFile(&binPath))
+    drop run Effect.result(FileSystem.removeFile(&objPath))
+  }
+}
