@@ -1,8 +1,9 @@
-//! Region inference kernels for one body: liveness, region values, loans in scope, universals.
+//! Region inference kernels for one body: CFG contraction, liveness, region values, loans, universals.
 //!
 //! The caller numbers CFG points, locals, regions and loans; this module only solves the
-//! integer problems they describe. Every set is a bitset of u64 words stored back to back,
-//! one row per point, region component or loan owner. Nothing here reads types or queries.
+//! integer problems they describe. Liveness solves on contracted basic blocks; region point sets
+//! stay inline (`Empty`, `All`, `OneWord`) until a region actually spans multiple 64-point words;
+//! loan overwrites use sparse per-loan slices. Nothing here reads types or queries.
 
 import silk.mem.allocator {Allocator, OutOfMemoryError}
 import silk.core.effect {Effect}
@@ -79,138 +80,531 @@ impl Cfg {
     if single[point] == usize.MAX { return Slice.view<usize>(single, point, usize.ZERO) }
     return Slice.view<usize>(single, point, usize.ONE)
   }
+
+  /// The sole successor of `point` when it has exactly one, or `usize.MAX` otherwise.
+  pub fn soleNext(self: &Self, point: usize) -> usize {
+    if List<usize>.asSlice(&self.spill)[point] != usize.MAX { return usize.MAX }
+    return List<usize>.asSlice(&self.single)[point]
+  }
 }
 
-/// Per-point reads, drop uses and assignments of `locals` locals. Bit `local` of a row is an
-/// ordinary use, bit `locals + local` a drop use; an assignment kills both.
+/// Maximal straight-line basic blocks contracted from a [`Cfg`], with CSR block successor and
+/// predecessor tables. Every point belongs to exactly one block, and interior edges have in-degree
+/// and out-degree 1.
+pub struct ContractedCfg {
+  pub points: usize,
+  pub blocks: usize,
+  pub blockOf: List<usize>,
+  pub offsetInBlock: List<usize>,
+  pub blockStarts: List<usize>,
+  pub blockPoints: List<usize>,
+  pub succStarts: List<usize>,
+  pub succBlocks: List<usize>,
+  pub predStarts: List<usize>,
+  pub predBlocks: List<usize>,
+}
+
+impl ContractedCfg {
+  /// Contracts `cfg` into maximal straight-line basic blocks in O(V + E) time.
+  pub effect fn contract(cfg: &Cfg) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let points = Cfg.points(cfg)
+    let mut inDeg = run filled(points, usize.ZERO)
+    let mut solePred = run filled(points, usize.MAX)
+    let mut p = usize.ZERO
+    while p < points {
+      let next = Cfg.next(cfg, p)
+      let mut i = usize.ZERO
+      while i < next.length {
+        let s = next[i]
+        let degs = List<usize>.asMutSlice(&mut inDeg)
+        degs[s] = degs[s] + usize.ONE
+        List<usize>.set(&mut solePred, s, p)
+        i = i + usize.ONE
+      }
+      p = p + usize.ONE
+    }
+    let mut isLeader = List<bool>.make()
+    run List<bool>.appendRepeated(&mut isLeader, false, points)
+    let degSlice = List<usize>.asSlice(&inDeg)
+    let predSlice = List<usize>.asSlice(&solePred)
+    p = usize.ZERO
+    while p < points {
+      if degSlice[p] != usize.ONE {
+        List<bool>.set(&mut isLeader, p, true)
+      } else {
+        let pred = predSlice[p]
+        if pred == p || Cfg.next(cfg, pred).length != usize.ONE {
+          List<bool>.set(&mut isLeader, p, true)
+        }
+      }
+      p = p + usize.ONE
+    }
+    let mut blockOf = run filled(points, usize.MAX)
+    let mut offsetInBlock = run filled(points, usize.ZERO)
+    let mut blockStarts = List<usize>.make()
+    let mut blockPoints = List<usize>.make()
+    run List<usize>.reserveExact(&mut blockPoints, points)
+    let mut blocks = usize.ZERO
+    let leaderSlice = List<bool>.asSlice(&isLeader)
+    p = usize.ZERO
+    while p < points {
+      if leaderSlice[p] && List<usize>.asSlice(&blockOf)[p] == usize.MAX {
+        let b = blocks
+        blocks = blocks + usize.ONE
+        run List<usize>.append(&mut blockStarts, List<usize>.length(&blockPoints))
+        let mut cur = p
+        let mut off = usize.ZERO
+        while true {
+          List<usize>.set(&mut blockOf, cur, b)
+          List<usize>.set(&mut offsetInBlock, cur, off)
+          run List<usize>.append(&mut blockPoints, cur)
+          off = off + usize.ONE
+          let next = Cfg.next(cfg, cur)
+          if next.length != usize.ONE { break }
+          let nxt = next[usize.ZERO]
+          if leaderSlice[nxt] || List<usize>.asSlice(&blockOf)[nxt] != usize.MAX { break }
+          cur = nxt
+        }
+      }
+      p = p + usize.ONE
+    }
+    // Any unreachable pure cycle of in-degree 1 / out-degree 1 points gets a block of its own.
+    p = usize.ZERO
+    while p < points {
+      if List<usize>.asSlice(&blockOf)[p] == usize.MAX {
+        let b = blocks
+        blocks = blocks + usize.ONE
+        run List<usize>.append(&mut blockStarts, List<usize>.length(&blockPoints))
+        let mut cur = p
+        let mut off = usize.ZERO
+        while List<usize>.asSlice(&blockOf)[cur] == usize.MAX {
+          List<usize>.set(&mut blockOf, cur, b)
+          List<usize>.set(&mut offsetInBlock, cur, off)
+          run List<usize>.append(&mut blockPoints, cur)
+          off = off + usize.ONE
+          let next = Cfg.next(cfg, cur)
+          if next.length != usize.ONE { break }
+          cur = next[usize.ZERO]
+        }
+      }
+      p = p + usize.ONE
+    }
+    run List<usize>.append(&mut blockStarts, List<usize>.length(&blockPoints))
+    let mut succStarts = List<usize>.make()
+    run List<usize>.reserveExact(&mut succStarts, blocks + usize.ONE)
+    let mut succBlocks = List<usize>.make()
+    let mut predStarts = run filled(blocks + usize.ONE, usize.ZERO)
+    let bof = List<usize>.asSlice(&blockOf)
+    let bStarts = List<usize>.asSlice(&blockStarts)
+    let bPts = List<usize>.asSlice(&blockPoints)
+    let mut b = usize.ZERO
+    while b < blocks {
+      run List<usize>.append(&mut succStarts, List<usize>.length(&succBlocks))
+      let tail = bPts[bStarts[b + usize.ONE] - usize.ONE]
+      let next = Cfg.next(cfg, tail)
+      let mut i = usize.ZERO
+      while i < next.length {
+        let targetBlock = bof[next[i]]
+        run List<usize>.append(&mut succBlocks, targetBlock)
+        let pCounts = List<usize>.asMutSlice(&mut predStarts)
+        pCounts[targetBlock + usize.ONE] = pCounts[targetBlock + usize.ONE] + usize.ONE
+        i = i + usize.ONE
+      }
+      b = b + usize.ONE
+    }
+    run List<usize>.append(&mut succStarts, List<usize>.length(&succBlocks))
+    b = usize.ZERO
+    while b < blocks {
+      let sums = List<usize>.asMutSlice(&mut predStarts)
+      sums[b + usize.ONE] = sums[b + usize.ONE] + sums[b]
+      b = b + usize.ONE
+    }
+    let mut cursor = run copyAll(List<usize>.asSlice(&predStarts))
+    let mut predBlocks = run filled(List<usize>.length(&succBlocks), usize.ZERO)
+    let sStarts = List<usize>.asSlice(&succStarts)
+    let sBlocks = List<usize>.asSlice(&succBlocks)
+    b = usize.ZERO
+    while b < blocks {
+      let mut e = sStarts[b]
+      while e < sStarts[b + usize.ONE] {
+        let target = sBlocks[e]
+        let slot = List<usize>.asSlice(&cursor)[target]
+        List<usize>.set(&mut predBlocks, slot, b)
+        List<usize>.set(&mut cursor, target, slot + usize.ONE)
+        e = e + usize.ONE
+      }
+      b = b + usize.ONE
+    }
+    return ContractedCfg {points: points, blocks: blocks, blockOf: move blockOf, offsetInBlock: move offsetInBlock,
+      blockStarts: move blockStarts, blockPoints: move blockPoints, succStarts: move succStarts,
+      succBlocks: move succBlocks, predStarts: move predStarts, predBlocks: move predBlocks}
+  }
+
+  /// The points of basic block `block` in execution order.
+  pub fn pointsOf(self: &Self, block: usize) -> &[usize] {
+    let starts = List<usize>.asSlice(&self.blockStarts)
+    let start = starts[block]
+    return Slice.view<usize>(List<usize>.asSlice(&self.blockPoints), start, starts[block + usize.ONE] - start)
+  }
+
+  /// The successor basic blocks of `block`.
+  pub fn nextBlocks(self: &Self, block: usize) -> &[usize] {
+    let starts = List<usize>.asSlice(&self.succStarts)
+    let start = starts[block]
+    return Slice.view<usize>(List<usize>.asSlice(&self.succBlocks), start, starts[block + usize.ONE] - start)
+  }
+
+  /// The predecessor basic blocks of `block`.
+  pub fn prevBlocks(self: &Self, block: usize) -> &[usize] {
+    let starts = List<usize>.asSlice(&self.predStarts)
+    let start = starts[block]
+    return Slice.view<usize>(List<usize>.asSlice(&self.predBlocks), start, starts[block + usize.ONE] - start)
+  }
+}
+
+/// Per-point sparse reads, drop uses and assignments of `locals` locals.
+/// Stored as flat `(point, encodedOp)` entries rather than dense `points * width` matrices.
 pub struct Liveness {
   points: usize,
   locals: usize,
   width: usize,
-  reads: List<u64>,
-  kills: List<u64>,
+  opPoints: List<usize>,
+  // `0..locals`: read; `locals..2*locals`: dropUse; `2*locals..3*locals`: assign (kills both).
+  opCodes: List<usize>,
 }
 
-/// Live-on-entry locals per point.
+/// Live-on-exit sets per basic block plus per-point sparse operations, answering point queries
+/// and fast single-pass backward block walks without materializing a `points * width` matrix.
 pub struct Live {
   points: usize,
   locals: usize,
   width: usize,
-  entering: List<u64>,
+  blocks: usize,
+  blockOf: List<usize>,
+  offsetInBlock: List<usize>,
+  blockStarts: List<usize>,
+  blockPoints: List<usize>,
+  blockOut: List<u64>,
+  pointOpStarts: List<usize>,
+  pointOpCodes: List<usize>,
 }
 
 impl Liveness {
   pub effect fn make(points: usize, locals: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
     let width = wordsFor(locals + locals)
-    let reads = run zeros(points * width)
-    let kills = run zeros(points * width)
-    return Liveness {points: points, locals: locals, width: width, reads: move reads, kills: move kills}
+    return Liveness {points: points, locals: locals, width: width,
+      opPoints: List<usize>.make(), opCodes: List<usize>.make()}
   }
 
   /// `local` is read at `point`, before any assignment there.
-  pub fn read(self: &mut Self, point: usize, local: usize) -> () {
+  pub effect fn read(self: &mut Self, point: usize, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     let bit = requireLocal(&self.*, point, local)
-    let base = point * self.width
-    mark(List<u64>.asMutSlice(&mut self.reads), base, bit)
+    run List<usize>.append(&mut self.opPoints, point)
+    run List<usize>.append(&mut self.opCodes, bit)
+    return ()
   }
 
   /// `local`'s destructor runs at `point`; only a type with a user `Drop` has such a use.
-  pub fn dropUse(self: &mut Self, point: usize, local: usize) -> () {
+  pub effect fn dropUse(self: &mut Self, point: usize, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     let bit = requireLocal(&self.*, point, local) + self.locals
-    let base = point * self.width
-    mark(List<u64>.asMutSlice(&mut self.reads), base, bit)
+    run List<usize>.append(&mut self.opPoints, point)
+    run List<usize>.append(&mut self.opCodes, bit)
+    return ()
   }
 
   /// `local` is wholly overwritten or bound at `point`, after any read there.
-  pub fn assign(self: &mut Self, point: usize, local: usize) -> () {
-    let bit = requireLocal(&self.*, point, local)
-    let base = point * self.width
-    let dropBit = bit + self.locals
-    mark(List<u64>.asMutSlice(&mut self.kills), base, bit)
-    mark(List<u64>.asMutSlice(&mut self.kills), base, dropBit)
+  pub effect fn assign(self: &mut Self, point: usize, local: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bit = requireLocal(&self.*, point, local) + self.locals + self.locals
+    run List<usize>.append(&mut self.opPoints, point)
+    run List<usize>.append(&mut self.opCodes, bit)
+    return ()
   }
 
-  /// Backward may-dataflow: live-in = reads | (union of successors' live-in & ~kills).
+  /// Backward may-dataflow: contracts `cfg` into basic blocks and solves on blocks.
   pub effect fn solve(self: &Self, cfg: &Cfg) -> Live ! OutOfMemoryError ? &mut Allocator {
     if Cfg.points(cfg) != self.points { CompilerBug.panic(b"liveness and CFG disagree on point count") }
-    let predecessors = run reverse(cfg)
-    let reads = List<u64>.asSlice(&self.reads)
-    let kills = List<u64>.asSlice(&self.kills)
+    let contracted = run ContractedCfg.contract(cfg)
+    return run Liveness.solveContracted(self, &contracted)
+  }
+
+  /// Backward may-dataflow on an already-contracted CFG: live-in = reads | (union of successors' live-in & ~kills).
+  pub effect fn solveContracted(self: &Self, contracted: &ContractedCfg) -> Live ! OutOfMemoryError ? &mut Allocator {
+    if contracted.points != self.points { CompilerBug.panic(b"liveness and CFG disagree on point count") }
+    let points = self.points
+    let locals = self.locals
     let width = self.width
-    let mut entering = run zeros(self.points * width)
+    let blocks = contracted.blocks
+    let blockOfCopy = run copyAll(List<usize>.asSlice(&contracted.blockOf))
+    let offsetCopy = run copyAll(List<usize>.asSlice(&contracted.offsetInBlock))
+    let bStartsCopy = run copyAll(List<usize>.asSlice(&contracted.blockStarts))
+    let bPointsCopy = run copyAll(List<usize>.asSlice(&contracted.blockPoints))
+    if locals == usize.ZERO || width == usize.ZERO {
+      let emptyStarts = run filled(points + usize.ONE, usize.ZERO)
+      return Live {points: points, locals: locals, width: width, blocks: blocks,
+        blockOf: move blockOfCopy, offsetInBlock: move offsetCopy, blockStarts: move bStartsCopy,
+        blockPoints: move bPointsCopy, blockOut: List<u64>.make(),
+        pointOpStarts: move emptyStarts, pointOpCodes: List<usize>.make()}
+    }
+    // Bucket sparse ops by point into CSR.
+    let opPts = List<usize>.asSlice(&self.opPoints)
+    let opCds = List<usize>.asSlice(&self.opCodes)
+    let mut pointOpStarts = run filled(points + usize.ONE, usize.ZERO)
+    let mut at = usize.ZERO
+    while at < opPts.length {
+      let p = opPts[at]
+      let counts = List<usize>.asMutSlice(&mut pointOpStarts)
+      counts[p + usize.ONE] = counts[p + usize.ONE] + usize.ONE
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < points {
+      let sums = List<usize>.asMutSlice(&mut pointOpStarts)
+      sums[at + usize.ONE] = sums[at + usize.ONE] + sums[at]
+      at = at + usize.ONE
+    }
+    let mut cursor = run copyAll(List<usize>.asSlice(&pointOpStarts))
+    let mut pointOpCodes = run filled(opPts.length, usize.ZERO)
+    at = usize.ZERO
+    while at < opPts.length {
+      let p = opPts[at]
+      let slot = List<usize>.asSlice(&cursor)[p]
+      List<usize>.set(&mut pointOpCodes, slot, opCds[at])
+      List<usize>.set(&mut cursor, p, slot + usize.ONE)
+      at = at + usize.ONE
+    }
+    let opStarts = List<usize>.asSlice(&pointOpStarts)
+    let ops = List<usize>.asSlice(&pointOpCodes)
+    let twoLocals = locals + locals
+    // Summarize each basic block: forward over its points, reads/dropUses not yet killed enter
+    // blockReads, then assigns enter blockKills.
+    let mut blockReads = run zeros(blocks * width)
+    let mut blockKills = run zeros(blocks * width)
+    let mut b = usize.ZERO
+    while b < blocks {
+      let pts = ContractedCfg.pointsOf(contracted, b)
+      let base = b * width
+      let mut idx = usize.ZERO
+      while idx < pts.length {
+        let p = pts[idx]
+        let start = opStarts[p]
+        let end = opStarts[p + usize.ONE]
+        // Reads and drop uses at `p` precede assigns at `p`.
+        let mut o = start
+        while o < end {
+          let code = ops[o]
+          if code < twoLocals {
+            if !isSet(List<u64>.asSlice(&blockKills), base, code) {
+              mark(List<u64>.asMutSlice(&mut blockReads), base, code)
+            }
+          }
+          o = o + usize.ONE
+        }
+        o = start
+        while o < end {
+          let code = ops[o]
+          if code >= twoLocals {
+            let local = code - twoLocals
+            mark(List<u64>.asMutSlice(&mut blockKills), base, local)
+            mark(List<u64>.asMutSlice(&mut blockKills), base, local + locals)
+          }
+          o = o + usize.ONE
+        }
+        idx = idx + usize.ONE
+      }
+      b = b + usize.ONE
+    }
+    let reads = List<u64>.asSlice(&blockReads)
+    let kills = List<u64>.asSlice(&blockKills)
+    let mut blockIn = run zeros(blocks * width)
+    let mut blockOut = run zeros(blocks * width)
     let mut queued = List<bool>.make()
     let mut pending = List<usize>.make()
-    run List<bool>.reserveExact(&mut queued, self.points)
-    run List<usize>.reserveExact(&mut pending, self.points)
-    run List<bool>.appendRepeated(&mut queued, true, self.points)
-    let mut point = usize.ZERO
-    while point < self.points {
-      run List<usize>.append(&mut pending, point)
-      point = point + usize.ONE
+    run List<bool>.reserveExact(&mut queued, blocks)
+    run List<usize>.reserveExact(&mut pending, blocks)
+    run List<bool>.appendRepeated(&mut queued, true, blocks)
+    b = usize.ZERO
+    while b < blocks {
+      run List<usize>.append(&mut pending, b)
+      b = b + usize.ONE
     }
-    // A stack popped from the end visits later points first, the usual backward order.
     while List<usize>.length(&pending) > usize.ZERO {
       let last = List<usize>.length(&pending) - usize.ONE
-      let at = List<usize>.asSlice(&pending)[last]
+      let cur = List<usize>.asSlice(&pending)[last]
       List<usize>.truncate(&mut pending, last)
-      List<bool>.set(&mut queued, at, false)
-      let next = Cfg.next(cfg, at)
+      List<bool>.set(&mut queued, cur, false)
+      let next = ContractedCfg.nextBlocks(contracted, cur)
       let mut changed = false
-      let mut rows = List<u64>.asMutSlice(&mut entering)
+      let mut inRows = List<u64>.asMutSlice(&mut blockIn)
+      let mut outRows = List<u64>.asMutSlice(&mut blockOut)
       let mut word = usize.ZERO
       while word < width {
         let mut out = u64.MIN
         let mut each = usize.ZERO
         while each < next.length {
-          out = u64.bitOr(out, rows[next[each] * width + word])
+          out = u64.bitOr(out, inRows[next[each] * width + word])
           each = each + usize.ONE
         }
-        let slot = at * width + word
+        let slot = cur * width + word
+        outRows[slot] = out
         let value = u64.bitOr(reads[slot], u64.bitAnd(out, u64.bitNot(kills[slot])))
-        if rows[slot] != value {
-          rows[slot] = value
+        if inRows[slot] != value {
+          inRows[slot] = value
           changed = true
         }
         word = word + usize.ONE
       }
-      if changed { run enqueue(&mut pending, &mut queued, Predecessors.of(&predecessors, at)) }
+      if changed { run enqueue(&mut pending, &mut queued, ContractedCfg.prevBlocks(contracted, cur)) }
     }
-    return Live {points: self.points, locals: self.locals, width: width, entering: move entering}
+    return Live {points: points, locals: locals, width: width, blocks: blocks,
+      blockOf: move blockOfCopy, offsetInBlock: move offsetCopy, blockStarts: move bStartsCopy,
+      blockPoints: move bPointsCopy, blockOut: move blockOut,
+      pointOpStarts: move pointOpStarts, pointOpCodes: move pointOpCodes}
   }
 }
 
 impl Live {
+  /// Number of basic blocks in this liveness solution.
+  pub fn blockCount(self: &Self) -> usize { return self.blocks }
+
+  /// Number of `u64` words per live row.
+  pub fn rowWidth(self: &Self) -> usize { return self.width }
+
+  /// The points of basic block `block` in execution order.
+  pub fn blockPointsOf(self: &Self, block: usize) -> &[usize] {
+    let starts = List<usize>.asSlice(&self.blockStarts)
+    let start = starts[block]
+    return Slice.view<usize>(List<usize>.asSlice(&self.blockPoints), start, starts[block + usize.ONE] - start)
+  }
+
+  /// Copies `block`'s live-on-exit row into `row[0..width]`.
+  pub fn copyBlockOut(self: &Self, block: usize, row: &mut [u64]) -> () {
+    let out = List<u64>.asSlice(&self.blockOut)
+    let base = block * self.width
+    let mut word = usize.ZERO
+    while word < self.width {
+      row[word] = out[base + word]
+      word = word + usize.ONE
+    }
+  }
+
+  /// Transforms `row` from live-on-exit of `point` to live-on-entry of `point`:
+  /// `row = reads(point) | (row & ~kills(point))`.
+  pub fn stepBackward(self: &Self, point: usize, row: &mut [u64]) -> () {
+    let starts = List<usize>.asSlice(&self.pointOpStarts)
+    let start = starts[point]
+    let end = starts[point + usize.ONE]
+    if start == end { return () }
+    let ops = List<usize>.asSlice(&self.pointOpCodes)
+    let locals = self.locals
+    let twoLocals = locals + locals
+    let mut o = start
+    while o < end {
+      let code = ops[o]
+      if code >= twoLocals {
+        let local = code - twoLocals
+        let a1 = local / 64
+        row[a1] = u64.bitAnd(row[a1], u64.bitNot(maskOf(local)))
+        let d = local + locals
+        let a2 = d / 64
+        row[a2] = u64.bitAnd(row[a2], u64.bitNot(maskOf(d)))
+      }
+      o = o + usize.ONE
+    }
+    o = start
+    while o < end {
+      let code = ops[o]
+      if code < twoLocals {
+        let at = code / 64
+        row[at] = u64.bitOr(row[at], maskOf(code))
+      }
+      o = o + usize.ONE
+    }
+  }
+
+  /// The first local from `from` on that is live or drop-live in `row`, or `usize.MAX`.
+  pub fn nextHeldInRow(self: &Self, row: &[u64], from: usize) -> usize {
+    let used = nextSet(row, usize.ZERO, from, self.locals)
+    let dropped = nextSet(row, usize.ZERO, self.locals + from, self.locals + self.locals)
+    if dropped == usize.MAX { return used }
+    if dropped - self.locals < used { return dropped - self.locals }
+    return used
+  }
+
+  /// Whether `local` is ordinarily live in `row`.
+  pub fn liveInRow(self: &Self, row: &[u64], local: usize) -> bool {
+    return isSet(row, usize.ZERO, local)
+  }
+
+  /// Whether `local` is drop-live in `row`.
+  pub fn dropLiveInRow(self: &Self, row: &[u64], local: usize) -> bool {
+    return isSet(row, usize.ZERO, local + self.locals)
+  }
+
+  // Evaluates whether a single bit (`local` or `locals + local`) is live on entry to `point`.
+  fn bitLive(self: &Self, point: usize, bit: usize) -> bool {
+    let b = List<usize>.asSlice(&self.blockOf)[point]
+    let off = List<usize>.asSlice(&self.offsetInBlock)[point]
+    let pts = Live.blockPointsOf(self, b)
+    let starts = List<usize>.asSlice(&self.pointOpStarts)
+    let ops = List<usize>.asSlice(&self.pointOpCodes)
+    let locals = self.locals
+    let twoLocals = locals + locals
+    let targetLocal = if bit >= locals { bit - locals } else { bit }
+    let killCode = twoLocals + targetLocal
+    let mut alive = isSet(List<u64>.asSlice(&self.blockOut), b * self.width, bit)
+    let mut idx = pts.length
+    while idx > off {
+      idx = idx - usize.ONE
+      let p = pts[idx]
+      let start = starts[p]
+      let end = starts[p + usize.ONE]
+      let mut o = start
+      while o < end {
+        if ops[o] == killCode { alive = false }
+        o = o + usize.ONE
+      }
+      o = start
+      while o < end {
+        if ops[o] == bit { alive = true }
+        o = o + usize.ONE
+      }
+    }
+    return alive
+  }
+
   /// A later ordinary use may read `local` from `point` on.
   pub fn live(self: &Self, point: usize, local: usize) -> bool {
     if point >= self.points || local >= self.locals { CompilerBug.panic(b"liveness query out of range") }
-    return isSet(List<u64>.asSlice(&self.entering), point * self.width, local)
+    return Live.bitLive(self, point, local)
   }
 
   /// `local`'s destructor may still run from `point` on.
   pub fn dropLive(self: &Self, point: usize, local: usize) -> bool {
     if point >= self.points || local >= self.locals { CompilerBug.panic(b"liveness query out of range") }
-    return isSet(List<u64>.asSlice(&self.entering), point * self.width, local + self.locals)
-  }
-
-  /// The first local from `from` on that is live or drop-live at `point`, or `usize.MAX`; it skips
-  /// a word of dead locals at a time.
-  pub fn nextHeld(self: &Self, point: usize, from: usize) -> usize {
-    if point >= self.points { CompilerBug.panic(b"liveness query out of range") }
-    let rows = List<u64>.asSlice(&self.entering)
-    let base = point * self.width
-    let used = nextSet(rows, base, from, self.locals)
-    let dropped = nextSet(rows, base, self.locals + from, self.locals + self.locals)
-    if dropped == usize.MAX { return used }
-    if dropped - self.locals < used { return dropped - self.locals }
-    return used
+    return Live.bitLive(self, point, local + self.locals)
   }
 }
+
+// Compact representation of the points a region or SCC holds:
+// - `Empty`: no points.
+// - `All`: every point `0..points` (any universal region or SCC reaching a universal).
+// - `OneWord`: points confined to a single 64-point word (covers ~90% of local regions).
+// - `Dense`: `width` u64 words in a backing pool starting at `offset`, with non-zero span `[minWord..=maxWord]`.
+union PointSet {
+  Empty,
+  All,
+  OneWord {word: usize, bits: u64},
+  Dense {offset: usize, minWord: usize, maxWord: usize},
+}
+
+impl Copy for PointSet {}
 
 /// Region variables, their liveness seeds and location-insensitive outlives edges.
 pub struct Regions {
   points: usize,
   width: usize,
-  seeds: List<u64>,
+  seedSets: List<PointSet>,
+  seedPool: List<u64>,
   // Each region's universal marker, or `usize.MAX` for an existential region.
   markers: List<usize>,
   // The region of each universal marker.
@@ -219,7 +613,7 @@ pub struct Regions {
   shorter: List<usize>,
 }
 
-/// Solved region values: one points row and one markers row per strongly connected component.
+/// Solved region values: one compact [`PointSet`] and one markers row per strongly connected component.
 pub struct Values {
   points: usize,
   width: usize,
@@ -227,20 +621,254 @@ pub struct Values {
   component: List<usize>,
   markers: List<usize>,
   universals: List<usize>,
-  pointRows: List<u64>,
+  pointSets: List<PointSet>,
+  pointPool: List<u64>,
   markerRows: List<u64>,
+}
+
+effect fn addPointToSet(set: &mut PointSet, pool: &mut List<u64>, width: usize, point: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let w = point / 64
+  let m = maskOf(point)
+  match set.* {
+    PointSet.All => { return () }
+    PointSet.Empty => {
+      set.* = PointSet.OneWord {word: w, bits: m}
+      return ()
+    }
+    PointSet.OneWord {word, bits} => {
+      if word == w {
+        set.* = PointSet.OneWord {word: word, bits: u64.bitOr(bits, m)}
+        return ()
+      }
+      let offset = List<u64>.length(&pool.*)
+      run appendZeros(&mut pool.*, width)
+      let rows = List<u64>.asMutSlice(&mut pool.*)
+      rows[offset + word] = bits
+      rows[offset + w] = m
+      let lo = if word < w { word } else { w }
+      let hi = if word > w { word } else { w }
+      set.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+      return ()
+    }
+    PointSet.Dense {offset, minWord, maxWord} => {
+      let rows = List<u64>.asMutSlice(&mut pool.*)
+      rows[offset + w] = u64.bitOr(rows[offset + w], m)
+      let lo = if w < minWord { w } else { minWord }
+      let hi = if w > maxWord { w } else { maxWord }
+      if lo != minWord || hi != maxWord {
+        set.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+      }
+      return ()
+    }
+  }
+}
+
+effect fn mergePointSet(dst: &mut PointSet, dstPool: &mut List<u64>, src: PointSet, srcPool: &[u64], width: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  match src {
+    PointSet.Empty => { return () }
+    PointSet.All => {
+      dst.* = PointSet.All
+      return ()
+    }
+    PointSet.OneWord {word: sw, bits: sb} => {
+      match dst.* {
+        PointSet.All => { return () }
+        PointSet.Empty => {
+          dst.* = PointSet.OneWord {word: sw, bits: sb}
+          return ()
+        }
+        PointSet.OneWord {word: dw, bits: db} => {
+          if dw == sw {
+            dst.* = PointSet.OneWord {word: dw, bits: u64.bitOr(db, sb)}
+            return ()
+          }
+          let offset = List<u64>.length(&dstPool.*)
+          run appendZeros(&mut dstPool.*, width)
+          let rows = List<u64>.asMutSlice(&mut dstPool.*)
+          rows[offset + dw] = db
+          rows[offset + sw] = sb
+          let lo = if dw < sw { dw } else { sw }
+          let hi = if dw > sw { dw } else { sw }
+          dst.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+          return ()
+        }
+        PointSet.Dense {offset, minWord, maxWord} => {
+          let rows = List<u64>.asMutSlice(&mut dstPool.*)
+          rows[offset + sw] = u64.bitOr(rows[offset + sw], sb)
+          let lo = if sw < minWord { sw } else { minWord }
+          let hi = if sw > maxWord { sw } else { maxWord }
+          if lo != minWord || hi != maxWord {
+            dst.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+          }
+          return ()
+        }
+      }
+    }
+    PointSet.Dense {offset: so, minWord: sMin, maxWord: sMax} => {
+      match dst.* {
+        PointSet.All => { return () }
+        PointSet.Empty => {
+          let offset = List<u64>.length(&dstPool.*)
+          run appendZeros(&mut dstPool.*, width)
+          let rows = List<u64>.asMutSlice(&mut dstPool.*)
+          let mut w = sMin
+          while w <= sMax {
+            rows[offset + w] = srcPool[so + w]
+            w = w + usize.ONE
+          }
+          dst.* = PointSet.Dense {offset: offset, minWord: sMin, maxWord: sMax}
+          return ()
+        }
+        PointSet.OneWord {word: dw, bits: db} => {
+          let offset = List<u64>.length(&dstPool.*)
+          run appendZeros(&mut dstPool.*, width)
+          let rows = List<u64>.asMutSlice(&mut dstPool.*)
+          let mut w = sMin
+          while w <= sMax {
+            rows[offset + w] = srcPool[so + w]
+            w = w + usize.ONE
+          }
+          rows[offset + dw] = u64.bitOr(rows[offset + dw], db)
+          let lo = if dw < sMin { dw } else { sMin }
+          let hi = if dw > sMax { dw } else { sMax }
+          dst.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+          return ()
+        }
+        PointSet.Dense {offset: doff, minWord: dMin, maxWord: dMax} => {
+          let rows = List<u64>.asMutSlice(&mut dstPool.*)
+          let mut w = sMin
+          while w <= sMax {
+            rows[doff + w] = u64.bitOr(rows[doff + w], srcPool[so + w])
+            w = w + usize.ONE
+          }
+          let lo = if sMin < dMin { sMin } else { dMin }
+          let hi = if sMax > dMax { sMax } else { dMax }
+          if lo != dMin || hi != dMax {
+            dst.* = PointSet.Dense {offset: doff, minWord: lo, maxWord: hi}
+          }
+          return ()
+        }
+      }
+    }
+  }
+}
+
+effect fn mergeSelfPointSet(dst: &mut PointSet, pool: &mut List<u64>, src: PointSet, width: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  match src {
+    PointSet.Empty => { return () }
+    PointSet.All => {
+      dst.* = PointSet.All
+      return ()
+    }
+    PointSet.OneWord {word: sw, bits: sb} => {
+      match dst.* {
+        PointSet.All => { return () }
+        PointSet.Empty => {
+          dst.* = PointSet.OneWord {word: sw, bits: sb}
+          return ()
+        }
+        PointSet.OneWord {word: dw, bits: db} => {
+          if dw == sw {
+            dst.* = PointSet.OneWord {word: dw, bits: u64.bitOr(db, sb)}
+            return ()
+          }
+          let offset = List<u64>.length(&pool.*)
+          run appendZeros(&mut pool.*, width)
+          let rows = List<u64>.asMutSlice(&mut pool.*)
+          rows[offset + dw] = db
+          rows[offset + sw] = sb
+          let lo = if dw < sw { dw } else { sw }
+          let hi = if dw > sw { dw } else { sw }
+          dst.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+          return ()
+        }
+        PointSet.Dense {offset, minWord, maxWord} => {
+          let rows = List<u64>.asMutSlice(&mut pool.*)
+          rows[offset + sw] = u64.bitOr(rows[offset + sw], sb)
+          let lo = if sw < minWord { sw } else { minWord }
+          let hi = if sw > maxWord { sw } else { maxWord }
+          if lo != minWord || hi != maxWord {
+            dst.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+          }
+          return ()
+        }
+      }
+    }
+    PointSet.Dense {offset: so, minWord: sMin, maxWord: sMax} => {
+      match dst.* {
+        PointSet.All => { return () }
+        PointSet.Empty => {
+          let offset = List<u64>.length(&pool.*)
+          run appendZeros(&mut pool.*, width)
+          let rows = List<u64>.asMutSlice(&mut pool.*)
+          let mut w = sMin
+          while w <= sMax {
+            rows[offset + w] = rows[so + w]
+            w = w + usize.ONE
+          }
+          dst.* = PointSet.Dense {offset: offset, minWord: sMin, maxWord: sMax}
+          return ()
+        }
+        PointSet.OneWord {word: dw, bits: db} => {
+          let offset = List<u64>.length(&pool.*)
+          run appendZeros(&mut pool.*, width)
+          let rows = List<u64>.asMutSlice(&mut pool.*)
+          let mut w = sMin
+          while w <= sMax {
+            rows[offset + w] = rows[so + w]
+            w = w + usize.ONE
+          }
+          rows[offset + dw] = u64.bitOr(rows[offset + dw], db)
+          let lo = if dw < sMin { dw } else { sMin }
+          let hi = if dw > sMax { dw } else { sMax }
+          dst.* = PointSet.Dense {offset: offset, minWord: lo, maxWord: hi}
+          return ()
+        }
+        PointSet.Dense {offset: doff, minWord: dMin, maxWord: dMax} => {
+          let rows = List<u64>.asMutSlice(&mut pool.*)
+          let mut w = sMin
+          while w <= sMax {
+            rows[doff + w] = u64.bitOr(rows[doff + w], rows[so + w])
+            w = w + usize.ONE
+          }
+          let lo = if sMin < dMin { sMin } else { dMin }
+          let hi = if sMax > dMax { sMax } else { dMax }
+          if lo != dMin || hi != dMax {
+            dst.* = PointSet.Dense {offset: doff, minWord: lo, maxWord: hi}
+          }
+          return ()
+        }
+      }
+    }
+  }
+}
+
+fn pointSetContains(set: PointSet, pool: &[u64], point: usize) -> bool {
+  return match set {
+    PointSet.Empty => false
+    PointSet.All => true
+    PointSet.OneWord {word, bits} => (point / 64) == word && u64.bitAnd(bits, maskOf(point)) != 0
+    PointSet.Dense {offset, minWord, maxWord} => {
+      let w = point / 64
+      w >= minWord && w <= maxWord && u64.bitAnd(pool[offset + w], maskOf(point)) != 0
+    }
+  }
 }
 
 impl Regions {
   pub fn make(points: usize) -> Self {
-    return Regions {points: points, width: wordsFor(points), seeds: List<u64>.make(),
+    return Regions {points: points, width: wordsFor(points),
+      seedSets: List<PointSet>.make(), seedPool: List<u64>.make(),
       markers: List<usize>.make(), universals: List<usize>.make(),
       longer: List<usize>.make(), shorter: List<usize>.make()}
   }
 
   pub effect fn region(self: &mut Self) -> Region ! OutOfMemoryError ? &mut Allocator {
     let created = Region {index: List<usize>.length(&self.markers)}
-    run appendZeros(&mut self.seeds, self.width)
+    run List<PointSet>.append(&mut self.seedSets, PointSet.Empty)
     run List<usize>.append(&mut self.markers, usize.MAX)
     return created
   }
@@ -248,25 +876,20 @@ impl Regions {
   /// A lifetime parameter or `'static`: every point plus its own end-of-body marker.
   pub effect fn universal(self: &mut Self) -> Region ! OutOfMemoryError ? &mut Allocator {
     let created = Region {index: List<usize>.length(&self.markers)}
-    run appendZeros(&mut self.seeds, self.width)
+    run List<PointSet>.append(&mut self.seedSets, PointSet.All)
     run List<usize>.append(&mut self.markers, List<usize>.length(&self.universals))
     run List<usize>.append(&mut self.universals, created.index)
-    let base = created.index * self.width
-    let points = self.points
-    let mut point = usize.ZERO
-    while point < points {
-      mark(List<u64>.asMutSlice(&mut self.seeds), base, point)
-      point = point + usize.ONE
-    }
     return created
   }
 
   /// A liveness seed: `region` contains `point`.
-  pub fn include(self: &mut Self, region: Region, point: usize) -> () {
+  pub effect fn include(self: &mut Self, region: Region, point: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     requireRegion(&self.*, region)
     if point >= self.points { CompilerBug.panic(b"region seed names an unreserved point") }
-    let base = region.index * self.width
-    mark(List<u64>.asMutSlice(&mut self.seeds), base, point)
+    let mut current = List<PointSet>.asSlice(&self.seedSets)[region.index]
+    run addPointToSet(&mut current, &mut self.seedPool, self.width, point)
+    List<PointSet>.set(&mut self.seedSets, region.index, current)
+    return ()
   }
 
   /// `longer: shorter`: the value of `longer` contains the value of `shorter`.
@@ -285,8 +908,14 @@ impl Regions {
     let regions = List<usize>.length(&self.markers)
     let width = self.width
     let markerWidth = wordsFor(List<usize>.length(&self.universals))
+    if regions == usize.ZERO {
+      return Values {points: self.points, width: width, markerWidth: markerWidth,
+        component: List<usize>.make(), markers: List<usize>.make(), universals: List<usize>.make(),
+        pointSets: List<PointSet>.make(), pointPool: List<u64>.make(), markerRows: List<u64>.make()}
+    }
     let markers = List<usize>.asSlice(&self.markers)
-    let seeds = List<u64>.asSlice(&self.seeds)
+    let seedSets = List<PointSet>.asSlice(&self.seedSets)
+    let seedPool = List<u64>.asSlice(&self.seedPool)
     // Compressed adjacency: the edges of region `r` are targets[offsets[r]..offsets[r + 1]].
     let longer = List<usize>.asSlice(&self.longer)
     let shorter = List<usize>.asSlice(&self.shorter)
@@ -321,7 +950,8 @@ impl Regions {
       visited: usize.ZERO}
     run List<bool>.appendRepeated(&mut search.onStack, false, regions)
     let mut component = run filled(regions, usize.MAX)
-    let mut pointRows = List<u64>.make()
+    let mut pointSets = List<PointSet>.make()
+    let mut pointPool = List<u64>.make()
     let mut markerRows = List<u64>.make()
     let mut components = usize.ZERO
     let mut root = usize.ZERO
@@ -352,7 +982,7 @@ impl Regions {
             if low == List<usize>.asSlice(&search.order)[region] {
               let id = components
               components = components + usize.ONE
-              run appendZeros(&mut pointRows, width)
+              let mut compSet = PointSet.Empty
               run appendZeros(&mut markerRows, markerWidth)
               let mut first = List<usize>.length(&search.stack)
               let mut found = false
@@ -367,7 +997,7 @@ impl Regions {
               let mut each = first
               while each < members.length {
                 let member = members[each]
-                orRow(List<u64>.asMutSlice(&mut pointRows), id * width, seeds, member * width, width)
+                run mergePointSet(&mut compSet, &mut pointPool, seedSets[member], seedPool, width)
                 if markers[member] != usize.MAX {
                   mark(List<u64>.asMutSlice(&mut markerRows), id * markerWidth, markers[member])
                 }
@@ -375,13 +1005,15 @@ impl Regions {
                 while out < edges[member + usize.ONE] {
                   let from = List<usize>.asSlice(&component)[toward[out]]
                   if from != id {
-                    orSelf(List<u64>.asMutSlice(&mut pointRows), id * width, from * width, width)
+                    let fromSet = List<PointSet>.asSlice(&pointSets)[from]
+                    run mergeSelfPointSet(&mut compSet, &mut pointPool, fromSet, width)
                     orSelf(List<u64>.asMutSlice(&mut markerRows), id * markerWidth, from * markerWidth, markerWidth)
                   }
                   out = out + usize.ONE
                 }
                 each = each + usize.ONE
               }
+              run List<PointSet>.append(&mut pointSets, compSet)
               List<usize>.truncate(&mut search.stack, first)
             }
           }
@@ -392,7 +1024,8 @@ impl Regions {
     let markerCopy = run copyAll(markers)
     let universalCopy = run copyAll(List<usize>.asSlice(&self.universals))
     return Values {points: self.points, width: width, markerWidth: markerWidth, component: move component,
-      markers: move markerCopy, universals: move universalCopy, pointRows: move pointRows, markerRows: move markerRows}
+      markers: move markerCopy, universals: move universalCopy,
+      pointSets: move pointSets, pointPool: move pointPool, markerRows: move markerRows}
   }
 }
 
@@ -426,9 +1059,17 @@ impl Search {
 }
 
 impl Values {
+  /// Constructs an empty solution for bodies with zero regions.
+  pub fn empty(points: usize) -> Self {
+    return Values {points: points, width: wordsFor(points), markerWidth: usize.ZERO,
+      component: List<usize>.make(), markers: List<usize>.make(), universals: List<usize>.make(),
+      pointSets: List<PointSet>.make(), pointPool: List<u64>.make(), markerRows: List<u64>.make()}
+  }
+
   pub fn contains(self: &Self, region: Region, point: usize) -> bool {
     if point >= self.points { CompilerBug.panic(b"region query names an unreserved point") }
-    return isSet(List<u64>.asSlice(&self.pointRows), Values.componentOf(self, region) * self.width, point)
+    let comp = Values.componentOf(self, region)
+    return pointSetContains(List<PointSet>.asSlice(&self.pointSets)[comp], List<u64>.asSlice(&self.pointPool), point)
   }
 
   /// `region`'s value contains `universal`'s end-of-body marker, so it must outlive it.
@@ -454,6 +1095,7 @@ impl Values {
   pub effect fn undeclared(self: &Self, declared: &[Bound]) -> List<Bound> ! OutOfMemoryError ? &mut Allocator {
     let universals = List<usize>.asSlice(&self.universals)
     let count = universals.length
+    if count <= usize.ONE { return List<Bound>.make() }
     // The declared edges by longer universal, so each universal's closure is one walk of what it
     // reaches rather than a dense count-cubed closure of every pair.
     let mut starts = List<usize>.make()
@@ -572,6 +1214,15 @@ pub struct LoanScope {
   escaping: List<bool>,
 }
 
+fn pointOverwritten(pts: &[usize], point: usize) -> bool {
+  let mut i = usize.ZERO
+  while i < pts.length {
+    if pts[i] == point { return true }
+    i = i + usize.ONE
+  }
+  return false
+}
+
 impl Loans {
   pub fn make() -> Self {
     return Loans {births: List<usize>.make(), regions: List<Region>.make(),
@@ -594,68 +1245,115 @@ impl Loans {
     return ()
   }
 
-  /// Forward may-dataflow, solved per loan. On entry to a point, loans whose region excludes it
-  /// leave scope; the point's own overwrites then kill, and its borrows generate, on exit. A loan
-  /// is in scope at a point exactly when a path from its birth reaches the point through points of
-  /// its region that do not overwrite it, so each loan walks only its own region instead of every
-  /// point of the body.
+  /// Forward may-dataflow, solved per loan with sparse per-loan overwrite lists and straight-line
+  /// chain walking so single-successor runs avoid worklist traffic.
   pub effect fn solve(self: &Self, cfg: &Cfg, values: &Values) -> LoanScope ! OutOfMemoryError ? &mut Allocator {
     let points = Cfg.points(cfg)
     if values.points != points { CompilerBug.panic(b"loans, regions and CFG disagree on point count") }
     let births = List<usize>.asSlice(&self.births)
     let regions = List<Region>.asSlice(&self.regions)
     let loans = births.length
+    if loans == usize.ZERO {
+      return LoanScope.empty(points)
+    }
     let width = wordsFor(loans)
-    let mut overwritten = run zeros(points * width)
+    // Bucket overwrites per loan into CSR (most loans have 0 overwrites).
     let killedLoans = List<usize>.asSlice(&self.overwrittenLoans)
     let killedPoints = List<usize>.asSlice(&self.overwrittenPoints)
+    let mut ovStarts = run filled(loans + usize.ONE, usize.ZERO)
     let mut at = usize.ZERO
     while at < killedLoans.length {
       if killedPoints[at] >= points { CompilerBug.panic(b"overwrite names an unreserved point") }
-      mark(List<u64>.asMutSlice(&mut overwritten), killedPoints[at] * width, killedLoans[at])
+      let counts = List<usize>.asMutSlice(&mut ovStarts)
+      let l = killedLoans[at]
+      counts[l + usize.ONE] = counts[l + usize.ONE] + usize.ONE
       at = at + usize.ONE
     }
+    at = usize.ZERO
+    while at < loans {
+      let sums = List<usize>.asMutSlice(&mut ovStarts)
+      sums[at + usize.ONE] = sums[at + usize.ONE] + sums[at]
+      at = at + usize.ONE
+    }
+    let mut ovCursor = run copyAll(List<usize>.asSlice(&ovStarts))
+    let mut ovPoints = run filled(killedLoans.length, usize.ZERO)
+    at = usize.ZERO
+    while at < killedLoans.length {
+      let l = killedLoans[at]
+      let slot = List<usize>.asSlice(&ovCursor)[l]
+      List<usize>.set(&mut ovPoints, slot, killedPoints[at])
+      List<usize>.set(&mut ovCursor, l, slot + usize.ONE)
+      at = at + usize.ONE
+    }
+    let ovStartSlice = List<usize>.asSlice(&ovStarts)
+    let ovPtSlice = List<usize>.asSlice(&ovPoints)
     let mut inScope = run zeros(points * width)
     let mut escaping = List<bool>.make()
-    // The loan that last queued each point, so no visited set is cleared between loans.
-    let mut seen = List<usize>.make()
-    run List<usize>.appendRepeated(&mut seen, usize.MAX, points)
+    run List<bool>.reserveExact(&mut escaping, loans)
+    let mut seen = run filled(points, usize.MAX)
     let mut pending = List<usize>.make()
+    let pointSets = List<PointSet>.asSlice(&values.pointSets)
+    let pointPool = List<u64>.asSlice(&values.pointPool)
     let mut loan = usize.ZERO
     while loan < loans {
       let birth = births[loan]
       if birth >= points { CompilerBug.panic(b"loan birth names an unreserved point") }
-      // The birth generates the loan on exit whatever its own scope, so its successors are the roots.
-      let roots = Cfg.next(cfg, birth)
-      at = usize.ZERO
-      while at < roots.length {
-        if List<usize>.asSlice(&seen)[roots[at]] != loan {
-          List<usize>.set(&mut seen, roots[at], loan)
-          run List<usize>.append(&mut pending, roots[at])
+      let region = regions[loan]
+      let comp = Values.componentOf(values, region)
+      let pset = pointSets[comp]
+      let ovStart = ovStartSlice[loan]
+      let ovLen = ovStartSlice[loan + usize.ONE] - ovStart
+      let ovSlice = Slice.view<usize>(ovPtSlice, ovStart, ovLen)
+      let loanWord = loan / 64
+      let loanMask = maskOf(loan)
+      let mut walkNeeded = true
+      if let PointSet.Empty = pset { walkNeeded = false }
+      if walkNeeded {
+        let roots = Cfg.next(cfg, birth)
+        at = usize.ZERO
+        while at < roots.length {
+          let r = roots[at]
+          if List<usize>.asSlice(&seen)[r] != loan {
+            List<usize>.set(&mut seen, r, loan)
+            run List<usize>.append(&mut pending, r)
+          }
+          at = at + usize.ONE
         }
-        at = at + usize.ONE
-      }
-      while List<usize>.length(&pending) > usize.ZERO {
-        let last = List<usize>.length(&pending) - usize.ONE
-        let current = List<usize>.asSlice(&pending)[last]
-        List<usize>.truncate(&mut pending, last)
-        if Values.contains(values, regions[loan], current) {
-          mark(List<u64>.asMutSlice(&mut inScope), current * width, loan)
-          // An overwrite kills the loan on exit; the birth generates it again.
-          if current == birth || !isSet(List<u64>.asSlice(&overwritten), current * width, loan) {
+        while List<usize>.length(&pending) > usize.ZERO {
+          let last = List<usize>.length(&pending) - usize.ONE
+          let mut current = List<usize>.asSlice(&pending)[last]
+          List<usize>.truncate(&mut pending, last)
+          // Follow straight-line chains without pushing/popping `pending`.
+          while true {
+            if !pointSetContains(pset, pointPool, current) { break }
+            let scopeRows = List<u64>.asMutSlice(&mut inScope)
+            let slot = current * width + loanWord
+            scopeRows[slot] = u64.bitOr(scopeRows[slot], loanMask)
+            if current != birth && ovLen != usize.ZERO && pointOverwritten(ovSlice, current) { break }
+            let sole = Cfg.soleNext(cfg, current)
+            if sole != usize.MAX {
+              if List<usize>.asSlice(&seen)[sole] != loan {
+                List<usize>.set(&mut seen, sole, loan)
+                current = sole
+                continue
+              }
+              break
+            }
             let next = Cfg.next(cfg, current)
             let mut each = usize.ZERO
             while each < next.length {
-              if List<usize>.asSlice(&seen)[next[each]] != loan {
-                List<usize>.set(&mut seen, next[each], loan)
-                run List<usize>.append(&mut pending, next[each])
+              let nxt = next[each]
+              if List<usize>.asSlice(&seen)[nxt] != loan {
+                List<usize>.set(&mut seen, nxt, loan)
+                run List<usize>.append(&mut pending, nxt)
               }
               each = each + usize.ONE
             }
+            break
           }
         }
       }
-      run List<bool>.append(&mut escaping, Values.escapes(values, regions[loan]))
+      run List<bool>.append(&mut escaping, Values.escapes(values, region))
       loan = loan + usize.ONE
     }
     return LoanScope {points: points, loans: loans, width: width, inScope: move inScope, escaping: move escaping}
@@ -663,6 +1361,12 @@ impl Loans {
 }
 
 impl LoanScope {
+  /// Constructs an empty loan scope for bodies with zero loans.
+  pub fn empty(points: usize) -> Self {
+    return LoanScope {points: points, loans: usize.ZERO, width: usize.ZERO,
+      inScope: List<u64>.make(), escaping: List<bool>.make()}
+  }
+
   /// `loan` is in scope when the access at `point` is checked.
   pub fn contains(self: &Self, point: usize, loan: Loan) -> bool {
     if point >= self.points || loan.index >= self.loans { CompilerBug.panic(b"loan scope query out of range") }
@@ -723,12 +1427,9 @@ fn mark(rows: &mut [u64], base: usize, bit: usize) -> () {
   rows[at] = u64.bitOr(rows[at], maskOf(bit))
 }
 
-fn orRow(rows: &mut [u64], base: usize, from: &[u64], start: usize, width: usize) -> () {
-  let mut word = usize.ZERO
-  while word < width {
-    rows[base + word] = u64.bitOr(rows[base + word], from[start + word])
-    word = word + usize.ONE
-  }
+fn clearBit(rows: &mut [u64], base: usize, bit: usize) -> () {
+  let at = base + bit / 64
+  rows[at] = u64.bitAnd(rows[at], u64.bitNot(maskOf(bit)))
 }
 
 fn orSelf(rows: &mut [u64], base: usize, start: usize, width: usize) -> () {
@@ -777,62 +1478,6 @@ effect fn copyAll(values: &[usize]) -> List<usize> ! OutOfMemoryError ? &mut All
   return move result
 }
 
-// Every point's predecessors, stored as one array of sources grouped by target point.
-struct Predecessors {
-  // Where each point's sources start in `sources`, with one final entry for the end.
-  starts: List<usize>,
-  sources: List<usize>,
-}
-
-impl Predecessors {
-  fn of(self: &Self, point: usize) -> &[usize] {
-    let starts = List<usize>.asSlice(&self.starts)
-    let start = starts[point]
-    return Slice.view<usize>(List<usize>.asSlice(&self.sources), start, starts[point + usize.ONE] - start)
-  }
-}
-
-effect fn reverse(cfg: &Cfg) -> Predecessors ! OutOfMemoryError ? &mut Allocator {
-  let points = Cfg.points(cfg)
-  // Count each point's predecessors, turn the counts into starts, then place every source.
-  let mut starts = run filled(points + usize.ONE, usize.ZERO)
-  let mut edges = usize.ZERO
-  let mut at = usize.ZERO
-  while at < points {
-    let next = Cfg.next(cfg, at)
-    let mut each = usize.ZERO
-    while each < next.length {
-      let target = next[each] + usize.ONE
-      let counted = List<usize>.get(&starts, target) + usize.ONE
-      List<usize>.set(&mut starts, target, counted)
-      each = each + usize.ONE
-    }
-    edges = edges + next.length
-    at = at + usize.ONE
-  }
-  at = usize.ZERO
-  while at < points {
-    let total = List<usize>.get(&starts, at) + List<usize>.get(&starts, at + usize.ONE)
-    List<usize>.set(&mut starts, at + usize.ONE, total)
-    at = at + usize.ONE
-  }
-  let mut cursor = run copyAll(List<usize>.asSlice(&starts))
-  let mut sources = run filled(edges, usize.ZERO)
-  at = usize.ZERO
-  while at < points {
-    let next = Cfg.next(cfg, at)
-    let mut each = usize.ZERO
-    while each < next.length {
-      let slot = List<usize>.get(&cursor, next[each])
-      List<usize>.set(&mut sources, slot, at)
-      List<usize>.set(&mut cursor, next[each], slot + usize.ONE)
-      each = each + usize.ONE
-    }
-    at = at + usize.ONE
-  }
-  return Predecessors {starts: move starts, sources: move sources}
-}
-
 effect fn enqueue(pending: &mut List<usize>, queued: &mut List<bool>, points: &[usize]) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   let mut at = usize.ZERO
@@ -847,7 +1492,8 @@ effect fn enqueue(pending: &mut List<usize>, queued: &mut List<bool>, points: &[
 }
 
 // Each test pins one solver duty: back-edge liveness, SCC collapse, completion order across
-// words, region-exit versus overwrite kills, declared-bound closure, and marker escape.
+// words, region-exit versus overwrite kills, declared-bound closure, marker escape, and basic-block
+// contraction with multi-word PointSet promotion.
 
 test effect fn regionSolverLivenessFollowsLoopBackEdge() -> () ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -870,15 +1516,15 @@ effect fn livenessClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? 
   let result: usize = 2
   let guard: usize = 3
   let mut facts = run Liveness.make(Cfg.points(&cfg), 4)
-  Liveness.assign(&mut facts, entry, condition)
-  Liveness.read(&mut facts, header, condition)
-  Liveness.assign(&mut facts, entry, item)
-  Liveness.read(&mut facts, body, item)
-  Liveness.assign(&mut facts, entry, result)
-  Liveness.assign(&mut facts, body, result)
-  Liveness.read(&mut facts, exit, result)
-  Liveness.assign(&mut facts, entry, guard)
-  Liveness.dropUse(&mut facts, exit, guard)
+  run Liveness.assign(&mut facts, entry, condition)
+  run Liveness.read(&mut facts, header, condition)
+  run Liveness.assign(&mut facts, entry, item)
+  run Liveness.read(&mut facts, body, item)
+  run Liveness.assign(&mut facts, entry, result)
+  run Liveness.assign(&mut facts, body, result)
+  run Liveness.read(&mut facts, exit, result)
+  run Liveness.assign(&mut facts, entry, guard)
+  run Liveness.dropUse(&mut facts, exit, guard)
   let live = run Liveness.solve(&facts, &cfg)
   run Testing.expect(Live.live(&live, body, condition) && Live.live(&live, header, condition),
     "a header read keeps its local live through the loop body via the back edge")
@@ -911,10 +1557,10 @@ effect fn cycleClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mu
   run Regions.outlives(&mut regions, second, third)
   run Regions.outlives(&mut regions, third, first)
   run Regions.outlives(&mut regions, third, inner)
-  Regions.include(&mut regions, first, usize.ZERO)
-  Regions.include(&mut regions, third, 2)
-  Regions.include(&mut regions, inner, usize.ONE)
-  Regions.include(&mut regions, outer, 3)
+  run Regions.include(&mut regions, first, usize.ZERO)
+  run Regions.include(&mut regions, third, 2)
+  run Regions.include(&mut regions, inner, usize.ONE)
+  run Regions.include(&mut regions, outer, 3)
   let values = run Regions.solve(&regions)
   run Testing.expect(Values.contains(&values, first, 2) && Values.contains(&values, second, usize.ZERO)
     && Values.contains(&values, third, usize.ZERO) && Values.contains(&values, second, usize.ONE),
@@ -944,8 +1590,8 @@ effect fn chainClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mu
   run Regions.outlives(&mut regions, last, second)
   run Regions.outlives(&mut regions, first, fourth)
   run Regions.outlives(&mut regions, second, first)
-  Regions.include(&mut regions, third, 66)
-  Regions.include(&mut regions, first, 5)
+  run Regions.include(&mut regions, third, 66)
+  run Regions.include(&mut regions, first, 5)
   let values = run Regions.solve(&regions)
   run Testing.expect(Values.contains(&values, last, 66) && Values.contains(&values, second, 66)
     && Values.contains(&values, first, 66) && Values.contains(&values, fourth, 66),
@@ -978,13 +1624,13 @@ effect fn loanClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut
   let mut regions = Regions.make(6)
   let gapped = run Regions.region(&mut regions)
   let whole = run Regions.region(&mut regions)
-  Regions.include(&mut regions, gapped, usize.ONE)
-  Regions.include(&mut regions, gapped, 2)
-  Regions.include(&mut regions, gapped, 3)
-  Regions.include(&mut regions, gapped, 5)
+  run Regions.include(&mut regions, gapped, usize.ONE)
+  run Regions.include(&mut regions, gapped, 2)
+  run Regions.include(&mut regions, gapped, 3)
+  run Regions.include(&mut regions, gapped, 5)
   point = usize.ONE
   while point < 6 {
-    Regions.include(&mut regions, whole, point)
+    run Regions.include(&mut regions, whole, point)
     point = point + usize.ONE
   }
   let values = run Regions.solve(&regions)
@@ -1021,7 +1667,7 @@ effect fn universalClaims() -> () ! OutOfMemoryError | AssertionError<'static> ?
   let b = run Regions.universal(&mut regions)
   let c = run Regions.universal(&mut regions)
   let local = run Regions.region(&mut regions)
-  Regions.include(&mut regions, local, usize.ONE)
+  run Regions.include(&mut regions, local, usize.ONE)
   run Regions.outlives(&mut regions, a, local)
   run Regions.outlives(&mut regions, local, b)
   run Regions.outlives(&mut regions, c, a)
@@ -1072,7 +1718,7 @@ effect fn escapeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &m
   run Regions.outlives(&mut regions, outer, stored)
   run Regions.outlives(&mut regions, stored, returned)
   run Regions.outlives(&mut regions, returned, local)
-  Regions.include(&mut regions, local, end)
+  run Regions.include(&mut regions, local, end)
   let values = run Regions.solve(&regions)
   let mut loans = Loans.make()
   let escaping = run Loans.loan(&mut loans, start, outer)
@@ -1082,5 +1728,43 @@ effect fn escapeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &m
     "a loan whose region transitively outlives a universal escapes the body")
   run Testing.expect(!LoanScope.escapes(&scope, contained) && LoanScope.contains(&scope, end, contained),
     "a loan that a universal outlives stays local")
+  return ()
+}
+
+test effect fn regionSolverContractsChainsAndPreservesIntraBlockOrder() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run contractionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn contractionClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // Straight chain 0 -> 1 -> 2 -> 3 -> 4 contracts into a single basic block.
+  let mut cfg = Cfg.make()
+  let mut i = usize.ZERO
+  while i < 5 {
+    drop run Cfg.point(&mut cfg)
+    i = i + usize.ONE
+  }
+  run Cfg.edge(&mut cfg, usize.ZERO, usize.ONE)
+  run Cfg.edge(&mut cfg, usize.ONE, 2)
+  run Cfg.edge(&mut cfg, 2, 3)
+  run Cfg.edge(&mut cfg, 3, 4)
+  let contracted = run ContractedCfg.contract(&cfg)
+  run Testing.expect(contracted.blocks == usize.ONE, "a 5-point straight chain contracts to 1 basic block")
+  let mut liveness = run Liveness.make(5, 2)
+  // Local 0: assigned at 1, read AND reassigned at 2, read at 4 -> live at 2 (read before assign), 3, 4; dead at 0, 1.
+  run Liveness.assign(&mut liveness, usize.ONE, usize.ZERO)
+  run Liveness.read(&mut liveness, 2, usize.ZERO)
+  run Liveness.assign(&mut liveness, 2, usize.ZERO)
+  run Liveness.read(&mut liveness, 4, usize.ZERO)
+  // Local 1: read at 1, assigned at 3 -> live at 0, 1; dead at 2, 3, 4.
+  run Liveness.read(&mut liveness, usize.ONE, usize.ONE)
+  run Liveness.assign(&mut liveness, 3, usize.ONE)
+  let live = run Liveness.solveContracted(&liveness, &contracted)
+  run Testing.expect(!Live.live(&live, usize.ZERO, usize.ZERO) && !Live.live(&live, usize.ONE, usize.ZERO)
+    && Live.live(&live, 2, usize.ZERO) && Live.live(&live, 3, usize.ZERO) && Live.live(&live, 4, usize.ZERO),
+    "intra-block read-before-assign preserves exact liveness on entry")
+  run Testing.expect(Live.live(&live, usize.ZERO, usize.ONE) && Live.live(&live, usize.ONE, usize.ONE)
+    && !Live.live(&live, 2, usize.ONE) && !Live.live(&live, 3, usize.ONE),
+    "intra-block read propagates backward to block entry and dies afterwards")
   return ()
 }

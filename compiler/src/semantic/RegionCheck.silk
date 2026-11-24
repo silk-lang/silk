@@ -57,7 +57,7 @@ import semantic.CallableSchema {CallableSchema}
 import semantic.CallableWitness
 import semantic.CallableWitness {CallableWitness as WitnessRecipe}
 import semantic.Type {ArrayShape, Requirement, Row, Type}
-import semantic.RegionSolver {Bound, Cfg, Live, Liveness, Loan, LoanScope, Loans, Region, Regions, Values}
+import semantic.RegionSolver {Bound, Cfg, ContractedCfg, Live, Liveness, Loan, LoanScope, Loans, Region, Regions, Values}
 import semantic.TypedBody {
   AggregateField,
   BindingAccess,
@@ -4592,16 +4592,20 @@ fn nextReaching(state: &[u64], width: usize, point: usize, from: usize, count: u
   return found
 }
 
-fn reaches(state: &[u64], width: usize, point: usize, bit: usize) -> bool {
-  return u64.bitAnd(state[point * width + wordOf(bit)], maskOf(bit)) != 0
+fn reachesRow(row: &[u64], bit: usize) -> bool {
+  return u64.bitAnd(row[wordOf(bit)], maskOf(bit)) != 0
 }
 
-// Reaching moves along forward edges: bit `m` of a point's row is set when move event `moves[m]`
+// Reaching moves along forward edges: bit `m` of a row is set when move event `moves[m]`
 // reaches it in the same loop iteration, on a path that neither rebinds nor replaces its place.
-// Repetition is checked separately at each loop header.
+// Solved on the contracted forward basic-block graph; `eventEntering` holds one row per event
+// (indexed by event ordinal, not CFG point), and `blockIn` + `forward` answer loop-header
+// `pointLeaving` queries without allocating `points * width` matrices.
 struct Reach {
-  entering: List<u64>,
-  leaving: List<u64>,
+  eventEntering: List<u64>,
+  blockIn: List<u64>,
+  forward: ContractedCfg,
+  groups: MoveGroups,
 }
 
 // The move bits grouped by the root of their place, and the bit of each move event. `grouped` is
@@ -4664,159 +4668,290 @@ effect fn groupMoves(events: &[Event], moves: &[usize]) -> MoveGroups ! OutOfMem
   return move groups
 }
 
+// Applies the kill then gen of a single CFG `point` to a reaching-moves `row` (length `width`).
+fn applyReachPoint(events: &[Event], recorded: &[usize], initializes: &[usize], moves: &[usize],
+  grouping: &MoveGroups, point: usize, row: &mut [u64]) -> () {
+  let event = recorded[point]
+  if grouping.grouped {
+    let starts = List<usize>.asSlice(&grouping.rootStarts)
+    let grouped = List<usize>.asSlice(&grouping.rootBits)
+    let root = initializes[point]
+    if root < grouping.roots {
+      let mut at = starts[root]
+      while at < starts[root + usize.ONE] {
+        let bit = grouped[at]
+        let w = wordOf(bit)
+        row[w] = u64.bitAnd(row[w], u64.bitNot(maskOf(bit)))
+        at = at + usize.ONE
+      }
+    }
+    if event != usize.MAX && events[event].kind == Kind.Write {
+      let written = events[event].place.root
+      if written < grouping.roots {
+        let mut at = starts[written]
+        while at < starts[written + usize.ONE] {
+          let bit = grouped[at]
+          if covers(&events[event].place, &events[moves[bit]].place) {
+            let w = wordOf(bit)
+            row[w] = u64.bitAnd(row[w], u64.bitNot(maskOf(bit)))
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+    if event != usize.MAX {
+      let bit = List<usize>.asSlice(&grouping.eventBits)[event]
+      if bit != usize.MAX {
+        let w = wordOf(bit)
+        row[w] = u64.bitOr(row[w], maskOf(bit))
+      }
+    }
+  } else {
+    let mut bit = usize.ZERO
+    while bit < moves.length {
+      let moved = &events[moves[bit]].place
+      let w = wordOf(bit)
+      if initializes[point] == moved.root
+        || (event != usize.MAX && events[event].kind == Kind.Write && covers(&events[event].place, moved)) {
+        row[w] = u64.bitAnd(row[w], u64.bitNot(maskOf(bit)))
+      }
+      if event == moves[bit] {
+        row[w] = u64.bitOr(row[w], maskOf(bit))
+      }
+      bit = bit + usize.ONE
+    }
+  }
+}
+
+// Summarizes one point's effect into a block's `(gen, kill)` pair at `base`:
+// kill clears both `gen` and adds to `kill`; gen adds to `gen`.
+fn accumulateReachBlock(events: &[Event], recorded: &[usize], initializes: &[usize], moves: &[usize],
+  grouping: &MoveGroups, point: usize, gen: &mut [u64], kill: &mut [u64], base: usize) -> () {
+  let event = recorded[point]
+  if grouping.grouped {
+    let starts = List<usize>.asSlice(&grouping.rootStarts)
+    let grouped = List<usize>.asSlice(&grouping.rootBits)
+    let root = initializes[point]
+    if root < grouping.roots {
+      let mut at = starts[root]
+      while at < starts[root + usize.ONE] {
+        let bit = grouped[at]
+        let slot = base + wordOf(bit)
+        let m = maskOf(bit)
+        kill[slot] = u64.bitOr(kill[slot], m)
+        gen[slot] = u64.bitAnd(gen[slot], u64.bitNot(m))
+        at = at + usize.ONE
+      }
+    }
+    if event != usize.MAX && events[event].kind == Kind.Write {
+      let written = events[event].place.root
+      if written < grouping.roots {
+        let mut at = starts[written]
+        while at < starts[written + usize.ONE] {
+          let bit = grouped[at]
+          if covers(&events[event].place, &events[moves[bit]].place) {
+            let slot = base + wordOf(bit)
+            let m = maskOf(bit)
+            kill[slot] = u64.bitOr(kill[slot], m)
+            gen[slot] = u64.bitAnd(gen[slot], u64.bitNot(m))
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+    if event != usize.MAX {
+      let bit = List<usize>.asSlice(&grouping.eventBits)[event]
+      if bit != usize.MAX {
+        let slot = base + wordOf(bit)
+        gen[slot] = u64.bitOr(gen[slot], maskOf(bit))
+      }
+    }
+  } else {
+    let mut bit = usize.ZERO
+    while bit < moves.length {
+      let moved = &events[moves[bit]].place
+      let slot = base + wordOf(bit)
+      let m = maskOf(bit)
+      if initializes[point] == moved.root
+        || (event != usize.MAX && events[event].kind == Kind.Write && covers(&events[event].place, moved)) {
+        kill[slot] = u64.bitOr(kill[slot], m)
+        gen[slot] = u64.bitAnd(gen[slot], u64.bitNot(m))
+      }
+      if event == moves[bit] {
+        gen[slot] = u64.bitOr(gen[slot], m)
+      }
+      bit = bit + usize.ONE
+    }
+  }
+}
+
 effect fn reaching(walker: &Walker<'_>, moves: &[usize], width: usize) -> Reach ! OutOfMemoryError ? &mut Allocator {
   let points = Cfg.points(&walker.cfg)
   let events = List<Event>.asSlice(&walker.events)
   let recorded = List<usize>.asSlice(&walker.pointEvents)
   let initializes = List<usize>.asSlice(&walker.initializes)
-  let mut entering = List<u64>.make()
-  let mut leaving = List<u64>.make()
-  // What each point adds and removes does not change between passes, nor do its forward edges, so
-  // both are found once and each pass is word operations.
-  let mut generated = List<u64>.make()
-  let mut killed = List<u64>.make()
-  run List<u64>.reserveExact(&mut entering, points * width)
-  run List<u64>.reserveExact(&mut leaving, points * width)
-  run List<u64>.reserveExact(&mut generated, points * width)
-  run List<u64>.reserveExact(&mut killed, points * width)
-  run List<u64>.appendRepeated(&mut entering, 0, points * width)
-  run List<u64>.appendRepeated(&mut leaving, 0, points * width)
-  run List<u64>.appendRepeated(&mut generated, 0, points * width)
-  run List<u64>.appendRepeated(&mut killed, 0, points * width)
   let grouping = run groupMoves(events, moves)
-  let mut forward = List<usize>.make()
-  let mut firstForward = List<usize>.make()
-  run List<usize>.reserveExact(&mut firstForward, points + usize.ONE)
-  let mut point = usize.ZERO
-  while point < points {
-    run List<usize>.append(&mut firstForward, List<usize>.length(&forward))
-    let event = recorded[point]
-    if grouping.grouped {
-      // Only the bits whose root this point rebinds or writes can die here, and only its own
-      // event's bit is born.
-      let starts = List<usize>.asSlice(&grouping.rootStarts)
-      let grouped = List<usize>.asSlice(&grouping.rootBits)
-      let root = initializes[point]
-      if root < grouping.roots {
-        let mut at = starts[root]
-        while at < starts[root + usize.ONE] {
-          let bit = grouped[at]
-          let slot = point * width + wordOf(bit)
-          let kill = u64.bitOr(List<u64>.asSlice(&killed)[slot], maskOf(bit))
-          List<u64>.set(&mut killed, slot, kill)
-          at = at + usize.ONE
-        }
-      }
-      if event != usize.MAX && events[event].kind == Kind.Write {
-        let written = events[event].place.root
-        if written < grouping.roots {
-          let mut at = starts[written]
-          while at < starts[written + usize.ONE] {
-            let bit = grouped[at]
-            if covers(&events[event].place, &events[moves[bit]].place) {
-              let slot = point * width + wordOf(bit)
-              let kill = u64.bitOr(List<u64>.asSlice(&killed)[slot], maskOf(bit))
-              List<u64>.set(&mut killed, slot, kill)
-            }
-            at = at + usize.ONE
-          }
-        }
-      }
-      if event != usize.MAX {
-        let bit = List<usize>.get(&grouping.eventBits, event)
-        if bit != usize.MAX {
-          let slot = point * width + wordOf(bit)
-          let gen = u64.bitOr(List<u64>.asSlice(&generated)[slot], maskOf(bit))
-          List<u64>.set(&mut generated, slot, gen)
-        }
-      }
-    } else {
-      let mut bit = usize.ZERO
-      while bit < moves.length {
-        let moved = &events[moves[bit]].place
-        let slot = point * width + wordOf(bit)
-        if initializes[point] == moved.root
-          || (event != usize.MAX && events[event].kind == Kind.Write && covers(&events[event].place, moved)) {
-          let kill = u64.bitOr(List<u64>.asSlice(&killed)[slot], maskOf(bit))
-          List<u64>.set(&mut killed, slot, kill)
-        }
-        if event == moves[bit] {
-          let gen = u64.bitOr(List<u64>.asSlice(&generated)[slot], maskOf(bit))
-          List<u64>.set(&mut generated, slot, gen)
-        }
-        bit = bit + usize.ONE
-      }
+  // Build the forward-only CFG (dropping loop back edges) and contract it into basic blocks.
+  let forward = if List<Loop>.length(&walker.loops) == usize.ZERO {
+    run ContractedCfg.contract(&walker.cfg)
+  } else {
+    let mut fcfg = Cfg.make()
+    let mut p = usize.ZERO
+    while p < points {
+      drop run Cfg.point(&mut fcfg)
+      p = p + usize.ONE
     }
-    let next = Cfg.next(&walker.cfg, point)
-    let mut successor = usize.ZERO
-    while successor < next.length {
-      if !isBackEdge(walker, point, next[successor]) { run List<usize>.append(&mut forward, next[successor]) }
-      successor = successor + usize.ONE
+    p = usize.ZERO
+    while p < points {
+      let next = Cfg.next(&walker.cfg, p)
+      let mut s = usize.ZERO
+      while s < next.length {
+        if !isBackEdge(walker, p, next[s]) { run Cfg.edge(&mut fcfg, p, next[s]) }
+        s = s + usize.ONE
+      }
+      p = p + usize.ONE
     }
-    point = point + usize.ONE
+    run ContractedCfg.contract(&fcfg)
   }
-  run List<usize>.append(&mut firstForward, List<usize>.length(&forward))
-  let gens = List<u64>.asSlice(&generated)
-  let kills = List<u64>.asSlice(&killed)
-  let edges = List<usize>.asSlice(&forward)
-  let starts = List<usize>.asSlice(&firstForward)
-  // A worklist popped from the end visits earlier points first, and a point whose entering set
-  // grows is queued again. Every point is visited at least once, so its leaving set is final.
+  let blocks = forward.blocks
+  let mut blockIn = List<u64>.make()
+  let mut blockOut = List<u64>.make()
+  let mut blockGen = List<u64>.make()
+  let mut blockKill = List<u64>.make()
+  run List<u64>.reserveExact(&mut blockIn, blocks * width)
+  run List<u64>.reserveExact(&mut blockOut, blocks * width)
+  run List<u64>.reserveExact(&mut blockGen, blocks * width)
+  run List<u64>.reserveExact(&mut blockKill, blocks * width)
+  run List<u64>.appendRepeated(&mut blockIn, 0, blocks * width)
+  run List<u64>.appendRepeated(&mut blockOut, 0, blocks * width)
+  run List<u64>.appendRepeated(&mut blockGen, 0, blocks * width)
+  run List<u64>.appendRepeated(&mut blockKill, 0, blocks * width)
+  let mut b = usize.ZERO
+  while b < blocks {
+    let pts = ContractedCfg.pointsOf(&forward, b)
+    let base = b * width
+    let mut i = usize.ZERO
+    while i < pts.length {
+      accumulateReachBlock(events, recorded, initializes, moves, &grouping, pts[i],
+        List<u64>.asMutSlice(&mut blockGen), List<u64>.asMutSlice(&mut blockKill), base)
+      i = i + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+  let gens = List<u64>.asSlice(&blockGen)
+  let kills = List<u64>.asSlice(&blockKill)
   let mut queued = List<bool>.make()
-  run List<bool>.appendRepeated(&mut queued, true, points)
+  run List<bool>.appendRepeated(&mut queued, true, blocks)
   let mut pending = List<usize>.make()
-  run List<usize>.reserveExact(&mut pending, points)
-  point = points
-  while point > usize.ZERO {
-    point = point - usize.ONE
-    run List<usize>.append(&mut pending, point)
+  run List<usize>.reserveExact(&mut pending, blocks)
+  b = blocks
+  while b > usize.ZERO {
+    b = b - usize.ONE
+    run List<usize>.append(&mut pending, b)
   }
   while List<usize>.length(&pending) > usize.ZERO {
     let last = List<usize>.length(&pending) - usize.ONE
-    let at = List<usize>.get(&pending, last)
+    let at = List<usize>.asSlice(&pending)[last]
     List<usize>.truncate(&mut pending, last)
     List<bool>.set(&mut queued, at, false)
     let mut word = usize.ZERO
     while word < width {
       let slot = at * width + word
-      let left = u64.bitOr(u64.bitAnd(List<u64>.asSlice(&entering)[slot], u64.bitNot(kills[slot])), gens[slot])
-      List<u64>.set(&mut leaving, slot, left)
+      let left = u64.bitOr(u64.bitAnd(List<u64>.asSlice(&blockIn)[slot], u64.bitNot(kills[slot])), gens[slot])
+      List<u64>.set(&mut blockOut, slot, left)
       word = word + usize.ONE
     }
-    let mut edge = starts[at]
-    while edge < starts[at + usize.ONE] {
-      let target = edges[edge]
+    let next = ContractedCfg.nextBlocks(&forward, at)
+    let mut edge = usize.ZERO
+    while edge < next.length {
+      let target = next[edge]
       let mut grew = false
       word = usize.ZERO
       while word < width {
         let slot = target * width + word
-        let current = List<u64>.asSlice(&entering)[slot]
-        let merged = u64.bitOr(current, List<u64>.asSlice(&leaving)[at * width + word])
+        let current = List<u64>.asSlice(&blockIn)[slot]
+        let merged = u64.bitOr(current, List<u64>.asSlice(&blockOut)[at * width + word])
         if merged != current {
-          List<u64>.set(&mut entering, slot, merged)
+          List<u64>.set(&mut blockIn, slot, merged)
           grew = true
         }
         word = word + usize.ONE
       }
-      if grew && !List<bool>.get(&queued, target) {
+      if grew && !List<bool>.asSlice(&queued)[target] {
         List<bool>.set(&mut queued, target, true)
         run List<usize>.append(&mut pending, target)
       }
       edge = edge + usize.ONE
     }
   }
-  return Reach {entering: move entering, leaving: move leaving}
+  // Materialize entering rows ONLY for event points (indexed by event ordinal).
+  let mut eventEntering = List<u64>.make()
+  run List<u64>.reserveExact(&mut eventEntering, events.length * width)
+  run List<u64>.appendRepeated(&mut eventEntering, 0, events.length * width)
+  let mut row = List<u64>.make()
+  run List<u64>.appendRepeated(&mut row, 0, width)
+  let bIn = List<u64>.asSlice(&blockIn)
+  b = usize.ZERO
+  while b < blocks {
+    let pts = ContractedCfg.pointsOf(&forward, b)
+    let base = b * width
+    let mut word = usize.ZERO
+    while word < width {
+      List<u64>.set(&mut row, word, bIn[base + word])
+      word = word + usize.ONE
+    }
+    let mut i = usize.ZERO
+    while i < pts.length {
+      let p = pts[i]
+      let ev = recorded[p]
+      if ev != usize.MAX {
+        let rowSlice = List<u64>.asSlice(&row)
+        let evBase = ev * width
+        let mut dst = List<u64>.asMutSlice(&mut eventEntering)
+        word = usize.ZERO
+        while word < width {
+          dst[evBase + word] = rowSlice[word]
+          word = word + usize.ONE
+        }
+      }
+      applyReachPoint(events, recorded, initializes, moves, &grouping, p, List<u64>.asMutSlice(&mut row))
+      i = i + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+  return Reach {eventEntering: move eventEntering, blockIn: move blockIn, forward: move forward, groups: move grouping}
+}
+
+// Computes the leaving reaching-moves row of `point` into `out[0..width]`.
+fn pointLeaving(walker: &Walker<'_>, reach: &Reach, events: &[Event], moves: &[usize], width: usize, point: usize, out: &mut List<u64>) -> () {
+  let b = List<usize>.asSlice(&reach.forward.blockOf)[point]
+  let off = List<usize>.asSlice(&reach.forward.offsetInBlock)[point]
+  let pts = ContractedCfg.pointsOf(&reach.forward, b)
+  let bIn = List<u64>.asSlice(&reach.blockIn)
+  let base = b * width
+  let mut word = usize.ZERO
+  while word < width {
+    List<u64>.set(&mut out.*, word, bIn[base + word])
+    word = word + usize.ONE
+  }
+  let recorded = List<usize>.asSlice(&walker.pointEvents)
+  let initializes = List<usize>.asSlice(&walker.initializes)
+  let mut i = usize.ZERO
+  while i <= off {
+    applyReachPoint(events, recorded, initializes, moves, &reach.groups, pts[i], List<u64>.asMutSlice(&mut out.*))
+    i = i + usize.ONE
+  }
 }
 
 fn samePlace(left: &Place, right: &Place) -> bool {
   return overlap(left, right) == usize.ONE && List<Step>.length(&left.steps) == List<Step>.length(&right.steps)
 }
 
-// Whether `place` is moved in `state` at `point`: some reaching move names exactly it.
-fn movedIn(events: &[Event], moves: &[usize], state: &[u64], width: usize, point: usize, place: &Place) -> bool {
+// Whether `place` is moved in `row`: some reaching move names exactly it.
+fn movedInRow(events: &[Event], moves: &[usize], row: &[u64], place: &Place) -> bool {
   let mut bit = usize.ZERO
   while bit < moves.length {
-    if reaches(state, width, point, bit) && samePlace(&events[moves[bit]].place, place) { return true }
+    if reachesRow(row, bit) && samePlace(&events[moves[bit]].place, place) { return true }
     bit = bit + usize.ONE
   }
   return false
@@ -4837,18 +4972,46 @@ fn boundInside(walker: &Walker<'_>, repeat: &Loop, root: usize) -> bool {
 // otherwise).
 // The first move, as an ordinal of `moves`, whose place is moved on some path into `repeat`'s header
 // and not on another; `usize.MAX` when every path agrees.
-fn incompatibleHeader(walker: &Walker<'_>, events: &[Event], moves: &[usize], reach: &Reach, width: usize, repeat: &Loop) -> usize {
+effect fn incompatibleHeader(walker: &Walker<'_>, events: &[Event], moves: &[usize], reach: &Reach, width: usize, repeat: &Loop) -> usize
+! OutOfMemoryError ? &mut Allocator {
   if repeat.before == usize.MAX { return usize.MAX }
-  let leaving = List<u64>.asSlice(&reach.leaving)
   let sources = List<usize>.asSlice(&repeat.sources)
+  if sources.length == usize.ZERO { return usize.MAX }
+  let mut beforeRow = List<u64>.make()
+  run List<u64>.appendRepeated(&mut beforeRow, 0, width)
+  pointLeaving(walker, reach, events, moves, width, repeat.before, &mut beforeRow)
+  let mut sourceRows = List<u64>.make()
+  run List<u64>.appendRepeated(&mut sourceRows, 0, sources.length * width)
+  let mut anyDiff = false
+  let beforeSlice = List<u64>.asSlice(&beforeRow)
+  let mut index = usize.ZERO
+  while index < sources.length {
+    let base = index * width
+    let mut tmp = List<u64>.make()
+    run List<u64>.appendRepeated(&mut tmp, 0, width)
+    pointLeaving(walker, reach, events, moves, width, sources[index], &mut tmp)
+    let tmpSlice = List<u64>.asSlice(&tmp)
+    let mut dst = List<u64>.asMutSlice(&mut sourceRows)
+    let mut w = usize.ZERO
+    while w < width {
+      dst[base + w] = tmpSlice[w]
+      if tmpSlice[w] != beforeSlice[w] { anyDiff = true }
+      w = w + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  if !anyDiff { return usize.MAX }
+  // At least one back-edge differs from loop entry: check each outer move in order.
+  let srcAll = List<u64>.asSlice(&sourceRows)
   let mut bit = usize.ZERO
   while bit < moves.length {
     let place = &events[moves[bit]].place
     if !boundInside(walker, repeat, place.root) {
-      let entered = movedIn(events, moves, leaving, width, repeat.before, place)
-      let mut index = usize.ZERO
+      let entered = movedInRow(events, moves, beforeSlice, place)
+      index = usize.ZERO
       while index < sources.length {
-        if movedIn(events, moves, leaving, width, sources[index], place) != entered { return bit }
+        let srcRow = Slice.view<u64>(srcAll, index * width, width)
+        if movedInRow(events, moves, srcRow, place) != entered { return bit }
         index = index + usize.ONE
       }
     }
@@ -4890,25 +5053,97 @@ fn refinementTest(walker: &Walker<'_>, subject: usize) -> usize {
   return usize.MAX
 }
 
+// Replacing events (`replaces(kind)`) bucketed by `place.root` for O(1) lookup per refined use.
+struct ReplacesByRoot {
+  grouped: bool,
+  roots: usize,
+  starts: List<usize>,
+  indices: List<usize>,
+  all: List<usize>,
+}
+
+effect fn groupReplaces(events: &[Event]) -> ReplacesByRoot ! OutOfMemoryError ? &mut Allocator {
+  let mut all = List<usize>.make()
+  let mut roots = usize.ZERO
+  let mut grouped = true
+  let mut i = usize.ZERO
+  while i < events.length {
+    if replaces(events[i].kind) {
+      run List<usize>.append(&mut all, i)
+      let r = events[i].place.root
+      if r >= 16777216 { grouped = false }
+      else if r + usize.ONE > roots { roots = r + usize.ONE }
+    }
+    i = i + usize.ONE
+  }
+  if !grouped || List<usize>.length(&all) == usize.ZERO {
+    return ReplacesByRoot {grouped: false, roots: usize.ZERO, starts: List<usize>.make(),
+      indices: List<usize>.make(), all: move all}
+  }
+  let allSlice = List<usize>.asSlice(&all)
+  let mut starts = List<usize>.make()
+  run List<usize>.appendRepeated(&mut starts, usize.ZERO, roots + usize.ONE)
+  i = usize.ZERO
+  while i < allSlice.length {
+    let r = events[allSlice[i]].place.root
+    let counts = List<usize>.asMutSlice(&mut starts)
+    counts[r + usize.ONE] = counts[r + usize.ONE] + usize.ONE
+    i = i + usize.ONE
+  }
+  let mut r = usize.ZERO
+  while r < roots {
+    let sums = List<usize>.asMutSlice(&mut starts)
+    sums[r + usize.ONE] = sums[r + usize.ONE] + sums[r]
+    r = r + usize.ONE
+  }
+  let mut cursor = List<usize>.make()
+  run List<usize>.appendSlice(&mut cursor, Slice.view<usize>(List<usize>.asSlice(&starts), usize.ZERO, roots))
+  let mut indices = List<usize>.make()
+  run List<usize>.appendRepeated(&mut indices, usize.ZERO, allSlice.length)
+  i = usize.ZERO
+  while i < allSlice.length {
+    let ev = allSlice[i]
+    let root = events[ev].place.root
+    let slot = List<usize>.asSlice(&cursor)[root]
+    List<usize>.set(&mut indices, slot, ev)
+    List<usize>.set(&mut cursor, root, slot + usize.ONE)
+    i = i + usize.ONE
+  }
+  return ReplacesByRoot {grouped: true, roots: roots, starts: move starts, indices: move indices, all: move all}
+}
+
+fn replacesForRoot(replacesIndex: &ReplacesByRoot, root: usize) -> &[usize] {
+  if !replacesIndex.grouped { return List<usize>.asSlice(&replacesIndex.all) }
+  if root >= replacesIndex.roots {
+    let empty = List<usize>.asSlice(&replacesIndex.indices)
+    return Slice.view<usize>(empty, usize.ZERO, usize.ZERO)
+  }
+  let starts = List<usize>.asSlice(&replacesIndex.starts)
+  let start = starts[root]
+  return Slice.view<usize>(List<usize>.asSlice(&replacesIndex.indices), start, starts[root + usize.ONE] - start)
+}
+
 // Whether a loop repeats with every `match place` refinement it uses intact: a replacement in the
 // body of the subject of a match outside the loop invalidates a binding the next iteration uses.
-effect fn refinementRepeats(walker: &Walker<'_>, events: &[Event], repeat: &Loop, cache: &mut List<Reached>) -> bool
+effect fn refinementRepeats(walker: &Walker<'_>, events: &[Event], replacesIndex: &ReplacesByRoot, repeat: &Loop, cache: &mut List<Reached>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
+  if List<Refinement>.length(&walker.refinements) == usize.ZERO { return true }
   let mut use = usize.ZERO
   while use < events.length {
     let used = &events[use]
     if used.refiner != usize.MAX && used.point >= repeat.header && used.point < repeat.end && used.kind != Kind.End && used.kind != Kind.Expire {
       let test = refinementTest(walker, used.refiner)
       if test != usize.MAX && (test < repeat.header || test >= repeat.end) {
-        let mut source = usize.ZERO
-        while source < events.length {
-          let written = &events[source]
-          if written.point >= repeat.header && written.point < repeat.end && replaces(written.kind)
+        let candidates = replacesForRoot(replacesIndex, used.place.root)
+        let mut ci = usize.ZERO
+        while ci < candidates.length {
+          let written = &events[candidates[ci]]
+          if written.point >= repeat.header && written.point < repeat.end
             && coversRefined(&written.place, &used.place, used.refinedDepth)
             && run reachesAvoiding(walker, &mut cache.*, written.point, used.point, test) {
             return false
           }
-          source = source + usize.ONE
+          ci = ci + usize.ONE
         }
       }
     }
@@ -4971,8 +5206,6 @@ effect fn rejection(code: RejectionCode, access: Location, earlier: Option<Locat
 struct Solved {
   values: Values,
   scope: LoanScope,
-  // Per region, the regions it outlives directly.
-  shorter: List<List<usize>>,
 }
 
 // Where a view that carries `loan` is next used after `point`: the first read or cleanup reachable
@@ -4983,12 +5216,40 @@ effect fn expiredUse(walker: &Walker<'_>, solved: &Solved, loan: usize, point: u
 ! OutOfMemoryError ? &mut Allocator {
   let region = List<LoanFact>.asSlice(&walker.loans)[loan].region
   let regions = List<bool>.length(&walker.table.universalFlags)
-  let mut carried = List<bool>.make()
+  // Build outlives adjacency lazily (only called on the error path).
+  let longer = List<Region>.asSlice(&walker.table.longer)
+  let ends = List<Region>.asSlice(&walker.table.shorter)
+  let mut starts = List<usize>.make()
+  run List<usize>.appendRepeated(&mut starts, usize.ZERO, regions + usize.ONE)
   let mut at = usize.ZERO
-  while at < regions {
-    run List<bool>.append(&mut carried, false)
+  while at < longer.length {
+    let l = longer[at].index
+    let counts = List<usize>.asMutSlice(&mut starts)
+    counts[l + usize.ONE] = counts[l + usize.ONE] + usize.ONE
     at = at + usize.ONE
   }
+  at = usize.ZERO
+  while at < regions {
+    let sums = List<usize>.asMutSlice(&mut starts)
+    sums[at + usize.ONE] = sums[at + usize.ONE] + sums[at]
+    at = at + usize.ONE
+  }
+  let mut cursor = List<usize>.make()
+  run List<usize>.appendSlice(&mut cursor, Slice.view<usize>(List<usize>.asSlice(&starts), usize.ZERO, regions))
+  let mut targets = List<usize>.make()
+  run List<usize>.appendRepeated(&mut targets, usize.ZERO, longer.length)
+  at = usize.ZERO
+  while at < longer.length {
+    let l = longer[at].index
+    let slot = List<usize>.asSlice(&cursor)[l]
+    List<usize>.set(&mut targets, slot, ends[at].index)
+    List<usize>.set(&mut cursor, l, slot + usize.ONE)
+    at = at + usize.ONE
+  }
+  let startSlice = List<usize>.asSlice(&starts)
+  let targetSlice = List<usize>.asSlice(&targets)
+  let mut carried = List<bool>.make()
+  run List<bool>.appendRepeated(&mut carried, false, regions)
   let mut pending = List<usize>.make()
   run List<usize>.append(&mut pending, region.index)
   List<bool>.set(&mut carried, region.index, true)
@@ -4996,14 +5257,14 @@ effect fn expiredUse(walker: &Walker<'_>, solved: &Solved, loan: usize, point: u
     let last = List<usize>.length(&pending) - usize.ONE
     let current = List<usize>.asSlice(&pending)[last]
     List<usize>.truncate(&mut pending, last)
-    let next = List<usize>.asSlice(&List<List<usize>>.asSlice(&solved.shorter)[current])
-    let mut each = usize.ZERO
-    while each < next.length {
-      if !List<bool>.asSlice(&carried)[next[each]] {
-        List<bool>.set(&mut carried, next[each], true)
-        run List<usize>.append(&mut pending, next[each])
+    let mut e = startSlice[current]
+    while e < startSlice[current + usize.ONE] {
+      let nxt = targetSlice[e]
+      if !List<bool>.asSlice(&carried)[nxt] {
+        List<bool>.set(&mut carried, nxt, true)
+        run List<usize>.append(&mut pending, nxt)
       }
-      each = each + usize.ONE
+      e = e + usize.ONE
     }
   }
   let reached = run reachable(&walker.cfg, point, usize.MAX)
@@ -5540,158 +5801,308 @@ effect fn knownRelations(table: &RegionTable, declared: &mut List<Bound>) -> () 
 // For each consumed root (in `walker.consumed` order of first appearance), the points where it is moved
 // on every path: a forward must-analysis that a move sets and an assignment clears.
 struct Moved {
-  roots: List<usize>,
-  // `points` rows of `roots` flags.
-  flags: List<bool>,
+  // Dense column index for each value `0..valueCount`, or `usize.MAX` if untracked.
+  rootToCol: List<usize>,
+  words: usize,
+  // Per basic block: bitset of columns definitely moved on block entry (`blocks * words`).
+  blockIn: List<u64>,
+  // Sparse per-point effects: CSR by point (`opCodes`: `col` = consumed, `width + col` = assigned).
+  width: usize,
+  opStarts: List<usize>,
+  opCodes: List<usize>,
 }
 
-effect fn definitelyMoved(walker: &Walker<'_>) -> Moved ! OutOfMemoryError ? &mut Allocator {
+effect fn definitelyMoved(walker: &Walker<'_>, denseOf: &[usize], contracted: &ContractedCfg) -> Moved ! OutOfMemoryError ? &mut Allocator {
+  let values = denseOf.length
+  let drops = List<ValueUse>.asSlice(&walker.drops)
   let consumed = List<ValueUse>.asSlice(&walker.consumed)
-  let mut roots = List<usize>.make()
+  if drops.length == usize.ZERO || consumed.length == usize.ZERO {
+    return Moved {rootToCol: List<usize>.make(), words: usize.ZERO, blockIn: List<u64>.make(),
+      width: usize.ZERO, opStarts: List<usize>.make(), opCodes: List<usize>.make()}
+  }
+  // Only values that are both dropped (with tracked regions) AND consumed ever need `movedAt`.
+  let mut hasDrop = List<bool>.make()
+  run List<bool>.appendRepeated(&mut hasDrop, false, values)
+  let mut anyDrop = false
   let mut index = usize.ZERO
-  while index < consumed.length {
-    if !listed(List<usize>.asSlice(&roots), consumed[index].value) { run List<usize>.append(&mut roots, consumed[index].value) }
+  while index < drops.length {
+    let v = drops[index].value
+    if v < values && denseOf[v] != usize.MAX {
+      List<bool>.set(&mut hasDrop, v, true)
+      anyDrop = true
+    }
     index = index + usize.ONE
   }
-  let width = List<usize>.length(&roots)
-  let points = Cfg.points(&walker.cfg)
-  let mut flags = List<bool>.make()
-  let mut known = List<bool>.make()
-  let mut at = usize.ZERO
-  while at < points * width {
-    run List<bool>.append(&mut flags, true)
-    at = at + usize.ONE
+  if !anyDrop {
+    return Moved {rootToCol: List<usize>.make(), words: usize.ZERO, blockIn: List<u64>.make(),
+      width: usize.ZERO, opStarts: List<usize>.make(), opCodes: List<usize>.make()}
   }
-  at = usize.ZERO
-  while at < points {
-    run List<bool>.append(&mut known, false)
-    at = at + usize.ONE
-  }
-  if width == usize.ZERO { return Moved {roots: move roots, flags: move flags} }
-  // Per point: which roots it moves (1) or assigns (2).
-  let mut effects = List<u64>.make()
-  at = usize.ZERO
-  while at < points * width {
-    run List<u64>.append(&mut effects, 0)
-    at = at + usize.ONE
-  }
-  let listedRoots = List<usize>.asSlice(&roots)
+  let mut rootToCol = List<usize>.make()
+  run List<usize>.appendRepeated(&mut rootToCol, usize.MAX, values)
+  let mut width = usize.ZERO
+  let dropMask = List<bool>.asSlice(&hasDrop)
   index = usize.ZERO
   while index < consumed.length {
-    let column = slot(listedRoots, consumed[index].value)
-    List<u64>.set(&mut effects, consumed[index].point * width + column, 1)
+    let v = consumed[index].value
+    if v < values && dropMask[v] && List<usize>.asSlice(&rootToCol)[v] == usize.MAX {
+      List<usize>.set(&mut rootToCol, v, width)
+      width = width + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  if width == usize.ZERO {
+    return Moved {rootToCol: List<usize>.make(), words: usize.ZERO, blockIn: List<u64>.make(),
+      width: usize.ZERO, opStarts: List<usize>.make(), opCodes: List<usize>.make()}
+  }
+  let points = contracted.points
+  let blocks = contracted.blocks
+  let words = (width + 63) / 64
+  let colOf = List<usize>.asSlice(&rootToCol)
+  // Collect sparse per-point ops (assigns apply after consumed at same point, matching original overwrite order).
+  let mut opStarts = List<usize>.make()
+  run List<usize>.appendRepeated(&mut opStarts, usize.ZERO, points + usize.ONE)
+  let mut totalOps = usize.ZERO
+  index = usize.ZERO
+  while index < consumed.length {
+    let v = consumed[index].value
+    if v < values && colOf[v] != usize.MAX {
+      let p = consumed[index].point
+      let counts = List<usize>.asMutSlice(&mut opStarts)
+      counts[p + usize.ONE] = counts[p + usize.ONE] + usize.ONE
+      totalOps = totalOps + usize.ONE
+    }
     index = index + usize.ONE
   }
   let assigns = List<ValueUse>.asSlice(&walker.assigns)
   index = usize.ZERO
   while index < assigns.length {
-    let column = slot(listedRoots, assigns[index].value)
-    if column != usize.MAX { List<u64>.set(&mut effects, assigns[index].point * width + column, 2) }
+    let v = assigns[index].value
+    if v < values && colOf[v] != usize.MAX {
+      let p = assigns[index].point
+      let counts = List<usize>.asMutSlice(&mut opStarts)
+      counts[p + usize.ONE] = counts[p + usize.ONE] + usize.ONE
+      totalOps = totalOps + usize.ONE
+    }
     index = index + usize.ONE
   }
-  // Entry holds nothing moved; every other point starts unknown (all moved) and only loses flags.
-  let mut pending = List<usize>.make()
-  at = usize.ZERO
-  while at < width {
-    List<bool>.set(&mut flags, walker.entry * width + at, false)
-    at = at + usize.ONE
+  let mut p = usize.ZERO
+  while p < points {
+    let sums = List<usize>.asMutSlice(&mut opStarts)
+    sums[p + usize.ONE] = sums[p + usize.ONE] + sums[p]
+    p = p + usize.ONE
   }
-  List<bool>.set(&mut known, walker.entry, true)
-  run List<usize>.append(&mut pending, walker.entry)
-  while List<usize>.length(&pending) != usize.ZERO {
+  let mut cursor = List<usize>.make()
+  run List<usize>.appendSlice(&mut cursor, Slice.view<usize>(List<usize>.asSlice(&opStarts), usize.ZERO, points))
+  let mut opCodes = List<usize>.make()
+  run List<usize>.appendRepeated(&mut opCodes, usize.ZERO, totalOps)
+  // Place consumed ops first, then assign ops so assign overrides consumed at the same point.
+  index = usize.ZERO
+  while index < consumed.length {
+    let v = consumed[index].value
+    if v < values && colOf[v] != usize.MAX {
+      let pt = consumed[index].point
+      let slot = List<usize>.asSlice(&cursor)[pt]
+      List<usize>.set(&mut opCodes, slot, colOf[v])
+      List<usize>.set(&mut cursor, pt, slot + usize.ONE)
+    }
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < assigns.length {
+    let v = assigns[index].value
+    if v < values && colOf[v] != usize.MAX {
+      let pt = assigns[index].point
+      let slot = List<usize>.asSlice(&cursor)[pt]
+      List<usize>.set(&mut opCodes, slot, width + colOf[v])
+      List<usize>.set(&mut cursor, pt, slot + usize.ONE)
+    }
+    index = index + usize.ONE
+  }
+  let opStartSlice = List<usize>.asSlice(&opStarts)
+  let opCodeSlice = List<usize>.asSlice(&opCodes)
+  // Summarize per-block transfer: out = (in & ~blockClear) | blockSet.
+  let mut blockSet = List<u64>.make()
+  let mut blockClear = List<u64>.make()
+  run List<u64>.appendRepeated(&mut blockSet, 0, blocks * words)
+  run List<u64>.appendRepeated(&mut blockClear, 0, blocks * words)
+  let mut b = usize.ZERO
+  while b < blocks {
+    let pts = ContractedCfg.pointsOf(contracted, b)
+    let base = b * words
+    let mut i = usize.ZERO
+    while i < pts.length {
+      let pt = pts[i]
+      let mut o = opStartSlice[pt]
+      let end = opStartSlice[pt + usize.ONE]
+      while o < end {
+        let code = opCodeSlice[o]
+        if code < width {
+          let slot = base + wordOf(code)
+          let m = maskOf(code)
+          let sets = List<u64>.asMutSlice(&mut blockSet)
+          sets[slot] = u64.bitOr(sets[slot], m)
+          let clears = List<u64>.asMutSlice(&mut blockClear)
+          clears[slot] = u64.bitAnd(clears[slot], u64.bitNot(m))
+        } else {
+          let col = code - width
+          let slot = base + wordOf(col)
+          let m = maskOf(col)
+          let clears = List<u64>.asMutSlice(&mut blockClear)
+          clears[slot] = u64.bitOr(clears[slot], m)
+          let sets = List<u64>.asMutSlice(&mut blockSet)
+          sets[slot] = u64.bitAnd(sets[slot], u64.bitNot(m))
+        }
+        o = o + usize.ONE
+      }
+      i = i + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+  // Forward must-analysis on contracted blocks: entry starts all-0, others start all-1 and intersect.
+  let mut blockIn = List<u64>.make()
+  run List<u64>.appendRepeated(&mut blockIn, u64.MAX, blocks * words)
+  let mut known = List<bool>.make()
+  run List<bool>.appendRepeated(&mut known, false, blocks)
+  let mut queued = List<bool>.make()
+  run List<bool>.appendRepeated(&mut queued, false, blocks)
+  let entryBlock = List<usize>.asSlice(&contracted.blockOf)[walker.entry]
+  let mut w = usize.ZERO
+  while w < words {
+    List<u64>.set(&mut blockIn, entryBlock * words + w, 0)
+    w = w + usize.ONE
+  }
+  List<bool>.set(&mut known, entryBlock, true)
+  List<bool>.set(&mut queued, entryBlock, true)
+  let mut pending = List<usize>.make()
+  run List<usize>.append(&mut pending, entryBlock)
+  let setSlice = List<u64>.asSlice(&blockSet)
+  let clearSlice = List<u64>.asSlice(&blockClear)
+  while List<usize>.length(&pending) > usize.ZERO {
     let last = List<usize>.length(&pending) - usize.ONE
-    let point = List<usize>.remove(&mut pending, last)
-    let next = Cfg.next(&walker.cfg, point)
-    let mut successor = usize.ZERO
-    while successor < next.length {
-      let target = next[successor]
-      let mut changed = !List<bool>.get(&known, target)
+    let cur = List<usize>.asSlice(&pending)[last]
+    List<usize>.truncate(&mut pending, last)
+    List<bool>.set(&mut queued, cur, false)
+    let next = ContractedCfg.nextBlocks(contracted, cur)
+    let mut s = usize.ZERO
+    while s < next.length {
+      let target = next[s]
+      let mut changed = !List<bool>.asSlice(&known)[target]
       List<bool>.set(&mut known, target, true)
-      let mut column = usize.ZERO
-      while column < width {
-        // The state after `point`: its own move or assignment applies after its uses.
-        let change = List<u64>.get(&effects, point * width + column)
-        let mut out = List<bool>.get(&flags, point * width + column)
-        if change == 1 { out = true }
-        if change == 2 { out = false }
-        if !out && List<bool>.get(&flags, target * width + column) {
-          List<bool>.set(&mut flags, target * width + column, false)
+      w = usize.ZERO
+      while w < words {
+        let curSlot = cur * words + w
+        let out = u64.bitOr(u64.bitAnd(List<u64>.asSlice(&blockIn)[curSlot], u64.bitNot(clearSlice[curSlot])), setSlice[curSlot])
+        let tSlot = target * words + w
+        let before = List<u64>.asSlice(&blockIn)[tSlot]
+        let after = u64.bitAnd(before, out)
+        if after != before {
+          List<u64>.set(&mut blockIn, tSlot, after)
           changed = true
         }
-        column = column + usize.ONE
+        w = w + usize.ONE
       }
-      if changed { run List<usize>.append(&mut pending, target) }
-      successor = successor + usize.ONE
+      if changed && !List<bool>.asSlice(&queued)[target] {
+        List<bool>.set(&mut queued, target, true)
+        run List<usize>.append(&mut pending, target)
+      }
+      s = s + usize.ONE
     }
   }
-  return Moved {roots: move roots, flags: move flags}
+  return Moved {rootToCol: move rootToCol, words: words, blockIn: move blockIn,
+    width: width, opStarts: move opStarts, opCodes: move opCodes}
 }
 
-fn slot(roots: &[usize], root: usize) -> usize {
-  let mut at = usize.ZERO
-  while at < roots.length {
-    if roots[at] == root { return at }
-    at = at + usize.ONE
+// Whether `use`'s value is definitely moved on entry to `use.point`.
+fn movedAt(moved: &Moved, contracted: &ContractedCfg, use: ValueUse) -> bool {
+  if moved.width == usize.ZERO { return false }
+  let colMap = List<usize>.asSlice(&moved.rootToCol)
+  if use.value >= colMap.length { return false }
+  let col = colMap[use.value]
+  if col == usize.MAX { return false }
+  let b = List<usize>.asSlice(&contracted.blockOf)[use.point]
+  let off = List<usize>.asSlice(&contracted.offsetInBlock)[use.point]
+  let mut state = u64.bitAnd(List<u64>.asSlice(&moved.blockIn)[b * moved.words + wordOf(col)], maskOf(col)) != 0
+  let pts = ContractedCfg.pointsOf(contracted, b)
+  let starts = List<usize>.asSlice(&moved.opStarts)
+  let codes = List<usize>.asSlice(&moved.opCodes)
+  let assignCode = moved.width + col
+  let mut i = usize.ZERO
+  while i < off {
+    let pt = pts[i]
+    let mut o = starts[pt]
+    let end = starts[pt + usize.ONE]
+    while o < end {
+      let code = codes[o]
+      if code == col { state = true }
+      else if code == assignCode { state = false }
+      o = o + usize.ONE
+    }
+    i = i + usize.ONE
   }
-  return usize.MAX
-}
-
-// Whether `use`'s value is definitely moved where it is used.
-fn movedAt(moved: &Moved, walker: &Walker<'_>, use: ValueUse) -> bool {
-  let column = slot(List<usize>.asSlice(&moved.roots), use.value)
-  if column == usize.MAX { return false }
-  let width = List<usize>.length(&moved.roots)
-  return List<bool>.get(&moved.flags, use.point * width + column)
+  return state
 }
 
 // Adds each path inclusion's points: those reachable from its `from` from which its `to` is reachable
-// without passing through `from` again.
-effect fn includePaths(walker: &Walker<'_>, regions: &mut Regions) -> () ! OutOfMemoryError ? &mut Allocator {
+// without passing through `from` again. Uses O(1) intra-block fast path and contracted block BFS otherwise.
+effect fn includePaths(walker: &Walker<'_>, contracted: &ContractedCfg, regions: &mut Regions) -> () ! OutOfMemoryError ? &mut Allocator {
   let paths = List<PathInclusion>.asSlice(&walker.paths)
   if paths.length == usize.ZERO { return () }
-  let points = Cfg.points(&walker.cfg)
-  let mut previous = List<List<usize>>.make()
-  let mut point = usize.ZERO
-  while point < points {
-    run List<List<usize>>.append(&mut previous, List<usize>.make())
-    point = point + usize.ONE
-  }
-  point = usize.ZERO
-  while point < points {
-    let next = Cfg.next(&walker.cfg, point)
-    let mut at = usize.ZERO
-    while at < next.length {
-      run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut previous)[next[at]], point)
-      at = at + usize.ONE
-    }
-    point = point + usize.ONE
-  }
+  let blocks = contracted.blocks
+  let blockOf = List<usize>.asSlice(&contracted.blockOf)
+  let offsetOf = List<usize>.asSlice(&contracted.offsetInBlock)
   let mut forward = List<bool>.make()
   let mut backward = List<bool>.make()
-  point = usize.ZERO
-  while point < points {
-    run List<bool>.append(&mut forward, false)
-    run List<bool>.append(&mut backward, false)
-    point = point + usize.ONE
-  }
+  run List<bool>.appendRepeated(&mut forward, false, blocks)
+  run List<bool>.appendRepeated(&mut backward, false, blocks)
   let mut stack = List<usize>.make()
   let mut reached = List<usize>.make()
   let mut returned = List<usize>.make()
   let mut index = usize.ZERO
   while index < paths.length {
     let path = paths[index]
+    let fb = blockOf[path.from]
+    let tb = blockOf[path.to]
+    let fOff = offsetOf[path.from]
+    let tOff = offsetOf[path.to]
+    // Same basic block with `from <= to`: no path can leave and re-enter `fb` without passing `from` again.
+    if fb == tb && fOff <= tOff {
+      let pts = ContractedCfg.pointsOf(contracted, fb)
+      let mut i = fOff
+      while i <= tOff {
+        run Regions.include(&mut regions.*, path.region, pts[i])
+        i = i + usize.ONE
+      }
+      index = index + usize.ONE
+      continue
+    }
     List<usize>.truncate(&mut reached, usize.ZERO)
     List<usize>.truncate(&mut returned, usize.ZERO)
-    List<bool>.set(&mut forward, path.from, true)
-    run List<usize>.append(&mut reached, path.from)
-    run List<usize>.append(&mut stack, path.from)
-    while List<usize>.length(&stack) != usize.ZERO {
+    // Forward reachability on blocks starting from `fb`'s outgoing edges (plus `fb` itself if `fb != tb`).
+    if fb == tb {
+      // `fOff > tOff`: must leave `fb` and cycle back to `fb`.
+      let next = ContractedCfg.nextBlocks(contracted, fb)
+      let mut s = usize.ZERO
+      while s < next.length {
+        if !List<bool>.asSlice(&forward)[next[s]] {
+          List<bool>.set(&mut forward, next[s], true)
+          run List<usize>.append(&mut reached, next[s])
+          run List<usize>.append(&mut stack, next[s])
+        }
+        s = s + usize.ONE
+      }
+    } else {
+      List<bool>.set(&mut forward, fb, true)
+      run List<usize>.append(&mut reached, fb)
+      run List<usize>.append(&mut stack, fb)
+    }
+    while List<usize>.length(&stack) > usize.ZERO {
       let last = List<usize>.length(&stack) - usize.ONE
-      let current = List<usize>.remove(&mut stack, last)
-      let next = Cfg.next(&walker.cfg, current)
+      let current = List<usize>.asSlice(&stack)[last]
+      List<usize>.truncate(&mut stack, last)
+      let next = ContractedCfg.nextBlocks(contracted, current)
       let mut at = usize.ZERO
       while at < next.length {
-        if !List<bool>.get(&forward, next[at]) {
+        if !List<bool>.asSlice(&forward)[next[at]] {
           List<bool>.set(&mut forward, next[at], true)
           run List<usize>.append(&mut reached, next[at])
           run List<usize>.append(&mut stack, next[at])
@@ -5699,18 +6110,35 @@ effect fn includePaths(walker: &Walker<'_>, regions: &mut Regions) -> () ! OutOf
         at = at + usize.ONE
       }
     }
-    List<bool>.set(&mut backward, path.to, true)
-    run List<usize>.append(&mut returned, path.to)
-    run List<usize>.append(&mut stack, path.to)
-    while List<usize>.length(&stack) != usize.ZERO {
+    // Backward reachability on blocks starting from `tb`, stopping at `fb` (not walking past `from`).
+    let mut toTailBackward = false
+    if fb == tb {
+      // Must reach `fb` from its predecessors (wrapping back around the loop).
+      let prev = ContractedCfg.prevBlocks(contracted, fb)
+      let mut p = usize.ZERO
+      while p < prev.length {
+        if !List<bool>.asSlice(&backward)[prev[p]] {
+          List<bool>.set(&mut backward, prev[p], true)
+          run List<usize>.append(&mut returned, prev[p])
+          run List<usize>.append(&mut stack, prev[p])
+        }
+        p = p + usize.ONE
+      }
+    } else {
+      List<bool>.set(&mut backward, tb, true)
+      run List<usize>.append(&mut returned, tb)
+      run List<usize>.append(&mut stack, tb)
+    }
+    while List<usize>.length(&stack) > usize.ZERO {
       let last = List<usize>.length(&stack) - usize.ONE
-      let current = List<usize>.remove(&mut stack, last)
-      let before = List<usize>.asSlice(&List<List<usize>>.asSlice(&previous)[current])
-      // A path through the borrow again, around a loop, reaches a fresh loan.
+      let current = List<usize>.asSlice(&stack)[last]
+      List<usize>.truncate(&mut stack, last)
+      if current == fb { continue }
+      let before = ContractedCfg.prevBlocks(contracted, current)
       let mut at = usize.ZERO
-      if current == path.from { at = before.length }
       while at < before.length {
-        if !List<bool>.get(&backward, before[at]) {
+        if before[at] == tb { toTailBackward = true }
+        if !List<bool>.asSlice(&backward)[before[at]] {
           List<bool>.set(&mut backward, before[at], true)
           run List<usize>.append(&mut returned, before[at])
           run List<usize>.append(&mut stack, before[at])
@@ -5718,19 +6146,58 @@ effect fn includePaths(walker: &Walker<'_>, regions: &mut Regions) -> () ! OutOf
         at = at + usize.ONE
       }
     }
-    // Only the points the forward walk reached can be on a path, and only those flags were set.
-    let forwardPoints = List<usize>.asSlice(&reached)
+    if fb == tb {
+      // `fb` is on a cycle iff `forward[fb]` is true (reached back from `nextBlocks(fb)`).
+      if List<bool>.asSlice(&forward)[fb] {
+        let pts = ContractedCfg.pointsOf(contracted, fb)
+        let mut i = usize.ZERO
+        while i <= tOff {
+          run Regions.include(&mut regions.*, path.region, pts[i])
+          i = i + usize.ONE
+        }
+        i = fOff
+        while i < pts.length {
+          run Regions.include(&mut regions.*, path.region, pts[i])
+          i = i + usize.ONE
+        }
+      }
+    }
+    let forwardBlocks = List<usize>.asSlice(&reached)
     let mut each = usize.ZERO
-    while each < forwardPoints.length {
-      let at = forwardPoints[each]
-      if List<bool>.get(&backward, at) { Regions.include(&mut regions.*, path.region, at) }
-      List<bool>.set(&mut forward, at, false)
+    while each < forwardBlocks.length {
+      let b = forwardBlocks[each]
+      if List<bool>.asSlice(&backward)[b] {
+        let pts = ContractedCfg.pointsOf(contracted, b)
+        if b == fb && b == tb {
+          // Already handled above for `fb == tb`.
+        } else if b == fb {
+          let mut i = fOff
+          while i < pts.length {
+            run Regions.include(&mut regions.*, path.region, pts[i])
+            i = i + usize.ONE
+          }
+        } else if b == tb {
+          let limit = if toTailBackward { pts.length } else { tOff + usize.ONE }
+          let mut i = usize.ZERO
+          while i < limit {
+            run Regions.include(&mut regions.*, path.region, pts[i])
+            i = i + usize.ONE
+          }
+        } else {
+          let mut i = usize.ZERO
+          while i < pts.length {
+            run Regions.include(&mut regions.*, path.region, pts[i])
+            i = i + usize.ONE
+          }
+        }
+      }
+      List<bool>.set(&mut forward, b, false)
       each = each + usize.ONE
     }
-    let backwardPoints = List<usize>.asSlice(&returned)
+    let backwardBlocks = List<usize>.asSlice(&returned)
     each = usize.ZERO
-    while each < backwardPoints.length {
-      List<bool>.set(&mut backward, backwardPoints[each], false)
+    while each < backwardBlocks.length {
+      List<bool>.set(&mut backward, backwardBlocks[each], false)
       each = each + usize.ONE
     }
     index = index + usize.ONE
@@ -5740,6 +6207,13 @@ effect fn includePaths(walker: &Walker<'_>, regions: &mut Regions) -> () ! OutOf
 
 effect fn solve(walker: &Walker<'_>, declared: &[Bound]) -> Solved ! OutOfMemoryError ? &mut Allocator {
   let points = Cfg.points(&walker.cfg)
+  let flags = List<bool>.asSlice(&walker.table.universalFlags)
+  let facts = List<LoanFact>.asSlice(&walker.loans)
+  // Fast path: bodies with no regions and no loans need zero liveness, region, or loan solving.
+  if flags.length == usize.ZERO && facts.length == usize.ZERO {
+    return Solved {values: Values.empty(points), scope: LoanScope.empty(points)}
+  }
+  let contracted = run ContractedCfg.contract(&walker.cfg)
   let numberings = List<Renumbering>.asSlice(&walker.table.numberings)
   let values = walker.input.locals.length + walker.input.nodes.length
   // Only values whose types name regions take part in liveness, densely numbered.
@@ -5758,42 +6232,10 @@ effect fn solve(walker: &Walker<'_>, declared: &[Bound]) -> Solved ! OutOfMemory
   }
   let denseOf = List<usize>.asSlice(&dense)
   let tracked = List<usize>.asSlice(&members)
-  let mut liveness = run Liveness.make(points, tracked.length)
-  let reads = List<ValueUse>.asSlice(&walker.reads)
-  index = usize.ZERO
-  while index < reads.length {
-    if reads[index].value < values && denseOf[reads[index].value] != usize.MAX { Liveness.read(&mut liveness, reads[index].point, denseOf[reads[index].value]) }
-    index = index + usize.ONE
-  }
-  let moved = run definitelyMoved(&walker.*)
-  let drops = List<ValueUse>.asSlice(&walker.drops)
-  index = usize.ZERO
-  while index < drops.length {
-    if drops[index].value < values && denseOf[drops[index].value] != usize.MAX && !movedAt(&moved, &walker.*, drops[index]) {
-      Liveness.dropUse(&mut liveness, drops[index].point, denseOf[drops[index].value])
-    }
-    index = index + usize.ONE
-  }
-  let consumed = List<ValueUse>.asSlice(&walker.consumed)
-  index = usize.ZERO
-  while index < consumed.length {
-    if consumed[index].value < values && denseOf[consumed[index].value] != usize.MAX { Liveness.assign(&mut liveness, consumed[index].point, denseOf[consumed[index].value]) }
-    index = index + usize.ONE
-  }
-  let assigns = List<ValueUse>.asSlice(&walker.assigns)
-  index = usize.ZERO
-  while index < assigns.length {
-    if assigns[index].value < values && denseOf[assigns[index].value] != usize.MAX { Liveness.assign(&mut liveness, assigns[index].point, denseOf[assigns[index].value]) }
-    index = index + usize.ONE
-  }
-  let live = run Liveness.solve(&liveness, &walker.cfg)
-  let flags = List<bool>.asSlice(&walker.table.universalFlags)
   let mut regions = Regions.make(points)
-  let mut shorter = List<List<usize>>.make()
   index = usize.ZERO
   while index < flags.length {
     if flags[index] { drop run Regions.universal(&mut regions) } else { drop run Regions.region(&mut regions) }
-    run List<List<usize>>.append(&mut shorter, List<usize>.make())
     index = index + usize.ONE
   }
   let longer = List<Region>.asSlice(&walker.table.longer)
@@ -5801,61 +6243,168 @@ effect fn solve(walker: &Walker<'_>, declared: &[Bound]) -> Solved ! OutOfMemory
   index = usize.ZERO
   while index < longer.length {
     run Regions.outlives(&mut regions, longer[index], ends[index])
-    run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut shorter)[longer[index].index], ends[index].index)
     index = index + usize.ONE
   }
   let inclusions = List<Inclusion>.asSlice(&walker.inclusions)
   index = usize.ZERO
   while index < inclusions.length {
-    Regions.include(&mut regions, inclusions[index].region, inclusions[index].point)
+    run Regions.include(&mut regions, inclusions[index].region, inclusions[index].point)
     index = index + usize.ONE
   }
-  run includePaths(&walker.*, &mut regions)
-  // A region holds every point where a value whose type names it is live, and a region its cleanup
-  // reads every point where its cleanup may still run.
-  let cleanup = List<bool>.asSlice(&walker.cleanupRegions)
-  let mut point = usize.ZERO
-  while point < points {
-    let mut member = Live.nextHeld(&live, point, usize.ZERO)
-    while member < tracked.length {
-      let used = Live.live(&live, point, member)
-      if used || Live.dropLive(&live, point, member) {
-        let held = List<Region>.asSlice(&numberings[tracked[member]].regions)
-        let mut each = usize.ZERO
-        while each < held.length {
-          if used || (held[each].index < cleanup.length && cleanup[held[each].index]) {
-            Regions.include(&mut regions, held[each], point)
+  run includePaths(&walker.*, &contracted, &mut regions)
+  if tracked.length > usize.ZERO {
+    let mut liveness = run Liveness.make(points, tracked.length)
+    let reads = List<ValueUse>.asSlice(&walker.reads)
+    index = usize.ZERO
+    while index < reads.length {
+      if reads[index].value < values && denseOf[reads[index].value] != usize.MAX {
+        run Liveness.read(&mut liveness, reads[index].point, denseOf[reads[index].value])
+      }
+      index = index + usize.ONE
+    }
+    let moved = run definitelyMoved(&walker.*, denseOf, &contracted)
+    let drops = List<ValueUse>.asSlice(&walker.drops)
+    index = usize.ZERO
+    while index < drops.length {
+      if drops[index].value < values && denseOf[drops[index].value] != usize.MAX && !movedAt(&moved, &contracted, drops[index]) {
+        run Liveness.dropUse(&mut liveness, drops[index].point, denseOf[drops[index].value])
+      }
+      index = index + usize.ONE
+    }
+    let consumed = List<ValueUse>.asSlice(&walker.consumed)
+    index = usize.ZERO
+    while index < consumed.length {
+      if consumed[index].value < values && denseOf[consumed[index].value] != usize.MAX {
+        run Liveness.assign(&mut liveness, consumed[index].point, denseOf[consumed[index].value])
+      }
+      index = index + usize.ONE
+    }
+    let assigns = List<ValueUse>.asSlice(&walker.assigns)
+    index = usize.ZERO
+    while index < assigns.length {
+      if assigns[index].value < values && denseOf[assigns[index].value] != usize.MAX {
+        run Liveness.assign(&mut liveness, assigns[index].point, denseOf[assigns[index].value])
+      }
+      index = index + usize.ONE
+    }
+    let live = run Liveness.solveContracted(&liveness, &contracted)
+    // Walk each block backward with a single reusable live-row buffer to seed regions without
+    // materializing a `points * width` liveness matrix.
+    let cleanup = List<bool>.asSlice(&walker.cleanupRegions)
+    let rowWidth = Live.rowWidth(&live)
+    let mut row = List<u64>.make()
+    run List<u64>.appendRepeated(&mut row, 0, rowWidth)
+    let blockCount = Live.blockCount(&live)
+    let mut b = usize.ZERO
+    while b < blockCount {
+      Live.copyBlockOut(&live, b, List<u64>.asMutSlice(&mut row))
+      let pts = Live.blockPointsOf(&live, b)
+      let mut idx = pts.length
+      while idx > usize.ZERO {
+        idx = idx - usize.ONE
+        let pt = pts[idx]
+        Live.stepBackward(&live, pt, List<u64>.asMutSlice(&mut row))
+        let rowSlice = List<u64>.asSlice(&row)
+        let mut member = Live.nextHeldInRow(&live, rowSlice, usize.ZERO)
+        while member < tracked.length {
+          let used = Live.liveInRow(&live, rowSlice, member)
+          if used || Live.dropLiveInRow(&live, rowSlice, member) {
+            let held = List<Region>.asSlice(&numberings[tracked[member]].regions)
+            let mut each = usize.ZERO
+            while each < held.length {
+              if used || (held[each].index < cleanup.length && cleanup[held[each].index]) {
+                run Regions.include(&mut regions, held[each], pt)
+              }
+              each = each + usize.ONE
+            }
           }
-          each = each + usize.ONE
+          member = Live.nextHeldInRow(&live, rowSlice, member + usize.ONE)
         }
       }
-      member = Live.nextHeld(&live, point, member + usize.ONE)
+      b = b + usize.ONE
     }
-    point = point + usize.ONE
   }
   let solvedValues = run Regions.solve(&regions)
+  if facts.length == usize.ZERO {
+    return Solved {values: move solvedValues, scope: LoanScope.empty(points)}
+  }
   let mut loans = Loans.make()
-  let facts = List<LoanFact>.asSlice(&walker.loans)
+  let mut maxLoanRoot = usize.ZERO
+  let mut bucketLoans = true
   index = usize.ZERO
   while index < facts.length {
     drop run Loans.loan(&mut loans, facts[index].point, facts[index].region)
+    let r = facts[index].place.root
+    if r >= 16777216 { bucketLoans = false }
+    else if r + usize.ONE > maxLoanRoot { maxLoanRoot = r + usize.ONE }
     index = index + usize.ONE
   }
   // Replacing a place, or a prefix of it, leaves no path to what a loan of it borrowed.
+  // Bucket loans by `place.root` into CSR so Write x Loans is O(W + L) instead of O(W * L).
   let events = List<Event>.asSlice(&walker.events)
-  index = usize.ZERO
-  while index < events.length {
-    if events[index].kind == Kind.Write {
-      let mut loan = usize.ZERO
-      while loan < facts.length {
-        if covers(&events[index].place, &facts[loan].place) { run Loans.overwrite(&mut loans, Loan {index: loan}, events[index].point) }
-        loan = loan + usize.ONE
-      }
+  if bucketLoans {
+    let mut loanStarts = List<usize>.make()
+    run List<usize>.appendRepeated(&mut loanStarts, usize.ZERO, maxLoanRoot + usize.ONE)
+    index = usize.ZERO
+    while index < facts.length {
+      let r = facts[index].place.root
+      let counts = List<usize>.asMutSlice(&mut loanStarts)
+      counts[r + usize.ONE] = counts[r + usize.ONE] + usize.ONE
+      index = index + usize.ONE
     }
-    index = index + usize.ONE
+    let mut r = usize.ZERO
+    while r < maxLoanRoot {
+      let sums = List<usize>.asMutSlice(&mut loanStarts)
+      sums[r + usize.ONE] = sums[r + usize.ONE] + sums[r]
+      r = r + usize.ONE
+    }
+    let mut cursor = List<usize>.make()
+    run List<usize>.appendSlice(&mut cursor, Slice.view<usize>(List<usize>.asSlice(&loanStarts), usize.ZERO, maxLoanRoot))
+    let mut loanItems = List<usize>.make()
+    run List<usize>.appendRepeated(&mut loanItems, usize.ZERO, facts.length)
+    index = usize.ZERO
+    while index < facts.length {
+      let root = facts[index].place.root
+      let slot = List<usize>.asSlice(&cursor)[root]
+      List<usize>.set(&mut loanItems, slot, index)
+      List<usize>.set(&mut cursor, root, slot + usize.ONE)
+      index = index + usize.ONE
+    }
+    let startSlice = List<usize>.asSlice(&loanStarts)
+    let itemSlice = List<usize>.asSlice(&loanItems)
+    index = usize.ZERO
+    while index < events.length {
+      if events[index].kind == Kind.Write {
+        let root = events[index].place.root
+        if root < maxLoanRoot {
+          let mut pos = startSlice[root]
+          let end = startSlice[root + usize.ONE]
+          while pos < end {
+            let loan = itemSlice[pos]
+            if covers(&events[index].place, &facts[loan].place) {
+              run Loans.overwrite(&mut loans, Loan {index: loan}, events[index].point)
+            }
+            pos = pos + usize.ONE
+          }
+        }
+      }
+      index = index + usize.ONE
+    }
+  } else {
+    index = usize.ZERO
+    while index < events.length {
+      if events[index].kind == Kind.Write {
+        let mut loan = usize.ZERO
+        while loan < facts.length {
+          if covers(&events[index].place, &facts[loan].place) { run Loans.overwrite(&mut loans, Loan {index: loan}, events[index].point) }
+          loan = loan + usize.ONE
+        }
+      }
+      index = index + usize.ONE
+    }
   }
   let scope = run Loans.solve(&loans, &walker.cfg, &solvedValues)
-  return Solved {values: move solvedValues, scope: move scope, shorter: move shorter}
+  return Solved {values: move solvedValues, scope: move scope}
 }
 
 // Every check over the solved body, in evaluation order: loop headers, consumed targets, moves,
@@ -5877,8 +6426,20 @@ effect fn findConflicts(walker: &Walker<'_>, solved: &Solved, relation: Option<L
   }
   let moved = List<usize>.asSlice(&moves)
   let width = (moved.length + 63) / 64
-  let mut reach = Reach {entering: List<u64>.make(), leaving: List<u64>.make()}
+  let mut reach = Reach {eventEntering: List<u64>.make(), blockIn: List<u64>.make(),
+    forward: ContractedCfg {points: usize.ZERO, blocks: usize.ZERO, blockOf: List<usize>.make(),
+      offsetInBlock: List<usize>.make(), blockStarts: List<usize>.make(), blockPoints: List<usize>.make(),
+      succStarts: List<usize>.make(), succBlocks: List<usize>.make(), predStarts: List<usize>.make(),
+      predBlocks: List<usize>.make()},
+    groups: MoveGroups {grouped: false, roots: usize.ZERO, rootStarts: List<usize>.make(),
+      rootBits: List<usize>.make(), eventBits: List<usize>.make()}}
   if width > usize.ZERO { reach = run reaching(walker, moved, width) }
+  let replacesIndex = if List<Refinement>.length(&walker.refinements) > usize.ZERO {
+    run groupReplaces(events)
+  } else {
+    ReplacesByRoot {grouped: false, roots: usize.ZERO, starts: List<usize>.make(),
+      indices: List<usize>.make(), all: List<usize>.make()}
+  }
   let mut cache = List<Reached>.make()
   let mut reports = List<Report>.make()
   let mut checkedLoops = usize.ZERO
@@ -5887,9 +6448,9 @@ effect fn findConflicts(walker: &Walker<'_>, solved: &Solved, relation: Option<L
   while at <= events.length && !stopped {
     // A loop header is checked in evaluation order, before the first access after it.
     while checkedLoops < loops.length && (at == events.length || loops[checkedLoops].header < events[at].point) {
-      let repeats = run refinementRepeats(walker, events, &loops[checkedLoops], &mut cache)
+      let repeats = run refinementRepeats(walker, events, &replacesIndex, &loops[checkedLoops], &mut cache)
       let mut differing = usize.MAX
-      if repeats && width > usize.ZERO { differing = incompatibleHeader(walker, events, moved, &reach, width, &loops[checkedLoops]) }
+      if repeats && width > usize.ZERO { differing = run incompatibleHeader(walker, events, moved, &reach, width, &loops[checkedLoops]) }
       if !repeats || differing != usize.MAX {
         if List<Report>.length(&reports) == usize.ZERO {
           // A move that only some paths into the header made is related, so the report names it.
@@ -5911,7 +6472,7 @@ effect fn findConflicts(walker: &Walker<'_>, solved: &Solved, relation: Option<L
       break
     }
     let mut bit = usize.ZERO
-    if width > usize.ZERO { bit = nextReaching(List<u64>.asSlice(&reach.entering), width, event.point, usize.ZERO, moved.length) }
+    if width > usize.ZERO { bit = nextReaching(List<u64>.asSlice(&reach.eventEntering), width, at, usize.ZERO, moved.length) }
     while event.kind != Kind.End && event.kind != Kind.Expire && bit < moved.length {
       let source = &events[moved[bit]]
       if overlap(&source.place, &event.place) != usize.ZERO {
@@ -5929,23 +6490,26 @@ effect fn findConflicts(walker: &Walker<'_>, solved: &Solved, relation: Option<L
           break
         }
       }
-      bit = nextReaching(List<u64>.asSlice(&reach.entering), width, event.point, bit + usize.ONE, moved.length)
+      bit = nextReaching(List<u64>.asSlice(&reach.eventEntering), width, at, bit + usize.ONE, moved.length)
     }
     if stopped { break }
     // A `match place` binding names the payload its match selected; once the subject place is
     // replaced, the binding no longer denotes a place of it.
     if event.refiner != usize.MAX && event.kind != Kind.End && event.kind != Kind.Expire && List<Report>.length(&reports) == usize.ZERO {
       let test = refinementTest(walker, event.refiner)
-      let mut source = usize.ZERO
-      while test != usize.MAX && source < events.length {
-        let written = &events[source]
-        if replaces(written.kind) && coversRefined(&written.place, &event.place, event.refinedDepth)
-          && run reachesAvoiding(walker, &mut cache, written.point, event.point, test) {
-          run List<Report>.append(&mut reports, Report {code: RejectionCode.ExtractionBoundary, access: event.span, related: true,
-            earlier: written.span, requestedExclusive: false, existingExclusive: false, verb: ConflictVerb.Reading, local: false})
-          break
+      if test != usize.MAX {
+        let candidates = replacesForRoot(&replacesIndex, event.place.root)
+        let mut ci = usize.ZERO
+        while ci < candidates.length {
+          let written = &events[candidates[ci]]
+          if coversRefined(&written.place, &event.place, event.refinedDepth)
+            && run reachesAvoiding(walker, &mut cache, written.point, event.point, test) {
+            run List<Report>.append(&mut reports, Report {code: RejectionCode.ExtractionBoundary, access: event.span, related: true,
+              earlier: written.span, requestedExclusive: false, existingExclusive: false, verb: ConflictVerb.Reading, local: false})
+            break
+          }
+          ci = ci + usize.ONE
         }
-        source = source + usize.ONE
       }
     }
     // Only the loans in scope at this point can conflict with it.
