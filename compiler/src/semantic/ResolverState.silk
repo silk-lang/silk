@@ -70,6 +70,7 @@ import semantic.SourceRevision {Observation}
 import semantic.StorageOperation {StorageOperation}
 import semantic.StaticExecution
 import semantic.StaticExecution {PrefixWork as StaticPrefixWork, Binding as StaticBinding}
+import semantic.StaticValue
 import semantic.StaticValue {Value as StaticData}
 import semantic.Target {Target as MachineTarget}
 import semantic.Type {
@@ -97,6 +98,7 @@ import silk.core.ownership {Copy}
 import silk.core.result {Result}
 import silk.mem.shared {Shared}
 import silk.mem.interned {Interned}
+import silk.num.u32
 import silk.num.usize
 import silk.collections.list {List}
 import silk.collections.slice {Slice}
@@ -148,7 +150,7 @@ import semantic.Implementations {
 import semantic.SignatureCheck {answerBackendGap, reportedDiagnostics}
 import semantic.ConformanceProve {Discovery, ModuleScan, RegionProof, proveAppliedBounds}
 import semantic.PatternAndLambda {ActiveLambda, RowFieldSite}
-import semantic.BodyDriver {BodyFacts, StaticCallHint, StaticReads}
+import semantic.BodyDriver {BodyFacts, StaticReads}
 import semantic.MirLowering {
   CheckScope,
   CheckedDispatch,
@@ -1012,6 +1014,29 @@ pub union SelectionFact {
 pub struct IterationFacts {
   pub ordinal: usize,
   pub calls: List<ResolvedCall>,
+  pub bindings: List<StaticBinding>,
+  pub checkedBinders: List<StaticRootBinder>,
+}
+
+pub struct StaticForFrame {
+  pub syntax: HirId,
+  pub ordinal: usize,
+}
+
+pub struct BodyStaticContext {
+  pub ordinal: usize,
+  pub application: Application,
+  pub bindings: List<StaticBinding>,
+  pub checkedBinders: List<StaticRootBinder>,
+  pub constants: List<StaticBinding>,
+  pub iterations: List<StaticForFrame>,
+}
+
+pub struct ResolvedCalls {
+  pub entries: List<ResolvedCall>,
+  pub byId: InternIndex,
+  pub hasSelected: bool,
+  pub hasRefused: bool,
 }
 
 // An authored name resolves to a source function, a constant, a sealed primitive, or a selected
@@ -1248,6 +1273,8 @@ pub struct Resolver {
   // Modules with a NonParking obligation on an Effect that still needs a provider.
   pub nonParkingCallers: List<usize>,
   pub checkImageScope: ContentHash,
+  pub buildImageScope: ContentHash,
+  pub activeImageScope: ContentHash,
   // Whether a module the store's load read writes an erased type (`Semantic.offerErasure`).
   pub loadedErasure: bool,
   pub typeErasure: ErasedTypeMemo,
@@ -1261,9 +1288,6 @@ pub struct Resolver {
   // and selected application. A call that reaches one of them again runs in its caller's machine,
   // which reports the cycle.
   pub staticResultsInFlight: List<usize>,
-  // The receiver call whose static arguments the body being checked found no selection for: its
-  // Body query selects again with it (`resolveBody`).
-  pub discoveredStaticCall: Option<StaticCallHint>,
   // The field read whose subject is the index expression being checked next, which an
   // `Intrinsic.Rows` subject answers as one place (INDEX-002), and whether that subject did.
   pub rowFieldSite: Option<RowFieldSite>,
@@ -1417,8 +1441,11 @@ pub struct Resolver {
   // Why each outdated unit failed verification while the store is traced: the unit, then the
   // dependee that changed.
   pub staleCauses: List<StaleCause>,
-  // Never published; separates nested inference transactions within this resolver.
-  pub nextInferenceId: usize,
+  // Never published; body-local counter for stack-scoped InferVar(u32) owners (0 = elided,
+  // 1 = call prefix, 2+ = dynamic).
+  pub nextInferenceId: u32,
+  // Cached interned `DeclarationId.inferVar(slot)` values indexed by `slot`.
+  pub inferOwners: List<Interned<DeclarationId>>,
   // Set while a section's arguments are checked: the region check does not relate a section's bound
   // regions to its captured loans, so caller-local invariant regions stay exact there.
   pub exactLocalRegions: bool,
@@ -1524,6 +1551,9 @@ pub struct BodyFrame {
   /// A declaration body's own source, where a diagnostic finds the spelling of a type parameter
   /// (`spellParameters`); none for every other frame.
   pub naming: Option<AuthoredCursor>,
+  /// A selected declaration body's static evaluation context for inline receiver static argument
+  /// evaluation; none for unselected bodies and nested frames.
+  pub staticContext: Option<BodyStaticContext>,
 }
 
 // A recovered statement's module and source span.
@@ -1706,6 +1736,9 @@ pub struct EscapeMemo {
   pub unit: usize,
   // The raw MIR and source dependencies that established this check's dispatch members.
   pub discovery: usize,
+  // The `checkImageScope` under which `closeCheckErasures` established this escape check's
+  // dispatchers; zero when checked without a selected check scope or in a revisable session.
+  pub discoveryScope: ContentHash,
   pub concrete: List<DeclarationId>,
   pub result: DeclarationCheckResult,
   // The record of the walk that found nothing to report, which `cacheImage` writes.
@@ -2146,4 +2179,244 @@ pub union StaticCallable {
   /// A call through a function value, or a partial application of one: the callee expression
   /// holds the value, and the written operands follow its open parameters.
   Through,
+}
+
+/// Returns the cached interned body-local inference owner for slot `id` (0 = elided lifetime,
+/// 1 = call prefix lifetime, 2+ = dynamic inference transaction).
+pub effect fn inferOwnerAt(resolver: &mut Resolver, id: u32) -> Interned<DeclarationId>
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let slot = u32.toUsize(id)
+  while List<Interned<DeclarationId>>.length(&resolver.inferOwners) <= slot {
+    let next = usize.toU32(List<Interned<DeclarationId>>.length(&resolver.inferOwners))
+    let owner = run Types.internDeclaration(run DeclarationId.inferVar(next))
+    run List<Interned<DeclarationId>>.append(&mut resolver.inferOwners, move owner)
+  }
+  return Interned<DeclarationId>.clone(&List<Interned<DeclarationId>>.asSlice(&resolver.inferOwners)[slot])
+}
+
+/// Allocates the next body-local inference owner slot from `resolver.nextInferenceId`.
+pub effect fn freshInferOwner(resolver: &mut Resolver) -> Interned<DeclarationId>
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let id = resolver.nextInferenceId
+  resolver.nextInferenceId = id + 1
+  return run inferOwnerAt(&mut resolver.*, id)
+}
+
+/// Clones one [`SelectionFact`] without rescanning a call list.
+pub fn cloneSelectionFact(fact: &SelectionFact) -> SelectionFact {
+  return match &fact.* {
+    SelectionFact.Embedded {value, ty} => SelectionFact.Embedded {
+      value: Interned<StaticData>.clone(&value),
+      ty: Interned<Type>.clone(&ty),
+    }
+    SelectionFact.Condition {selected} => SelectionFact.Condition {selected: selected}
+    SelectionFact.StaticFor {iterations} => SelectionFact.StaticFor {
+      iterations: Shared<List<IterationFacts>>.clone(&iterations),
+    }
+    SelectionFact.StaticBinding {value: bound} => SelectionFact.StaticBinding {
+      value: Interned<StaticData>.clone(&bound),
+    }
+    SelectionFact.StaticArguments {slots} => SelectionFact.StaticArguments {
+      slots: Shared<List<StaticSlot>>.clone(&slots),
+    }
+  }
+}
+
+/// Reports whether `rejection` records a static phase violation.
+pub fn isStaticPhaseViolation(rejection: &Rejection) -> bool {
+  return rejection.code == RejectionCode.StaticPhaseViolation
+}
+
+/// Indexes `entries` into a [`ResolvedCalls`] lookup table with fast-path presence flags and an
+/// oldest-first `HirId` hash index when `entries` exceeds 8 elements.
+pub effect fn indexResolvedCalls(entries: List<ResolvedCall>) -> ResolvedCalls
+  ! OutOfMemoryError ? &mut Allocator {
+  let slice = List<ResolvedCall>.asSlice(&entries)
+  let mut hasSelected = false
+  let mut hasRefused = false
+  let indexed = slice.length > 8
+  let mut byId = InternIndex.make()
+  if indexed { byId = run InternIndex.withCapacity(slice.length) }
+  let mut at = usize.ZERO
+  while at < slice.length {
+    match &slice[at].result {
+      Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Selected {..}} => { hasSelected = true }
+      Result<ResolvedTarget, Shared<Rejection>>.Failure {error} => {
+        if Shared<Rejection>.with<bool>(&error, isStaticPhaseViolation) { hasRefused = true }
+      }
+      _ => ()
+    }
+    if indexed { run InternIndex.record(&mut byId, usize.toU64(slice[at].id.index)) }
+    at = at + usize.ONE
+  }
+  return ResolvedCalls {entries: move entries, byId: move byId, hasSelected: hasSelected, hasRefused: hasRefused}
+}
+
+pub effect fn copyStaticBindings(source: &[StaticBinding]) -> List<StaticBinding>
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<StaticBinding>.make()
+  run List<StaticBinding>.reserve(&mut copied, source.length)
+  let mut at = usize.ZERO
+  while at < source.length {
+    run List<StaticBinding>.append(&mut copied, StaticBinding {
+      module: ModuleId.copy(&source[at].module),
+      binder: source[at].binder,
+      value: StaticValue.copy(&source[at].value),
+    })
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+pub effect fn copyStaticRootBinders(source: &[StaticRootBinder]) -> List<StaticRootBinder>
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<StaticRootBinder>.make()
+  run List<StaticRootBinder>.reserve(&mut copied, source.length)
+  let mut at = usize.ZERO
+  while at < source.length {
+    let item = match &source[at] {
+      StaticRootBinder.Parameter {syntax} => StaticRootBinder.Parameter {syntax: syntax}
+      StaticRootBinder.Binding {syntax, checked} => StaticRootBinder.Binding {
+        syntax: syntax,
+        checked: Shared<Result<Answer, NoRejection>>.clone(&checked),
+      }
+      StaticRootBinder.Iteration {syntax, evidence} => StaticRootBinder.Iteration {
+        syntax: syntax,
+        evidence: StaticExecution.copyIteration(&evidence),
+      }
+    }
+    run List<StaticRootBinder>.append(&mut copied, move item)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+/// Returns the index in `frames` of the enclosing root body frame that holds a
+/// [`BodyStaticContext`], stopping at the first `root: true` frame so nested queries never
+/// inherit an outer body's static context, or `usize.MAX` when absent.
+pub fn activeStaticContextFrame(frames: &[BodyFrame]) -> usize {
+  let mut at = frames.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if let Option<BodyStaticContext>.Some {..} = &frames[at].staticContext {
+      return at
+    }
+    if frames[at].root {
+      return usize.MAX
+    }
+  }
+  return usize.MAX
+}
+
+/// Removes and returns the active [`BodyStaticContext`] from frame `frameIndex` without cloning.
+pub fn takeActiveStaticContext(resolver: &mut Resolver, frameIndex: usize) -> Option<BodyStaticContext> {
+  let frames = List<BodyFrame>.asMutSlice(&mut resolver.bodies)
+  return Intrinsic.replace(frames[frameIndex].staticContext, Option<BodyStaticContext>.none())
+}
+
+/// Restores a previously taken [`BodyStaticContext`] back into frame `frameIndex`.
+pub fn restoreActiveStaticContext(resolver: &mut Resolver, frameIndex: usize, context: BodyStaticContext) -> () {
+  let frames = List<BodyFrame>.asMutSlice(&mut resolver.bodies)
+  frames[frameIndex].staticContext = Option<BodyStaticContext>.some(move context)
+  return ()
+}
+
+pub struct SavedIterationStaticContext {
+  pub frame: usize,
+  pub bindings: List<StaticBinding>,
+  pub checkedBinders: List<StaticRootBinder>,
+}
+
+/// Swaps the active body's static bindings/checkedBinders to an iteration's own scope and pushes
+/// a [`StaticForFrame`] for diagnostic traces. Call [`popIterationStaticContext`] on every exit.
+pub effect fn pushIterationStaticContext(
+  resolver: &mut Resolver,
+  iterations: &Shared<List<IterationFacts>>,
+  ordinal: usize,
+  syntax: HirId,
+) -> Option<SavedIterationStaticContext> ! OutOfMemoryError ? &mut Allocator {
+  let frame = activeStaticContextFrame(List<BodyFrame>.asSlice(&resolver.bodies))
+  if frame == usize.MAX { return Option<SavedIterationStaticContext>.none() }
+  let bindingCount = Shared<List<IterationFacts>>.with<usize>(
+    iterations,
+    |items: &List<IterationFacts>| -> usize {
+      return List<StaticBinding>.length(&List<IterationFacts>.asSlice(items)[ordinal].bindings)
+    },
+  )
+  let mut nextBindings = List<StaticBinding>.make()
+  run List<StaticBinding>.reserve(&mut nextBindings, bindingCount)
+  let mut at = usize.ZERO
+  while at < bindingCount {
+    let copied = Shared<List<IterationFacts>>.with<StaticBinding>(
+      iterations,
+      |items: &List<IterationFacts>| -> StaticBinding {
+        let bound = &List<StaticBinding>.asSlice(&List<IterationFacts>.asSlice(items)[ordinal].bindings)[at]
+        return StaticBinding {
+          module: ModuleId.copy(&bound.module),
+          binder: bound.binder,
+          value: StaticValue.copy(&bound.value),
+        }
+      },
+    )
+    run List<StaticBinding>.append(&mut nextBindings, move copied)
+    at = at + usize.ONE
+  }
+  let binderCount = Shared<List<IterationFacts>>.with<usize>(
+    iterations,
+    |items: &List<IterationFacts>| -> usize {
+      return List<StaticRootBinder>.length(&List<IterationFacts>.asSlice(items)[ordinal].checkedBinders)
+    },
+  )
+  let mut nextBinders = List<StaticRootBinder>.make()
+  run List<StaticRootBinder>.reserve(&mut nextBinders, binderCount)
+  at = usize.ZERO
+  while at < binderCount {
+    let copied = Shared<List<IterationFacts>>.with<StaticRootBinder>(
+      iterations,
+      |items: &List<IterationFacts>| -> StaticRootBinder {
+        let item = &List<StaticRootBinder>.asSlice(&List<IterationFacts>.asSlice(items)[ordinal].checkedBinders)[at]
+        return match &item.* {
+          StaticRootBinder.Parameter {syntax: binderSyntax} => StaticRootBinder.Parameter {syntax: binderSyntax}
+          StaticRootBinder.Binding {syntax: binderSyntax, checked} => StaticRootBinder.Binding {
+            syntax: binderSyntax,
+            checked: Shared<Result<Answer, NoRejection>>.clone(&checked),
+          }
+          StaticRootBinder.Iteration {syntax: binderSyntax, evidence} => StaticRootBinder.Iteration {
+            syntax: binderSyntax,
+            evidence: StaticExecution.copyIteration(&evidence),
+          }
+        }
+      },
+    )
+    run List<StaticRootBinder>.append(&mut nextBinders, move copied)
+    at = at + usize.ONE
+  }
+  let mut context = match move takeActiveStaticContext(&mut resolver.*, frame) {
+    Option<BodyStaticContext>.Some {value} => move value
+    Option<BodyStaticContext>.None => { return Option<SavedIterationStaticContext>.none() }
+  }
+  let savedBindings = Intrinsic.replace(context.bindings, move nextBindings)
+  let savedBinders = Intrinsic.replace(context.checkedBinders, move nextBinders)
+  run List<StaticForFrame>.append(&mut context.iterations, StaticForFrame {syntax: syntax, ordinal: ordinal})
+  restoreActiveStaticContext(&mut resolver.*, frame, move context)
+  return Option<SavedIterationStaticContext>.some(SavedIterationStaticContext {
+    frame: frame,
+    bindings: move savedBindings,
+    checkedBinders: move savedBinders,
+  })
+}
+
+/// Restores the outer body's static bindings/checkedBinders and pops the pushed [`StaticForFrame`].
+pub fn popIterationStaticContext(resolver: &mut Resolver, saved: Option<SavedIterationStaticContext>) -> () {
+  if let Option<SavedIterationStaticContext>.Some {value} = move saved {
+    let SavedIterationStaticContext {frame, bindings, checkedBinders} = move value
+    if let Option<BodyStaticContext>.Some {value: taken} = move takeActiveStaticContext(&mut resolver.*, frame) {
+      let mut context = move taken
+      context.bindings = move bindings
+      context.checkedBinders = move checkedBinders
+      drop List<StaticForFrame>.pop(&mut context.iterations)
+      restoreActiveStaticContext(&mut resolver.*, frame, move context)
+    }
+  }
+  return ()
 }

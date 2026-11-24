@@ -20,7 +20,6 @@ import backend.Gap {Code as GapCode, Gap as BackendGap}
 import semantic.CallableWitness {CallableWitness as WitnessRecipe, OperandLoan as WitnessLoan}
 import semantic.Specialization {Application, StaticSlot}
 import lexer.Span {Span}
-import semantic.RuntimeEncoding
 import semantic.CallInput {CallInput, Arguments as CallArguments}
 import semantic.DeclarationId {DeclarationId}
 import semantic.SourceInputs {Facet as SourceFacet}
@@ -40,6 +39,7 @@ import semantic.ParameterSchema {ParameterSchema}
 import semantic.TargetSchema {TargetSchema, Scope as ApplicationScope, BinderSlot as ApplicationSlot}
 import semantic.ModuleIndex {CandidateKind, ModuleIndex}
 import semantic.RegionCheck {namedLifetimes}
+import semantic.InternIndex {InternIndex}
 import semantic.Query {Cycle, Query}
 import semantic.Rejection {
   make as makeRejection,
@@ -150,6 +150,7 @@ import semantic.ResolverState {
   ReceiverPosition,
   ResolvedAnnotation,
   ResolvedCall,
+  ResolvedCalls,
   ResolvedTarget,
   Resolver,
   SelectedDeclaration,
@@ -161,6 +162,8 @@ import semantic.ResolverState {
   WrittenSignature,
   emptyCallPrefix,
   headerRejection,
+  inferOwnerAt,
+  isStaticPhaseViolation,
 }
 import semantic.SemanticInputs {
   applicationArgument,
@@ -294,7 +297,6 @@ import semantic.SignatureCheck {
   signatureParameterCount,
   signatureRequirements,
   signatureResult,
-  signatureStaticSlots,
   signatureTypeParameter,
   signatureTypeParameterCount,
   signatureUnsafe,
@@ -393,9 +395,9 @@ import semantic.ExpressionAndCallCheck {
   valueMismatchReason,
 }
 import semantic.BodyDriver {
-  StaticCallHint,
   bareRejection,
   containsLifetime,
+  evaluateReceiverStaticArguments,
   indexOfAnnotation,
   normalizeCallableResult,
   rawCallableType,
@@ -406,34 +408,6 @@ import semantic.BodyDriver {
 import semantic.StaticPortImpl {bindConstraint, sectionInferenceOrdinal, sectionScopeInferenceOrdinal}
 import semantic.MirLowering {foreignHeader, singleMemberType}
 import semantic.EmissionAndAssembly {slotAt, slotCount}
-
-// Reports a receiver call whose callee has static parameters and whose selection supplied none:
-// its Body query selects again with these slots, written-argument positions `receivers` before
-// the callee's parameter indices. SEM0249 stands only if no selection can supply them.
-pub effect fn discoverStaticCall(resolver: &mut Resolver, signature: &Shared<Result<Answer, NoRejection>>, call: HirId, receivers: usize) -> ()
-! OutOfMemoryError ? &mut Allocator {
-  let count = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureStaticCount)
-  let parameters = run signatureStaticSlots(signature, count)
-  let listed = List<usize>.asSlice(&parameters)
-  let mut slots = List<usize>.make()
-  let mut types = List<Option<Interned<Type>>>.make()
-  let mut at = usize.ZERO
-  while at < listed.length {
-    let index = listed[at]
-    if index < receivers { return () }
-    run List<usize>.append(&mut slots, index - receivers)
-    let declared = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(signature,
-      |answer: &Result<Answer, NoRejection>| -> Option<Interned<Type>> { return signatureParameter(answer, index) })
-    let mut closed = Option<Interned<Type>>.none()
-    if let Option<Interned<Type>>.Some {value} = move declared {
-      if !Type.hasOpenParameters(&value) { closed = Option<Interned<Type>>.some(move value) }
-    }
-    run List<Option<Interned<Type>>>.append(&mut types, move closed)
-    at = at + usize.ONE
-  }
-  resolver.discoveredStaticCall = Option<StaticCallHint>.some(StaticCallHint {call: call, slots: move slots, types: move types, offset: receivers})
-  return ()
-}
 
 // A function whose static arguments cannot be selected where it is written (SEM0249): a call to
 // an interface operation (template 0) or to an inherent method with method-call syntax
@@ -801,7 +775,7 @@ effect fn collectModuleQualifiedOwner(hir: &Module, expression: HirId, calls: &m
 }
 
 // The refusal of a module-qualified applied owner, as `g.Box` in `g.Box<i32>.make`.
-pub effect fn moduleQualifiedOwnerRefusal(source: &SourceIndex, cursor: &AuthoredCursor, calls: &[ResolvedCall], expression: HirId)
+pub effect fn moduleQualifiedOwnerRefusal(source: &SourceIndex, cursor: &AuthoredCursor, calls: &ResolvedCalls, expression: HirId)
   -> Option<Shared<Rejection>> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   if let Node.MemberExpression {selector, fields} = run bodyNode(source, cursor, expression) {
     if fields.present { return Option<Shared<Rejection>>.none() }
@@ -1758,13 +1732,9 @@ effect fn resolveCallPrefix(
       Option<DeclarationId>.Some {value: prefixDeclaration} => move prefixDeclaration
       _ => { fail RevisionMismatch {} }
     }
-    let mut prefixScope = Bytes.make()
-    run Bytes.append(&mut prefixScope, b"\0call-prefix-lifetimes")
-    run RuntimeEncoding.word(&mut prefixScope, usize.toU64(callerOrdinal))
-    run RuntimeEncoding.word(&mut prefixScope, usize.toU64(written.id.index))
     let prefixOwner = match move seededOwner {
       Option<Interned<DeclarationId>>.Some {value: seededPrefixOwner} => DeclarationId.copyShared(&seededPrefixOwner)
-      Option<Interned<DeclarationId>>.None => run DeclarationId.inference(&declared, Bytes.asSlice(&prefixScope))
+      Option<Interned<DeclarationId>>.None => DeclarationId.copyShared(&run inferOwnerAt(&mut resolver.*, 1))
     }
     let mut elision = LifetimeElision {
       owner: Option<DeclarationId>.some(DeclarationId.copy(&prefixOwner)),
@@ -2240,6 +2210,7 @@ effect fn serviceOperationTarget(
   qualifierModule: &ModuleId,
   operation: usize,
   applied: Option<Interned<Type>>,
+  genericService: bool,
   memberSpan: Span,
   span: Span,
 ) -> Result<ResolvedTarget, Shared<Rejection>>
@@ -2334,7 +2305,7 @@ effect fn serviceOperationTarget(
     }
   }
   let mut scopeArguments = List<Argument>.make()
-  let mut inferOwner = true
+  let mut inferOwner = genericService
   if let Option<Interned<Type>>.Some {value: serviceType} = &applied {
     scopeArguments = run typeApplicationArguments(&serviceType)
     inferOwner = false
@@ -2790,17 +2761,7 @@ effect fn qualifiedNominalCallTarget(
   // A service operation's provider application cannot omit a lifetime yet.
   let mut template = Option<DeclarationId>.none()
   if !isService {
-    let qualifierIdentity = match move run declarationAt(&mut resolver.*, &qualifierModule, qualifier.ordinal) {
-      Option<DeclarationId>.Some {value} => move value
-      Option<DeclarationId>.None => { fail RevisionMismatch {} }
-    }
-    let mut qualifierScope = Bytes.make()
-    run Bytes.append(&mut qualifierScope, b"\0qualifier-lifetimes")
-    run RuntimeEncoding.word(&mut qualifierScope, usize.toU64(moduleOrdinal))
-    run RuntimeEncoding.word(&mut qualifierScope, usize.toU64(application.id.index))
-    // An alias use writes no application; its own lifetimes are scoped by the qualifier's place.
-    if !application.present { run RuntimeEncoding.word(&mut qualifierScope, usize.toU64(subjectSpan.start)) }
-    template = Option<DeclarationId>.some(run DeclarationId.inference(&qualifierIdentity, Bytes.asSlice(&qualifierScope)))
+    template = Option<DeclarationId>.some(DeclarationId.copyShared(&run inferOwnerAt(&mut resolver.*, 1)))
   }
   let mut omitted = usize.ZERO
   let qualifierTemplate = match &template {
@@ -2855,7 +2816,7 @@ effect fn qualifiedNominalCallTarget(
         Option<Interned<Type>>.None => Option<Interned<Type>>.none()
       }
       return run serviceOperationTarget(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, syntax,
-        scope, constraints, &qualifier, &qualifierModule, operation, move applied, memberSpan, span)
+        scope, constraints, &qualifier, &qualifierModule, operation, move applied, genericService, memberSpan, span)
     }
   }
   let declarationAccess106Request = Key {
@@ -4011,7 +3972,7 @@ pub fn signatureStaticCount(answer: &Result<Answer, NoRejection>) -> usize {
 }
 
 // The static values this body's selection pass recorded for one call.
-pub fn staticArgumentsFact(calls: &[ResolvedCall], id: HirId) -> Option<Shared<List<StaticSlot>>> {
+pub fn staticArgumentsFact(calls: &ResolvedCalls, id: HirId) -> Option<Shared<List<StaticSlot>>> {
   let fact = selectedFact(calls, id)
   return match move fact {
     Option<SelectionFact>.Some {value: SelectionFact.StaticArguments {slots}} => Option<Shared<List<StaticSlot>>>.some(move slots)
@@ -4108,39 +4069,70 @@ pub effect fn copyResolvedTarget(value: &ResolvedTarget) -> ResolvedTarget
 
 // The refusal a selection recorded for an expression it ran and could not embed
 // (`selectionContextFacts`). The expression's ordinary callee target is an earlier fact.
-pub fn refusedEmbedding(calls: &[ResolvedCall], id: HirId) -> Option<Shared<Rejection>> {
-  let mut at = usize.ZERO
-  while at < calls.length {
-    if calls[at].id.index == id.index {
-      if let Result<ResolvedTarget, Shared<Rejection>>.Failure {error} = &calls[at].result {
-        if Shared<Rejection>.with<bool>(&error, |rejection: &Rejection| -> bool { return rejection.code == RejectionCode.StaticPhaseViolation }) {
+pub fn refusedEmbedding(calls: &ResolvedCalls, id: HirId) -> Option<Shared<Rejection>> {
+  if !calls.hasRefused { return Option<Shared<Rejection>>.none() }
+  let entries = List<ResolvedCall>.asSlice(&calls.entries)
+  if entries.length <= 8 {
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if entries[at].id.index == id.index {
+        if let Result<ResolvedTarget, Shared<Rejection>>.Failure {error} = &entries[at].result {
+          if Shared<Rejection>.with<bool>(&error, isStaticPhaseViolation) {
+            return Option<Shared<Rejection>>.some(Shared<Rejection>.clone(&error))
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    return Option<Shared<Rejection>>.none()
+  }
+  let mut at = InternIndex.first(&calls.byId, usize.toU64(id.index))
+  while at != usize.MAX {
+    if entries[at].id.index == id.index {
+      if let Result<ResolvedTarget, Shared<Rejection>>.Failure {error} = &entries[at].result {
+        if Shared<Rejection>.with<bool>(&error, isStaticPhaseViolation) {
           return Option<Shared<Rejection>>.some(Shared<Rejection>.clone(&error))
         }
       }
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&calls.byId, at)
   }
   return Option<Shared<Rejection>>.none()
 }
 
-fn indexOfResolvedCall(calls: &[ResolvedCall], id: HirId) -> Option<usize> {
-  let mut at = usize.ZERO
-  while at < calls.length {
-    if calls[at].id.index == id.index {
-      // Static operands are selection metadata for this invocation. Its ordinary callee target
-      // remains a separate fact at the same authored identity and controls runtime dispatch.
-      let operands = match &calls[at].result {
+fn indexOfResolvedCall(calls: &ResolvedCalls, id: HirId) -> Option<usize> {
+  let entries = List<ResolvedCall>.asSlice(&calls.entries)
+  if entries.length <= 8 {
+    let mut at = usize.ZERO
+    while at < entries.length {
+      if entries[at].id.index == id.index {
+        // Static operands are selection metadata for this invocation. Its ordinary callee target
+        // remains a separate fact at the same authored identity and controls runtime dispatch.
+        let operands = match &entries[at].result {
+          Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Selected {fact: SelectionFact.StaticArguments {..}}} => true
+          _ => false
+        }
+        if !operands { return Option<usize>.some(at) }
+      }
+      at = at + usize.ONE
+    }
+    return Option<usize>.none()
+  }
+  let mut at = InternIndex.first(&calls.byId, usize.toU64(id.index))
+  while at != usize.MAX {
+    if entries[at].id.index == id.index {
+      let operands = match &entries[at].result {
         Result<ResolvedTarget, Shared<Rejection>>.Success {value: ResolvedTarget.Selected {fact: SelectionFact.StaticArguments {..}}} => true
         _ => false
       }
-      if !operands {return Option<usize>.some(at)}
+      if !operands { return Option<usize>.some(at) }
     }
-    at = at + usize.ONE
+    at = InternIndex.after(&calls.byId, at)
   }
   return Option<usize>.none()
 }
 
-pub effect fn resolvedCall(calls: &[ResolvedCall], id: HirId) -> Option<
+pub effect fn resolvedCall(calls: &ResolvedCalls, id: HirId) -> Option<
   Result<ResolvedTarget, Shared<Rejection>>,
 > ! OutOfMemoryError ? &mut Allocator {
   let found = indexOfResolvedCall(calls, id)
@@ -4150,7 +4142,8 @@ pub effect fn resolvedCall(calls: &[ResolvedCall], id: HirId) -> Option<
       return Option<Result<ResolvedTarget, Shared<Rejection>>>.none()
     }
   }
-  return match & calls[at].result {
+  let entries = List<ResolvedCall>.asSlice(&calls.entries)
+  return match &entries[at].result {
     Result<ResolvedTarget, Shared<Rejection>>.Success {value} => Option<
       Result<ResolvedTarget, Shared<Rejection>>,
     >.some(Result<ResolvedTarget, Shared<Rejection>>.succeed(run copyResolvedTarget(&value)))
@@ -4551,7 +4544,7 @@ effect fn inferredInterfaceApplication(
 effect fn checkReceiverBorrow<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
   dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
-  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut List<BodyNode>,
+  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &ResolvedCalls, nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>, requiredBodies: &mut List<DeclarationId>,
   argument: HirId, access: Access, operand: HirId, constraints: &[Constraint], contractBody: bool, unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
@@ -4705,7 +4698,7 @@ pub effect fn checkQualifiedInterfaceCall<'scope>(
   cursor: &AuthoredCursor,
   caller: &DeclarationId,
   statementScope: &mut StatementScope<'scope>,
-  calls: &[ResolvedCall],
+  calls: &ResolvedCalls,
   nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>,
   requiredBodies: &mut List<DeclarationId>,
@@ -5096,16 +5089,25 @@ pub effect fn checkQualifiedInterfaceCall<'scope>(
     run Bytes.append(&mut operation, b"`")
     return run staticOperationAtRuntime(module, span, move operation)
   }
-  // Static parameters take the values this body's selection pass evaluated for the call. The
-  // operation is known only now, so a call the selection has not seen reports itself and the body
-  // is selected again; a static body cannot supply them yet.
+  // Static parameters take the values this body's selection pass evaluated for the call, or are
+  // evaluated inline in the enclosing selected body's static context; unselected and static bodies
+  // report SEM0249.
   let mut suppliedStatics = Option<Shared<List<StaticSlot>>>.none()
   if Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureStaticCount) > usize.ZERO {
     if staticBody { return Result<BodyNodeId, Shared<Rejection>>.failResult(run staticArgumentsGap(module, span, b"0")) }
     suppliedStatics = staticArgumentsFact(calls, expression)
     if let Option<Shared<List<StaticSlot>>>.None = &suppliedStatics {
-      run discoverStaticCall(&mut resolver.*, &signature, expression, usize.ZERO)
-      return Result<BodyNodeId, Shared<Rejection>>.failResult(run staticArgumentsGap(module, span, b"0"))
+      match move run evaluateReceiverStaticArguments(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, &signature, arguments, usize.ZERO) {
+        Option<Result<Shared<List<StaticSlot>>, Shared<Rejection>>>.Some {value: Result<Shared<List<StaticSlot>>, Shared<Rejection>>.Success {value: slots}} => {
+          suppliedStatics = Option<Shared<List<StaticSlot>>>.some(move slots)
+        }
+        Option<Result<Shared<List<StaticSlot>>, Shared<Rejection>>>.Some {value: Result<Shared<List<StaticSlot>>, Shared<Rejection>>.Failure {error}} => {
+          return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+        }
+        Option<Result<Shared<List<StaticSlot>>, Shared<Rejection>>>.None => {
+          return Result<BodyNodeId, Shared<Rejection>>.failResult(run staticArgumentsGap(module, span, b"0"))
+        }
+      }
     }
   }
   let mut statics = List<StaticSlot>.make()
@@ -5787,7 +5789,7 @@ pub effect fn checkOperatorOperand<'scope>(
   cursor: &AuthoredCursor,
   caller: &DeclarationId,
   statementScope: &mut StatementScope<'scope>,
-  calls: &[ResolvedCall],
+  calls: &ResolvedCalls,
   nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>,
   requiredBodies: &mut List<DeclarationId>,
@@ -5907,7 +5909,7 @@ effect fn selectInterfaceReceiverCall(
 // A receiver call's written list binds a prefix of its member's own type binders; more arguments
 // than the member declares is an arity error at the call (the receiver supplies the owner's). An
 // open owner's `ownerTypes` binders lead the signature's list and are never written here.
-effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor,
+effect fn writtenMemberPrefix(resolver: &mut Resolver, module: &ModuleId, cursor: &AuthoredCursor,
   caller: &DeclarationId, annotations: &[ResolvedAnnotation], signature: &Shared<Result<Answer, NoRejection>>,
   member: &DeclarationId, generics: HirRef, ownerTypes: usize, span: Span) -> Result<CallPrefix, Shared<Rejection>>
 ! RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -5925,20 +5927,19 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
     supported = !environment.present && !failures.present && !requirements.present
   }
   if !supported {
-    return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Undetermined, listSpan))
+    return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Undetermined, listSpan))
   }
   let declared = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureTypeParameterCount) - ownerTypes
   if written.length > declared {
-    return Result<CallPrefix, Shared<Rejection>>.failResult(run rejectArity(resolver, module, span, declared, written.length))
+    return Result<CallPrefix, Shared<Rejection>>.failResult(run rejectArity(&resolver.*, module, span, declared, written.length))
   }
-  let elided = run elidedLifetimeOwner(caller)
+  let elidedShared = run inferOwnerAt(&mut resolver.*, 0)
+  let elided = DeclarationId.copyShared(&elidedShared)
   // A region elided inside a written argument, as in `Engine<i32>` for `Engine<'m, S>`, is a
   // private prefix lifetime the call infers from its operands, as at a direct call. `taken` lists
   // the caller's elided ordinals in the order they become the prefix owner's.
-  let mut prefixScope = Bytes.make()
-  run Bytes.append(&mut prefixScope, b"\0call-prefix-lifetimes")
-  run RuntimeEncoding.word(&mut prefixScope, usize.toU64(generics.id.index))
-  let prefixOwner = run DeclarationId.inference(member, Bytes.asSlice(&prefixScope))
+  let prefixShared = run inferOwnerAt(&mut resolver.*, 1)
+  let prefixOwner = DeclarationId.copyShared(&prefixShared)
   let mut taken = List<usize>.make()
   let mut at = usize.ZERO
   while at < written.length {
@@ -5953,7 +5954,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
         }
       }
       Option<usize>.None => {
-        return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Undetermined, argumentSpan))
+        return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Undetermined, argumentSpan))
       }
     }
     let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Interned<Type>>>(signature,
@@ -5961,7 +5962,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
     let binder = match move parameter {
       Option<Interned<Type>>.Some {value} => move value
       Option<Interned<Type>>.None => {
-        return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Undetermined, argumentSpan))
+        return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Undetermined, argumentSpan))
       }
     }
     let ordinal = Interned<Type>.with<usize>(&binder, |value: &Type| -> usize { return Type.parameterOrdinalOf(value, member) })
@@ -5969,7 +5970,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
     let mut rows = List<usize>.make()
     run Type.collectOwned(&resolved, &elided, &mut types, &mut taken, &mut rows)
     if ordinal == usize.MAX || List<usize>.length(&types) != usize.ZERO || List<usize>.length(&rows) != usize.ZERO {
-      return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Undetermined, argumentSpan))
+      return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Undetermined, argumentSpan))
     }
     let mut value = move resolved
     if List<usize>.length(&taken) != usize.ZERO {
@@ -5977,7 +5978,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
       let mut bindings = run List<Binding>.makeWithCapacity(ordinals.length)
       let mut index = usize.ZERO
       while index < ordinals.length {
-        run List<Binding>.append(&mut bindings, Binding {declaration: run Types.internDeclaration(DeclarationId.copy(&elided)),
+        run List<Binding>.append(&mut bindings, Binding {declaration: Interned<DeclarationId>.clone(&elidedShared),
           ordinal: ordinals[index], value: Argument.Lifetime {value: run Types.internLifetime(Lifetime.Parameter {
             declaration: DeclarationId.copy(&prefixOwner), ordinal: index})}})
         index = index + usize.ONE
@@ -5990,7 +5991,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
   }
   let lifetimes = List<usize>.length(&taken)
   let mut owner = Option<Interned<DeclarationId>>.none()
-  if lifetimes != usize.ZERO { owner = Option<Interned<DeclarationId>>.some(run Types.internDeclaration(move prefixOwner)) }
+  if lifetimes != usize.ZERO { owner = Option<Interned<DeclarationId>>.some(move prefixShared) }
   return Result<CallPrefix, Shared<Rejection>>.succeed(CallPrefix {arguments: move arguments, slots: move slots,
     owner: move owner, lifetimes: lifetimes})
 }
@@ -6036,7 +6037,8 @@ pub effect fn matchReceiverOperand(resolver: &mut Resolver, owner: &mut Query<An
 // that is not already a reference, as the explicit `&place` or `&mut place` argument would, or it
 // takes the receiver by value, as the explicit moved or copied operand would.
 fn explicitReceiver(choice: &InherentCallChoice, receiverType: &Interned<Type>) -> bool {
-  if let InherentCallChoice.Selected {receiver, ..} = &choice.* {
+  if let InherentCallChoice.Selected {target, receiver} = &choice.* {
+    if List<Argument>.length(&target.scopeArguments) == usize.ZERO { return false }
     if let Option<ReceiverPosition>.Some {value} = &receiver {
       return value.mode == BodyReceiverPass.Take || !Interned<Type>.with<bool>(receiverType, referenceValue)
     }
@@ -6381,7 +6383,7 @@ pub effect fn checkReceiverCall<'scope>(
   cursor: &AuthoredCursor,
   caller: &DeclarationId,
   statementScope: &mut StatementScope<'scope>,
-  calls: &[ResolvedCall],
+  calls: &ResolvedCalls,
   nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>,
   requiredBodies: &mut List<DeclarationId>,
@@ -6443,7 +6445,7 @@ pub effect fn checkReceiverCallOn<'scope>(
   cursor: &AuthoredCursor,
   caller: &DeclarationId,
   statementScope: &mut StatementScope<'scope>,
-  calls: &[ResolvedCall],
+  calls: &ResolvedCalls,
   nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>,
   requiredBodies: &mut List<DeclarationId>,
@@ -6666,16 +6668,25 @@ pub effect fn checkReceiverCallOn<'scope>(
     run Bytes.append(&mut operation, b"`")
     return run staticOperationAtRuntime(module, span, move operation)
   }
-  // An interface operation's static arguments are selected once this check reports the call, as
-  // an inherent method's are (`checkDeclarationCall`); a static body cannot supply them yet.
+  // An interface operation's static arguments are evaluated inline in the enclosing selected
+  // body's static context; unselected and static bodies report SEM0249.
   let mut suppliedStatics = Option<Shared<List<StaticSlot>>>.none()
   if Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureStaticCount) > usize.ZERO {
     if let ReceiverCallChoice.Interface {..} = &choice {
       if staticBody { return Result<BodyNodeId, Shared<Rejection>>.failResult(run staticArgumentsGap(module, span, b"0")) }
       suppliedStatics = staticArgumentsFact(calls, expression)
       if let Option<Shared<List<StaticSlot>>>.None = &suppliedStatics {
-        run discoverStaticCall(&mut resolver.*, &signature, expression, usize.ONE)
-        return Result<BodyNodeId, Shared<Rejection>>.failResult(run staticArgumentsGap(module, span, b"0"))
+        match move run evaluateReceiverStaticArguments(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, &signature, arguments, usize.ONE) {
+          Option<Result<Shared<List<StaticSlot>>, Shared<Rejection>>>.Some {value: Result<Shared<List<StaticSlot>>, Shared<Rejection>>.Success {value: slots}} => {
+            suppliedStatics = Option<Shared<List<StaticSlot>>>.some(move slots)
+          }
+          Option<Result<Shared<List<StaticSlot>>, Shared<Rejection>>>.Some {value: Result<Shared<List<StaticSlot>>, Shared<Rejection>>.Failure {error}} => {
+            return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+          }
+          Option<Result<Shared<List<StaticSlot>>, Shared<Rejection>>>.None => {
+            return Result<BodyNodeId, Shared<Rejection>>.failResult(run staticArgumentsGap(module, span, b"0"))
+          }
+        }
       }
     }
   }
@@ -6748,7 +6759,7 @@ pub effect fn checkReceiverCallOn<'scope>(
   let selected = match move choice {
     ReceiverCallChoice.Inherent {target, ..} => {
       let mut declaration = move target
-      let prefix = run writtenMemberPrefix(&resolver.*, module, cursor, caller, statementScope.annotations,
+      let prefix = run writtenMemberPrefix(&mut resolver.*, module, cursor, caller, statementScope.annotations,
         &signature, &callDeclaration, generics, ownerTypes, span)
       let written = match move prefix {
         Result<CallPrefix, Shared<Rejection>>.Success {value} => move value
@@ -8264,7 +8275,7 @@ pub effect fn checkedTupleElements(
 pub effect fn checkedProjectionSubject<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
   dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
-  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut List<BodyNode>,
+  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &ResolvedCalls, nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>, requiredBodies: &mut List<DeclarationId>,
   subject: HirId, constraints: &[Constraint], contractBody: bool, staticBody: bool, unsafeAllowed: bool,
 ) -> Result<BodyNodeId, Shared<Rejection>>
@@ -8304,7 +8315,7 @@ pub effect fn checkedProjectionSubject<'scope>(
 pub effect fn checkPositionalAggregate<'scope>(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
   dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
-  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall], nodes: &mut List<BodyNode>,
+  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &ResolvedCalls, nodes: &mut List<BodyNode>,
   signatures: &mut List<SignatureDependency>, requiredBodies: &mut List<DeclarationId>,
   expression: HirId, elements: CallArguments, ty: &Interned<Type>, fields: &[Interned<Type>],
   inference: &Option<InferredAggregateTarget>, expected: &Option<Interned<Type>>, mismatchCode: RejectionCode, constraints: &[Constraint], contractBody: bool,
