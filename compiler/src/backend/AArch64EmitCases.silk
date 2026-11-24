@@ -303,16 +303,19 @@ effect fn neonResidencyClaims() -> () ! OutOfMemoryError | AssertionError<'stati
   let regs = List<u8>.asSlice(&frame.valueRegs)
   let offs = List<i64>.asSlice(&frame.valueOffsets)
 
-  let residentVals = [raw, sp65, sp9, sel, sum8, asV4, sp16, rotV4, shufV4, asV2, backV16, tblRes]
+  let residentVals = [raw, sp65, sp9, mask, sel, sum8, asV4, rotV4, shufV4, asV2, backV16, tblRes]
   let mut k = usize.ZERO
   while k < residentVals.length {
     let idx = u64.toUsize(residentVals[k])
     run Testing.expect(vecs[idx] != AArch64Frame.regNone() && isValidVecHome(vecs[idx]),
-      "every 128-bit NEON value (including bitcasts and Shuffle/Rotate/Tbl) stays in v0..v27")
+      "every 128-bit NEON value (including NEON masks, bitcasts, and Shuffle/Rotate/Tbl) stays in v0..v27")
     run Testing.expect(offs[idx] == 0,
       "resident 128-bit NEON values are never evicted to stack offsets")
     k = k + usize.ONE
   }
+  let sp16Idx = u64.toUsize(sp16)
+  run Testing.expect(vecs[sp16Idx] == AArch64Frame.regNone() && offs[sp16Idx] == 0,
+    "uniform-constant rotate splat consumes neither a NEON register nor a stack slot")
   let i128Idx = u64.toUsize(asI128)
   run Testing.expect(vecs[i128Idx] == AArch64Frame.regNone() && regs[i128Idx] == AArch64Frame.regNone(),
     "i128 bitcast intermediate is not assigned a GPR or NEON register")
@@ -798,18 +801,24 @@ effect fn vec128SpillPressureClaims() -> () ! OutOfMemoryError | AssertionError<
   let offs = List<i64>.asSlice(&frame.valueOffsets)
   let mut callerMask: u64 = 0
   let mut spilled = usize.ZERO
+  let mut vIdx = usize.ZERO
+  while vIdx < vecRegs.length {
+    let r = vecRegs[vIdx]
+    if r != AArch64Frame.regNone() {
+      run Testing.expect(r < 8 || r > 15, "isVec128 never enters callee-saved d8..d15 (v8..v15)")
+      run Testing.expect(isValidVecHome(r), "isVec128 never enters scratch v28..v31")
+      callerMask = callerMask | u64.shiftLeft(1, u8.toU64(r))
+    }
+    vIdx = vIdx + usize.ONE
+  }
   k = usize.ZERO
   while k < vecSlice.length {
     let idx = u64.toUsize(vecSlice[k])
     let r = vecRegs[idx]
-    run Testing.expect(r < 8 || r > 15, "isVec128 never enters callee-saved d8..d15 (v8..v15)")
-    run Testing.expect(isValidVecHome(r), "isVec128 never enters scratch v28..v31")
     if r == AArch64Frame.regNone() {
       run Testing.expect(offs[idx] < 0 && (0 - offs[idx]) % 16 == 0,
         "spilled isVec128 value receives a 16-byte-aligned negative stack offset")
       spilled = spilled + usize.ONE
-    } else {
-      callerMask = callerMask | u64.shiftLeft(1, u8.toU64(r))
     }
     k = k + usize.ONE
   }
@@ -1485,9 +1494,11 @@ effect fn darwinAbiAndOddWidthClaims() -> () ! Unsupported | OutOfMemoryError | 
   // `blr x17` = 0xD63F0220 for TLV thunk call, and `sxtb x0, w0` (`0x93401C00`) for signed i8 ABI ext.
   run Testing.expect(containsWord(oddCode, 0xD63F0220) && containsWord(oddCode, 0x93401C00),
     "TLV emits blr x17 and C call applies sxtb extension on i8 register arg")
-  // `ubfm xDst, xSrc, #0, #23` (imms=23 -> 0xD3405C00 mask over bits 31..10 = 0xFFC0FC00 -> 0xD3405C00).
-  run Testing.expect(containsWordMasked(oddCode, 0xFFFFFC00, 0xD3405C00),
-    "i24 ZExt/Load normalizes via ubfm ..., #0, #23")
+  // Odd-width i24/i56 loads assemble bytes with shifted `orr xDst, xDst, x16, lsl #16` (`0xAA104000`)
+  // and `lsl #48` (`0xAA10C000`), leaving upper bits zero so `ZExt` needs no redundant `ubfm`.
+  run Testing.expect(containsWordMasked(oddCode, 0xFFFFFC00, 0xAA104000)
+    && containsWordMasked(oddCode, 0xFFFFFC00, 0xAA10C000),
+    "i24/i56 odd-width loads zero-extend via shifted orr without redundant ubfm")
   drop f64K
   drop v40
   drop v48
@@ -2043,4 +2054,109 @@ effect fn neonAndArchClaims() -> () ! Unsupported | OutOfMemoryError | Assertion
     && containsWordMasked(code, 0xFFE0FC00, 0x4E809400), "emits NEON udot and sdot")
   run Testing.expect(containsWordMasked(code, 0xFFFFFC00, 0x4E284800)
     && containsWordMasked(code, 0xFFE0FC00, 0x5E004000), "emits ARMv8 crypto aese and sha256h")
+}
+
+test effect fn optimizesSpeedCodegenPatterns() -> () ! OutOfMemoryError | Unsupported | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run speedCodegenOptimizationClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn speedCodegenOptimizationClaims() -> () ! OutOfMemoryError | Unsupported | AssertionError<'static> ? &mut Allocator {
+  let i64K = Kind.integer(64)
+  let i32K = Kind.integer(32)
+  let i1K = Kind.integer(1)
+  let ptrK = Kind.address(64)
+  let v16i8 = Kind.vector(Kind.integer(8), 16)
+  let v4i32 = Kind.vector(i32K, 4)
+  let v2i64 = Kind.vector(i64K, 2)
+
+  // NEON-resident mask (`cmhs + bsl + umaxv`), zero-rodata shuffles (`rev64+ext`, `zip1.2d`),
+  // `shl+sri` rotate, inline `Fill`/`CopyBytes`, constant `UDiv`/`URem` (`umulh+msub`),
+  // negated-compare branch fusion (`Xor(Compare, 1)`), dead stack-slot elimination, and
+  // terminal `Exit.Trap` call non-clobbering.
+  let mut f = run SsaFunction.make(b"speed_opt_patterns", 64)
+  let a = run f.argument(v16i8)
+  let b = run f.argument(v16i8)
+  let n = run f.argument(i64K)
+  let dst = run f.argument(ptrK)
+  let src = run f.argument(ptrK)
+  f.setResult(i64K)
+  let deadSlot = run f.declareSlot(256, 16)
+  let b0 = run f.newBlock()
+  let b1 = run f.newBlock()
+  let bTrap = run f.newBlock()
+  f.startBlock(b0)
+
+  // Negated compare branch: `!(n <= 96)` -> fused `cmp + b.hi`, no `cset` or `eor`.
+  let c96 = run f.integer(64, 96)
+  let le96 = run f.compare(Predicate.Ule, n, c96)
+  let c1 = run f.integer(1, 1)
+  let notLe96 = run f.binary(Binary.Xor, le96, c1)
+  run f.branchIf(notLe96, bTrap, b1)
+
+  f.startBlock(bTrap)
+  drop run f.call(b"fatal_oob", &[n], Kind.unit())
+  run f.trap()
+
+  f.startBlock(b1)
+  // NEON-resident mask + select + Reduce(Or).
+  let mask = run f.compare(Predicate.Uge, a, b)
+  let picked = run f.select(mask, a, b)
+  let anyLane = run f.addInstruction(Operation.Reduce {which: Reduction.Or}, i1K, &[mask])
+  // 16-byte reverse (`rev64.16b + ext.16b #8`) and `zip1.2d` without rodata `tbl`.
+  let revMask: [u64; 16] = [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+  let rev16 = run f.shuffle(picked, picked, &revMask)
+  let as2dA = run f.cast(Cast.Bitcast, rev16, v2i64)
+  let as2dB = run f.cast(Cast.Bitcast, b, v2i64)
+  let zipMask: [u64; 2] = [0, 2]
+  let zipped = run f.shuffle(as2dA, as2dB, &zipMask)
+  // NEON 4x32 rotate by 7 -> `shl.4s + sri.4s`.
+  let as4s = run f.cast(Cast.Bitcast, zipped, v4i32)
+  let c7 = run f.integer(32, 7)
+  let sp7 = run f.splat(c7, 4)
+  let rot7 = run f.rotate(true, as4s, sp7)
+  run f.store(rot7, dst, 0, 16)
+  // Inline small `Fill` (64B) and `CopyBytes` (32B and odd 3B) with zero `_memset`/`_memmove` calls.
+  run f.fill(dst, 0x33, 64)
+  run f.copyBytes(dst, src, 32)
+  run f.copyBytes(dst, src, 3)
+  // Constant `UDiv` and `URem` by 96 -> `umulh + msub`, zero `udiv`.
+  let q = run f.binary(Binary.UDiv, n, c96)
+  let r = run f.binary(Binary.URem, n, c96)
+  let sum0 = run f.binary(Binary.Add, q, r)
+  let any64 = run f.cast(Cast.ZExt, anyLane, i64K)
+  let sum1 = run f.binary(Binary.Add, sum0, any64)
+  run f.ret(sum1)
+  run f.finish()
+  run expectValidSsa(&f)
+
+  let frame = run AArch64Frame.plan(&f)
+  run Testing.expect(List<i64>.asSlice(&frame.slotOffsets)[deadSlot] == 0,
+    "unused MIR stack slot receives no frame space")
+  run Testing.expect(List<u8>.asSlice(&frame.valueNeonMask)[u64.toUsize(mask)] != 0,
+    "16-byte compare mask stays NEON-resident")
+  run Testing.expect(List<u8>.asSlice(&frame.valueVecs)[u64.toUsize(a)] != AArch64Frame.regNone(),
+    "terminal Exit.Trap call does not force non-trap NEON arguments to spill")
+
+  let out = run AArch64Emit.emit(&f, b"speed_opt_patterns", b"")
+  let code = Bytes.asSlice(&out.code)
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0x4EC03800), "emits zip1.2d for [0, 2] shuffle")
+  run Testing.expect(containsWordMasked(code, 0xFFFFFC00, 0x4E200800), "emits rev64.16b for 16-byte reverse")
+  run Testing.expect(containsWordMasked(code, 0xFFE08400, 0x6E000000), "emits ext.16b for 16-byte reverse")
+  run Testing.expect(!containsWordMasked(code, 0xFFE0FC00, 0x4E000000), "avoids tbl for rev128 and zip1.2d")
+  run Testing.expect(containsWordMasked(code, 0xFF80FC00, 0x6F004400), "emits sri for NEON rotate by constant")
+  run Testing.expect(containsWordMasked(code, 0xFFE0FC00, 0x9BC07C00), "emits umulh for constant UDiv/URem")
+  run Testing.expect(!containsWordMasked(code, 0xFFE0FC00, 0x9AC00800), "avoids hardware udiv for constant 96")
+  run Testing.expect(!hasReloc(&out, RelocationKind.Branch26, b"_memset")
+    && !hasReloc(&out, RelocationKind.Branch26, b"_memmove"),
+    "inlines small Fill (64B) and CopyBytes (32B, 3B) without libc calls")
+  // 3-byte CopyBytes must use unscaled `ldurh`/`sturh` at byte offset +1 (`imm9 = 1`, bits 20:12 = 1).
+  run Testing.expect(containsWordMasked(code, 0xFFFFFC00, 0x78401000)
+    && containsWordMasked(code, 0xFFFFFC00, 0x78001000),
+    "3-byte CopyBytes emits ldurh/sturh at unaligned byte offset +1")
+  // Negated `Ule` (`!(n <= 96)`) fuses directly into `b.hi` (`ccHi == 8`) with no `cset`.
+  run Testing.expect(containsWordMasked(code, 0xFF00001F, 0x54000008),
+    "fuses Xor(Compare(Ule), 1) directly into b.hi")
+  run Testing.expect(!containsWordMasked(code, 0xFFE00C00, 0x9A9F0400),
+    "emits no cset when negated compare is fused into branch")
 }
