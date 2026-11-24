@@ -200,6 +200,8 @@ pub effect fn number(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! Out
     if let Option<Counter>.Some {value: counter} = SsaInduction.find(&function.*, graph, block) {
       run List<Fact>.append(&mut state.facts, Fact {predicate: Predicate.Uge, left: counter.value, right: counter.initial, truth: true})
       run List<Fact>.append(&mut state.facts, Fact {predicate: Predicate.Ule, left: counter.value, right: counter.limit, truth: true})
+    } else {
+      run learnLoopLowerBound(&mut state, &function.*, &graph, block)
     }
     run learnFromPredecessor(&mut state, &mut function.*, graph, block)
     run visitBlock(&mut state, &mut function.*, block)
@@ -518,6 +520,8 @@ effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: u
     let mut added = run narrowThrough(&mut state.*, &mut function.*, block, at, instruction)
     added = added + run uncheck(&mut state.*, &mut function.*, block, at + added, instruction)
     added = added + run foldIndexedAccess(&mut state.*, &mut function.*, block, at + added, instruction)
+    added = added + run foldRangeAnd(&mut state.*, &mut function.*, block, at + added, instruction)
+    added = added + run foldBitMaskOr(&mut state.*, &mut function.*, block, at + added, instruction)
     at = at + added
     count = count + added
     run visitInstruction(&mut state.*, &mut function.*, instruction)
@@ -526,7 +530,16 @@ effect fn visitBlock(state: &mut Numbering, function: &mut SsaFunction, block: u
   // The exit's value and arguments.
   let value = function.block(block).value
   if value != none() {
-    let resolved = resolve(&state.*, value)
+    let mut resolved = resolve(&state.*, value)
+    if function.block(block).exit == Exit.Branch && !function.isConstant(resolved) {
+      let producer = function.producerOf(resolved)
+      if producer != usize.MAX {
+        let proved = decidedByFacts(&state.*, &function.*, producer)
+        if proved != usize.MAX {
+          resolved = run flagOf(&mut state.*, &mut function.*, proved == usize.ONE)
+        }
+      }
+    }
     if resolved != value {
       function.setExitValue(block, resolved)
       state.changed = true
@@ -741,6 +754,25 @@ effect fn uncheck(state: &mut Numbering, function: &mut SsaFunction, block: usiz
         if operation == Binary.Sub { fits = first.low >= second.high }
         if operation == Binary.Mul { fits = first.high == 0 || second.high <= most / first.high }
       }
+      if !fits && operation == Binary.Sub {
+        if decidedByDifferenceBounds(&state.*, &function.*, Predicate.Uge, left, right) == usize.ONE {
+          fits = true
+        }
+      }
+      if !fits && operation == Binary.Add {
+        let mut addBase = none()
+        let mut addConst: u64 = 0
+        if function.isBits(right) {
+          addBase = left
+          addConst = masked(function.constantOf(right).low, kind.bits)
+        } else if function.isBits(left) {
+          addBase = right
+          addConst = masked(function.constantOf(left).low, kind.bits)
+        }
+        if addBase != none() && addConst > 0 && provesAddConstNoWrap(&state.*, &function.*, addBase, addConst, kind.bits) {
+          fits = true
+        }
+      }
     }
     if !fits && !signed && operation == Binary.Mul {
       let mut multiplier = right
@@ -838,7 +870,8 @@ fn normalize(function: &mut SsaFunction, instruction: usize) -> () {
   if left <= right || !function.kindOf(left).isInteger() && !function.kindOf(left).isAddress() { return () }
   match found.operation {
     Operation.Binary {operation} => {
-      if operation != Binary.Add && operation != Binary.Mul && operation != Binary.And && operation != Binary.Or && operation != Binary.Xor { return () }
+      if operation != Binary.Add && operation != Binary.Mul && operation != Binary.UMulHi && operation != Binary.SMulHi
+        && operation != Binary.And && operation != Binary.Or && operation != Binary.Xor { return () }
       if !function.kindOf(left).isInteger() { return () }
     }
     Operation.Compare {predicate} => {
@@ -1011,7 +1044,348 @@ fn decidedByFacts(state: &Numbering, function: &SsaFunction, instruction: usize)
       if implies(holding, inverse(asked)) { return usize.ZERO }
     }
   }
+  let diffDecided = decidedByDifferenceBounds(state, function, asked, left, right)
+  if diffDecided != usize.MAX { return diffDecided }
   return decidedByRanges(state, function, asked, left, right)
+}
+
+fn isUnsignedPredicate(predicate: Predicate) -> bool {
+  return predicate == Predicate.Eq || predicate == Predicate.Ne
+    || predicate == Predicate.Ult || predicate == Predicate.Ule
+    || predicate == Predicate.Ugt || predicate == Predicate.Uge
+}
+
+fn decideFromKnown(known: Predicate, asked: Predicate) -> usize {
+  if implies(known, asked) { return usize.ONE }
+  if implies(known, inverse(asked)) { return usize.ZERO }
+  return usize.MAX
+}
+
+// If `val` is a non-vector integer `base + constOff` with `constOff > 0` (either `Binary.Add`
+// or `Overflow.Add` result 0), writes `base` and `constOff` and returns true.
+fn constAddOf(state: &Numbering, function: &SsaFunction, val: u64, outBase: &mut u64, outConst: &mut u64) -> bool {
+  let rv = resolve(state, val)
+  let kind = function.kindOf(rv)
+  if !kind.isInteger() || kind.isVector() || kind.bits > 64 { return false }
+  let prod = function.producerOf(rv)
+  if prod == usize.MAX { return false }
+  let inst = function.instruction(prod)
+  if inst.result != rv { return false }
+  let isAdd = match inst.operation {
+    Operation.Binary {operation} => operation == Binary.Add
+    Operation.Overflow {operation, signed} => operation == Binary.Add && !signed
+    _ => false
+  }
+  if !isAdd { return false }
+  let args = function.operandsOf(prod)
+  if args.length != 2 { return false }
+  let a0 = resolve(state, args[usize.ZERO])
+  let a1 = resolve(state, args[usize.ONE])
+  if function.isBits(a1) {
+    let c = masked(function.constantOf(a1).low, kind.bits)
+    if c > 0 {
+      outBase.* = a0
+      outConst.* = c
+      return true
+    }
+  } else if function.isBits(a0) {
+    let c = masked(function.constantOf(a0).low, kind.bits)
+    if c > 0 {
+      outBase.* = a1
+      outConst.* = c
+      return true
+    }
+  }
+  return false
+}
+
+// If `val` is a non-vector integer `lhs - rhs` (either `Binary.Sub` or `Overflow.Sub` result 0),
+// writes resolved `lhs` and `rhs` and returns true.
+fn subOf(state: &Numbering, function: &SsaFunction, val: u64, outLhs: &mut u64, outRhs: &mut u64) -> bool {
+  let rv = resolve(state, val)
+  let kind = function.kindOf(rv)
+  if !kind.isInteger() || kind.isVector() || kind.bits > 64 { return false }
+  let prod = function.producerOf(rv)
+  if prod == usize.MAX { return false }
+  let inst = function.instruction(prod)
+  if inst.result != rv { return false }
+  let isSub = match inst.operation {
+    Operation.Binary {operation} => operation == Binary.Sub
+    Operation.Overflow {operation, signed} => operation == Binary.Sub && !signed
+    _ => false
+  }
+  if !isSub { return false }
+  let args = function.operandsOf(prod)
+  if args.length != 2 { return false }
+  outLhs.* = resolve(state, args[usize.ZERO])
+  outRhs.* = resolve(state, args[usize.ONE])
+  return true
+}
+
+// Whether a dominating fact proves `a <= b` (or `a < b` when `requireStrict` is true).
+fn factProvesUle(state: &Numbering, a: u64, b: u64, requireStrict: bool) -> bool {
+  let ra = resolve(state, a)
+  let rb = resolve(state, b)
+  if !requireStrict && ra == rb { return true }
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let fl = resolve(state, fact.left)
+    let fr = resolve(state, fact.right)
+    if fl == ra && fr == rb {
+      if requireStrict {
+        if holding == Predicate.Ult { return true }
+      } else {
+        if holding == Predicate.Ult || holding == Predicate.Ule || holding == Predicate.Eq { return true }
+      }
+    } else if fl == rb && fr == ra {
+      if requireStrict {
+        if holding == Predicate.Ugt { return true }
+      } else {
+        if holding == Predicate.Ugt || holding == Predicate.Uge || holding == Predicate.Eq { return true }
+      }
+    }
+  }
+  return false
+}
+
+// Whether `sumVal = base + c` (`c > 0`, width `bits`) is provably known not to have wrapped
+// unsignedly at the current program point.
+fn sumDidNotWrap(state: &Numbering, function: &SsaFunction, base: u64, c: u64, sumVal: u64, bits: usize) -> bool {
+  if c == 0 { return true }
+  // 1. Direct fact `base <= sumVal` / `base < sumVal` (equivalent to `!(sumVal < base)`).
+  if factProvesUle(state, base, sumVal, false) { return true }
+  // 2. If `sumVal` is `Overflow.Add` result 0, check whether its overflow flag (result + 1) is known 0.
+  let rs = resolve(state, sumVal)
+  let prod = function.producerOf(rs)
+  if prod != usize.MAX {
+    let inst = function.instruction(prod)
+    if inst.result == rs {
+      if let Operation.Overflow {operation: Binary.Add, signed} = inst.operation {
+        if !signed {
+        let ovf = resolve(state, rs + 1)
+        if function.isBits(ovf) && function.constantOf(ovf).low == 0 { return true }
+        let facts = List<Fact>.asSlice(&state.facts)
+        let mut at = facts.length
+        let mut seen = usize.ZERO
+        while at > usize.ZERO && seen < factWindow() {
+          at = at - usize.ONE
+          seen = seen + usize.ONE
+          let fact = facts[at]
+          let mut holding = fact.predicate
+          if !fact.truth { holding = inverse(fact.predicate) }
+          let fl = resolve(state, fact.left)
+          let fr = resolve(state, fact.right)
+          if fl == ovf && function.isBits(fr) && function.constantOf(fr).low == 0 && holding == Predicate.Eq { return true }
+          if fr == ovf && function.isBits(fl) && function.constantOf(fl).low == 0 && holding == Predicate.Eq { return true }
+        }
+        }
+      }
+    }
+  }
+  // 3. Static range of `base` fits `base + c <= maxVal`.
+  let rng = rangeOf(state, function, base, rangeDepth())
+  let most = masked(u64.MAX, bits)
+  if rng.low <= rng.high && rng.high <= most - c { return true }
+  return false
+}
+
+// Whether dominating facts prove `base + c` (`c > 0`, width `bits`) cannot wrap unsignedly.
+fn provesAddConstNoWrap(state: &Numbering, function: &SsaFunction, base: u64, c: u64, bits: usize) -> bool {
+  let rb = resolve(state, base)
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let fl = resolve(state, fact.left)
+    let fr = resolve(state, fact.right)
+    // Check if `base + c2` with `c2 >= c` is known not to have wrapped.
+    let mut cand = none()
+    if holding == Predicate.Ule || holding == Predicate.Ult || holding == Predicate.Eq {
+      if fl == rb { cand = fr }
+    } else if holding == Predicate.Uge || holding == Predicate.Ugt {
+      if fr == rb { cand = fl }
+    }
+    if cand != none() {
+      let mut cb = none()
+      let mut cc: u64 = 0
+      if constAddOf(state, function, cand, &mut cb, &mut cc) && cb == rb && cc >= c {
+        return true
+      }
+    }
+    // Check if `y - base >= c2` (or `> c2`) with `base <= y` and `c2 >= c`.
+    let mut diffVal = none()
+    let mut limVal = none()
+    let mut strict = false
+    if holding == Predicate.Uge || holding == Predicate.Ugt {
+      diffVal = fl
+      limVal = fr
+      strict = holding == Predicate.Ugt
+    } else if holding == Predicate.Ule || holding == Predicate.Ult {
+      diffVal = fr
+      limVal = fl
+      strict = holding == Predicate.Ult
+    }
+    if diffVal != none() && function.isBits(limVal) {
+      let mut dl = none()
+      let mut dr = none()
+      if subOf(state, function, diffVal, &mut dl, &mut dr) && dr == rb {
+        let dConst = masked(function.constantOf(limVal).low, bits)
+        if (dConst >= c || (strict && dConst + 1 >= c)) && factProvesUle(state, rb, dl, false) {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+// Relational difference-bound proof for unsigned scalar comparisons:
+// - From no-wrap `a + c <= b` (or `< b`) with constant `c > 0`:
+//   proves `a < b`, `b - a >= c` (or `> c`), `a + d <= b` (or `< b`) for `d <= c`, and `a + d > a`.
+// - From `a <= b` and `b - a >= c` (or `> c`) with constant `c > 0`:
+//   proves `a + d <= b` (or `< b`) and `a + d > a` for `0 < d <= c`.
+fn decidedByDifferenceBounds(state: &Numbering, function: &SsaFunction, asked: Predicate, left: u64, right: u64) -> usize {
+  if !isUnsignedPredicate(asked) { return usize.MAX }
+  let lk = function.kindOf(left)
+  if !lk.isInteger() || lk.isVector() || lk.bits > 64 { return usize.MAX }
+  let rl = resolve(state, left)
+  let rr = resolve(state, right)
+  let bits = lk.bits
+
+  // Pre-decompose `rl` and `rr` once.
+  let mut lSubA = none()
+  let mut lSubB = none()
+  let lIsSub = subOf(state, function, rl, &mut lSubA, &mut lSubB)
+  let mut rSubA = none()
+  let mut rSubB = none()
+  let rIsSub = subOf(state, function, rr, &mut rSubA, &mut rSubB)
+  let mut lAddBase = none()
+  let mut lAddC: u64 = 0
+  let lIsAdd = constAddOf(state, function, rl, &mut lAddBase, &mut lAddC)
+  let mut rAddBase = none()
+  let mut rAddC: u64 = 0
+  let rIsAdd = constAddOf(state, function, rr, &mut rAddBase, &mut rAddC)
+  let lIsConst = function.isBits(rl)
+  let rIsConst = function.isBits(rr)
+  let lConst = if lIsConst { masked(function.constantOf(rl).low, bits) } else { 0 }
+  let rConst = if rIsConst { masked(function.constantOf(rr).low, bits) } else { 0 }
+
+  let facts = List<Fact>.asSlice(&state.facts)
+  let mut at = facts.length
+  let mut seen = usize.ZERO
+  while at > usize.ZERO && seen < factWindow() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let fact = facts[at]
+    let mut holding = fact.predicate
+    if !fact.truth { holding = inverse(fact.predicate) }
+    let fl = resolve(state, fact.left)
+    let fr = resolve(state, fact.right)
+    // Normalize ordered facts to `small <= big` (or `small < big` when `strict`).
+    let mut small = none()
+    let mut big = none()
+    let mut strict = false
+    if holding == Predicate.Ule || holding == Predicate.Ult || holding == Predicate.Eq {
+      small = fl
+      big = fr
+      strict = holding == Predicate.Ult
+    } else if holding == Predicate.Uge || holding == Predicate.Ugt {
+      small = fr
+      big = fl
+      strict = holding == Predicate.Ugt
+    }
+    if small == none() { continue }
+
+    // Pattern A: `small` is `a + c` (`c > 0`), no-wrap, and `a + c <= big` (or `< big`).
+    let mut a = none()
+    let mut c: u64 = 0
+    if constAddOf(state, function, small, &mut a, &mut c) && sumDidNotWrap(state, function, a, c, small, bits) {
+      // A1: `a < big`
+      if rl == a && rr == big {
+        let d = decideFromKnown(Predicate.Ult, asked)
+        if d != usize.MAX { return d }
+      } else if rl == big && rr == a {
+        let d = decideFromKnown(Predicate.Ugt, asked)
+        if d != usize.MAX { return d }
+      }
+      // A2: `big - a >= c` (or `> c`) compared against constant `k`
+      if lIsSub && lSubA == big && lSubB == a && rIsConst {
+        if rConst < c || (rConst == c && strict) {
+          let d = decideFromKnown(Predicate.Ugt, asked)
+          if d != usize.MAX { return d }
+        } else if rConst == c {
+          let d = decideFromKnown(Predicate.Uge, asked)
+          if d != usize.MAX { return d }
+        }
+      } else if rIsSub && rSubA == big && rSubB == a && lIsConst {
+        if lConst < c || (lConst == c && strict) {
+          let d = decideFromKnown(Predicate.Ult, asked)
+          if d != usize.MAX { return d }
+        } else if lConst == c {
+          let d = decideFromKnown(Predicate.Ule, asked)
+          if d != usize.MAX { return d }
+        }
+      }
+      // A3: `a + d <= big` (or `< big`) for `0 < d <= c`
+      if lIsAdd && lAddBase == a && lAddC <= c && rr == big {
+        let kPred = if lAddC < c || strict { Predicate.Ult } else { Predicate.Ule }
+        let d = decideFromKnown(kPred, asked)
+        if d != usize.MAX { return d }
+      } else if rIsAdd && rAddBase == a && rAddC <= c && rl == big {
+        let kPred = if rAddC < c || strict { Predicate.Ugt } else { Predicate.Uge }
+        let d = decideFromKnown(kPred, asked)
+        if d != usize.MAX { return d }
+      }
+      // A4: `a + d > a` (no-wrap check for `0 < d <= c`)
+      if lIsAdd && lAddBase == a && lAddC <= c && rr == a {
+        let d = decideFromKnown(Predicate.Ugt, asked)
+        if d != usize.MAX { return d }
+      } else if rIsAdd && rAddBase == a && rAddC <= c && rl == a {
+        let d = decideFromKnown(Predicate.Ult, asked)
+        if d != usize.MAX { return d }
+      }
+    }
+
+    // Pattern B: `big` is `y - x`, `small` is constant `c > 0` (`y - x >= c` or `> c`), and `x <= y`.
+    let mut y = none()
+    let mut x = none()
+    if function.isBits(small) && subOf(state, function, big, &mut y, &mut x) {
+      let cMin = masked(function.constantOf(small).low, bits)
+      if cMin > 0 && factProvesUle(state, x, y, false) {
+        // B1: `x + d <= y` (or `< y`) for `0 < d <= cMin`
+        if lIsAdd && lAddBase == x && lAddC <= cMin && rr == y {
+          let kPred = if lAddC < cMin || strict { Predicate.Ult } else { Predicate.Ule }
+          let d = decideFromKnown(kPred, asked)
+          if d != usize.MAX { return d }
+        } else if rIsAdd && rAddBase == x && rAddC <= cMin && rl == y {
+          let kPred = if rAddC < cMin || strict { Predicate.Ugt } else { Predicate.Uge }
+          let d = decideFromKnown(kPred, asked)
+          if d != usize.MAX { return d }
+        }
+        // B2: `x + d > x` (no-wrap for `0 < d <= cMin`)
+        if lIsAdd && lAddBase == x && lAddC <= cMin && rr == x {
+          let d = decideFromKnown(Predicate.Ugt, asked)
+          if d != usize.MAX { return d }
+        } else if rIsAdd && rAddBase == x && rAddC <= cMin && rl == x {
+          let d = decideFromKnown(Predicate.Ult, asked)
+          if d != usize.MAX { return d }
+        }
+      }
+    }
+  }
+  return usize.MAX
 }
 
 // The unsigned values a value can have where the walk stands, from `low` to `high`.
@@ -1149,14 +1523,37 @@ fn rangeIn(state: &Numbering, window: &Window, function: &SsaFunction, value: u6
       holding = swapped(holding)
     }
     if bound == none() {
-      // With x < y, x cannot be the largest unsigned value and y cannot be zero.
-      // This also bounds an ascending or descending index before its unit step.
+      // With x < y / x <= y, narrow against the peer's unsigned range (and at minimum x < most, y > 0).
       if holding == Predicate.Ult || holding == Predicate.Ugt {
         let mut smaller = left
         let mut larger = right
         if holding == Predicate.Ugt { smaller = right larger = left }
-        if value == smaller && range.high == most { range.high = most - 1 }
-        if value == larger && range.low == 0 { range.low = 1 }
+        if value == smaller {
+          if range.high == most && most > 0 { range.high = most - 1 }
+          if depth >= 3 && larger != value && function.kindOf(larger).bits <= 64 {
+            let peer = rangeIn(state, window, function, larger, depth - 3)
+            if peer.high > 0 && peer.high - 1 < range.high { range.high = peer.high - 1 }
+          }
+        }
+        if value == larger {
+          if range.low == 0 { range.low = 1 }
+          if depth >= 3 && smaller != value && function.kindOf(smaller).bits <= 64 {
+            let peer = rangeIn(state, window, function, smaller, depth - 3)
+            if peer.low < most && peer.low + 1 > range.low { range.low = peer.low + 1 }
+          }
+        }
+      } else if holding == Predicate.Ule || holding == Predicate.Uge {
+        let mut smaller = left
+        let mut larger = right
+        if holding == Predicate.Uge { smaller = right larger = left }
+        if value == smaller && depth >= 3 && larger != value && function.kindOf(larger).bits <= 64 {
+          let peer = rangeIn(state, window, function, larger, depth - 3)
+          if peer.high < range.high { range.high = peer.high }
+        }
+        if value == larger && depth >= 3 && smaller != value && function.kindOf(smaller).bits <= 64 {
+          let peer = rangeIn(state, window, function, smaller, depth - 3)
+          if peer.low <= most && peer.low > range.low { range.low = peer.low }
+        }
       }
       continue
     }
@@ -1577,3 +1974,383 @@ fn sameOperation(first: Operation, second: Operation) -> bool {
   }
   return false
 }
+
+// Infers `counter >= initial` for a loop header parameter `counter` whose entry edge supplies a
+// non-zero constant `initial` and whose sole backedge advances `counter` by `+1` from a loop body
+// guarded by `counter < limit` (where `limit` may be any runtime value, guaranteeing `counter + 1`
+// cannot wrap to 0).
+effect fn learnLoopLowerBound(state: &mut Numbering, function: &SsaFunction, graph: &SsaGraph, block: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let head = function.block(block)
+  if head.exit != Exit.Branch || List<u64>.length(&head.parameters) == usize.ZERO { return () }
+  let before = graph.predecessorsOf(block)
+  if block == usize.ZERO || before.length != 2 || before[usize.ZERO] == before[usize.ONE] { return () }
+  let test = function.producerOf(head.value)
+  if test == usize.MAX { return () }
+  let predicate = match function.instruction(test).operation {
+    Operation.Compare {predicate: found} => found
+    _ => { return () }
+  }
+  let args = function.operandsOf(test)
+  if args.length < 2 { return () }
+  // Check both operand orientations: `counter < limit` / `counter >= limit` and `limit > counter` / `limit <= counter`.
+  let parameters = List<u64>.asSlice(&head.parameters)
+  let mut side = usize.ZERO
+  while side < 2 {
+    let counter = args[side]
+    let kind = function.kindOf(counter)
+    if kind.isInteger() && !kind.isVector() && kind.bits <= 64 {
+      let mut pIdx = usize.ZERO
+      while pIdx < parameters.length && parameters[pIdx] != counter { pIdx = pIdx + usize.ONE }
+      if pIdx < parameters.length {
+        let mut arm = usize.MAX
+        if side == usize.ZERO {
+          if predicate == Predicate.Ult { arm = usize.ZERO }
+          else if predicate == Predicate.Uge { arm = usize.ONE }
+        } else {
+          if predicate == Predicate.Ugt { arm = usize.ZERO }
+          else if predicate == Predicate.Ule { arm = usize.ONE }
+        }
+        if arm != usize.MAX && graph.reaches(before[usize.ZERO]) && graph.reaches(before[usize.ONE]) {
+          let body = List<Edge>.asSlice(&head.edges)[arm].block
+          if body != usize.ZERO && body != block && graph.predecessorsOf(body).length == usize.ONE {
+            let mut latch = before[usize.ZERO]
+            let mut entry = before[usize.ONE]
+            if !graph.dominates(body, latch) { latch = before[usize.ONE] entry = before[usize.ZERO] }
+            if graph.dominates(body, latch) && !graph.dominates(block, entry) {
+              let startEdge = function.block(entry).edgeTo(block)
+              let stepEdge = function.block(latch).edgeTo(block)
+              let initial = List<u64>.get(&List<Edge>.asSlice(&function.block(entry).edges)[startEdge].arguments, pIdx)
+              if function.isBits(initial) && masked(function.constantOf(initial).low, kind.bits) > 0 {
+                let next = List<u64>.get(&List<Edge>.asSlice(&function.block(latch).edges)[stepEdge].arguments, pIdx)
+                let prod = function.producerOf(next)
+                if prod != usize.MAX {
+                  let mut isUnitStep = false
+                  match function.instruction(prod).operation {
+                    Operation.Binary {operation: Binary.Add} => {
+                      let ops = function.operandsOf(prod)
+                      if (ops[0] == counter && function.isBits(ops[1]) && function.constantOf(ops[1]).low == 1)
+                        || (ops[1] == counter && function.isBits(ops[0]) && function.constantOf(ops[0]).low == 1) {
+                        isUnitStep = true
+                      }
+                    }
+                    Operation.Overflow {operation: Binary.Add, signed} if !signed => {
+                      if function.value(next).index == usize.ZERO {
+                        let ops = function.operandsOf(prod)
+                        if (ops[0] == counter && function.isBits(ops[1]) && function.constantOf(ops[1]).low == 1)
+                          || (ops[1] == counter && function.isBits(ops[0]) && function.constantOf(ops[0]).low == 1) {
+                          isUnitStep = true
+                        }
+                      }
+                    }
+                    _ => {}
+                  }
+                  if isUnitStep {
+                    run List<Fact>.append(&mut state.facts, Fact {predicate: Predicate.Uge, left: counter, right: initial, truth: true})
+                    return ()
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    side = side + usize.ONE
+  }
+  return ()
+}
+
+struct RangeBound {
+  valid: bool,
+  isLow: bool,
+  x: u64,
+  bound: u64,
+}
+
+impl Copy for RangeBound {}
+
+fn extractConstLane(state: &Numbering, function: &SsaFunction, val: u64, bits: usize) -> u64 {
+  if function.isBits(val) { return masked(function.constantOf(val).low, bits) }
+  let prod = function.producerOf(val)
+  if prod != usize.MAX {
+    if let Operation.Splat {..} = function.instruction(prod).operation {
+      let ops = function.operandsOf(prod)
+      if ops.length >= usize.ONE {
+        let elem = resolve(state, ops[usize.ZERO])
+        if function.isBits(elem) { return masked(function.constantOf(elem).low, bits) }
+      }
+    }
+  }
+  return u64.MAX
+}
+
+// Extracts an unsigned lower (`x >= bound`) or upper (`x <= bound`) constant bound from a scalar
+// integer or `u8x16` SIMD `Operation.Compare` instruction.
+fn extractRangeBound(state: &Numbering, function: &SsaFunction, cmpVal: u64) -> RangeBound {
+  let bad = RangeBound {valid: false, isLow: false, x: none(), bound: 0}
+  let prod = function.producerOf(cmpVal)
+  if prod == usize.MAX { return bad }
+  let pred = match function.instruction(prod).operation {
+    Operation.Compare {predicate} => predicate
+    _ => { return bad }
+  }
+  let ops = function.operandsOf(prod)
+  if ops.length < 2 { return bad }
+  let a = resolve(state, ops[usize.ZERO])
+  let b = resolve(state, ops[usize.ONE])
+  let ak = function.kindOf(a)
+  let isScalarInt = !ak.isVector() && ak.isInteger() && (ak.bits == 8 || ak.bits == 16 || ak.bits == 32 || ak.bits == 64)
+  let isU8x16 = ak.isVector() && ak.isInteger() && ak.bits == 8 && ak.elements == 16
+  if !isScalarInt && !isU8x16 { return bad }
+  let aLane = extractConstLane(state, function, a, ak.bits)
+  let bLane = extractConstLane(state, function, b, ak.bits)
+  let aConst = aLane != u64.MAX
+  let bConst = bLane != u64.MAX
+  if aConst == bConst { return bad }
+  let x = if bConst { a } else { b }
+  let c = if bConst { bLane } else { aLane }
+  let maxVal = masked(u64.MAX, ak.bits)
+  let p = if bConst { pred } else { swapped(pred) }
+  if p == Predicate.Uge { return RangeBound {valid: true, isLow: true, x: x, bound: c} }
+  if p == Predicate.Ugt && c < maxVal { return RangeBound {valid: true, isLow: true, x: x, bound: c + 1} }
+  if p == Predicate.Ule { return RangeBound {valid: true, isLow: false, x: x, bound: c} }
+  if p == Predicate.Ult && c > 0 { return RangeBound {valid: true, isLow: false, x: x, bound: c - 1} }
+  return bad
+}
+
+// Rewrites `(x >= lo) & (x <= hi)` (for scalar unsigned integers and `u8x16` SIMD vectors where
+// `0 < lo <= hi` and `hi - lo < maxVal`) into `(x - lo) <= (hi - lo)`, halving compare work.
+effect fn foldRangeAnd(state: &mut Numbering, function: &mut SsaFunction, block: usize, position: usize, instruction: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  if found.removed || !found.kind.isInteger() || found.kind.bits != 1 { return usize.ZERO }
+  if let Operation.Binary {operation: Binary.And} = found.operation {} else { return usize.ZERO }
+  let ops = function.operandsOf(instruction)
+  if ops.length < 2 { return usize.ZERO }
+  let b0 = extractRangeBound(&state.*, &function.*, resolve(&state.*, ops[usize.ZERO]))
+  if !b0.valid { return usize.ZERO }
+  let b1 = extractRangeBound(&state.*, &function.*, resolve(&state.*, ops[usize.ONE]))
+  if !b1.valid || b0.x != b1.x || b0.isLow == b1.isLow { return usize.ZERO }
+  let lo = if b0.isLow { b0.bound } else { b1.bound }
+  let hi = if b0.isLow { b1.bound } else { b0.bound }
+  let x = b0.x
+  let xk = function.kindOf(x)
+  let maxVal = masked(u64.MAX, xk.bits)
+  if lo == 0 || hi < lo || (hi - lo) >= maxVal { return usize.ZERO }
+  let mut added = usize.ZERO
+  let mut loVal = none()
+  let mut spanVal = none()
+  if xk.isVector() {
+    let elemKind = Kind.integer(xk.bits)
+    let loScalar = run function.constant(elemKind, lo)
+    let spanScalar = run function.constant(elemKind, hi - lo)
+    loVal = run function.insertInstruction(block, position + added, Operation.Splat {count: xk.elements}, xk, &[loScalar], found.place)
+    run grow(&mut state.*, loVal)
+    added = added + usize.ONE
+    spanVal = run function.insertInstruction(block, position + added, Operation.Splat {count: xk.elements}, xk, &[spanScalar], found.place)
+    run grow(&mut state.*, spanVal)
+    added = added + usize.ONE
+  } else {
+    loVal = run function.constant(xk, lo)
+    spanVal = run function.constant(xk, hi - lo)
+  }
+  let shifted = run function.insertInstruction(block, position + added, Operation.Binary {operation: Binary.Sub}, xk, &[x, loVal], found.place)
+  run grow(&mut state.*, shifted)
+  added = added + usize.ONE
+  function.setOperation(instruction, Operation.Compare {predicate: Predicate.Ule})
+  function.setOperand(instruction, usize.ZERO, shifted)
+  function.setOperand(instruction, usize.ONE, spanVal)
+  state.changed = true
+  return added
+}
+
+struct EqConst {
+  valid: bool,
+  x: u64,
+  c: u64,
+}
+
+impl Copy for EqConst {}
+
+fn extractEqConst(state: &Numbering, function: &SsaFunction, cmpVal: u64) -> EqConst {
+  let bad = EqConst {valid: false, x: none(), c: 0}
+  let prod = function.producerOf(cmpVal)
+  if prod == usize.MAX { return bad }
+  if let Operation.Compare {predicate: Predicate.Eq} = function.instruction(prod).operation {} else { return bad }
+  let ops = function.operandsOf(prod)
+  if ops.length < 2 { return bad }
+  let a = resolve(state, ops[usize.ZERO])
+  let b = resolve(state, ops[usize.ONE])
+  let ak = function.kindOf(a)
+  let isScalarInt = !ak.isVector() && ak.isInteger() && (ak.bits == 8 || ak.bits == 16 || ak.bits == 32 || ak.bits == 64)
+  let isU8x16 = ak.isVector() && ak.isInteger() && ak.bits == 8 && ak.elements == 16
+  if !isScalarInt && !isU8x16 { return bad }
+  let aLane = extractConstLane(state, function, a, ak.bits)
+  let bLane = extractConstLane(state, function, b, ak.bits)
+  let aConst = aLane != u64.MAX
+  let bConst = bLane != u64.MAX
+  if aConst == bConst { return bad }
+  let x = if bConst { a } else { b }
+  let c = if bConst { bLane } else { aLane }
+  return EqConst {valid: true, x: x, c: c}
+}
+
+struct ShiftedRange {
+  valid: bool,
+  x: u64,
+  lo: u64,
+  width: u64,
+}
+
+impl Copy for ShiftedRange {}
+
+fn extractShiftedRange(state: &Numbering, function: &SsaFunction, cmpVal: u64) -> ShiftedRange {
+  let bad = ShiftedRange {valid: false, x: none(), lo: 0, width: 0}
+  let prod = function.producerOf(cmpVal)
+  if prod == usize.MAX { return bad }
+  let pred = match function.instruction(prod).operation {
+    Operation.Compare {predicate} => predicate
+    _ => { return bad }
+  }
+  let ops = function.operandsOf(prod)
+  if ops.length < 2 { return bad }
+  let a = resolve(state, ops[usize.ZERO])
+  let b = resolve(state, ops[usize.ONE])
+  let ak = function.kindOf(a)
+  let isScalarInt = !ak.isVector() && ak.isInteger() && (ak.bits == 8 || ak.bits == 16 || ak.bits == 32 || ak.bits == 64)
+  let isU8x16 = ak.isVector() && ak.isInteger() && ak.bits == 8 && ak.elements == 16
+  if !isScalarInt && !isU8x16 { return bad }
+  let aLane = extractConstLane(state, function, a, ak.bits)
+  let bLane = extractConstLane(state, function, b, ak.bits)
+  let aConst = aLane != u64.MAX
+  let bConst = bLane != u64.MAX
+  if aConst == bConst { return bad }
+  let shiftedVal = if bConst { a } else { b }
+  let c = if bConst { bLane } else { aLane }
+  let p = if bConst { pred } else { swapped(pred) }
+  let mut w: u64 = 0
+  if p == Predicate.Ule {
+    w = c
+  } else if p == Predicate.Ult && c > 0 {
+    w = c - 1
+  } else {
+    return bad
+  }
+  let sProd = function.producerOf(shiftedVal)
+  if sProd == usize.MAX { return bad }
+  let sInst = function.instruction(sProd)
+  let sOps = function.operandsOf(sProd)
+  if sOps.length < 2 { return bad }
+  let sa = resolve(state, sOps[usize.ZERO])
+  let sb = resolve(state, sOps[usize.ONE])
+  if let Operation.Binary {operation: Binary.Sub} = sInst.operation {
+    let subC = extractConstLane(state, function, sb, ak.bits)
+    if subC != u64.MAX { return ShiftedRange {valid: true, x: sa, lo: subC, width: w} }
+  } else if let Operation.Binary {operation: Binary.Add} = sInst.operation {
+    let addB = extractConstLane(state, function, sb, ak.bits)
+    if addB != u64.MAX {
+      let lo = masked(u64.wrappingSubtract(0, addB), ak.bits)
+      return ShiftedRange {valid: true, x: sa, lo: lo, width: w}
+    }
+    let addA = extractConstLane(state, function, sa, ak.bits)
+    if addA != u64.MAX {
+      let lo = masked(u64.wrappingSubtract(0, addA), ak.bits)
+      return ShiftedRange {valid: true, x: sb, lo: lo, width: w}
+    }
+  }
+  return bad
+}
+
+effect fn makeConstOrSplat(
+  state: &mut Numbering,
+  function: &mut SsaFunction,
+  block: usize,
+  position: usize,
+  xk: Kind,
+  bitsVal: u64,
+  place: u64,
+  added: &mut usize,
+) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  if xk.isVector() {
+    let elemKind = Kind.integer(xk.bits)
+    let scalar = run function.constant(elemKind, bitsVal)
+    let splat = run function.insertInstruction(block, position + added.*, Operation.Splat {count: xk.elements}, xk, &[scalar], place)
+    run grow(&mut state.*, splat)
+    added.* = added.* + usize.ONE
+    return splat
+  }
+  return run function.constant(xk, bitsVal)
+}
+
+// Rewrites `(x == c0) | (x == c1)` and `((x - c0) <= w) | ((x - c1) <= w)` when `c0 ^ c1` is a
+// single bit `d` (for ranges, also requiring `[lo, lo + w]` not to cross bit `d`), collapsing
+// pairs such as `'+' | '/'` and `'A'..'Z' | 'a'..'z'` into one masked check.
+effect fn foldBitMaskOr(state: &mut Numbering, function: &mut SsaFunction, block: usize, position: usize, instruction: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let found = function.instruction(instruction)
+  if found.removed || !found.kind.isInteger() || found.kind.bits != 1 { return usize.ZERO }
+  if let Operation.Binary {operation: Binary.Or} = found.operation {} else { return usize.ZERO }
+  let ops = function.operandsOf(instruction)
+  if ops.length < 2 { return usize.ZERO }
+  let lhs = resolve(&state.*, ops[usize.ZERO])
+  let rhs = resolve(&state.*, ops[usize.ONE])
+  let e0 = extractEqConst(&state.*, &function.*, lhs)
+  if e0.valid {
+    let e1 = extractEqConst(&state.*, &function.*, rhs)
+    if e1.valid && e0.x == e1.x {
+      let d = u64.bitXor(e0.c, e1.c)
+      if d != 0 && (d & (d - 1)) == 0 {
+        let xk = function.kindOf(e0.x)
+        let maskBits = masked(u64.bitNot(d), xk.bits)
+        let baseBits = e0.c & maskBits
+        let mut added = usize.ZERO
+        let maskVal = run makeConstOrSplat(&mut state.*, &mut function.*, block, position, xk, maskBits, found.place, &mut added)
+        let baseVal = run makeConstOrSplat(&mut state.*, &mut function.*, block, position, xk, baseBits, found.place, &mut added)
+        let maskedX = run function.insertInstruction(block, position + added, Operation.Binary {operation: Binary.And}, xk, &[e0.x, maskVal], found.place)
+        run grow(&mut state.*, maskedX)
+        added = added + usize.ONE
+        function.setOperation(instruction, Operation.Compare {predicate: Predicate.Eq})
+        function.setOperand(instruction, usize.ZERO, maskedX)
+        function.setOperand(instruction, usize.ONE, baseVal)
+        state.changed = true
+        return added
+      }
+    }
+  }
+  let r0 = extractShiftedRange(&state.*, &function.*, lhs)
+  if r0.valid {
+    let r1 = extractShiftedRange(&state.*, &function.*, rhs)
+    if r1.valid && r0.x == r1.x && r0.width == r1.width {
+      let d = u64.bitXor(r0.lo, r1.lo)
+      if d != 0 && (d & (d - 1)) == 0 {
+        let xk = function.kindOf(r0.x)
+        let maxVal = masked(u64.MAX, xk.bits)
+        let maskBits = masked(u64.bitNot(d), xk.bits)
+        let lo = r0.lo & maskBits
+        if r0.width < maxVal && lo <= maxVal - r0.width {
+          let hi = lo + r0.width
+          if u64.bitXor(lo, hi) < d {
+            let mut added = usize.ZERO
+            let maskVal = run makeConstOrSplat(&mut state.*, &mut function.*, block, position, xk, maskBits, found.place, &mut added)
+            let loVal = run makeConstOrSplat(&mut state.*, &mut function.*, block, position, xk, lo, found.place, &mut added)
+            let wVal = run makeConstOrSplat(&mut state.*, &mut function.*, block, position, xk, r0.width, found.place, &mut added)
+            let maskedX = run function.insertInstruction(block, position + added, Operation.Binary {operation: Binary.And}, xk, &[r0.x, maskVal], found.place)
+            run grow(&mut state.*, maskedX)
+            added = added + usize.ONE
+            let shifted = run function.insertInstruction(block, position + added, Operation.Binary {operation: Binary.Sub}, xk, &[maskedX, loVal], found.place)
+            run grow(&mut state.*, shifted)
+            added = added + usize.ONE
+            function.setOperation(instruction, Operation.Compare {predicate: Predicate.Ule})
+            function.setOperand(instruction, usize.ZERO, shifted)
+            function.setOperand(instruction, usize.ONE, wVal)
+            state.changed = true
+            return added
+          }
+        }
+      }
+    }
+  }
+  return usize.ZERO
+}
+

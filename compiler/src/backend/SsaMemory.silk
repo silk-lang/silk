@@ -59,9 +59,11 @@
 import backend.SsaDeadCode
 import backend.SsaFunction {
   Binary,
+  Cast,
   ConstantForm,
   Definition,
   Edge,
+  Exit,
   Kind,
   Operation,
   SsaFunction,
@@ -669,8 +671,9 @@ struct Forwarding {
 pub effect fn forward(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! OutOfMemoryError ? &mut Allocator {
   let escaped = run escapedSlots(&function.*, graph)
   let bypassed = run bypassTemporaryCopies(&mut function.*, List<bool>.asSlice(&escaped))
+  let promotedRo = run promoteReadOnlyCopies(&mut function.*, List<bool>.asSlice(&escaped))
   let mut state = Forwarding {reads: List<Read>.make(), killedReads: List<usize>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
-    bits: function.addressBits, changed: bypassed}
+    bits: function.addressBits, changed: bypassed || promotedRo}
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
   let mut marks = List<usize>.make()
@@ -928,6 +931,167 @@ effect fn bypassTemporaryCopies(function: &mut SsaFunction, escaped: &[bool]) ->
   return changed
 }
 
+fn hasPrefix(bytes: &[u8], prefix: &[u8]) -> bool {
+  if bytes.length < prefix.length { return false }
+  let mut i = usize.ZERO
+  while i < prefix.length {
+    if bytes[i] != prefix[i] { return false }
+    i = i + usize.ONE
+  }
+  return true
+}
+
+fn isImmutableRodataSymbol(function: &SsaFunction, value: u64) -> bool {
+  if !function.isConstant(value) { return false }
+  let c = function.constantOf(value)
+  if c.form == ConstantForm.Symbol && c.low == 0 {
+    let name = function.symbolName(c.symbol)
+    return hasPrefix(name, b"silk.rodata.") || hasPrefix(name, b"silk.bytes.")
+  }
+  return false
+}
+
+// Replaces private non-escaping slots whose sole write in the entire function is an entry-block
+// whole-slot `CopyBytes` from an immutable `.rodata` symbol (`silk.rodata.*` / `silk.bytes.*`)
+// directly with that symbol, eliminating stack storage and `memmove@plt`.
+effect fn promoteReadOnlyCopies(function: &mut SsaFunction, escaped: &[bool]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let slotCount = function.slotCount()
+  if slotCount == usize.ZERO { return false }
+  let mut writeCounts = List<usize>.make()
+  run List<usize>.appendRepeated(&mut writeCounts, usize.ZERO, slotCount)
+  let mut copyInst = List<usize>.make()
+  run List<usize>.appendRepeated(&mut copyInst, usize.MAX, slotCount)
+  let mut copySrc = List<u64>.make()
+  run List<u64>.appendRepeated(&mut copySrc, none(), slotCount)
+  let mut bad = List<bool>.make()
+  run List<bool>.appendRepeated(&mut bad, false, slotCount)
+
+  let mut block = usize.ZERO
+  while block < function.blockCount() {
+    let listed = List<usize>.asSlice(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let id = listed[at]
+      at = at + usize.ONE
+      let inst = function.instruction(id)
+      if inst.removed { continue }
+      let ops = function.operandsOf(id)
+      match inst.operation {
+        Operation.Store {..} => {
+          let p = placeOf(&function.*, ops[usize.ONE], 0)
+          if p.form == BaseForm.Slot {
+            let s = u64.toUsize(p.base)
+            let prev = List<usize>.get(&writeCounts, s)
+            List<usize>.set(&mut writeCounts, s, prev + usize.ONE)
+          }
+        }
+        Operation.Fill {..} => {
+          let p = placeOf(&function.*, ops[usize.ZERO], 0)
+          if p.form == BaseForm.Slot {
+            let s = u64.toUsize(p.base)
+            let prev = List<usize>.get(&writeCounts, s)
+            List<usize>.set(&mut writeCounts, s, prev + usize.ONE)
+          }
+        }
+        Operation.CopyBytes {size} => {
+          let dst = placeOf(&function.*, ops[usize.ZERO], 0)
+          let src = placeOf(&function.*, ops[usize.ONE], 0)
+          if src.form == BaseForm.Slot {
+            let rs = u64.toUsize(src.base)
+            if block == usize.ZERO && List<usize>.get(&writeCounts, rs) == usize.ZERO {
+              List<bool>.set(&mut bad, rs, true)
+            }
+          }
+          if dst.form == BaseForm.Slot {
+            let s = u64.toUsize(dst.base)
+            let wc = List<usize>.get(&writeCounts, s) + usize.ONE
+            List<usize>.set(&mut writeCounts, s, wc)
+            if wc == usize.ONE && block == usize.ZERO && !escaped[s] && dst.known && dst.offset == 0
+              && size == function.slot(s).size && isImmutableRodataSymbol(&function.*, ops[usize.ONE]) {
+              List<usize>.set(&mut copyInst, s, id)
+              List<u64>.set(&mut copySrc, s, ops[usize.ONE])
+            } else {
+              List<usize>.set(&mut copyInst, s, usize.MAX)
+            }
+          }
+        }
+        Operation.Load {..} => {
+          let p = placeOf(&function.*, ops[usize.ZERO], 0)
+          if p.form == BaseForm.Slot {
+            let rs = u64.toUsize(p.base)
+            if block == usize.ZERO && List<usize>.get(&writeCounts, rs) == usize.ZERO {
+              List<bool>.set(&mut bad, rs, true)
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+    block = block + usize.ONE
+  }
+
+  let mut any = false
+  let mut s = usize.ZERO
+  while s < slotCount {
+    if !escaped[s] && !List<bool>.get(&bad, s) && List<usize>.get(&writeCounts, s) == usize.ONE
+      && List<usize>.get(&copyInst, s) != usize.MAX {
+      any = true
+      break
+    }
+    s = s + usize.ONE
+  }
+  if !any { return false }
+
+  let mut substitution = List<u64>.make()
+  run List<u64>.appendRepeated(&mut substitution, none(), function.valueCount())
+  s = usize.ZERO
+  while s < slotCount {
+    let cid = List<usize>.get(&copyInst, s)
+    if !escaped[s] && !List<bool>.get(&bad, s) && List<usize>.get(&writeCounts, s) == usize.ONE && cid != usize.MAX {
+      function.remove(cid)
+    }
+    s = s + usize.ONE
+  }
+
+  block = usize.ZERO
+  while block < function.blockCount() {
+    let instCount = List<usize>.length(&function.block(block).instructions)
+    let mut at = usize.ZERO
+    while at < instCount {
+      let id = List<usize>.get(&function.block(block).instructions, at)
+      at = at + usize.ONE
+      let inst = function.instruction(id)
+      if inst.removed { continue }
+      match inst.operation {
+        Operation.SlotAddress {slot} => {
+          let cid = List<usize>.get(&copyInst, slot)
+          if !escaped[slot] && !List<bool>.get(&bad, slot) && List<usize>.get(&writeCounts, slot) == usize.ONE && cid != usize.MAX {
+            List<u64>.set(&mut substitution, u64.toUsize(inst.result), List<u64>.get(&copySrc, slot))
+            function.remove(id)
+          }
+        }
+        Operation.SlotStart {slot} => {
+          let cid = List<usize>.get(&copyInst, slot)
+          if !escaped[slot] && !List<bool>.get(&bad, slot) && List<usize>.get(&writeCounts, slot) == usize.ONE && cid != usize.MAX {
+            function.remove(id)
+          }
+        }
+        Operation.SlotEnd {slot} => {
+          let cid = List<usize>.get(&copyInst, slot)
+          if !escaped[slot] && !List<bool>.get(&bad, slot) && List<usize>.get(&writeCounts, slot) == usize.ONE && cid != usize.MAX {
+            function.remove(id)
+          }
+        }
+        _ => {}
+      }
+    }
+    block = block + usize.ONE
+  }
+  function.substitute(&mut substitution)
+  function.sweep()
+  return true
+}
+
 // Whether all the bytes belong to a single stack slot whose address stays private.
 fn privateSlotContains(function: &SsaFunction, escaped: &[bool], place: Place, size: u64) -> bool {
   if !place.known || place.form != BaseForm.Slot { return false }
@@ -1075,8 +1239,47 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
         lastCopy = usize.MAX
         run killSlot(&mut state.*, slot)
       }
+      Operation.Extract => {
+        let operands = function.operandsOf(instruction)
+        if operands.length >= 2 && function.isBits(operands[usize.ONE]) && !found.kind.isVector() && !found.kind.isFloat() && found.kind.bits >= 8 {
+          let vecVal = resolved(&state.*, operands[usize.ZERO])
+          let vecKind = function.kindOf(vecVal)
+          let idx = function.constantOf(operands[usize.ONE]).low
+          let elemBytes = usize.toU64(found.kind.storeSize())
+          if vecKind.isVector() && idx < usize.toU64(vecKind.elements) && elemBytes > 0 {
+            let byteOff = idx * elemBytes
+            let mut srcVal = vecVal
+            let prod0 = function.producerOf(srcVal)
+            if prod0 != usize.MAX {
+              if let Operation.Cast {operation: Cast.Bitcast} = function.instruction(prod0).operation {
+                srcVal = resolved(&state.*, function.operandsOf(prod0)[usize.ZERO])
+              }
+            }
+            let held = List<Held>.asSlice(&state.held)
+            let mut hi = held.length
+            let mut seen = usize.ZERO
+            while hi > state.floor && seen < window() {
+              hi = hi - usize.ONE
+              seen = seen + usize.ONE
+              if held[hi].alive && held[hi].value == srcVal && held[hi].place.form == BaseForm.Slot
+                && byteOff + elemBytes <= held[hi].size {
+                let loadProd = function.producerOf(srcVal)
+                if loadProd != usize.MAX {
+                  if let Operation.Load {offset: ldOff, alignment: ldAlign} = function.instruction(loadProd).operation {
+                    let ldAddr = resolved(&state.*, function.operandsOf(loadProd)[usize.ZERO])
+                    let newAlign = if ldAlign < found.kind.storeSize() { ldAlign } else { found.kind.storeSize() }
+                    function.replaceWithUnary(instruction, Operation.Load {offset: ldOff + byteOff, alignment: if newAlign == 0 { usize.ONE } else { newAlign }}, ldAddr)
+                    state.changed = true
+                  }
+                }
+                break
+              }
+            }
+          }
+        }
+      }
       _ => {
-        if clobbers(found.operation) {
+        if clobbers(found.operation) && !found.pure {
           lastCopy = usize.MAX
           state.readFloor = List<Read>.length(&state.reads)
           run clobber(&mut state.*)
@@ -1125,6 +1328,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
   // The places each read covers.
   let mut reads = List<Place>.make()
   let mut readSizes = List<u64>.make()
+  let mut readBlocks = List<usize>.make()
   let mut writes = List<usize>.make()
   let mut block = usize.ZERO
   while block < function.blockCount() {
@@ -1140,6 +1344,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
           if place.form == BaseForm.Slot {
             run List<Place>.append(&mut reads, place)
             run List<u64>.append(&mut readSizes, usize.toU64(found.kind.storeSize()))
+            run List<usize>.append(&mut readBlocks, block)
           }
         }
         Operation.CopyBytes {size} => {
@@ -1147,6 +1352,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
           if from.form == BaseForm.Slot {
             run List<Place>.append(&mut reads, from)
             run List<u64>.append(&mut readSizes, size)
+            run List<usize>.append(&mut readBlocks, block)
           }
           if size > 0 && privateSlotContains(&function.*, escaped, placeOf(&function.*, operands[0], 0), size) { run List<usize>.append(&mut writes, instruction) }
         }
@@ -1161,6 +1367,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
   let candidates = List<usize>.asSlice(&writes)
   let read = List<Place>.asSlice(&reads)
   let sizes = List<u64>.asSlice(&readSizes)
+  let rBlocks = List<usize>.asSlice(&readBlocks)
   let mut removed = false
   let mut at = usize.ZERO
   while at < candidates.length {
@@ -1170,20 +1377,31 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
     let operands = function.operandsOf(instruction)
     let mut place = placeOf(&function.*, operands[usize.ZERO], 0)
     let mut size: u64 = 0
+    let mut isPlainStore = false
     match found.operation {
       Operation.Store {offset, ..} => {
         place = placeOf(&function.*, operands[usize.ONE], offset)
         size = usize.toU64(function.kindOf(operands[usize.ZERO]).storeSize())
+        isPlainStore = true
       }
       Operation.Fill {size: filled, ..} => { size = filled }
       Operation.CopyBytes {size: copied} => { size = copied }
       _ => {}
     }
     let mut unread = true
+    let mut otherBlockReads = false
     let mut other = usize.ZERO
-    while other < read.length && unread {
-      if mayAlias(read[other], sizes[other], place, size, escaped, function.addressBits) { unread = false }
+    while other < read.length {
+      if mayAlias(read[other], sizes[other], place, size, escaped, function.addressBits) {
+        unread = false
+        if rBlocks[other] != found.block { otherBlockReads = true }
+      }
       other = other + usize.ONE
+    }
+    if !unread && isPlainStore && place.form == BaseForm.Slot && place.known && size > 0 {
+      if isLocallyDeadStore(&function.*, escaped, found.block, instruction, place, size, otherBlockReads) {
+        unread = true
+      }
     }
     if unread {
       if let Operation.CopyBytes {size: copied} = found.operation {
@@ -1203,6 +1421,107 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
   }
   if removed { function.sweep() }
   return removed
+}
+
+fn coversSlotRange(wPlace: Place, wSize: u64, target: Place, targetSize: u64) -> bool {
+  if wPlace.form != BaseForm.Slot || !wPlace.known || wPlace.base != target.base { return false }
+  if wPlace.offset > target.offset { return false }
+  if wSize < targetSize { return false }
+  let rel = target.offset - wPlace.offset
+  return rel <= wSize - targetSize
+}
+
+fn isLocallyDeadStore(
+  function: &SsaFunction,
+  escaped: &[bool],
+  block: usize,
+  instruction: usize,
+  place: Place,
+  size: u64,
+  otherBlockReads: bool,
+) -> bool {
+  let listed = List<usize>.asSlice(&function.block(block).instructions)
+  let pos = positionIn(function, block, instruction)
+  if pos >= listed.length { return false }
+  let slotIdx = u64.toUsize(place.base)
+  let mut k = pos + usize.ONE
+  while k < listed.length {
+    let instId = listed[k]
+    let inst = function.instruction(instId)
+    if !inst.removed {
+      let ops = function.operandsOf(instId)
+      match inst.operation {
+        Operation.Load {offset, ..} => {
+          let rp = placeOf(function, ops[usize.ZERO], offset)
+          if mayAlias(rp, usize.toU64(inst.kind.storeSize()), place, size, escaped, function.addressBits) { return false }
+        }
+        Operation.CopyBytes {size: copied} => {
+          let rp = placeOf(function, ops[usize.ONE], 0)
+          if mayAlias(rp, copied, place, size, escaped, function.addressBits) { return false }
+          let wp = placeOf(function, ops[usize.ZERO], 0)
+          if coversSlotRange(wp, copied, place, size) { return true }
+        }
+        Operation.Store {offset, ..} => {
+          let wp = placeOf(function, ops[usize.ONE], offset)
+          let ws = usize.toU64(function.kindOf(ops[usize.ZERO]).storeSize())
+          if coversSlotRange(wp, ws, place, size) { return true }
+        }
+        Operation.Fill {size: filled, ..} => {
+          let wp = placeOf(function, ops[usize.ZERO], 0)
+          if coversSlotRange(wp, filled, place, size) { return true }
+        }
+        Operation.SlotEnd {slot} => {
+          if slot == slotIdx { return true }
+        }
+        _ => {}
+      }
+    }
+    k = k + usize.ONE
+  }
+  let exit = function.block(block).exit
+  if exit == Exit.Return || exit == Exit.Trap || exit == Exit.Unreachable { return true }
+  if otherBlockReads { return false }
+  // No other block reads `[place, place+size)` and nothing after `pos` in `block` reads it.
+  // If `block` resets or overwrites `[place, place+size)` before any earlier read in `block`,
+  // this store cannot even be observed across a loop back-edge into `block`.
+  let mut killedSinceEntry = false
+  let mut j = usize.ZERO
+  while j < pos {
+    let instId = listed[j]
+    let inst = function.instruction(instId)
+    if !inst.removed {
+      let ops = function.operandsOf(instId)
+      match inst.operation {
+        Operation.SlotStart {slot} => {
+          if slot == slotIdx { killedSinceEntry = true }
+        }
+        Operation.Store {offset, ..} => {
+          let wp = placeOf(function, ops[usize.ONE], offset)
+          let ws = usize.toU64(function.kindOf(ops[usize.ZERO]).storeSize())
+          if coversSlotRange(wp, ws, place, size) { killedSinceEntry = true }
+        }
+        Operation.Fill {size: filled, ..} => {
+          let wp = placeOf(function, ops[usize.ZERO], 0)
+          if coversSlotRange(wp, filled, place, size) { killedSinceEntry = true }
+        }
+        Operation.CopyBytes {size: copied} => {
+          let rp = placeOf(function, ops[usize.ONE], 0)
+          if !killedSinceEntry && mayAlias(rp, copied, place, size, escaped, function.addressBits) { return false }
+          let wp = placeOf(function, ops[usize.ZERO], 0)
+          if coversSlotRange(wp, copied, place, size) { killedSinceEntry = true }
+        }
+        Operation.Load {offset, ..} => {
+          if !killedSinceEntry {
+            let rp = placeOf(function, ops[usize.ZERO], offset)
+            if mayAlias(rp, usize.toU64(inst.kind.storeSize()), place, size, escaped, function.addressBits) { return false }
+          }
+        }
+        _ => {}
+      }
+    }
+    j = j + usize.ONE
+  }
+  return true
 }
 
 // Whether `address` is in a slot that does not escape.
