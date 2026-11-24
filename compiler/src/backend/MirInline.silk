@@ -22,7 +22,7 @@
 //! recursive expansions.
 
 import CompilerBug
-import hir.Hir { InfixOperator }
+import hir.Hir { InfixOperator, PrefixOperator }
 import backend.InstanceKey { InstanceKey }
 import backend.Mir
 import backend.MirWalk
@@ -46,6 +46,7 @@ import backend.Mir {
   Projection,
   Reference,
   Rvalue,
+  ScalarBinary,
   SharedAccess,
   Statement,
   Terminator,
@@ -62,6 +63,7 @@ import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.interned { Interned }
+import silk.num.u8
 import silk.num.usize
 
 /// Copies a complete MIR answer, preserving its local, block and origin indices and all body facts.
@@ -209,13 +211,17 @@ pub effect fn copy(function: &MirFunction) -> MirFunction ! OutOfMemoryError ? &
   let settled = List<InstanceKey>.asSlice(&function.quiet)
   at = 0
   while at < settled.length { run List<InstanceKey>.append(&mut quiet, InstanceKey.copy(&settled[at])) at = at + 1 }
+  let mut pureCallBlocks = List<usize>.make()
+  let pureCalls = List<usize>.asSlice(&function.pureCallBlocks)
+  at = 0
+  while at < pureCalls.length { run List<usize>.append(&mut pureCallBlocks, pureCalls[at]) at = at + 1 }
   let suspension = match &function.suspension { Option<Origin>.Some {value} => Option<Origin>.some(value) Option<Origin>.None => Option<Origin>.none() }
   let parks = match &function.parks { Option<Origin>.Some {value} => Option<Origin>.some(value) Option<Origin>.None => Option<Origin>.none() }
   return MirFunction {key: InstanceKey.copy(&function.key), borrow: function.borrow, result: Interned<Type>.clone(&function.result),
     parameters: move parameters, locals: move locals, blocks: move blocks, references: move references, externs: move externs,
     observes: function.observes, contexts: move contexts, traps: move traps, suspension: move suspension, parks: move parks,
     releasesPackages: function.releasesPackages, nonParking: move nonParking, cancels: move cancels, accesses: move accesses,
-    escapes: move escapes, erasures: move erasures, features: run Bytes.copy(Bytes.asSlice(&function.features)), inlining: function.inlining,
+    escapes: move escapes, erasures: move erasures, features: run Bytes.copy(Bytes.asSlice(&function.features)), pureCallBlocks: move pureCallBlocks, inlining: function.inlining,
     optimizeSize: function.optimizeSize, variadic: function.variadic, frame: run Bytes.copy(Bytes.asSlice(&function.frame)), lines: move lines,
     variables: move variables, inlined: move inlined, quiet: move quiet}
 }
@@ -241,7 +247,7 @@ pub const hintedExpanded: usize = 256
 pub const expansionCap: usize = 1024
 
 /// The largest body an `@inlineAlways` function may have and still be inlined.
-pub const alwaysBody: usize = 256
+pub const alwaysBody: usize = 8192
 
 /// The largest body that is no larger than the call it replaces, with the call's operands and
 /// result: an accessor, a wrapping operation, a conversion. Inlining one never grows the caller.
@@ -913,16 +919,68 @@ fn comparison(operation: InfixOperator) -> bool {
   }
 }
 
-fn sameFeatures(left: &Bytes, right: &Bytes) -> bool {
-  let first = Bytes.asSlice(left)
-  let second = Bytes.asSlice(right)
-  if first.length != second.length { return false }
+/// Whether every comma-separated target-feature token in `required` appears as a complete
+/// comma-separated token in `available`.
+///
+/// # Details
+///
+/// An empty `required` slice is a subset of every `available` slice, allowing baseline callees
+/// without `@features(...)` to inline into `@features(...)` callers. A non-empty `required`
+/// slice is never a subset of an empty `available` slice, so an `@features(...)` callee never
+/// inlines into a baseline caller. Matching compares complete comma-delimited tokens rather than
+/// substrings, so `+avx` never matches `+avx2` and `+sse4.1` never matches `+sse4.2`. Token
+/// order and duplicates in either list do not affect the result.
+pub fn featuresSubset(required: &[u8], available: &[u8]) -> bool {
+  if required.length == usize.ZERO { return true }
+  if available.length == usize.ZERO { return false }
+  if sameSlice(required, available) { return true }
+  let mut start = usize.ZERO
+  while start < required.length {
+    let mut end = start
+    while end < required.length && required[end] != 44 {
+      end = end + usize.ONE
+    }
+    if end > start && !containsFeatureToken(available, required, start, end) {
+      return false
+    }
+    start = end + usize.ONE
+  }
+  return true
+}
+
+fn sameSlice(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
   let mut at = usize.ZERO
-  while at < first.length {
-    if first[at] != second[at] { return false }
+  while at < left.length {
+    if left[at] != right[at] { return false }
     at = at + usize.ONE
   }
   return true
+}
+
+fn containsFeatureToken(available: &[u8], required: &[u8], reqStart: usize, reqEnd: usize) -> bool {
+  let reqLen = reqEnd - reqStart
+  let mut start = usize.ZERO
+  while start < available.length {
+    let mut end = start
+    while end < available.length && available[end] != 44 {
+      end = end + usize.ONE
+    }
+    if end - start == reqLen {
+      let mut at = usize.ZERO
+      let mut matched = true
+      while at < reqLen {
+        if available[start + at] != required[reqStart + at] {
+          matched = false
+          break
+        }
+        at = at + usize.ONE
+      }
+      if matched { return true }
+    }
+    start = end + usize.ONE
+  }
+  return false
 }
 
 /// Replaces the direct call ending block `point` with `callee`'s checked body. `nodes` is the
@@ -931,16 +989,18 @@ fn sameFeatures(left: &Bytes, right: &Bytes) -> bool {
 ///
 /// At a suspension point the callee's cancellation exits chain into the point's own. A splice at
 /// a suspension point, or any splice in a build for LLVM (`direct` false), is refused once the
-/// caller would exceed 256 blocks. Returns false, changing nothing,
-/// when the call's destinations are not whole locals, when the callee compiles for other target
-/// features than the caller, when a suspension point's splice is refused, or when `via`, the
-/// edge of the caller's references to the callee, cannot stand for the body's own references:
-/// each of them takes `via` when it is direct, and keeps its own edge when `via` is direct or
-/// both are plain witnesses.
+/// caller would exceed 256 blocks. Direct non-suspending splices may write into a projected
+/// success destination (such as a union variant field) through a fresh temporary local on each
+/// normal return. Returns false, changing nothing, when a failure destination is not a whole
+/// local, when a non-direct or suspending call's success destination is not a whole local, when
+/// the callee requires target features absent from the caller, when a suspension point's splice is
+/// refused, or when `via`, the edge of the caller's references to the callee, cannot stand for the
+/// body's own references: each of them takes `via` when it is direct, and keeps its own edge when
+/// `via` is direct or both are plain witnesses.
 pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction, direct: bool, nodes: &mut usize, via: &Edge) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  if !sameFeatures(&caller.features, &callee.features) {
+  if !featuresSubset(Bytes.asSlice(&callee.features), Bytes.asSlice(&caller.features)) {
     return false
   }
   if !joinsEdges(via, callee) {
@@ -971,6 +1031,8 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
   let mut normal = usize.MAX
   let mut failure = usize.MAX
   let mut origin = locals[0].origin
+  let mut projectedReturn = Option<Place>.none()
+  let mut returnLocal = usize.MAX
   if let Terminator.Call {
     arguments,
     providers,
@@ -982,7 +1044,10 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
     ..
   } = &target.* {
     if whole(&destination) == usize.MAX {
-      return false
+      if !direct || cancel != usize.MAX {
+        return false
+      }
+      projectedReturn = Option<Place>.some(run Mir.copyPlace(&destination))
     }
     if let Option<FailureEdge>.Some { value: edge } = &failed {
       if whole(&edge.destination) == usize.MAX {
@@ -1001,8 +1066,12 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
       let mut input = Option<Operand>.none()
       match &locals[at].kind {
         LocalKind.Return => {
-          mapped = destination.local
-          own = false
+          if Option<Place>.isSome(&projectedReturn) {
+            returnLocal = mapped
+          } else {
+            mapped = destination.local
+            own = false
+          }
         }
         LocalKind.Failure => {
           if let Option<FailureEdge>.Some { value: edge } = &failed {
@@ -1055,6 +1124,9 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
         )
       }
       at = at + usize.ONE
+    }
+    if Option<Place>.isSome(&projectedReturn) && returnLocal == usize.MAX {
+      return false
     }
   } else {
     return false
@@ -1125,6 +1197,22 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
       run List<Statement>.append(&mut statements, run statement(&listed[next], &splice))
       next = next + 1
     }
+    if let Option<Place>.Some { value: targetPlace } = &projectedReturn {
+      if let Terminator.Return { origin: retOrigin } = &blocks[at].terminator {
+        run List<Statement>.append(
+          &mut statements,
+          Statement.Assign {
+            destination: run Mir.copyPlace(&targetPlace),
+            value: Rvalue.Use {
+              value: Operand.Move {
+                place: Place { local: returnLocal, projections: List<Projection>.make() },
+              },
+            },
+            origin: mapOrigin(&splice, retOrigin),
+          },
+        )
+      }
+    }
     run List<Block>.append(
       &mut caller.blocks,
       Block {
@@ -1144,5 +1232,403 @@ pub effect fn call(caller: &mut MirFunction, point: usize, callee: &MirFunction,
     at = at + 1
   }
   run mergeTables(&mut caller.*, callee, &splice, via)
+  return true
+}
+
+fn placeIsPureLocal(place: &Place) -> bool {
+  let projs = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < projs.length {
+    match &projs[at] {
+      Projection.Deref => { return false }
+      Projection.Index {..} => { return false }
+      _ => {}
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn operandIsPure(op: &Operand) -> bool {
+  return match &op.* {
+    Operand.Copy {place} => placeIsPureLocal(&place)
+    Operand.Move {place} => placeIsPureLocal(&place)
+    Operand.Integer {..} => true
+    Operand.Float {..} => true
+    Operand.Boolean {..} => true
+    Operand.Unit => true
+    Operand.StaticBytes {..} => true
+    Operand.StaticText {..} => true
+    Operand.StaticValue {..} => true
+    Operand.Null {..} => true
+  }
+}
+
+fn operandPlainLocal(op: &Operand) -> usize {
+  return match &op.* {
+    Operand.Copy {place} => if List<Projection>.length(&place.projections) == usize.ZERO { place.local } else { usize.MAX }
+    Operand.Move {place} => if List<Projection>.length(&place.projections) == usize.ZERO { place.local } else { usize.MAX }
+    _ => usize.MAX
+  }
+}
+
+fn operandSmallConst(op: &Operand, maxVal: u64) -> u64 {
+  if let Operand.Integer {decimal, negative, ..} = &op.* {
+    if negative { return u64.MAX }
+    let bs = Bytes.asSlice(&decimal)
+    if bs.length == usize.ZERO || bs.length > 4 { return u64.MAX }
+    let mut acc: u64 = 0
+    let mut i = usize.ZERO
+    while i < bs.length {
+      let ch = bs[i]
+      if ch < 48 || ch > 57 { return u64.MAX }
+      acc = acc * 10 + u8.toU64(ch - 48)
+      if acc > maxVal { return u64.MAX }
+      i = i + usize.ONE
+    }
+    return acc
+  }
+  return u64.MAX
+}
+
+fn blockSmallConst(stmts: &[Statement], op: &Operand, maxVal: u64) -> u64 {
+  let direct = operandSmallConst(op, maxVal)
+  if direct <= maxVal { return direct }
+  let loc = operandPlainLocal(op)
+  if loc == usize.MAX { return u64.MAX }
+  let mut k = stmts.length
+  while k > usize.ZERO {
+    k = k - usize.ONE
+    if let Statement.Assign {destination, value, ..} = &stmts[k] {
+      if List<Projection>.length(&destination.projections) == usize.ZERO && destination.local == loc {
+        if let Rvalue.Use {value: rhs} = &value {
+          return operandSmallConst(&rhs, maxVal)
+        }
+        return u64.MAX
+      }
+    }
+  }
+  return u64.MAX
+}
+
+/// Returns true when `blocks[block]` ends in a 2-argument `Call` whose second argument is a
+/// non-negative integer constant `<= maxVal`.
+pub fn callArg1SmallConst(function: &MirFunction, block: usize, maxVal: u64) -> bool {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  if block >= blocks.length { return false }
+  if let Terminator.Call {arguments, ..} = &blocks[block].terminator {
+    let args = List<Operand>.asSlice(&arguments)
+    if args.length != 2 { return false }
+    let stmts = List<Statement>.asSlice(&blocks[block].statements)
+    return blockSmallConst(stmts, &args[usize.ONE], maxVal) <= maxVal
+  }
+  return false
+}
+
+fn resolveBlockCopy(stmts: &[Statement], op: &Operand) -> usize {
+  let mut loc = operandPlainLocal(op)
+  if loc == usize.MAX { return usize.MAX }
+  let mut hops = usize.ZERO
+  while hops < 4 {
+    let mut next = usize.MAX
+    let mut k = stmts.length
+    while k > usize.ZERO {
+      k = k - usize.ONE
+      if let Statement.Assign {destination, value, ..} = &stmts[k] {
+        if List<Projection>.length(&destination.projections) == usize.ZERO && destination.local == loc {
+          if let Rvalue.Use {value: rhs} = &value {
+            next = operandPlainLocal(&rhs)
+          }
+          k = usize.ZERO
+        }
+      }
+    }
+    if next == usize.MAX || next == loc { return loc }
+    loc = next
+    hops = hops + usize.ONE
+  }
+  return loc
+}
+
+fn rvalueIsPureNoTrap(rv: &Rvalue, allowCounterAdd: bool, counterLocal: usize, stmts: &[Statement]) -> bool {
+  return match &rv.* {
+    Rvalue.Use {value} => operandIsPure(&value)
+    Rvalue.Bitcast {value, ..} => operandIsPure(&value)
+    Rvalue.Fill {..} => true
+    Rvalue.Unary {operation, value} => {
+      if !operandIsPure(&value) { return false }
+      return operation == PrefixOperator.Not || operation == PrefixOperator.BitwiseNot
+    }
+    Rvalue.Binary {operation, left, right} => {
+      if !operandIsPure(&left) || !operandIsPure(&right) { return false }
+      if operation == InfixOperator.BitAnd || operation == InfixOperator.BitOr || operation == InfixOperator.BitXor
+        || operation == InfixOperator.Equals || operation == InfixOperator.NotEquals
+        || operation == InfixOperator.LessThan || operation == InfixOperator.LessOrEqual
+        || operation == InfixOperator.GreaterThan || operation == InfixOperator.GreaterOrEqual
+        || operation == InfixOperator.And || operation == InfixOperator.Or {
+        return true
+      }
+      if allowCounterAdd && operation == InfixOperator.Add {
+        return resolveBlockCopy(stmts, &left) == counterLocal && blockSmallConst(stmts, &right, 1) == 1
+      }
+      return false
+    }
+    Rvalue.ScalarBinary {operation, left, right} => {
+      if !operandIsPure(&left) || !operandIsPure(&right) { return false }
+      if operation == ScalarBinary.WrappingAdd || operation == ScalarBinary.WrappingSubtract
+        || operation == ScalarBinary.WrappingMultiply || operation == ScalarBinary.SaturatingAdd
+        || operation == ScalarBinary.SaturatingSubtract || operation == ScalarBinary.SaturatingMultiply
+        || operation == ScalarBinary.RotateLeft || operation == ScalarBinary.RotateRight
+        || operation == ScalarBinary.MultiplyHigh {
+        return true
+      }
+      if operation == ScalarBinary.ShiftLeft || operation == ScalarBinary.ShiftRight {
+        return blockSmallConst(stmts, &right, 7) <= 7
+      }
+      return false
+    }
+    _ => false
+  }
+}
+
+/// Returns true when `function` is a 1-block, 2-parameter pure wrapper around `ShiftLeft` or
+/// `ShiftRight` whose shift count is parameter 1 (so any call passing a constant `0 ..= 7` as
+/// argument 1 is guaranteed pure and non-trapping for every Silk integer width `>= 8` bits).
+pub fn isPureShift7Wrapper(function: &MirFunction) -> bool {
+  if function.releasesPackages { return false }
+  if List<Interned<DeclarationId>>.length(&function.externs) != usize.ZERO { return false }
+  if List<SharedAccess>.length(&function.accesses) != usize.ZERO { return false }
+  if List<EscapeSite>.length(&function.escapes) != usize.ZERO { return false }
+  if let Option.Some {..} = &function.suspension { return false }
+  if let Option.Some {..} = &function.parks { return false }
+  if List<Interned<Type>>.length(&function.parameters) != 2 { return false }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  if blocks.length != usize.ONE || blocks[usize.ZERO].suspends { return false }
+  if let Terminator.Return {..} = &blocks[usize.ZERO].terminator {} else { return false }
+  // Local 0 is the return slot; locals 1 and 2 are the two parameters.
+  let param1Local: usize = 2
+  let mut param1Alias = usize.MAX
+  let stmts = List<Statement>.asSlice(&blocks[usize.ZERO].statements)
+  let mut sawShift = false
+  let mut s = usize.ZERO
+  while s < stmts.length {
+    if let Statement.Assign {destination, value, ..} = &stmts[s] {
+      if !placeIsPureLocal(&destination) { return false }
+      let ok = match &value {
+        Rvalue.Use {value: op} => {
+          if List<Projection>.length(&destination.projections) == usize.ZERO && operandPlainLocal(&op) == param1Local {
+            param1Alias = destination.local
+          }
+          operandIsPure(&op)
+        }
+        Rvalue.ScalarBinary {operation, left, right} => {
+          let rLoc = operandPlainLocal(&right)
+          if (operation == ScalarBinary.ShiftLeft || operation == ScalarBinary.ShiftRight)
+            && operandIsPure(&left) && (rLoc == param1Local || (param1Alias != usize.MAX && rLoc == param1Alias)) {
+            sawShift = true
+            true
+          } else {
+            false
+          }
+        }
+        _ => false
+      }
+      if !ok { return false }
+    } else {
+      return false
+    }
+    s = s + usize.ONE
+  }
+  return sawShift
+}
+
+/// Classifies `function`'s self-purity: `1` = unconditionally pure & total (modulo callees),
+/// `2` = pure & total whenever called with a 2nd argument constant `<= 7`, `0` = impure/unknown.
+pub fn pureKind(function: &MirFunction) -> u8 {
+  if isSelfPureTotal(function) { return 1 }
+  if isPureShift7Wrapper(function) { return 2 }
+  return 0
+}
+
+fn reachesReturnSoon(blocks: &[Block], start: usize) -> bool {
+  let mut cur = start
+  let mut hops = usize.ZERO
+  while hops < 3 && cur < blocks.length {
+    match &blocks[cur].terminator {
+      Terminator.Return {..} => { return true }
+      Terminator.Goto {target, ..} => {
+        if target == cur { return false }
+        cur = target
+      }
+      _ => { return false }
+    }
+    hops = hops + usize.ONE
+  }
+  return false
+}
+
+/// Returns true when `function`'s own MIR body (ignoring callees of direct Silk `Call`s, which the
+/// caller verifies transitively) performs no memory reads/writes through pointers, cannot trap,
+/// cannot suspend, and is guaranteed to terminate (either acyclic or a single small counted
+/// `0 ..< K` loop with `K <= 64`).
+pub fn isSelfPureTotal(function: &MirFunction) -> bool {
+  if function.releasesPackages { return false }
+  if List<Interned<DeclarationId>>.length(&function.externs) != usize.ZERO { return false }
+  if List<SharedAccess>.length(&function.accesses) != usize.ZERO { return false }
+  if List<EscapeSite>.length(&function.escapes) != usize.ZERO { return false }
+  if let Option.Some {..} = &function.suspension { return false }
+  if let Option.Some {..} = &function.parks { return false }
+  let blocks = List<Block>.asSlice(&function.blocks)
+  if blocks.length == usize.ZERO { return false }
+
+  // Pass 1: Verify terminators and locate any back-edge (`target <= block`).
+  let mut backCount = usize.ZERO
+  let mut loopHdr = usize.MAX
+  let mut loopLatch = usize.MAX
+  let mut b = usize.ZERO
+  while b < blocks.length {
+    if blocks[b].suspends { return false }
+    match &blocks[b].terminator {
+      Terminator.Return {..} => {}
+      Terminator.Goto {target, ..} => {
+        if target <= b {
+          backCount = backCount + usize.ONE
+          loopHdr = target
+          loopLatch = b
+        }
+      }
+      Terminator.Branch {condition, thenBlock, elseBlock, ..} => {
+        if !operandIsPure(&condition) { return false }
+        if thenBlock <= b {
+          backCount = backCount + usize.ONE
+          loopHdr = thenBlock
+          loopLatch = b
+        }
+        if elseBlock <= b {
+          backCount = backCount + usize.ONE
+          loopHdr = elseBlock
+          loopLatch = b
+        }
+      }
+      Terminator.Call {callee, arguments, providers, failure, normal, ..} => {
+        if let Callee.Instance {..} = &callee {} else { return false }
+        if let Option.Some {..} = &failure { return false }
+        if List<Operand>.length(&providers) != usize.ZERO { return false }
+        let args = List<Operand>.asSlice(&arguments)
+        let mut a = usize.ZERO
+        while a < args.length {
+          if !operandIsPure(&args[a]) { return false }
+          a = a + usize.ONE
+        }
+        if normal <= b {
+          backCount = backCount + usize.ONE
+          loopHdr = normal
+          loopLatch = b
+        }
+      }
+      _ => { return false }
+    }
+    b = b + usize.ONE
+  }
+  if backCount > usize.ONE { return false }
+
+  // If there is one back-edge (`loopLatch -> loopHdr`), verify it is a simple counted
+  // `counter = 0; while counter < K { ...; counter = counter + 1 }` loop with `K <= 64`.
+  let mut counterLocal = usize.MAX
+  let mut exitBlk = usize.MAX
+  if backCount == usize.ONE {
+    if loopHdr == usize.ZERO || loopHdr >= blocks.length { return false }
+    let mut condLocal = usize.MAX
+    if let Terminator.Branch {condition, thenBlock, elseBlock, ..} = &blocks[loopHdr].terminator {
+      condLocal = operandPlainLocal(&condition)
+      if thenBlock <= loopHdr || thenBlock > loopLatch { return false }
+      let elseExits = elseBlock > loopLatch || reachesReturnSoon(blocks, elseBlock)
+      if elseBlock == loopHdr || !elseExits { return false }
+      exitBlk = elseBlock
+    } else {
+      return false
+    }
+    if condLocal == usize.MAX || exitBlk == usize.MAX { return false }
+    let hStmts = List<Statement>.asSlice(&blocks[loopHdr].statements)
+    let mut hs = usize.ZERO
+    while hs < hStmts.length {
+      if let Statement.Assign {destination, value, ..} = &hStmts[hs] {
+        if List<Projection>.length(&destination.projections) == usize.ZERO && destination.local == condLocal {
+          if let Rvalue.Binary {operation: InfixOperator.LessThan, left, right} = &value {
+            let cl = resolveBlockCopy(hStmts, &left)
+            if cl != usize.MAX && blockSmallConst(hStmts, &right, 64) <= 64 {
+              counterLocal = cl
+            }
+          }
+        }
+      }
+      hs = hs + usize.ONE
+    }
+    if counterLocal == usize.MAX { return false }
+    // Verify `counterLocal` is initialized to 0 before `loopHdr` and strictly incremented by +1
+    // in `loopLatch` (directly or via one temp) with no other writes inside the loop.
+    let mut sawInit = false
+    let mut sawStep = false
+    b = usize.ZERO
+    while b < blocks.length {
+      let stmts = List<Statement>.asSlice(&blocks[b].statements)
+      let mut s = usize.ZERO
+      let mut stepTemp = usize.MAX
+      while s < stmts.length {
+        if let Statement.Assign {destination, value, ..} = &stmts[s] {
+          let dstPlain = List<Projection>.length(&destination.projections) == usize.ZERO
+          if b < loopHdr && dstPlain && destination.local == counterLocal {
+            if let Rvalue.Use {value: op} = &value {
+              if blockSmallConst(stmts, &op, 0) == 0 { sawInit = true }
+            }
+          } else if b >= loopHdr && b <= loopLatch && b != exitBlk {
+            if dstPlain && destination.local == counterLocal {
+              let mut isValidStep = false
+              if b == loopLatch {
+                if let Rvalue.Binary {operation: InfixOperator.Add, left, right} = &value {
+                  if resolveBlockCopy(stmts, &left) == counterLocal && blockSmallConst(stmts, &right, 1) == 1 {
+                    isValidStep = true
+                  }
+                } else if let Rvalue.Use {value: op} = &value {
+                  if stepTemp != usize.MAX && operandPlainLocal(&op) == stepTemp {
+                    isValidStep = true
+                  }
+                }
+              }
+              if !isValidStep { return false }
+              sawStep = true
+            } else if b == loopLatch && dstPlain {
+              if let Rvalue.Binary {operation: InfixOperator.Add, left, right} = &value {
+                if resolveBlockCopy(stmts, &left) == counterLocal && blockSmallConst(stmts, &right, 1) == 1 {
+                  stepTemp = destination.local
+                }
+              }
+            }
+          }
+        }
+        s = s + usize.ONE
+      }
+      b = b + usize.ONE
+    }
+    if !sawInit || !sawStep { return false }
+  }
+
+  // Pass 2: Verify every statement in every block is a pure, non-trapping assignment.
+  b = usize.ZERO
+  while b < blocks.length {
+    let stmts = List<Statement>.asSlice(&blocks[b].statements)
+    let mut s = usize.ZERO
+    while s < stmts.length {
+      if let Statement.Assign {destination, value, ..} = &stmts[s] {
+        if !placeIsPureLocal(&destination) { return false }
+        let allowAdd = backCount == usize.ONE && b == loopLatch
+        if !rvalueIsPureNoTrap(&value, allowAdd, counterLocal, stmts) { return false }
+      } else {
+        return false
+      }
+      s = s + usize.ONE
+    }
+    b = b + usize.ONE
+  }
   return true
 }
