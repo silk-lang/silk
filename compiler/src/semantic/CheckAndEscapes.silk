@@ -11,11 +11,14 @@ import Tracing
 import silk.trace {Trace}
 import Progress {Progress}
 import hir.Hir {
+  CallableContract as HirContract,
   HirId,
   LinkageDirection,
   Module,
   Node,
   OwnerKind,
+  ParameterMode,
+  Range,
 }
 import backend.Coroutine {Facts as CoroutineFacts}
 import backend.Gap {Code as GapCode, Gap as BackendGap}
@@ -311,6 +314,8 @@ import semantic.BodyDriver {
   needsStaticResidualization,
   signatureKey,
   staticExpression,
+  StaticRoutingState,
+  staticRoutingState,
 }
 import semantic.MirLowering {
   CheckScope,
@@ -5150,11 +5155,15 @@ effect fn declarationIsSummaryTrivial(
   module: &ModuleId,
   ordinal: usize,
 ) -> bool ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let meta = run declarationBodyMeta(&mut thisStore.resolver, module, ordinal)
+  if !meta.hasBody || meta.deferred || meta.isStatic || meta.open || meta.staticWork || meta.hasStaticParams { return false }
   if run declarationNonParking(&mut thisStore.resolver, module, ordinal) { return false }
   let traceState: u8 = run declarationTraceState(&mut thisStore.resolver, module, ordinal)
   if traceState != 0 { return false }
-  let signature = run Semantic.demandSignatureOf(&mut thisStore.*, &mut request.*, declaration)
-  if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureHasNonParkingPremise) { return false }
+  if meta.hasConstraints {
+    let signature = run Semantic.demandSignatureOf(&mut thisStore.*, &mut request.*, declaration)
+    if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureHasNonParkingPremise) { return false }
+  }
   let moduleOrdinal = knownModuleOrdinal(&thisStore.resolver, module)
   if moduleOrdinal != usize.MAX {
     let mut routingDeps = List<Dependency>.make()
@@ -5205,8 +5214,9 @@ effect fn declarationIsSummaryTrivial(
     let dc = List<SummaryDirectCall>.asSlice(&s.directCalls)
     let mut di = usize.ZERO
     while di < dc.length {
+      if DeclarationId.isAmbientOperation(&dc[di].declaration) { return false }
       if !ModuleId.equals(DeclarationId.moduleId(&dc[di].declaration), module) { return false }
-      if Application.hasStatics(Interned<Application>.get(&dc[di].application)) { return false }
+      if !plainApplication(Interned<Application>.get(&dc[di].application)) { return false }
       if applicationHasNestedOpenTypeArg(&dc[di].application) { return false }
       di = di + usize.ONE
     }
@@ -5227,7 +5237,7 @@ effect fn carriedTrivialUnit(thisStore: &mut Semantic, declaration: &Declaration
   if found == usize.MAX { return usize.MAX }
   let mut candidate = false
   let memos = List<DeclarationMemo>.asSlice(&thisStore.declarationMemos)
-  if memos[found].carried && memos[found].summaryTrivial && DeclarationId.equals(&memos[found].identity, declaration) {
+  if memos[found].summaryTrivial && DeclarationId.equals(&memos[found].identity, declaration) {
     candidate = true
   }
   if !candidate { return usize.MAX }
@@ -5296,28 +5306,107 @@ struct SummaryBodyMeta {
   open: bool,
   staticWork: bool,
   deferred: bool,
+  isStatic: bool,
+  hasConstraints: bool,
+  hasRequirements: bool,
+  hasStaticParams: bool,
+}
+
+fn emptySummaryBodyMeta() -> SummaryBodyMeta {
+  return SummaryBodyMeta {
+    hasBody: false, open: false, staticWork: false, deferred: false,
+    isStatic: false, hasConstraints: false, hasRequirements: false, hasStaticParams: false,
+  }
+}
+
+fn genericsHaveBounds(hir: &Module, generics: Range) -> bool {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    if let Node.TypeParameter {bounds, ..} = Module.node(hir, Module.child(hir, generics, at)) {
+      if bounds.length > usize.ZERO { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn contractHasStaticParam(hir: &Module, parameters: Range) -> bool {
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    if let Node.Parameter {mode: ParameterMode.Static, ..} = Module.node(hir, Module.child(hir, parameters, at)) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 effect fn declarationBodyMeta(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> SummaryBodyMeta
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let hdrAnswer = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Header)
   let mut hasBody = false
+  let mut isStatic = false
+  let mut hasConstraints = false
+  let mut hasRequirements = false
+  let mut hasStaticParams = false
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &hdrAnswer, module) {
     let hir = IndexedSource.authored(indexed)
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if ordinal >= declarations.length { return SummaryBodyMeta {hasBody: false, open: false, staticWork: false, deferred: false} }
+    if ordinal >= declarations.length { return emptySummaryBodyMeta() }
     if let Node.Declaration {body: syntax, ..} = Module.node(hir, declarations[ordinal].local) {
       if let Node.CallableBody {block} = Module.node(hir, syntax) {
         hasBody = block.present
       }
     }
+    if hasBody {
+      let mut current = Option<usize>.some(ordinal)
+      while true {
+        let at = match move current {
+          Option<usize>.Some {value} => value
+          _ => { break }
+        }
+        match Module.node(hir, declarations[at].header) {
+          Node.FunctionHeader {contract, ..} => {
+            if let Option<HirContract>.Some {value: c} = Module.contractOf(hir, contract) {
+              if at == ordinal {
+                isStatic = c.isStatic
+                hasRequirements = c.requirements.present
+                hasStaticParams = contractHasStaticParam(hir, c.parameters)
+              }
+              if c.constraints.length > usize.ZERO || genericsHaveBounds(hir, c.generics) {
+                hasConstraints = true
+              }
+            }
+          }
+          Node.OperationHeader {contract, ..} => {
+            if let Option<HirContract>.Some {value: c} = Module.contractOf(hir, contract) {
+              if at == ordinal {
+                isStatic = c.isStatic
+                hasRequirements = c.requirements.present
+                hasStaticParams = contractHasStaticParam(hir, c.parameters)
+              }
+              if c.constraints.length > usize.ZERO || genericsHaveBounds(hir, c.generics) {
+                hasConstraints = true
+              }
+            }
+          }
+          Node.ImplHeader {generics, constraints, ..} => {
+            if constraints.length > usize.ZERO || genericsHaveBounds(hir, generics) {
+              hasConstraints = true
+            }
+          }
+          _ => ()
+        }
+        current = declarations[at].parent
+      }
+    }
   }
-  if !hasBody { return SummaryBodyMeta {hasBody: false, open: false, staticWork: false, deferred: false} }
+  if !hasBody { return emptySummaryBodyMeta() }
   let bodySrc = run observedDeclaration(&mut resolver.*, module, ordinal, SourceFacet.Body)
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &bodySrc, module) {
     let hir = IndexedSource.authored(indexed)
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    if ordinal >= declarations.length { return SummaryBodyMeta {hasBody: false, open: false, staticWork: false, deferred: false} }
+    if ordinal >= declarations.length { return emptySummaryBodyMeta() }
     let open = declarationOpen(hir, declarations, ordinal)
     let deferred = match move run StaticTemplate.reason(hir, declarations, ordinal) {
       Option<StaticTemplate.Reason>.Some {..} => true
@@ -5329,9 +5418,13 @@ effect fn declarationBodyMeta(resolver: &mut Resolver, module: &ModuleId, ordina
         if block.present { staticWork = run bodyHasStaticWork(hir, block.id) }
       }
     }
-    return SummaryBodyMeta {hasBody: true, open: open, staticWork: staticWork, deferred: deferred}
+    return SummaryBodyMeta {
+      hasBody: true, open: open, staticWork: staticWork, deferred: deferred,
+      isStatic: isStatic, hasConstraints: hasConstraints, hasRequirements: hasRequirements,
+      hasStaticParams: hasStaticParams,
+    }
   }
-  return SummaryBodyMeta {hasBody: false, open: false, staticWork: false, deferred: false}
+  return emptySummaryBodyMeta()
 }
 
 effect fn summaryEnqueueDecl(
@@ -5339,6 +5432,7 @@ effect fn summaryEnqueueDecl(
   request: &mut Request,
   declaration: &DeclarationId,
   isRoot: bool,
+  knownNoStatic: bool,
   decls: &mut List<DeclarationId>,
   bodies: &mut List<Shared<TypedBody>>,
   lookup: &mut InternIndex,
@@ -5362,14 +5456,15 @@ effect fn summaryEnqueueDecl(
   }
   let mut locModule = usize.MAX
   let mut locDecl = usize.MAX
-  let mut meta = SummaryBodyMeta {hasBody: false, open: false, staticWork: false, deferred: false}
+  let mut meta = emptySummaryBodyMeta()
   let identity = run Types.internDeclaration(DeclarationId.copy(declaration))
   if let Option<InstanceLocation>.Some {value: loc} = move run locationOfIdentity(&mut thisStore.resolver, &identity) {
     locModule = loc.module
     locDecl = loc.declaration
     let modId = resolvedModule(&thisStore.resolver, loc.module)
     meta = run declarationBodyMeta(&mut thisStore.resolver, &modId, loc.declaration)
-    if !meta.hasBody || meta.deferred { return usize.MAX }
+    if !meta.hasBody || meta.deferred || meta.isStatic { return usize.MAX }
+    if isRoot && (meta.open || meta.hasStaticParams) { return usize.MAX }
     if run declarationNonParking(&mut thisStore.resolver, &modId, loc.declaration) {
       anyDeclNonParking.* = true
     }
@@ -5379,32 +5474,30 @@ effect fn summaryEnqueueDecl(
   } else {
     return usize.MAX
   }
-  let signature = run Semantic.demandSignatureOf(&mut thisStore.*, &mut request.*, declaration)
-  if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsStatic) { return usize.MAX }
-  if isRoot && (meta.open || run signatureStartsNoWalk(&signature)) { return usize.MAX }
-  if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureHasNonParkingPremise) {
-    anyDeclNonParking.* = true
+  if meta.hasConstraints || (isRoot && meta.hasRequirements) {
+    let signature = run Semantic.demandSignatureOf(&mut thisStore.*, &mut request.*, declaration)
+    if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsStatic) { return usize.MAX }
+    if isRoot && run signatureStartsNoWalk(&signature) { return usize.MAX }
+    if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureHasNonParkingPremise) {
+      anyDeclNonParking.* = true
+    }
   }
   let modId = resolvedModule(&thisStore.resolver, locModule)
   let mut useSelected = meta.staticWork
   if meta.open {
     if useSelected { return usize.MAX }
-    let mut depDeps = List<Dependency>.make()
-    if run dependentStaticRouting(&mut thisStore.resolver, &mut thisStore.query, &mut depDeps, &modId, locModule, locDecl) {
-      return usize.MAX
+    if !knownNoStatic {
+      let mut routingDeps = List<Dependency>.make()
+      if let Result<StaticRoutingState, Shared<Rejection>>.Success {value: routing} = move run staticRoutingState(
+        &mut thisStore.resolver, &mut thisStore.query, &mut routingDeps, &modId, locModule, locDecl) {
+        if routing.dependent || routing.holds { return usize.MAX }
+      }
     }
+  } else if !useSelected && !knownNoStatic {
     let mut routingDeps = List<Dependency>.make()
-    let routing = run needsStaticResidualization(
-      &mut thisStore.resolver, &mut thisStore.query, &mut routingDeps, &modId, locModule, locDecl)
-    if let Result<bool, Shared<Rejection>>.Success {value: routingVal} = move routing {
-      if routingVal { return usize.MAX }
-    }
-  } else if !useSelected {
-    let mut routingDeps = List<Dependency>.make()
-    let routing = run needsStaticResidualization(
-      &mut thisStore.resolver, &mut thisStore.query, &mut routingDeps, &modId, locModule, locDecl)
-    if let Result<bool, Shared<Rejection>>.Success {value: routingVal} = move routing {
-      useSelected = routingVal
+    if let Result<StaticRoutingState, Shared<Rejection>>.Success {value: routing} = move run staticRoutingState(
+      &mut thisStore.resolver, &mut thisStore.query, &mut routingDeps, &modId, locModule, locDecl) {
+      useSelected = routing.holds
     }
   }
   let bodyAnswer = if useSelected {
@@ -5462,7 +5555,7 @@ effect fn summaryCheckEscapes(
   // Seed root declarations.
   let mut rAt = usize.ZERO
   while rAt < declarations.length && !needsMir {
-    drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &declarations[rAt], true,
+    drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &declarations[rAt], true, false,
       &mut decls, &mut bodies, &mut lookup, &mut queue, &mut result,
       &mut anyDeclNonParking, &mut anyAmbientOp, &mut needsMir)
     rAt = rAt + usize.ONE
@@ -5607,7 +5700,7 @@ effect fn summaryCheckEscapes(
         if let Option<Interned<DeclarationId>>.Some {value: implId} = move implOpt {
           let implDecl = DeclarationId.copyShared(&implId)
           if !run summaryWalkedElsewhere(&mut thisStore.resolver, boundary, &implDecl, true, false) {
-            drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &implDecl, false,
+            drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &implDecl, false, false,
               &mut decls, &mut bodies, &mut lookup, &mut queue, &mut result,
               &mut anyDeclNonParking, &mut anyAmbientOp, &mut needsMir)
           }
@@ -5635,25 +5728,44 @@ effect fn summaryCheckEscapes(
         }
         let hasStatics = Application.hasStatics(Interned<Application>.get(&appHandle))
         let isPlain = plainApplication(Interned<Application>.get(&appHandle))
+        if DeclarationId.isAmbientOperation(&callee) {
+          anyAmbientOp = true
+          needsMir = true
+          break
+        }
         if !run summaryWalkedElsewhere(&mut thisStore.resolver, boundary, &callee, isPlain, hasStatics) {
           let mut needsSelection = false
+          let mut knownNoStatic = false
+          let mut skipEnqueue = false
           if !isPlain && Application.isRuntimeClosed(Interned<Application>.get(&appHandle))
             && (hasStatics || findVisitedDecl(List<DeclarationId>.asSlice(&decls), &lookup, &callee) == usize.MAX) {
             let calleeId = run Types.internDeclaration(DeclarationId.copy(&callee))
             if let Option<InstanceLocation>.Some {value: cLoc} = move run locationOfIdentity(&mut thisStore.resolver, &calleeId) {
               let cMod = resolvedModule(&thisStore.resolver, cLoc.module)
               let cMeta = run declarationBodyMeta(&mut thisStore.resolver, &cMod, cLoc.declaration)
-              if cMeta.hasBody {
-                if hasStatics || (cMeta.open && (cMeta.deferred || cMeta.staticWork)) {
-                  needsSelection = true
-                } else if cMeta.open {
-                  let mut rDeps = List<Dependency>.make()
-                  if let Result<bool, Shared<Rejection>>.Success {value: rVal} = move run needsStaticResidualization(
-                    &mut thisStore.resolver, &mut thisStore.query, &mut rDeps, &cMod, cLoc.module, cLoc.declaration) {
-                    if rVal { needsSelection = true }
-                  }
+              if !cMeta.hasBody {
+                if hasStatics {
+                  needsMir = true
+                  break
+                }
+                if run operationNonParking(&mut thisStore.resolver, &callee) {
+                  anyDeclNonParking = true
+                }
+                skipEnqueue = true
+              } else if cMeta.isStatic {
+                skipEnqueue = true
+              } else if hasStatics || (cMeta.open && (cMeta.deferred || cMeta.staticWork)) {
+                needsSelection = true
+              } else if cMeta.open {
+                let mut rDeps = List<Dependency>.make()
+                if let Result<StaticRoutingState, Shared<Rejection>>.Success {value: routing} = move run staticRoutingState(
+                  &mut thisStore.resolver, &mut thisStore.query, &mut rDeps, &cMod, cLoc.module, cLoc.declaration) {
+                  if routing.holds || routing.dependent { needsSelection = true }
+                  else { knownNoStatic = true }
                 }
               }
+            } else {
+              skipEnqueue = true
             }
           }
           if needsSelection {
@@ -5685,8 +5797,8 @@ effect fn summaryCheckEscapes(
                 run List<usize>.append(&mut queue, sIdx)
               }
             }
-          } else {
-            drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &callee, false,
+          } else if !skipEnqueue {
+            drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &callee, false, knownNoStatic,
               &mut decls, &mut bodies, &mut lookup, &mut queue, &mut result,
               &mut anyDeclNonParking, &mut anyAmbientOp, &mut needsMir)
           }
@@ -5724,7 +5836,7 @@ effect fn summaryCheckEscapes(
             match move resolved {
               Result<ResolvedWitness, Shared<Rejection>>.Success {value: witness} => {
                 let wDecl = DeclarationId.copy(Application.bodyDeclaration(&witness.application))
-                drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &wDecl, false,
+                drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &wDecl, false, false,
                   &mut decls, &mut bodies, &mut lookup, &mut queue, &mut result,
                   &mut anyDeclNonParking, &mut anyAmbientOp, &mut needsMir)
               }
@@ -5772,7 +5884,7 @@ effect fn summaryCheckEscapes(
             let callee = Shared<TypedBody>.with<DeclarationId>(&body, |b: &TypedBody| -> DeclarationId {
               return DeclarationId.copy(&List<SummaryDirectCall>.asSlice(&TypedBody.summaryOf(b).directCalls)[di].declaration)
             })
-            drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &callee, false,
+            drop run summaryEnqueueDecl(&mut thisStore.*, &mut request.*, &callee, false, false,
               &mut decls, &mut bodies, &mut lookup, &mut queue, &mut result,
               &mut anyDeclNonParking, &mut anyAmbientOp, &mut needsMir)
             di = di + usize.ONE
