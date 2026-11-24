@@ -17,9 +17,9 @@ import semantic.SourceLocations {Location}
 import semantic.DeclarationId {DeclarationId}
 import semantic.CallableSchema {CallableSchema}
 import semantic.Lifetime {Lifetime}
-import semantic.Intrinsic {Member}
+import semantic.Intrinsic {Member, Primitive}
 import semantic.StorageOperation {StorageOperation}
-import semantic.Type {Binding, KeptRegions, Type}
+import semantic.Type {Binding, Composition, KeptRegions, Type}
 import semantic.Specialization {Application, StaticSlot}
 import semantic.StaticValue {IntegerType as StaticIntegerType, Value as StaticData}
 import silk.collections.bytes {Bytes}
@@ -30,6 +30,7 @@ import silk.core.ownership {Copy}
 import silk.mem.shared {Shared}
 import silk.mem.interned {Interned}
 import silk.mem.frozen {Frozen}
+import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silk.collections.list {List}
@@ -827,6 +828,62 @@ pub struct Resolution {
 ///
 /// Every position in the payload counts from its declaration's anchor, so moving the declaration
 /// leaves the payload equal; it is kept across an edit when its declaration and dependencies
+/// Flag bits recorded on [`BodySummary.flags`] during `TypedBody.make`.
+pub const SUMMARY_ERASURE: u32 = 1
+pub const SUMMARY_ERASED_CALL: u32 = 2
+pub const SUMMARY_ERASED_EFFECT_CALL: u32 = 4
+pub const SUMMARY_SHARED_ACCESS: u32 = 8
+pub const SUMMARY_NOTIFY_ESCAPE: u32 = 16
+pub const SUMMARY_RUN_ESCAPE: u32 = 32
+pub const SUMMARY_PARK: u32 = 64
+pub const SUMMARY_SUSPEND: u32 = 128
+pub const SUMMARY_NON_PARKING: u32 = 256
+pub const SUMMARY_AMBIENT_OP: u32 = 512
+pub const SUMMARY_COMPILE_ERROR: u32 = 1024
+pub const SUMMARY_FOREIGN: u32 = 2048
+pub const SUMMARY_CALLABLE_CALL: u32 = 4096
+pub const SUMMARY_NON_PARKING_INEXACT: u32 = 8192
+
+/// One erased interface conversion (`&T -> &any I`) summarized from a checked [`TypedBody`].
+pub struct SummaryErasure {
+  pub source: Interned<Type>,
+  pub target: Interned<Type>,
+  pub origin: Origin,
+}
+
+/// One direct Silk call summarized from a checked [`TypedBody`].
+pub struct SummaryDirectCall {
+  pub declaration: DeclarationId,
+  pub application: Interned<Application>,
+  pub origin: Origin,
+  pub callbackArgs: List<DeclarationId>,
+  pub hasOpaqueCallbackArg: bool,
+}
+
+/// One interface or service operation call summarized from a checked [`TypedBody`].
+pub struct SummaryInterfaceCall {
+  pub operation: DeclarationId,
+  pub contract: Interned<Type>,
+  pub implementation: Option<Interned<DeclarationId>>,
+  pub isErased: bool,
+  pub isEffect: bool,
+  pub origin: Origin,
+}
+
+/// Compact cross-body summary extracted directly from a checked [`TypedBody`], allowing
+/// `silk check` to prove escapes, NonParking, erased recursion, static routing, and
+/// specialization termination without lowering MIR.
+pub struct BodySummary {
+  pub directCalls: List<SummaryDirectCall>,
+  pub interfaceCalls: List<SummaryInterfaceCall>,
+  pub erasures: List<SummaryErasure>,
+  pub callables: List<Shared<TypedBody>>,
+  pub constants: List<Interned<DeclarationId>>,
+  pub sharedCallbacks: List<DeclarationId>,
+  pub hasOpaqueSharedCallback: bool,
+  pub flags: u32,
+}
+
 /// validate. Required bodies name runtime callees that a later program build must close.
 pub struct TypedBody {
   /// The canonical function declaration that owns this body.
@@ -850,6 +907,8 @@ pub struct TypedBody {
   /// The names the body's own syntax resolves, in checking order. Only a store that keeps editor
   /// tables records them; otherwise the list is empty.
   resolutions: List<Resolution>,
+  /// Compact cross-body summary extracted from `nodes` when this body was created.
+  summary: BodySummary,
 }
 
 fn callArgumentNode(arguments: &List<NodeId>, at: usize) -> Option<NodeId> {
@@ -1120,25 +1179,160 @@ impl TypedBody {
     run List<Local>.shrinkToFit(&mut locals)
     let mut foreignHandles = List<Interned<DeclarationId>>.make()
     let mut operations = List<InterfaceOperation>.make()
+    let mut directCalls = List<SummaryDirectCall>.make()
+    let mut interfaceCalls = List<SummaryInterfaceCall>.make()
+    let mut erasures = List<SummaryErasure>.make()
+    let mut callables = List<Shared<TypedBody>>.make()
+    let mut constants = List<Interned<DeclarationId>>.make()
+    let mut sharedCallbacks = List<DeclarationId>.make()
+    let mut hasOpaqueSharedCallback = false
+    let mut flags: u32 = 0
     let checked = List<Node>.asSlice(&nodes)
     let mut at = usize.ZERO
     while at < checked.length {
-      if let NodeKind.Expression {form: Expression.ForeignCall {data: _bx}, ..} = &checked[at].kind {
-  let ForeignCallData {declaration: foreignDeclaration, ..} = &_bx.get().*
-
-        run List<Interned<DeclarationId>>.append(
-          &mut foreignHandles,
-          run Types.internDeclaration(DeclarationId.copy(&foreignDeclaration)),
-        )
-      }
-      if let NodeKind.Expression {form: Expression.InterfaceCall {data: _bx}, ..} = &checked[at].kind {
-  let InterfaceCallData {operation, ..} = &_bx.get().*
-
-        run List<InterfaceOperation>.append(&mut operations, InterfaceOperation {
-          node: NodeId {index: at}, declaration: run Types.internDeclaration(DeclarationId.copy(&operation)),
-        })
+      let origin = checked[at].origin
+      if let NodeKind.Expression {ty: nodeTy, form} = &checked[at].kind {
+        flags = u32.bitOr(flags, scanEffectSummaryFlags(&nodeTy))
+        match &form {
+          Expression.ForeignCall {data: _bx} => {
+            let ForeignCallData {declaration: foreignDeclaration, ..} = &_bx.get().*
+            run List<Interned<DeclarationId>>.append(
+              &mut foreignHandles,
+              run Types.internDeclaration(DeclarationId.copy(&foreignDeclaration)),
+            )
+            flags = u32.bitOr(flags, SUMMARY_FOREIGN)
+          }
+          Expression.ForeignStatic {..} => { flags = u32.bitOr(flags, SUMMARY_FOREIGN) }
+          Expression.ForeignAddress {..} => { flags = u32.bitOr(flags, SUMMARY_FOREIGN) }
+          Expression.ForeignInstanceAddress {..} => { flags = u32.bitOr(flags, SUMMARY_FOREIGN) }
+          Expression.Constant {declaration: constantDecl} => {
+            run List<Interned<DeclarationId>>.append(&mut constants, Interned<DeclarationId>.clone(&constantDecl))
+          }
+          Expression.InterfaceCall {data: _bx} => {
+            let InterfaceCallData {contract, provider, operation, implementation, isEffect, ..} = &_bx.get().*
+            run List<InterfaceOperation>.append(&mut operations, InterfaceOperation {
+              node: NodeId {index: at}, declaration: run Types.internDeclaration(DeclarationId.copy(&operation)),
+            })
+            let erased = isErasedReceiverType(&provider)
+            if erased {
+              flags = u32.bitOr(flags, SUMMARY_ERASED_CALL)
+              if isEffect { flags = u32.bitOr(flags, SUMMARY_ERASED_EFFECT_CALL) }
+            }
+            let implCopy = match &implementation {
+              Option<Interned<DeclarationId>>.Some {value} => Option<Interned<DeclarationId>>.some(Interned<DeclarationId>.clone(&value))
+              Option<Interned<DeclarationId>>.None => Option<Interned<DeclarationId>>.none()
+            }
+            run List<SummaryInterfaceCall>.append(&mut interfaceCalls, SummaryInterfaceCall {
+              operation: DeclarationId.copy(&operation),
+              contract: Interned<Type>.clone(&contract),
+              implementation: move implCopy,
+              isErased: erased, isEffect: isEffect, origin: origin,
+            })
+          }
+          Expression.DirectCall {data: _bx} => {
+            let DirectCallData {declaration: callee, application, arguments, ..} = &_bx.get().*
+            let mut cbArgs = List<DeclarationId>.make()
+            let mut hasOpaqueCb = false
+            let argSlice = List<NodeId>.asSlice(&arguments)
+            let mut ai = usize.ZERO
+            while ai < argSlice.length {
+              let argNode = argSlice[ai]
+              if argNode.index < checked.length {
+                if let NodeKind.Expression {ty: argTy, ..} = &checked[argNode.index].kind {
+                  if isCallableLikeType(&argTy) {
+                    if let Option<DeclarationId>.Some {value: cbDecl} = move extractCallbackTarget(checked, argNode) {
+                      run List<DeclarationId>.append(&mut cbArgs, move cbDecl)
+                    } else {
+                      hasOpaqueCb = true
+                    }
+                  }
+                }
+              }
+              ai = ai + usize.ONE
+            }
+            run List<SummaryDirectCall>.append(&mut directCalls, SummaryDirectCall {
+              declaration: DeclarationId.copy(&callee),
+              application: Interned<Application>.clone(&application),
+              origin: origin,
+              callbackArgs: move cbArgs,
+              hasOpaqueCallbackArg: hasOpaqueCb,
+            })
+          }
+          Expression.Callable {data: _bx} => {
+            let CallableData {body, ..} = &_bx.get().*
+            run List<Shared<TypedBody>>.append(&mut callables, Shared<TypedBody>.clone(&body))
+          }
+          Expression.CallableCall {..} => { flags = u32.bitOr(flags, SUMMARY_CALLABLE_CALL) }
+          Expression.StagedCallable {..} => { flags = u32.bitOr(flags, SUMMARY_CALLABLE_CALL) }
+          Expression.EraseReference {value} => {
+            flags = u32.bitOr(flags, SUMMARY_ERASURE)
+            if value.index < checked.length {
+              if let NodeKind.Expression {ty: srcTy, ..} = &checked[value.index].kind {
+                run List<SummaryErasure>.append(&mut erasures, SummaryErasure {
+                  source: Interned<Type>.clone(&srcTy),
+                  target: Interned<Type>.clone(&nodeTy),
+                  origin: origin,
+                })
+              }
+            }
+          }
+          Expression.CompileError {..} => { flags = u32.bitOr(flags, SUMMARY_COMPILE_ERROR) }
+          Expression.Run {value, ..} => {
+            flags = u32.bitOr(flags, SUMMARY_RUN_ESCAPE)
+            if value.index < checked.length {
+              if let NodeKind.Expression {ty: effTy, ..} = &checked[value.index].kind {
+                flags = u32.bitOr(flags, scanEffectSummaryFlags(&effTy))
+              }
+            }
+          }
+          Expression.StorageCall {operation, arguments, ..} => {
+            match operation {
+              StorageOperation.SharedWithMut => {
+                flags = u32.bitOr(flags, SUMMARY_SHARED_ACCESS)
+                let argSlice = List<NodeId>.asSlice(&arguments)
+                let mut ai = usize.ONE
+                while ai < argSlice.length {
+                  let argNode = argSlice[ai]
+                  if let Option<DeclarationId>.Some {value: cbDecl} = move extractCallbackTarget(checked, argNode) {
+                    run List<DeclarationId>.append(&mut sharedCallbacks, move cbDecl)
+                  } else {
+                    hasOpaqueSharedCallback = true
+                  }
+                  ai = ai + usize.ONE
+                }
+              }
+              StorageOperation.ExecutionNotify => { flags = u32.bitOr(flags, SUMMARY_NOTIFY_ESCAPE) }
+              StorageOperation.Relinquish => { flags = u32.bitOr(flags, u32.bitOr(SUMMARY_PARK, SUMMARY_SUSPEND)) }
+              StorageOperation.ExecutionCurrent => { flags = u32.bitOr(flags, u32.bitOr(SUMMARY_PARK, SUMMARY_SUSPEND)) }
+              _ => ()
+            }
+          }
+          Expression.IntrinsicCall {member, ..} => {
+            if let Member.Primitive {primitive} = member {
+              match primitive {
+                Primitive.AmbientEntry => { flags = u32.bitOr(flags, SUMMARY_AMBIENT_OP) }
+                Primitive.AmbientSlot => { flags = u32.bitOr(flags, SUMMARY_AMBIENT_OP) }
+                Primitive.AmbientCount => { flags = u32.bitOr(flags, SUMMARY_AMBIENT_OP) }
+                Primitive.ObserveUnhandled => { flags = u32.bitOr(flags, SUMMARY_NON_PARKING) }
+                Primitive.ObserveHandled => { flags = u32.bitOr(flags, SUMMARY_NON_PARKING) }
+                _ => ()
+              }
+            }
+          }
+          _ => ()
+        }
       }
       at = at + usize.ONE
+    }
+    let summary = BodySummary {
+      directCalls: move directCalls,
+      interfaceCalls: move interfaceCalls,
+      erasures: move erasures,
+      callables: move callables,
+      constants: move constants,
+      sharedCallbacks: move sharedCallbacks,
+      hasOpaqueSharedCallback: hasOpaqueSharedCallback,
+      flags: flags,
     }
     return TypedBody {
       environment: Option<Environment>.none(),
@@ -1153,7 +1347,12 @@ impl TypedBody {
       stage: move stage,
       iterations: move iterations,
       resolutions: List<Resolution>.make(),
+      summary: move summary,
     }
+  }
+  /// Borrows the compact cross-body summary extracted when this body was created.
+  pub fn summaryOf(self: &Self) -> &BodySummary {
+    return &self.summary
   }
   /// This body with `resolutions` as its editor table.
   pub fn withResolutions(self: Self, resolutions: List<Resolution>) -> Self {
@@ -1717,3 +1916,117 @@ fn copyUnionMember(value: &Option<UnionMember>) -> Option<UnionMember> {
     _ => Option<UnionMember>.none()
   }
 }
+
+fn isErasedReceiverType(ty: &Interned<Type>) -> bool {
+  return match &Interned<Type>.get(ty).* {
+    Type.Erased {..} => true
+    Type.Reference {referent, ..} => match &Interned<Type>.get(&referent).* {
+      Type.Erased {..} => true
+      _ => false
+    }
+    _ => false
+  }
+}
+
+fn isCallableLikeType(ty: &Interned<Type>) -> bool {
+  return match &Interned<Type>.get(ty).* {
+    Type.Callable {..} => true
+    Type.CallableValue {..} => true
+    Type.CallableSchema {..} => true
+    Type.CallableStage {..} => true
+    Type.CallableResult {..} => true
+    Type.CallableOrigin {..} => true
+    Type.CallableWitnessResult {..} => true
+    Type.CallableView {..} => true
+    Type.Effect {..} => true
+    _ => false
+  }
+}
+
+fn extractCallbackFromType(ty: &Interned<Type>) -> Option<DeclarationId> {
+  return match &Interned<Type>.get(ty).* {
+    Type.CallableValue {application, ..} => Option<DeclarationId>.some(
+      DeclarationId.copy(Application.bodyDeclaration(Interned<Application>.get(&application))))
+    Type.CallableSchema {schema, ..} => Option<DeclarationId>.some(
+      Frozen<CallableSchema>.with<DeclarationId>(&schema, |s: &CallableSchema| -> DeclarationId {
+        return DeclarationId.copyShared(&s.target)
+      }))
+    Type.CallableOrigin {application, ..} => Option<DeclarationId>.some(
+      DeclarationId.copy(Application.bodyDeclaration(Interned<Application>.get(&application))))
+    Type.CallableView {representation, ..} => extractCallbackFromType(&representation)
+    Type.CallableStage {base, ..} => extractCallbackFromType(&base)
+    _ => Option<DeclarationId>.none()
+  }
+}
+
+fn extractCallbackTarget(nodes: &[Node], node: NodeId) -> Option<DeclarationId> {
+  if node.index >= nodes.length { return Option<DeclarationId>.none() }
+  if let NodeKind.Expression {ty, form} = &nodes[node.index].kind {
+    match &form {
+      Expression.Move {value, ..} => { return extractCallbackTarget(nodes, value) }
+      Expression.Callable {data: _bx} => {
+        let CallableData {body, ..} = &_bx.get().*
+        return Option<DeclarationId>.some(Shared<TypedBody>.with<DeclarationId>(&body, |inner: &TypedBody| -> DeclarationId {
+          return DeclarationId.copy(TypedBody.declarationId(inner))
+        }))
+      }
+      _ => { return extractCallbackFromType(&ty) }
+    }
+  }
+  return Option<DeclarationId>.none()
+}
+
+fn isTypeParam(ty: &Interned<Type>) -> bool {
+  return match &Interned<Type>.get(ty).* {
+    Type.Parameter {..} => true
+    _ => false
+  }
+}
+
+fn scanEffectSummaryFlags(ty: &Interned<Type>) -> u32 {
+  return match &Interned<Type>.get(ty).* {
+    Type.EffectComposite {operation, parts, ..} => {
+      let mut flags: u32 = match operation {
+        Composition.Suspend => SUMMARY_SUSPEND
+        Composition.FinalizeNonParking => SUMMARY_NON_PARKING
+        Composition.UseRelease => SUMMARY_NON_PARKING
+        Composition.Observe => SUMMARY_NON_PARKING
+        _ => 0
+      }
+      let listed = List<Interned<Type>>.asSlice(&parts)
+      if u32.bitAnd(flags, SUMMARY_NON_PARKING) != 0 {
+        let nonParkIdx = match operation {
+          Composition.FinalizeNonParking => if listed.length >= 2 { usize.ONE } else { usize.MAX }
+          Composition.UseRelease => if listed.length >= 3 { 2 } else { usize.MAX }
+          Composition.Observe => if listed.length >= 2 { usize.ONE } else { usize.MAX }
+          _ => usize.MAX
+        }
+        if nonParkIdx == usize.MAX {
+          flags = u32.bitOr(flags, SUMMARY_NON_PARKING_INEXACT)
+        } else if !isTypeParam(&listed[nonParkIdx]) {
+          if let Option<DeclarationId>.None = move extractCallbackFromType(&listed[nonParkIdx]) {
+            flags = u32.bitOr(flags, SUMMARY_NON_PARKING_INEXACT)
+          }
+        }
+      }
+      let mut i = usize.ZERO
+      while i < listed.length {
+        flags = u32.bitOr(flags, scanEffectSummaryFlags(&listed[i]))
+        i = i + usize.ONE
+      }
+      flags
+    }
+    Type.EffectJoin {alternatives, ..} => {
+      let mut flags: u32 = 0
+      let listed = List<Interned<Type>>.asSlice(&alternatives)
+      let mut i = usize.ZERO
+      while i < listed.length {
+        flags = u32.bitOr(flags, scanEffectSummaryFlags(&listed[i]))
+        i = i + usize.ONE
+      }
+      flags
+    }
+    _ => 0
+  }
+}
+
