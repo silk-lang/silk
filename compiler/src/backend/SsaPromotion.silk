@@ -3,7 +3,9 @@
 //!
 //! # When to use
 //! Run [`promote`] once on every finished `SsaFunction`: it always promotes the builder's variable
-//! slots, and with `all` every other slot it can, which an optimized build asks for.
+//! slots, and with `all` every other slot it can, which an optimized build asks for. Unoptimized
+//! builds run [`promoteScalars`] to promote builder variables plus non-escaping unmarked whole-slot
+//! scalar and vector slots without aggregate SROA or wide-access splitting.
 //!
 //! # Details
 //! A slot is promotable when every use of its address, directly or through `Offset` or an `Index`
@@ -52,6 +54,20 @@ impl Copy for Field {}
 // memory would become a block parameter for each field at every join of a long loop, which costs
 // more there than its loads and stores did.
 fn sharedSlot() -> u64 { return 32 }
+
+// Which stack slots `promoteWith` may promote: only builder variables, builder variables plus
+// unmarked whole-slot scalars and vectors, or every promotable slot including multi-field
+// aggregates and split wide accesses.
+enum Scope {
+  Variables,
+  Scalars,
+  All,
+}
+
+// Maximum `blocks * nonVarCrossCount` product for cross-block non-variable scalar promotion in
+// `Scope.Scalars`, keeping hot functions fully promoted while bounding IDF and parameter-pruning
+// work on giant functions and still promoting all builder variables and single-block temporaries.
+fn scalarCrossBudget() -> usize { return 131072 }
 
 // Whether accesses of `kind` can share a field with other integers there: a scalar integer of
 // one, two, four or eight bytes.
@@ -242,13 +258,14 @@ struct Scanned {
   accesses: List<List<Field>>,
 }
 
-effect fn scan(function: &SsaFunction, derived: &Derived, all: bool) -> Scanned ! OutOfMemoryError ? &mut Allocator {
+effect fn scan(function: &SsaFunction, derived: &Derived, scope: Scope) -> Scanned ! OutOfMemoryError ? &mut Allocator {
   let slots = function.slotCount()
   let mut scanned = Scanned {escaped: run List<bool>.makeWithCapacity(slots), accesses: run List<List<Field>>.makeWithCapacity(slots)}
   let mut slot = usize.ZERO
   while slot < slots {
     let declared = function.slot(slot)
-    run List<bool>.append(&mut scanned.escaped, !(declared.variable || all) || (derived.framed && !declared.variable))
+    let allowed = declared.variable || scope != Scope.Variables
+    run List<bool>.append(&mut scanned.escaped, !allowed || (derived.framed && !declared.variable))
     run List<List<Field>>.append(&mut scanned.accesses, List<Field>.make())
     slot = slot + usize.ONE
   }
@@ -261,6 +278,17 @@ effect fn scan(function: &SsaFunction, derived: &Derived, all: bool) -> Scanned 
     let mut at = usize.ZERO
     while at < listed.length {
       let found = function.instruction(listed[at])
+      if scope == Scope.Scalars {
+        match found.operation {
+          Operation.SlotStart {slot: marked} => {
+            if !function.slot(marked).variable { List<bool>.set(&mut scanned.escaped, marked, true) }
+          }
+          Operation.SlotEnd {slot: marked} => {
+            if !function.slot(marked).variable { List<bool>.set(&mut scanned.escaped, marked, true) }
+          }
+          _ => {}
+        }
+      }
       let operands = function.operandsOf(listed[at])
       let mut operand = usize.ZERO
       while operand < operands.length {
@@ -270,13 +298,23 @@ effect fn scan(function: &SsaFunction, derived: &Derived, all: bool) -> Scanned 
           let mut keeps = false
           match found.operation {
             Operation.Load {offset, ..} => {
-              keeps = true
-              run noteAccess(&mut List<List<Field>>.asMutSlice(&mut scanned.accesses)[from], Field {offset: u64.wrappingAdd(base, offset), kind: found.kind})
+              let access = Field {offset: u64.wrappingAdd(base, offset), kind: found.kind}
+              if scope == Scope.Scalars && !function.slot(from).variable {
+                keeps = run noteScalarAccess(&mut List<List<Field>>.asMutSlice(&mut scanned.accesses)[from], access, function.slot(from).size)
+              } else {
+                keeps = true
+                run noteAccess(&mut List<List<Field>>.asMutSlice(&mut scanned.accesses)[from], access)
+              }
             }
             Operation.Store {offset, ..} => {
               if operand == usize.ONE {
-                keeps = true
-                run noteAccess(&mut List<List<Field>>.asMutSlice(&mut scanned.accesses)[from], Field {offset: u64.wrappingAdd(base, offset), kind: function.kindOf(operands[usize.ZERO])})
+                let access = Field {offset: u64.wrappingAdd(base, offset), kind: function.kindOf(operands[usize.ZERO])}
+                if scope == Scope.Scalars && !function.slot(from).variable {
+                  keeps = run noteScalarAccess(&mut List<List<Field>>.asMutSlice(&mut scanned.accesses)[from], access, function.slot(from).size)
+                } else {
+                  keeps = true
+                  run noteAccess(&mut List<List<Field>>.asMutSlice(&mut scanned.accesses)[from], access)
+                }
               }
             }
             Operation.Offset {..} => { keeps = true }
@@ -292,6 +330,18 @@ effect fn scan(function: &SsaFunction, derived: &Derived, all: bool) -> Scanned 
     let exit = function.block(block)
     if exit.value != none() {
       let from = slotOf[u64.toUsize(exit.value)]
+      if from != usize.MAX { List<bool>.set(&mut scanned.escaped, from, true) }
+    }
+    if exit.secondValue != none() {
+      let from = slotOf[u64.toUsize(exit.secondValue)]
+      if from != usize.MAX { List<bool>.set(&mut scanned.escaped, from, true) }
+    }
+    if exit.thirdValue != none() {
+      let from = slotOf[u64.toUsize(exit.thirdValue)]
+      if from != usize.MAX { List<bool>.set(&mut scanned.escaped, from, true) }
+    }
+    if exit.fourthValue != none() {
+      let from = slotOf[u64.toUsize(exit.fourthValue)]
       if from != usize.MAX { List<bool>.set(&mut scanned.escaped, from, true) }
     }
     let edges = List<Edge>.asSlice(&exit.edges)
@@ -320,6 +370,18 @@ effect fn noteAccess(accesses: &mut List<Field>, access: Field) -> () ! OutOfMem
     at = at + usize.ONE
   }
   return run List<Field>.append(&mut accesses.*, access)
+}
+
+// Records a whole-slot uniform access at offset 0 for `Scope.Scalars`, answering false (escaping
+// the slot) when the access is offset, partial-width, or of another kind.
+effect fn noteScalarAccess(accesses: &mut List<Field>, access: Field, slotSize: u64) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if access.offset != 0 || usize.toU64(access.kind.storeSize()) != slotSize { return false }
+  let known = List<Field>.asSlice(&accesses.*)
+  if known.length == usize.ZERO {
+    run List<Field>.append(&mut accesses.*, access)
+    return true
+  }
+  return known[usize.ZERO].kind.equals(access.kind)
 }
 
 // How one access of a slot stands among the others: `Whole` when no other access starts inside
@@ -614,6 +676,18 @@ effect fn storePieces(
 /// address is only loaded and stored, to values and block parameters; then prunes the parameters
 /// that pass one value or feed nothing.
 pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if all { return run promoteWith(&mut function.*, Scope.All) }
+  return run promoteWith(&mut function.*, Scope.Variables)
+}
+
+/// Promotes the builder's variable slots and every non-escaping unmarked whole-slot scalar or
+/// vector stack slot of `function` to SSA values, skipping aggregate SROA and wide-access
+/// splitting and bounding cross-block IDF work on very large functions.
+pub effect fn promoteScalars(function: &mut SsaFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run promoteWith(&mut function.*, Scope.Scalars)
+}
+
+effect fn promoteWith(function: &mut SsaFunction, scope: Scope) -> () ! OutOfMemoryError ? &mut Allocator {
   let slots = function.slotCount()
   if slots == usize.ZERO { return () }
   let blocks = function.blockCount()
@@ -621,10 +695,10 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
   // The slot and offset each address value is derived from, which slots escape, and the accesses
   // of the others; once more after an access was cut into pieces.
   let mut pointing = run derive(&function.*, &graph)
-  let mut scanned = run scan(&function.*, &pointing, all)
-  if all && run splitWide(&mut function.*, &pointing, &scanned) {
+  let mut scanned = run scan(&function.*, &pointing, scope)
+  if scope == Scope.All && run splitWide(&mut function.*, &pointing, &scanned) {
     pointing = run derive(&function.*, &graph)
-    scanned = run scan(&function.*, &pointing, all)
+    scanned = run scan(&function.*, &pointing, scope)
   }
   // The fields of each slot that does not escape.
   let mut escaped = move scanned.escaped
@@ -635,7 +709,12 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
     if !List<bool>.get(&escaped, slot) {
       let mut cut = false
       let listed = List<Field>.asSlice(&List<List<Field>>.asSlice(&scanned.accesses)[slot])
-      if !(run layOut(listed, function.slot(slot).size <= sharedSlot(), &mut laid, &mut cut)) || cut { List<bool>.set(&mut escaped, slot, true) }
+      let shares = scope != Scope.Scalars && function.slot(slot).size <= sharedSlot()
+      if !(run layOut(listed, shares, &mut laid, &mut cut)) || cut {
+        List<bool>.set(&mut escaped, slot, true)
+      } else if scope == Scope.Scalars && !function.slot(slot).variable && List<Field>.length(&laid) != usize.ONE {
+        List<bool>.set(&mut escaped, slot, true)
+      }
     }
     run List<List<Field>>.append(&mut fields, move laid)
     slot = slot + usize.ONE
@@ -648,6 +727,8 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
   let mut kinds = List<Kind>.make()
   // Where each variable's field starts in its slot.
   let mut starts = List<u64>.make()
+  // Which slot each variable belongs to.
+  let mut varSlot = List<usize>.make()
   slot = usize.ZERO
   while slot < slots {
     run List<usize>.append(&mut firstVariable, List<Kind>.length(&kinds))
@@ -657,6 +738,7 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
       while at < listed.length {
         run List<Kind>.append(&mut kinds, listed[at].kind)
         run List<u64>.append(&mut starts, listed[at].offset)
+        run List<usize>.append(&mut varSlot, slot)
         at = at + usize.ONE
       }
     }
@@ -684,6 +766,8 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
   run List<bool>.appendRepeated(&mut crossing, false, variables)
   let mut storedIn = run List<usize>.makeWithCapacity(variables)
   run List<usize>.appendRepeated(&mut storedIn, usize.ZERO, variables)
+  let mut anyCrossing = false
+  let mut nonVarCrossCount = usize.ZERO
   block = usize.ZERO
   while block < blocks {
     let listed = List<usize>.asSlice(&function.block(block).instructions)
@@ -710,7 +794,11 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
             let field = fieldAt(List<Field>.asSlice(&List<List<Field>>.asSlice(&fields)[from]), u64.wrappingAdd(offsets[u64.toUsize(operands[usize.ZERO])], offset))
             let read = List<usize>.get(&firstVariable, from) + field
             List<usize>.set(&mut reached, instruction, read)
-            if List<usize>.get(&storedIn, read) != block + usize.ONE { List<bool>.set(&mut crossing, read, true) }
+            if List<usize>.get(&storedIn, read) != block + usize.ONE && !List<bool>.get(&crossing, read) {
+              List<bool>.set(&mut crossing, read, true)
+              anyCrossing = true
+              if !function.slot(from).variable { nonVarCrossCount = nonVarCrossCount + usize.ONE }
+            }
           }
         }
         Operation.Store {offset, ..} => {
@@ -720,8 +808,12 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
             let target = List<usize>.get(&firstVariable, from) + field
             List<usize>.set(&mut reached, instruction, target)
             // A store of a part reads the rest of the field first.
-            if function.kindOf(operands[usize.ZERO]).storeSize() != List<Kind>.get(&kinds, target).storeSize() && List<usize>.get(&storedIn, target) != block + usize.ONE {
+            if function.kindOf(operands[usize.ZERO]).storeSize() != List<Kind>.get(&kinds, target).storeSize()
+              && List<usize>.get(&storedIn, target) != block + usize.ONE
+              && !List<bool>.get(&crossing, target) {
               List<bool>.set(&mut crossing, target, true)
+              anyCrossing = true
+              if !function.slot(from).variable { nonVarCrossCount = nonVarCrossCount + usize.ONE }
             }
             List<usize>.set(&mut storedIn, target, block + usize.ONE)
             let blocksOf = &mut List<List<usize>>.asMutSlice(&mut stored)[target]
@@ -734,6 +826,119 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
       at = at + usize.ONE
     }
     block = block + usize.ONE
+  }
+  // In `Scope.Scalars`, cap cross-block non-variable promotion on giant functions so IDF and
+  // parameter pruning stay linear while still promoting builder variables and single-block temps.
+  if scope == Scope.Scalars && nonVarCrossCount > usize.ZERO && blocks > scalarCrossBudget() / nonVarCrossCount {
+    anyCrossing = false
+    let mut v = usize.ZERO
+    while v < variables {
+      if List<bool>.get(&crossing, v) {
+        let owner = List<usize>.get(&varSlot, v)
+        if !function.slot(owner).variable {
+          List<bool>.set(&mut escaped, owner, true)
+          List<bool>.set(&mut crossing, v, false)
+        } else {
+          anyCrossing = true
+        }
+      }
+      v = v + usize.ONE
+    }
+    let mut keptAny = false
+    v = usize.ZERO
+    while v < variables {
+      if !List<bool>.get(&escaped, List<usize>.get(&varSlot, v)) {
+        keptAny = true
+        break
+      }
+      v = v + usize.ONE
+    }
+    if !keptAny { return () }
+    block = usize.ZERO
+    while block < blocks {
+      let listed = List<usize>.asSlice(&function.block(block).instructions)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let instruction = listed[at]
+        let target = List<usize>.get(&reached, instruction)
+        if target != usize.MAX {
+          if List<bool>.get(&escaped, List<usize>.get(&varSlot, target)) {
+            List<usize>.set(&mut reached, instruction, usize.MAX)
+          }
+        } else if List<bool>.get(&removable, instruction) {
+          let found = function.instruction(instruction)
+          let mut owner = usize.MAX
+          match found.operation {
+            Operation.SlotAddress {slot: of} => { owner = of }
+            Operation.SlotStart {slot: of} => { owner = of }
+            Operation.SlotEnd {slot: of} => { owner = of }
+            Operation.Offset {..} => { owner = derived[u64.toUsize(function.operandsOf(instruction)[usize.ZERO])] }
+            Operation.Index => { owner = derived[u64.toUsize(function.operandsOf(instruction)[usize.ZERO])] }
+            _ => {}
+          }
+          if owner != usize.MAX && List<bool>.get(&escaped, owner) {
+            List<bool>.set(&mut removable, instruction, false)
+          }
+        }
+        at = at + usize.ONE
+      }
+      block = block + usize.ONE
+    }
+  }
+  // Fast path when no promoted variable crosses block boundaries: skip dominance frontiers,
+  // parameter placement, and dominator-tree undo logging in a single O(B + I) RPO pass.
+  if !anyCrossing {
+    let mut current = run List<u64>.makeWithCapacity(variables)
+    run List<u64>.appendRepeated(&mut current, none(), variables)
+    let mut zeros = run List<u64>.makeWithCapacity(variables)
+    run List<u64>.appendRepeated(&mut zeros, none(), variables)
+    let mut substitution = run List<u64>.makeWithCapacity(function.valueCount())
+    run List<u64>.appendRepeated(&mut substitution, none(), function.valueCount())
+    let sequence = graph.reversePostorder()
+    let mut step = usize.ZERO
+    while step < sequence.length {
+      let entered = sequence[step]
+      let mut count = List<usize>.length(&function.block(entered).instructions)
+      let mut at = usize.ZERO
+      while at < count {
+        let instruction = List<usize>.get(&function.block(entered).instructions, at)
+        let target = List<usize>.get(&reached, instruction)
+        let mut added = usize.ZERO
+        if target != usize.MAX {
+          let found = function.instruction(instruction)
+          let wide = List<Kind>.get(&kinds, target)
+          if let Operation.Store {offset, ..} = found.operation {
+            let mut value = resolve(List<u64>.asSlice(&substitution), function.operandsOf(instruction)[usize.ZERO])
+            if !function.kindOf(value).equals(wide) {
+              let shift = u64.wrappingAdd(offsets[u64.toUsize(function.operandsOf(instruction)[usize.ONE])], offset) - List<u64>.get(&starts, target)
+              let whole = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), target)
+              value = run writePart(&mut function.*, entered, at, &mut added, whole, value, shift, found.place)
+            }
+            List<u64>.set(&mut current, target, value)
+          } else {
+            let mut value = run currentValue(&mut function.*, &mut current, &mut zeros, List<Kind>.asSlice(&kinds), target)
+            if !found.kind.equals(wide) {
+              let mut shift: u64 = 0
+              if let Operation.Load {offset, ..} = found.operation {
+                shift = u64.wrappingAdd(offsets[u64.toUsize(function.operandsOf(instruction)[usize.ZERO])], offset) - List<u64>.get(&starts, target)
+              }
+              value = run readPart(&mut function.*, entered, at, &mut added, value, found.kind, shift, found.place)
+            }
+            List<u64>.set(&mut substitution, u64.toUsize(found.result), value)
+          }
+          function.remove(instruction)
+        } else if List<bool>.get(&removable, instruction) {
+          function.remove(instruction)
+        }
+        at = at + added + usize.ONE
+        count = count + added
+      }
+      step = step + usize.ONE
+    }
+    function.substitute(&mut substitution)
+    function.sweep()
+    if hasParameters(&function.*) { return run pruneParametersWith(&mut function.*, &graph) }
+    return ()
   }
   // Block parameters on each variable's iterated dominance frontier.
   let frontiers = run graph.frontiers()
@@ -880,7 +1085,8 @@ pub effect fn promote(function: &mut SsaFunction, all: bool) -> () ! OutOfMemory
   }
   function.substitute(&mut substitution)
   function.sweep()
-  return run pruneParameters(&mut function.*)
+  if hasParameters(&function.*) { return run pruneParametersWith(&mut function.*, &graph) }
+  return ()
 }
 
 // `value` after the loads already replaced: the end of its substitution chain.
@@ -902,11 +1108,27 @@ effect fn currentValue(function: &mut SsaFunction, current: &mut List<u64>, zero
   return made
 }
 
+// Whether any block of `function` has parameters to prune.
+fn hasParameters(function: &SsaFunction) -> bool {
+  let blocks = function.blockCount()
+  let mut block = usize.ONE
+  while block < blocks {
+    if List<u64>.length(&function.block(block).parameters) > usize.ZERO { return true }
+    block = block + usize.ONE
+  }
+  return false
+}
+
 /// Removes the block parameters of `function` that every edge passes one value for, apart from
 /// the parameter itself, replacing each with that value, then those whose value feeds no
 /// instruction, exit or other kept parameter.
 pub effect fn pruneParameters(function: &mut SsaFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !hasParameters(&function.*) { return () }
   let graph = run SsaGraph.of(&function.*)
+  return run pruneParametersWith(&mut function.*, &graph)
+}
+
+effect fn pruneParametersWith(function: &mut SsaFunction, graph: &SsaGraph) -> () ! OutOfMemoryError ? &mut Allocator {
   let blocks = function.blockCount()
   // Trivial parameters, until none is left.
   let mut changed = true

@@ -16,7 +16,7 @@
 //!   localBytes` is rounded up to a multiple of 16 so every outgoing `call` sees a 16-byte-aligned
 //!   stack pointer.
 
-import backend.SsaFunction {Binary, Cast, Definition, Edge, Exit, InlineAsm, Kind, Operation, SsaFunction, none}
+import backend.SsaFunction {Binary, Cast, Definition, Edge, Exit, InlineAsm, Instruction, Kind, Operation, ParameterAbi, SsaFunction, none}
 import backend.X86Asm
 import backend.X86Asm {Constraint, ConstraintKind}
 import silk.collections.bytes {Bytes}
@@ -34,10 +34,12 @@ pub fn regNone() -> u8 { return 255 }
 
 /// Complete stack frame layout and register assignment for one compiled x86-64 function.
 pub struct FramePlan {
-  /// Negative `rbp`-relative byte offset of each MIR stack slot `0 .. slotCount - 1`.
+  /// Negative `rbp`-relative byte offset of each MIR stack slot `0 .. slotCount - 1`
+  /// (`0` for unreferenced/promoted slots that have no `SlotAddress`).
   pub slotOffsets: List<i32>,
   /// Negative `rbp`-relative byte offset of each SSA value `0 .. valueCount - 1` (0 for constants,
-  /// unit values, rematerialized slot addresses, and values homed in GPR or XMM registers).
+  /// unit values, rematerialized slot addresses, fused loads/call-stores, unused arguments, and
+  /// values homed in GPR or XMM registers).
   pub valueOffsets: List<i32>,
   /// Allocated byte size of each SSA value's home slot (0, 8, 16, or rounded multiple of 16).
   pub valueSizes: List<usize>,
@@ -73,6 +75,29 @@ pub struct FramePlan {
   pub hasDynamicSlot: bool,
   /// True when the function contains any non-removed `Operation.InlineAsm`.
   pub hasInlineAsm: bool,
+  /// Byte width (`1`, `2`, `4`, or `8`) for single-use local-slot `Operation.Load` SSA values
+  /// fused directly into a subsequent `Call`/`CallIndirect` GP argument load, or `0` otherwise.
+  pub fusedLoadBytes: List<u8>,
+  /// Negative `rbp`-relative byte offset for each fused single-use `Operation.Load` SSA value
+  /// (`fusedLoadBytes[v] != 0`), or `0` otherwise.
+  pub fusedLoadOffsets: List<i32>,
+  /// Non-zero (`1`) for single-use scalar integer `Call`/`CallIndirect` results fused directly
+  /// into an immediately following local-slot `Operation.Store` from `rax`, or `0` otherwise.
+  pub fusedCallStores: List<u8>,
+  /// Folded non-slot addressing mode kind for each SSA value `0 .. valueCount - 1`:
+  /// `0` = not folded, `1` = `[base + disp]`, `2` = `[base + index*scale + disp]`,
+  /// `3` = skipped intermediate `Offset`/`Index`/`Mul`/`Shl` absorbed into an enclosing folded address.
+  pub foldedAddrKind: List<u8>,
+  /// Base SSA value for folded addressing modes (`foldedAddrKind[v]` in `{1, 2}`), or `none()`.
+  pub foldedAddrBase: List<u64>,
+  /// 64-bit integer index SSA value for scaled folded addressing modes (`foldedAddrKind[v] == 2`),
+  /// or `none()`.
+  pub foldedAddrIndex: List<u64>,
+  /// SIB scale (`1`, `2`, `4`, or `8`) for `foldedAddrKind[v] == 2`, or `1` otherwise.
+  pub foldedAddrScale: List<u8>,
+  /// Signed 32-bit displacement accumulated from folded `Offset`/constant-`Index` operations
+  /// (excluding the consuming `Load`/`Store`'s own `offset`), or `0` otherwise.
+  pub foldedAddrDisp: List<i32>,
 }
 
 struct Interval {
@@ -143,6 +168,13 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     run List<usize>.append(&mut blockExit, usize.ZERO)
     b = b + usize.ONE
   }
+  let mut coldBlocks = run List<u8>.makeWithCapacity(blockCount)
+  b = usize.ZERO
+  while b < blockCount {
+    run List<u8>.append(&mut coldBlocks, if isColdTrapBlock(function, blockCount, b) { 1 } else { 0 })
+    b = b + usize.ONE
+  }
+  let coldSlice = List<u8>.asSlice(&coldBlocks)
   if blockCount > usize.ZERO {
     let mut dfsBlocks = List<usize>.make()
     let mut dfsEdges = List<usize>.make()
@@ -172,14 +204,14 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
       }
     }
     let post = List<usize>.asSlice(&postOrder)
-    // Emit reachable non-trap blocks in RPO first, then sink cold `Exit.Trap` blocks (which have
-    // no outgoing edges) after all hot blocks. This preserves RPO dominance while keeping hot loops
-    // dense and within rel8 branch range.
+    // Emit reachable non-cold blocks in RPO first, then sink cold trap / trap-trampoline blocks
+    // (a sink DAG with no edges back to hot blocks) after all hot blocks. This preserves RPO
+    // dominance while keeping hot loops dense and within rel8 branch range.
     let mut pIdx = post.length
     while pIdx > usize.ZERO {
       pIdx = pIdx - usize.ONE
       let blkId = post[pIdx]
-      if blkId == usize.ZERO || function.block(blkId).exit != Exit.Trap {
+      if coldSlice[blkId] == 0 {
         run List<usize>.append(&mut rpoOrder, blkId)
       }
     }
@@ -187,7 +219,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     while pIdx > usize.ZERO {
       pIdx = pIdx - usize.ONE
       let blkId = post[pIdx]
-      if blkId != usize.ZERO && function.block(blkId).exit == Exit.Trap {
+      if coldSlice[blkId] != 0 {
         run List<usize>.append(&mut rpoOrder, blkId)
       }
     }
@@ -266,9 +298,11 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
 
   // Initialize MIR stack slot intervals and SSA value intervals, use counts, and weights.
   let mut slotIv = run List<Interval>.makeWithCapacity(slotCount)
+  let mut slotUsed = run List<u8>.makeWithCapacity(slotCount)
   let mut s = usize.ZERO
   while s < slotCount {
     run List<Interval>.append(&mut slotIv, Interval {start: totalPoints, end: usize.ZERO, hasStart: false, hasEnd: false, unmarked: false})
+    run List<u8>.append(&mut slotUsed, 0)
     s = s + usize.ONE
   }
 
@@ -280,6 +314,19 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   let mut valNoXmm = run List<u8>.makeWithCapacity(valueCount)
   let mut valSlotIdx = run List<usize>.makeWithCapacity(valueCount)
   let mut valSlotDisp = run List<i64>.makeWithCapacity(valueCount)
+  let mut valDefPt = run List<usize>.makeWithCapacity(valueCount)
+  let mut valDefBlock = run List<usize>.makeWithCapacity(valueCount)
+  let mut prefCallerReg = run List<u8>.makeWithCapacity(valueCount)
+  let mut fusedLoadSlot = run List<usize>.makeWithCapacity(valueCount)
+  let mut fusedLoadDisp = run List<i64>.makeWithCapacity(valueCount)
+  let mut fusedLoadBytes = run List<u8>.makeWithCapacity(valueCount)
+  let mut fusedCallStores = run List<u8>.makeWithCapacity(valueCount)
+  let mut fusedBranchCond = run List<u8>.makeWithCapacity(valueCount)
+  let mut foldedAddrKind = run List<u8>.makeWithCapacity(valueCount)
+  let mut foldedAddrBase = run List<u64>.makeWithCapacity(valueCount)
+  let mut foldedAddrIndex = run List<u64>.makeWithCapacity(valueCount)
+  let mut foldedAddrScale = run List<u8>.makeWithCapacity(valueCount)
+  let mut foldedAddrDisp = run List<i32>.makeWithCapacity(valueCount)
   let mut v = usize.ZERO
   while v < valueCount {
     let info = function.value(usize.toU64(v))
@@ -299,8 +346,56 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     run List<u8>.append(&mut valNoXmm, 0)
     run List<usize>.append(&mut valSlotIdx, usize.MAX)
     run List<i64>.append(&mut valSlotDisp, 0)
+    run List<usize>.append(&mut valDefPt, usize.MAX)
+    run List<usize>.append(&mut valDefBlock, usize.MAX)
+    run List<u8>.append(&mut prefCallerReg, regNone())
+    run List<usize>.append(&mut fusedLoadSlot, usize.MAX)
+    run List<i64>.append(&mut fusedLoadDisp, 0)
+    run List<u8>.append(&mut fusedLoadBytes, 0)
+    run List<u8>.append(&mut fusedCallStores, 0)
+    run List<u8>.append(&mut fusedBranchCond, 0)
+    run List<u8>.append(&mut foldedAddrKind, 0)
+    run List<u64>.append(&mut foldedAddrBase, none())
+    run List<u64>.append(&mut foldedAddrIndex, none())
+    run List<u8>.append(&mut foldedAddrScale, 1)
+    run List<i32>.append(&mut foldedAddrDisp, 0)
     run List<Interval>.append(&mut valIv, Interval {start: start, end: end, hasStart: false, hasEnd: false, unmarked: false})
     v = v + usize.ONE
+  }
+
+  // Record SysV ABI caller-saved GP preference hints (`rdi=7, rsi=6, r8=8, r9=9`) for incoming
+  // scalar arguments so arguments that fit in caller-saved GPRs home in place with zero moves.
+  let mut nativeInCaller = run List<u8>.makeWithCapacity(valueCount)
+  v = usize.ZERO
+  while v < valueCount {
+    run List<u8>.append(&mut nativeInCaller, 0)
+    v = v + usize.ONE
+  }
+  let prefMut = List<u8>.asMutSlice(&mut prefCallerReg)
+  let nativeInMut = List<u8>.asMutSlice(&mut nativeInCaller)
+  let incomingArgs = List<u64>.asSlice(&function.arguments)
+  let mut inGpIdx = usize.ZERO
+  let mut argI = usize.ZERO
+  while argI < incomingArgs.length {
+    let aVal = incomingArgs[argI]
+    let aAbi = function.argumentAbi(argI)
+    let aKind = function.value(aVal).kind
+    if aAbi.byvalSize == 0 && !aKind.isVector() && !aKind.isFloat() {
+      if aKind.bits > 64 {
+        if inGpIdx + 2 <= 6 { inGpIdx = inGpIdx + 2 }
+      } else if inGpIdx < 6 {
+        let aIdx = u64.toUsize(aVal)
+        if aIdx < valueCount {
+          let hint = sysvCallerHint(inGpIdx)
+          if hint != regNone() {
+            prefMut[aIdx] = hint
+            nativeInMut[aIdx] = 1
+          }
+        }
+        inGpIdx = inGpIdx + usize.ONE
+      }
+    }
+    argI = argI + usize.ONE
   }
 
   let mut hasVaStart = false
@@ -309,21 +404,25 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   let mut reservedCalleeMask: u64 = 0
   let calleeBits: u64 = u64.shiftLeft(1, 3) | u64.shiftLeft(1, 12) | u64.shiftLeft(1, 13) | u64.shiftLeft(1, 14) | u64.shiftLeft(1, 15)
   let mut clobberGpPoints = List<usize>.make()
+  let mut safeCallEndGpPoints = List<usize>.make()
   let mut clobberXmmPoints = List<usize>.make()
 
   // Walk every block in emission RPO order to populate live ranges, use counts, SlotAddress/Offset
   // chains, clobber points, and special frame needs.
   let slotIvMut = List<Interval>.asMutSlice(&mut slotIv)
+  let slotUsedMut = List<u8>.asMutSlice(&mut slotUsed)
   let slotIdxMut = List<usize>.asMutSlice(&mut valSlotIdx)
   let slotDispMut = List<i64>.asMutSlice(&mut valSlotDisp)
+  let valDefPtMut = List<usize>.asMutSlice(&mut valDefPt)
+  let valDefBlockMut = List<usize>.asMutSlice(&mut valDefBlock)
   let mut rpoIdx = usize.ZERO
   while rpoIdx < orderSlice.length {
     b = orderSlice[rpoIdx]
     let blk = function.block(b)
     let entryPt = bStart[b]
-    let isCold = b != usize.ZERO && blk.exit == Exit.Trap
-    // Cold trap blocks (`Exit.Trap`) receive 0 weight so diagnostic observer/cause arguments never
-    // steal registers from hot loops.
+    let isCold = coldSlice[b] != 0
+    // Cold trap blocks (`Exit.Trap` and unconditional trampolines to `Exit.Trap`) receive 0 weight
+    // so diagnostic observer/cause arguments never steal registers from hot loops.
     let blkWeight: u64 = if isCold { 0 } else if inLoop[b] != 0 { 16 } else { 1 }
     let paramWeight: u64 = if isCold { 0 } else if inLoop[b] != 0 { 32 } else { 2 }
     let params = List<u64>.asSlice(&blk.parameters)
@@ -341,10 +440,16 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         // Record result definitions.
         let rc = inst.resultCount()
         if inst.result != none() {
-          let mut rIdx = usize.ZERO
-          while rIdx < rc {
-            recordValDef(&mut valIv, &mut valWeights, inst.result + usize.toU64(rIdx), pt, blkWeight)
-            rIdx = rIdx + usize.ONE
+          let mut rOff = usize.ZERO
+          while rOff < rc {
+            let rv = inst.result + usize.toU64(rOff)
+            recordValDef(&mut valIv, &mut valWeights, rv, pt, blkWeight)
+            let rvIdx = u64.toUsize(rv)
+            if rvIdx < valueCount {
+              valDefPtMut[rvIdx] = pt
+              valDefBlockMut[rvIdx] = b
+            }
+            rOff = rOff + usize.ONE
           }
         }
         // Record operand uses.
@@ -357,6 +462,10 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         // Track caller-saved GPR and XMM clobber points.
         if instClobbersCallerGp(function, insts[i]) {
           run List<usize>.append(&mut clobberGpPoints, pt)
+          if callSafeEndGp(function, insts[i]) {
+            run List<usize>.append(&mut safeCallEndGpPoints, pt)
+            recordCallGpHints(function, insts[i], &mut prefCallerReg)
+          }
         }
         if instClobbersCallerXmm(function, insts[i]) {
           run List<usize>.append(&mut clobberXmmPoints, pt)
@@ -368,6 +477,10 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
           if inst.result != none() && inst.kind.isVector() {
             let rIdx = u64.toUsize(inst.result)
             if rIdx < noXmmMut.length { noXmmMut[rIdx] = 1 }
+          }
+          if rc >= 2 && inst.result != none() && inst.secondKind.isVector() {
+            let r2Idx = u64.toUsize(inst.result + 1)
+            if r2Idx < noXmmMut.length { noXmmMut[r2Idx] = 1 }
           }
           opIdx = usize.ZERO
           while opIdx < ops.length {
@@ -397,6 +510,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
           }
           Operation.SlotAddress {slot} => {
             if slot < slotCount {
+              slotUsedMut[slot] = 1
               if pt < slotIvMut[slot].start { slotIvMut[slot].start = pt }
               if pt > slotIvMut[slot].end { slotIvMut[slot].end = pt }
               if inst.result != none() {
@@ -415,12 +529,15 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
               let baseIdx = u64.toUsize(ops[0])
               let rIdx = u64.toUsize(inst.result)
               if baseIdx < valueCount && rIdx < valueCount && slotIdxMut[baseIdx] != usize.MAX {
-                let d = slotDispMut[baseIdx] + u64.wrappingToI64(offset)
-                if d >= -1073741824 && d <= 1073741824 {
-                  slotIdxMut[rIdx] = slotIdxMut[baseIdx]
-                  slotDispMut[rIdx] = d
-                  let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
-                  noRegMut[rIdx] = 1
+                let off = u64.wrappingToI64(offset)
+                if off >= -1073741824 && off <= 1073741824 {
+                  let d = slotDispMut[baseIdx] + off
+                  if d >= -1073741824 && d <= 1073741824 {
+                    slotIdxMut[rIdx] = slotIdxMut[baseIdx]
+                    slotDispMut[rIdx] = d
+                    let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                    noRegMut[rIdx] = 1
+                  }
                 }
               }
             }
@@ -432,12 +549,15 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
                 let baseIdx = u64.toUsize(ops[0])
                 let rIdx = u64.toUsize(inst.result)
                 if baseIdx < valueCount && rIdx < valueCount && slotIdxMut[baseIdx] != usize.MAX {
-                  let d = slotDispMut[baseIdx] + u64.wrappingToI64(function.constantOf(ops[1]).low)
-                  if d >= -1073741824 && d <= 1073741824 {
-                    slotIdxMut[rIdx] = slotIdxMut[baseIdx]
-                    slotDispMut[rIdx] = d
-                    let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
-                    noRegMut[rIdx] = 1
+                  let off = u64.wrappingToI64(function.constantOf(ops[1]).low)
+                  if off >= -1073741824 && off <= 1073741824 {
+                    let d = slotDispMut[baseIdx] + off
+                    if d >= -1073741824 && d <= 1073741824 {
+                      slotIdxMut[rIdx] = slotIdxMut[baseIdx]
+                      slotDispMut[rIdx] = d
+                      let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                      noRegMut[rIdx] = 1
+                    }
                   }
                 }
               }
@@ -503,7 +623,8 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     let mut exitClobbersGp = blk.exit == Exit.Switch
     if blk.value != none() {
       recordValUse(&mut valIv, &mut valUses, &mut valWeights, blk.value, exitPt, blkWeight)
-      if function.value(blk.value).kind.isVector() {
+      let vk = function.value(blk.value).kind
+      if vk.isVector() && vk.storeSize() != 16 {
         let noXmmMut = List<u8>.asMutSlice(&mut valNoXmm)
         let vi = u64.toUsize(blk.value)
         if vi < noXmmMut.length { noXmmMut[vi] = 1 }
@@ -511,7 +632,8 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     }
     if blk.secondValue != none() {
       recordValUse(&mut valIv, &mut valUses, &mut valWeights, blk.secondValue, exitPt, blkWeight)
-      if function.value(blk.secondValue).kind.isVector() {
+      let vk2 = function.value(blk.secondValue).kind
+      if vk2.isVector() && vk2.storeSize() != 16 {
         let noXmmMut = List<u8>.asMutSlice(&mut valNoXmm)
         let vi = u64.toUsize(blk.secondValue)
         if vi < noXmmMut.length { noXmmMut[vi] = 1 }
@@ -544,8 +666,11 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         if a < targetParams.length {
           recordValDef(&mut valIv, &mut valWeights, targetParams[a], exitPt, blkWeight)
           let pk = function.value(targetParams[a]).kind
-          if !pk.isUnit() && valueSlotBytes(pk) > 16 {
-            exitClobbersGp = true
+          if pk.isVector() {
+            let psz = pk.storeSize()
+            if psz != usize.ZERO && psz != 1 && psz != 2 && psz != 4 && psz != 8 && psz != 16 && psz != 32 {
+              exitClobbersGp = true
+            }
           }
         }
         a = a + usize.ONE
@@ -558,8 +683,280 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     rpoIdx = rpoIdx + usize.ONE
   }
 
-  // Extend all intervals across overlapping CFG back-edges to fixpoint.
+  // F10c: Fold single-use same-block non-slot `Offset`/`Index` (and scaled 64-bit `Mul`/`Shl`)
+  // addressing chains into eligible `Load`/`Store` consumers BEFORE `extendForLoops` so extended
+  // base/index live ranges properly propagate across loops and call clobber checks.
   let valIvMut = List<Interval>.asMutSlice(&mut valIv)
+  let valUsesPre = List<usize>.asSlice(&valUses)
+  let valDefPtPre = List<usize>.asSlice(&valDefPt)
+  let valDefBlockPre = List<usize>.asSlice(&valDefBlock)
+  let clobGpPre = List<usize>.asSlice(&clobberGpPoints)
+  let noRegPre = List<u8>.asMutSlice(&mut valNoReg)
+  let foldedKindMut = List<u8>.asMutSlice(&mut foldedAddrKind)
+  let foldedBaseMut = List<u64>.asMutSlice(&mut foldedAddrBase)
+  let foldedIndexMut = List<u64>.asMutSlice(&mut foldedAddrIndex)
+  let foldedScaleMut = List<u8>.asMutSlice(&mut foldedAddrScale)
+  let foldedDispMut = List<i32>.asMutSlice(&mut foldedAddrDisp)
+  b = usize.ZERO
+  while b < blockCount {
+    let blk = function.block(b)
+    let insts = List<usize>.asSlice(&blk.instructions)
+    let entryPt = bStart[b]
+    let mut i = usize.ZERO
+    while i < insts.length {
+      let instIdx = insts[i]
+      let inst = function.instruction(instIdx)
+      if !inst.removed {
+        let mut isEligible = false
+        let mut origAddr = none()
+        let mut loadOff: u64 = 0
+        let ops = function.operandsOf(instIdx)
+        match inst.operation {
+          Operation.Load {offset, ..} => {
+            if ops.length >= usize.ONE && canFoldAddrConsumer(inst.kind) {
+              isEligible = true
+              origAddr = ops[0]
+              loadOff = offset
+            }
+          }
+          Operation.Store {offset, ..} => {
+            if ops.length >= 2 && ops[0] != ops[1] && canFoldAddrConsumer(function.value(ops[0]).kind) {
+              isEligible = true
+              origAddr = ops[1]
+              loadOff = offset
+            }
+          }
+          _ => {}
+        }
+        if isEligible && origAddr != none() && !function.isConstant(origAddr) {
+          let loff = u64.wrappingToI64(loadOff)
+          if loff >= -1073741824 && loff <= 1073741824 {
+            let consumerPt = entryPt + i
+            let origIdx = u64.toUsize(origAddr)
+            if origIdx < valueCount && slotIdxMut[origIdx] == usize.MAX && valUsesPre[origIdx] == usize.ONE && foldedKindMut[origIdx] == 0 {
+              let mut cur = origAddr
+              let mut accDisp: i64 = 0
+              let mut skipped: [usize; 8] = [usize.MAX, usize.MAX, usize.MAX, usize.MAX, usize.MAX, usize.MAX, usize.MAX, usize.MAX]
+              let mut skipCount = usize.ZERO
+              let mut earliestPt = consumerPt
+              // Step A: Peel up to 4 single-use same-block `Operation.Offset` instructions.
+              while skipCount < 4 {
+                if cur == none() || function.isConstant(cur) { break }
+                let curIdx = u64.toUsize(cur)
+                if curIdx >= valueCount || slotIdxMut[curIdx] != usize.MAX || valUsesPre[curIdx] != usize.ONE || foldedKindMut[curIdx] != 0 { break }
+                if valDefBlockPre[curIdx] != b || valDefPtPre[curIdx] >= consumerPt { break }
+                let prod = function.producerOf(cur)
+                if prod == usize.MAX { break }
+                let pInst = function.instruction(prod)
+                if pInst.removed { break }
+                if let Operation.Offset {offset: d} = pInst.operation {
+                  let prodOps = function.operandsOf(prod)
+                  if prodOps.length < usize.ONE { break }
+                  let sd = u64.wrappingToI64(d)
+                  if sd < -1073741824 || sd > 1073741824 { break }
+                  let nextDisp = accDisp + sd
+                  let totalWithLoad = nextDisp + loff
+                  if nextDisp < -1073741824 || nextDisp > 1073741824 || totalWithLoad < -1073741824 || totalWithLoad > 1073741824 { break }
+                  skipped[skipCount] = curIdx
+                  skipCount = skipCount + usize.ONE
+                  accDisp = nextDisp
+                  if valDefPtPre[curIdx] < earliestPt { earliestPt = valDefPtPre[curIdx] }
+                  cur = prodOps[0]
+                } else {
+                  break
+                }
+              }
+              let mut finalKind: u8 = 0
+              let mut finalBase = none()
+              let mut finalIdx = none()
+              let mut finalScale: u8 = 1
+              let mut finalDisp: i32 = 0
+              // Step B: Optionally absorb one single-use same-block 64-bit `Operation.Index`.
+              if cur != none() && !function.isConstant(cur) {
+                let curIdx = u64.toUsize(cur)
+                if curIdx < valueCount && slotIdxMut[curIdx] == usize.MAX && valUsesPre[curIdx] == usize.ONE && foldedKindMut[curIdx] == 0 && valDefBlockPre[curIdx] == b && valDefPtPre[curIdx] < consumerPt {
+                  let prod = function.producerOf(cur)
+                  if prod != usize.MAX {
+                    let pInst = function.instruction(prod)
+                    if !pInst.removed {
+                      if let Operation.Index = pInst.operation {
+                        let prodOps = function.operandsOf(prod)
+                        if prodOps.length >= 2 {
+                          let idxKind = function.value(prodOps[1]).kind
+                          if !idxKind.isVector() && idxKind.isInteger() && idxKind.bits == 64 {
+                            if function.isBits(prodOps[1]) {
+                              // Subcase B1: constant 64-bit index -> BaseDisp.
+                              let sd = u64.wrappingToI64(function.constantOf(prodOps[1]).low)
+                              if sd >= -1073741824 && sd <= 1073741824 {
+                                let nextDisp = accDisp + sd
+                                let totalWithLoad = nextDisp + loff
+                                if nextDisp >= -1073741824 && nextDisp <= 1073741824 && totalWithLoad >= -1073741824 && totalWithLoad <= 1073741824 {
+                                  skipped[skipCount] = curIdx
+                                  skipCount = skipCount + usize.ONE
+                                  accDisp = nextDisp
+                                  cur = prodOps[0]
+                                }
+                              }
+                            } else if !function.isConstant(prodOps[1]) && prodOps[0] != none() {
+                              // Subcase B2: dynamic 64-bit index (+ optional single-use Mul/Shl scale).
+                              let rawIdx = prodOps[1]
+                              let mut idxVal = rawIdx
+                              let mut scale: u8 = 1
+                              let mut scaleSkipIdx = usize.MAX
+                              let mut idxEarliest = if valDefPtPre[curIdx] < earliestPt { valDefPtPre[curIdx] } else { earliestPt }
+                              let rawIdxIdx = u64.toUsize(rawIdx)
+                              if rawIdxIdx < valueCount && valUsesPre[rawIdxIdx] == usize.ONE && foldedKindMut[rawIdxIdx] == 0 && valDefBlockPre[rawIdxIdx] == b && valDefPtPre[rawIdxIdx] < valDefPtPre[curIdx] {
+                                let rawProd = function.producerOf(rawIdx)
+                                if rawProd != usize.MAX {
+                                  let rawInst = function.instruction(rawProd)
+                                  if !rawInst.removed && !rawInst.kind.isVector() && rawInst.kind.isInteger() && rawInst.kind.bits == 64 {
+                                    if let Operation.Binary {operation} = rawInst.operation {
+                                      let rawOps = function.operandsOf(rawProd)
+                                      if rawOps.length >= 2 {
+                                        if operation == Binary.Mul {
+                                          if function.isBits(rawOps[1]) && !function.isConstant(rawOps[0]) {
+                                            let c = function.constantOf(rawOps[1]).low
+                                            if c == 1 || c == 2 || c == 4 || c == 8 {
+                                              idxVal = rawOps[0]
+                                              scale = u64.wrappingToU8(c)
+                                              scaleSkipIdx = rawIdxIdx
+                                            }
+                                          } else if function.isBits(rawOps[0]) && !function.isConstant(rawOps[1]) {
+                                            let c = function.constantOf(rawOps[0]).low
+                                            if c == 1 || c == 2 || c == 4 || c == 8 {
+                                              idxVal = rawOps[1]
+                                              scale = u64.wrappingToU8(c)
+                                              scaleSkipIdx = rawIdxIdx
+                                            }
+                                          }
+                                        } else if operation == Binary.Shl {
+                                          if function.isBits(rawOps[1]) && !function.isConstant(rawOps[0]) {
+                                            let sh = function.constantOf(rawOps[1]).low
+                                            if sh <= 3 {
+                                              idxVal = rawOps[0]
+                                              scale = u8.shiftLeft(1, u64.wrappingToU8(sh))
+                                              scaleSkipIdx = rawIdxIdx
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                              if scaleSkipIdx != usize.MAX && valDefPtPre[scaleSkipIdx] < idxEarliest {
+                                idxEarliest = valDefPtPre[scaleSkipIdx]
+                              }
+                              // Optionally peel ONE single-use same-block `Offset` on `baseCand`.
+                              let mut baseCand = prodOps[0]
+                              let mut baseOffIdx = usize.MAX
+                              let mut b2Disp = accDisp
+                              if !function.isConstant(baseCand) {
+                                let bcIdx = u64.toUsize(baseCand)
+                                if bcIdx < valueCount && slotIdxMut[bcIdx] == usize.MAX && bcIdx != curIdx && bcIdx != scaleSkipIdx && valUsesPre[bcIdx] == usize.ONE && foldedKindMut[bcIdx] == 0 && valDefBlockPre[bcIdx] == b && valDefPtPre[bcIdx] < valDefPtPre[curIdx] {
+                                  let bcProd = function.producerOf(baseCand)
+                                  if bcProd != usize.MAX {
+                                    let bcInst = function.instruction(bcProd)
+                                    if !bcInst.removed {
+                                      if let Operation.Offset {offset: bd} = bcInst.operation {
+                                        let bcOps = function.operandsOf(bcProd)
+                                        if bcOps.length >= usize.ONE && bcOps[0] != none() {
+                                          let bsd = u64.wrappingToI64(bd)
+                                          if bsd >= -1073741824 && bsd <= 1073741824 {
+                                            let nextD = b2Disp + bsd
+                                            let totalD = nextD + loff
+                                            if nextD >= -1073741824 && nextD <= 1073741824 && totalD >= -1073741824 && totalD <= 1073741824 {
+                                              baseOffIdx = bcIdx
+                                              b2Disp = nextD
+                                              baseCand = bcOps[0]
+                                              if valDefPtPre[bcIdx] < idxEarliest { idxEarliest = valDefPtPre[bcIdx] }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                              // Call-crossing 2-reg pressure guard: decline non-slot BaseIndex across a Call.
+                              let baseIsSlot = !function.isConstant(baseCand) && u64.toUsize(baseCand) < valueCount && slotIdxMut[u64.toUsize(baseCand)] != usize.MAX
+                              let crossesCall = !baseIsSlot && consumerPt > usize.ZERO && idxEarliest + usize.ONE <= consumerPt - usize.ONE && hasPointInRange(clobGpPre, idxEarliest + usize.ONE, consumerPt - usize.ONE)
+                              if !crossesCall {
+                                skipped[skipCount] = curIdx
+                                skipCount = skipCount + usize.ONE
+                                if scaleSkipIdx != usize.MAX {
+                                  skipped[skipCount] = scaleSkipIdx
+                                  skipCount = skipCount + usize.ONE
+                                }
+                                if baseOffIdx != usize.MAX {
+                                  skipped[skipCount] = baseOffIdx
+                                  skipCount = skipCount + usize.ONE
+                                }
+                                finalKind = 2
+                                finalBase = baseCand
+                                finalIdx = idxVal
+                                finalScale = scale
+                                finalDisp = i64.wrappingToI32(b2Disp)
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              if finalKind == 0 && skipCount > usize.ZERO && cur != none() {
+                finalKind = 1
+                finalBase = cur
+                finalIdx = none()
+                finalScale = 1
+                finalDisp = i64.wrappingToI32(accDisp)
+              }
+              // Step C: Commit folded address and extend base/index live intervals to `consumerPt`.
+              if finalKind != 0 {
+                let mut sk = usize.ZERO
+                while sk < skipCount {
+                  let kIdx = skipped[sk]
+                  if kIdx < valueCount {
+                    foldedKindMut[kIdx] = 3
+                    noRegPre[kIdx] = 1
+                  }
+                  sk = sk + usize.ONE
+                }
+                foldedKindMut[origIdx] = finalKind
+                foldedBaseMut[origIdx] = finalBase
+                foldedIndexMut[origIdx] = finalIdx
+                foldedScaleMut[origIdx] = finalScale
+                foldedDispMut[origIdx] = finalDisp
+                noRegPre[origIdx] = 1
+                if finalBase != none() && !function.isConstant(finalBase) {
+                  let bi = u64.toUsize(finalBase)
+                  if bi < valueCount {
+                    if consumerPt > valIvMut[bi].end { valIvMut[bi].end = consumerPt }
+                    let bsi = slotIdxMut[bi]
+                    if bsi != usize.MAX && bsi < slotCount && consumerPt > slotIvMut[bsi].end {
+                      slotIvMut[bsi].end = consumerPt
+                    }
+                  }
+                }
+                if finalKind == 2 && finalIdx != none() && !function.isConstant(finalIdx) {
+                  let ii = u64.toUsize(finalIdx)
+                  if ii < valueCount && consumerPt > valIvMut[ii].end {
+                    valIvMut[ii].end = consumerPt
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      i = i + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+
+  // Extend all intervals across overlapping CFG back-edges to fixpoint.
   let mut changed = true
   while changed {
     changed = false
@@ -593,8 +990,9 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   let valUsesSlice = List<usize>.asSlice(&valUses)
   let valWeightSlice = List<u64>.asSlice(&valWeights)
 
-  // Do not waste a callee-saved register on a single-use scalar integer compare immediately
-  // consumed by its block's `Exit.Branch`, since `X86Emit` fuses it into `cmp + jcc`.
+  // Do not waste a register or spill slot on a single-use scalar integer compare or scalar
+  // `{8,16,32,64}`-bit overflow flag immediately consumed by its block's `Exit.Branch`, since
+  // `X86Emit` fuses it directly into flags + `jcc`.
   b = usize.ZERO
   while b < blockCount {
     let blk = function.block(b)
@@ -615,7 +1013,19 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
                   if !opKind.isVector() && !opKind.isFloat() && opKind.bits <= 64 {
                     let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
                     noRegMut[condIdx] = 1
+                    let fusedCondMut = List<u8>.asMutSlice(&mut fusedBranchCond)
+                    fusedCondMut[condIdx] = 1
                   }
+                }
+              }
+            } else if inst.result != none() && inst.result + 1 == blk.value {
+              if let Operation.Overflow {..} = inst.operation {
+                let ops = function.operandsOf(insts[last])
+                if ops.length >= 2 && !inst.kind.isVector() && (inst.kind.bits == 8 || inst.kind.bits == 16 || inst.kind.bits == 32 || inst.kind.bits == 64) {
+                  let noRegMut = List<u8>.asMutSlice(&mut valNoReg)
+                  noRegMut[condIdx] = 1
+                  let fusedCondMut = List<u8>.asMutSlice(&mut fusedBranchCond)
+                  fusedCondMut[condIdx] = 1
                 }
               }
             }
@@ -627,10 +1037,161 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     b = b + usize.ONE
   }
 
+  // Detect F8d single-use `Load(local slot) -> Call` GP-arg fusion and immediate
+  // `Call -> Store(local slot)` fusion in O(N) per block, suppressing register allocation for
+  // fused temporaries so they neither steal callee-saved GPRs nor allocate stack spill slots.
+  let noRegMutAll = List<u8>.asMutSlice(&mut valNoReg)
+  let fusedLoadSlotMut = List<usize>.asMutSlice(&mut fusedLoadSlot)
+  let fusedLoadDispMut = List<i64>.asMutSlice(&mut fusedLoadDisp)
+  let fusedLoadBytesMut = List<u8>.asMutSlice(&mut fusedLoadBytes)
+  let fusedCallStoresMut = List<u8>.asMutSlice(&mut fusedCallStores)
+  let slotIdxSlice = List<usize>.asSlice(&valSlotIdx)
+  let slotDispSlice = List<i64>.asSlice(&valSlotDisp)
+  b = usize.ZERO
+  while b < blockCount {
+    let blk = function.block(b)
+    let insts = List<usize>.asSlice(&blk.instructions)
+    let mut i = usize.ZERO
+    while i < insts.length {
+      let cInstId = insts[i]
+      let cInst = function.instruction(cInstId)
+      if !cInst.removed {
+        let mut isCall = false
+        let mut indirect = false
+        let mut abiIdx = usize.MAX
+        match cInst.operation {
+          Operation.Call {abi, ..} => { isCall = true abiIdx = abi }
+          Operation.CallIndirect {abi} => { isCall = true indirect = true abiIdx = abi }
+          _ => {}
+        }
+        if isCall {
+          // 1. Single-use `Load(local slot) -> Call` GP-arg (`cls == 0`) fusion.
+          let cOps = function.operandsOf(cInstId)
+          let argStart = if indirect { usize.ONE } else { usize.ZERO }
+          let argCount = if cOps.length > argStart { cOps.length - argStart } else { usize.ZERO }
+          let hasAbi = abiIdx != usize.MAX
+          let paramCount = if hasAbi { function.callAbi(abiIdx).parameterCount } else { usize.ZERO }
+          let mut callGpArgs: [u64; 6] = [none(), none(), none(), none(), none(), none()]
+          let mut callGpCount = usize.ZERO
+          let mut gpSeen = usize.ZERO
+          let mut a = usize.ZERO
+          while a < argCount && gpSeen < 6 {
+            let opVal = cOps[argStart + a]
+            let ak = function.value(opVal).kind
+            let pAbi = if hasAbi && a < paramCount { function.callParameterAbisOf(abiIdx)[a] } else { ParameterAbi.plain() }
+            if pAbi.byvalSize == 0 && !ak.isVector() && !ak.isFloat() {
+              if ak.bits > 64 {
+                if gpSeen + 2 <= 6 { gpSeen = gpSeen + 2 }
+              } else {
+                let opIdx = u64.toUsize(opVal)
+                if opIdx < valueCount && valUsesSlice[opIdx] == usize.ONE {
+                  callGpArgs[callGpCount] = opVal
+                  callGpCount = callGpCount + usize.ONE
+                }
+                gpSeen = gpSeen + usize.ONE
+              }
+            }
+            a = a + usize.ONE
+          }
+          if callGpCount > usize.ZERO {
+            let mut matched = usize.ZERO
+            let mut p = i
+            while p > usize.ZERO && matched < callGpCount {
+              p = p - usize.ONE
+              let pInstId = insts[p]
+              let pInst = function.instruction(pInstId)
+              if !pInst.removed {
+                if !instCannotWriteMemory(pInst) { break }
+                if let Operation.Load {offset, ..} = pInst.operation {
+                  let rVal = pInst.result
+                  let lk = pInst.kind
+                  if rVal != none() && !lk.isVector() && !lk.isFloat() && !lk.isUnit() && (lk.bits == 8 || lk.bits == 16 || lk.bits == 32 || lk.bits == 64) {
+                    let mut m = usize.ZERO
+                    let mut hit = false
+                    while m < callGpCount {
+                      if callGpArgs[m] == rVal {
+                        hit = true
+                        break
+                      }
+                      m = m + usize.ONE
+                    }
+                    if hit {
+                      let rIdx = u64.toUsize(rVal)
+                      let lOps = function.operandsOf(pInstId)
+                      if rIdx < valueCount && lOps.length >= usize.ONE {
+                        let addrIdx = u64.toUsize(lOps[0])
+                        if addrIdx < valueCount {
+                          let si = slotIdxSlice[addrIdx]
+                          if si != usize.MAX && si < slotCount {
+                            let bytes = lk.elementBytes()
+                            let sSzRaw = function.slot(si).size
+                            let sSz: u64 = if sSzRaw == 0 { 8 } else { sSzRaw }
+                            if offset <= 1073741824 && sSz <= 1073741824 {
+                              let d = slotDispSlice[addrIdx] + u64.wrappingToI64(offset)
+                              if d >= 0 && d <= 1073741824 && d + usize.toI64(bytes) <= u64.wrappingToI64(sSz) {
+                                fusedLoadSlotMut[rIdx] = si
+                                fusedLoadDispMut[rIdx] = d
+                                fusedLoadBytesMut[rIdx] = usize.toU8(bytes)
+                                noRegMutAll[rIdx] = 1
+                                matched = matched + usize.ONE
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // 2. Immediate `Call -> Store(local slot)` fusion.
+          let rc = cInst.resultCount()
+          if rc == usize.ONE && cInst.result != none() {
+            let rVal = cInst.result
+            let rIdx = u64.toUsize(rVal)
+            let rk = cInst.kind
+            if rIdx < valueCount && valUsesSlice[rIdx] == usize.ONE && !rk.isVector() && !rk.isFloat() && !rk.isUnit() && (rk.bits == 8 || rk.bits == 16 || rk.bits == 32 || rk.bits == 64) {
+              let mut q = i + usize.ONE
+              while q < insts.length {
+                let qInstId = insts[q]
+                let qInst = function.instruction(qInstId)
+                if !qInst.removed {
+                  if isZeroEmitSlotAddrInst(function, qInst, slotCount, slotIdxSlice, slotDispSlice) {
+                    q = q + usize.ONE
+                    continue
+                  }
+                  if let Operation.Store {..} = qInst.operation {
+                    let sOps = function.operandsOf(qInstId)
+                    if sOps.length >= 2 && sOps[0] == rVal && sOps[1] != rVal {
+                      let addrIdx = u64.toUsize(sOps[1])
+                      if addrIdx < valueCount && slotIdxSlice[addrIdx] != usize.MAX && slotIdxSlice[addrIdx] < slotCount {
+                        fusedCallStoresMut[rIdx] = 1
+                        noRegMutAll[rIdx] = 1
+                      }
+                    }
+                  }
+                  break
+                }
+                q = q + usize.ONE
+              }
+            }
+          }
+        }
+      }
+      i = i + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+
   let valNoRegSlice = List<u8>.asSlice(&valNoReg)
   let valNoXmmSlice = List<u8>.asSlice(&valNoXmm)
   let clobGpSlice = List<usize>.asSlice(&clobberGpPoints)
+  let safeCallEndSlice = List<usize>.asSlice(&safeCallEndGpPoints)
   let clobXmmSlice = List<usize>.asSlice(&clobberXmmPoints)
+  let valDefPtSlice = List<usize>.asSlice(&valDefPt)
+  let prefCallerSlice = List<u8>.asSlice(&prefCallerReg)
 
   let mut regCands = List<usize>.make()
   v = usize.ZERO
@@ -643,7 +1204,8 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     }
     v = v + usize.ONE
   }
-  heapSortCandidates(&mut regCands, valWeightSlice, List<Interval>.asSlice(&valIv))
+  let nativeInSlice = List<u8>.asSlice(&nativeInCaller)
+  heapSortCandidates(&mut regCands, valWeightSlice, List<Interval>.asSlice(&valIv), nativeInSlice)
   let candMut = List<usize>.asSlice(&regCands)
 
   // Caller-saved GPR pool (zero prologue save/restore cost): r8=8, r9=9, rsi=6, rdi=7.
@@ -660,6 +1222,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   let mut ranges3 = List<Range>.make()
   let mut ranges4 = List<Range>.make()
   let mut slotWeights: [u64; 5] = [0, 0, 0, 0, 0]
+  let mut slotMaxWeight: [u64; 5] = [0, 0, 0, 0, 0]
   let mut slotCountAssigned: [usize; 5] = [0, 0, 0, 0, 0]
   let valRegsMut = List<u8>.asMutSlice(&mut valueRegs)
 
@@ -668,8 +1231,27 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     let idx = candMut[cIdx]
     let iv = valIvSlice[idx]
     let mut assigned = false
-    let canCaller = iv.start > usize.ZERO && !hasPointInRange(clobGpSlice, iv.start, iv.end)
+    let prod = function.producerOf(usize.toU64(idx))
+    let defIsGpClobber = prod != usize.MAX && valDefPtSlice[idx] == iv.start && instClobbersCallerGp(function, prod)
+    let checkLo = if defIsGpClobber { iv.start + usize.ONE } else { iv.start }
+    let endsAtSafeCallGp = iv.end > usize.ZERO && hasPointInRange(safeCallEndSlice, iv.end, iv.end)
+    let checkHi = if endsAtSafeCallGp { iv.end - usize.ONE } else { iv.end }
+    let canCaller = !hasPointInRange(clobGpSlice, checkLo, checkHi)
     if canCaller {
+      let pref = prefCallerSlice[idx]
+      if pref == 8 && run tryAssignReg(&mut callerRanges0, iv.start, iv.end) {
+        valRegsMut[idx] = 8
+        assigned = true
+      } else if pref == 9 && run tryAssignReg(&mut callerRanges1, iv.start, iv.end) {
+        valRegsMut[idx] = 9
+        assigned = true
+      } else if pref == 6 && run tryAssignReg(&mut callerRanges2, iv.start, iv.end) {
+        valRegsMut[idx] = 6
+        assigned = true
+      } else if pref == 7 && run tryAssignReg(&mut callerRanges3, iv.start, iv.end) {
+        valRegsMut[idx] = 7
+        assigned = true
+      }
       if !assigned && run tryAssignReg(&mut callerRanges0, iv.start, iv.end) {
         valRegsMut[idx] = 8
         assigned = true
@@ -692,6 +1274,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         if run tryAssignReg(&mut ranges0, iv.start, iv.end) {
           valRegsMut[idx] = poolRegs[0]
           slotWeights[0] = slotWeights[0] + valWeightSlice[idx]
+          if valWeightSlice[idx] > slotMaxWeight[0] { slotMaxWeight[0] = valWeightSlice[idx] }
           slotCountAssigned[0] = slotCountAssigned[0] + usize.ONE
           assigned = true
         }
@@ -700,6 +1283,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         if run tryAssignReg(&mut ranges1, iv.start, iv.end) {
           valRegsMut[idx] = poolRegs[1]
           slotWeights[1] = slotWeights[1] + valWeightSlice[idx]
+          if valWeightSlice[idx] > slotMaxWeight[1] { slotMaxWeight[1] = valWeightSlice[idx] }
           slotCountAssigned[1] = slotCountAssigned[1] + usize.ONE
           assigned = true
         }
@@ -708,6 +1292,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         if run tryAssignReg(&mut ranges2, iv.start, iv.end) {
           valRegsMut[idx] = poolRegs[2]
           slotWeights[2] = slotWeights[2] + valWeightSlice[idx]
+          if valWeightSlice[idx] > slotMaxWeight[2] { slotMaxWeight[2] = valWeightSlice[idx] }
           slotCountAssigned[2] = slotCountAssigned[2] + usize.ONE
           assigned = true
         }
@@ -716,6 +1301,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         if run tryAssignReg(&mut ranges3, iv.start, iv.end) {
           valRegsMut[idx] = poolRegs[3]
           slotWeights[3] = slotWeights[3] + valWeightSlice[idx]
+          if valWeightSlice[idx] > slotMaxWeight[3] { slotMaxWeight[3] = valWeightSlice[idx] }
           slotCountAssigned[3] = slotCountAssigned[3] + usize.ONE
           assigned = true
         }
@@ -724,6 +1310,7 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
         if run tryAssignReg(&mut ranges4, iv.start, iv.end) {
           valRegsMut[idx] = poolRegs[4]
           slotWeights[4] = slotWeights[4] + valWeightSlice[idx]
+          if valWeightSlice[idx] > slotMaxWeight[4] { slotMaxWeight[4] = valWeightSlice[idx] }
           slotCountAssigned[4] = slotCountAssigned[4] + usize.ONE
           assigned = true
         }
@@ -732,18 +1319,17 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     cIdx = cIdx + usize.ONE
   }
 
-  // Profitability gate: only commit a callee-saved register when its total weighted benefit pays
-  // for the prologue push and epilogue pop (avoiding bloat in tiny leaf functions).
+  // Profitability gate: only commit a callee-saved GPR when its benefit strictly outweighs
+  // prologue push + epilogue pop (at least one value with weight >= 4, or multiple multi-use
+  // values with max weight >= 3 combining to total weight >= 6).
   let mut calleeMask: u64 = reservedCalleeMask
-  let mut anySaved = reservedCalleeMask != 0
   let mut rejectMask: u64 = 0
   let mut regSlot = usize.ZERO
   while regSlot < 5 {
     if slotCountAssigned[regSlot] > usize.ZERO {
-      let minW: u64 = if anySaved { 3 } else if regSlot == usize.ZERO { 4 } else { 5 }
-      if slotWeights[regSlot] >= minW {
+      let profitable = slotMaxWeight[regSlot] >= 4 || (slotMaxWeight[regSlot] >= 3 && slotWeights[regSlot] >= 6)
+      if profitable {
         calleeMask = calleeMask | u64.shiftLeft(1, u8.toU64(poolRegs[regSlot]))
-        anySaved = true
       } else {
         rejectMask = rejectMask | u64.shiftLeft(1, u8.toU64(poolRegs[regSlot]))
       }
@@ -763,28 +1349,45 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
 
   // Linear-scan allocation onto caller-saved XMM registers (`xmm4..xmm15`, 12 registers) for
   // scalar floats and 128-bit SSE2 vectors whose live ranges cross no XMM-clobbering calls.
+  // Incoming arguments (`iv.start == 0`) and values whose last use is an XMM-clobbering call are
+  // restricted to `xmm8..xmm15` so sequential moves to/from ABI `xmm0..xmm7` never conflict.
   let mut valueXmms = run List<u8>.makeWithCapacity(valueCount)
+  let mut xmmHigh = run List<u8>.makeWithCapacity(valueCount)
   v = usize.ZERO
   while v < valueCount {
     run List<u8>.append(&mut valueXmms, regNone())
+    run List<u8>.append(&mut xmmHigh, 0)
     v = v + usize.ONE
   }
+  let xmmHighMut = List<u8>.asMutSlice(&mut xmmHigh)
   let mut xmmCands = List<usize>.make()
   v = usize.ZERO
   while v < valueCount {
     let iv = valIvSlice[v]
-    if valNoXmmSlice[v] == 0 && valUsesSlice[v] > usize.ZERO && valWeightSlice[v] >= 1 && iv.start > usize.ZERO && iv.start <= iv.end {
+    if valNoXmmSlice[v] == 0 && valUsesSlice[v] > usize.ZERO && valWeightSlice[v] >= 1 && iv.start <= iv.end {
       let kind = function.value(usize.toU64(v)).kind
       let isScalarFloat = kind.isFloat() && !kind.isVector()
-      let isVec128 = kind.isVector() && valSizeSlice[v] == 16 && kind.isInteger() && (kind.bits == 8 || kind.bits == 16 || kind.bits == 32 || kind.bits == 64)
-      if (isScalarFloat || isVec128) && !hasPointInRange(clobXmmSlice, iv.start, iv.end) {
-        run List<usize>.append(&mut xmmCands, v)
+      let isVec128 = kind.isVector() && kind.storeSize() == 16 && kind.isInteger() && (kind.bits == 8 || kind.bits == 16 || kind.bits == 32 || kind.bits == 64)
+      if isScalarFloat || isVec128 {
+        let prod = function.producerOf(usize.toU64(v))
+        let defIsXmmClobber = prod != usize.MAX && instClobbersCallerXmm(function, prod)
+        let checkLo = if defIsXmmClobber { iv.start + usize.ONE } else { iv.start }
+        let endsAtXmmClobber = iv.end > usize.ZERO && hasPointInRange(clobXmmSlice, iv.end, iv.end)
+        let checkHi = if endsAtXmmClobber { iv.end - usize.ONE } else { iv.end }
+        if !hasPointInRange(clobXmmSlice, checkLo, checkHi) {
+          if iv.start == usize.ZERO || endsAtXmmClobber {
+            xmmHighMut[v] = 1
+          }
+          run List<usize>.append(&mut xmmCands, v)
+        }
       }
     }
     v = v + usize.ONE
   }
-  heapSortCandidates(&mut xmmCands, valWeightSlice, List<Interval>.asSlice(&valIv))
+  let emptyBonus: [u8; 0] = []
+  heapSortCandidates(&mut xmmCands, valWeightSlice, List<Interval>.asSlice(&valIv), &emptyBonus)
   let xmmCandSlice = List<usize>.asSlice(&xmmCands)
+  let xmmHighSlice = List<u8>.asSlice(&xmmHigh)
   let mut xR4 = List<Range>.make()
   let mut xR5 = List<Range>.make()
   let mut xR6 = List<Range>.make()
@@ -802,11 +1405,14 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   while cIdx < xmmCandSlice.length {
     let idx = xmmCandSlice[cIdx]
     let iv = valIvSlice[idx]
+    let highOnly = xmmHighSlice[idx] != 0
     let mut assigned = false
-    if !assigned && run tryAssignReg(&mut xR4, iv.start, iv.end) { valXmmsMut[idx] = 4 assigned = true }
-    if !assigned && run tryAssignReg(&mut xR5, iv.start, iv.end) { valXmmsMut[idx] = 5 assigned = true }
-    if !assigned && run tryAssignReg(&mut xR6, iv.start, iv.end) { valXmmsMut[idx] = 6 assigned = true }
-    if !assigned && run tryAssignReg(&mut xR7, iv.start, iv.end) { valXmmsMut[idx] = 7 assigned = true }
+    if !highOnly {
+      if !assigned && run tryAssignReg(&mut xR4, iv.start, iv.end) { valXmmsMut[idx] = 4 assigned = true }
+      if !assigned && run tryAssignReg(&mut xR5, iv.start, iv.end) { valXmmsMut[idx] = 5 assigned = true }
+      if !assigned && run tryAssignReg(&mut xR6, iv.start, iv.end) { valXmmsMut[idx] = 6 assigned = true }
+      if !assigned && run tryAssignReg(&mut xR7, iv.start, iv.end) { valXmmsMut[idx] = 7 assigned = true }
+    }
     if !assigned && run tryAssignReg(&mut xR8, iv.start, iv.end) { valXmmsMut[idx] = 8 assigned = true }
     if !assigned && run tryAssignReg(&mut xR9, iv.start, iv.end) { valXmmsMut[idx] = 9 assigned = true }
     if !assigned && run tryAssignReg(&mut xR10, iv.start, iv.end) { valXmmsMut[idx] = 10 assigned = true }
@@ -830,158 +1436,193 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
   let savedBytes = usize.toU64(savedCount * 8)
   let mut usedBytes: u64 = savedBytes
 
-  // 1. Reserve 176-byte SysV variadic register-save area if needed (16-byte aligned).
-  let mut regSaveOffset: i32 = 0
-  if hasVaStart {
-    usedBytes = alignUp(usedBytes + 176, 16)
-    regSaveOffset = 0 - u64.wrappingToI32(usedBytes)
-  }
-
-  // 2. Allocate MIR stack slots with greedy interval coloring for lifetime-marked slots.
+  // F11a: Hot-scalar-first `rbp` frame layout so scalar MIR slots and spilled SSA scalars occupy
+  // compact `disp8` offsets `[-128, -1]` before large arrays/buffers and the 176B `VaStart` save
+  // area.
   let mut slotOffsets = run List<i32>.makeWithCapacity(slotCount)
   s = usize.ZERO
   while s < slotCount {
     run List<i32>.append(&mut slotOffsets, 0)
     s = s + usize.ONE
   }
-  let slotOffMut = List<i32>.asMutSlice(&mut slotOffsets)
 
-  // Order slots: unmarked (whole-function) first, then marked slots sorted by start point.
-  let mut markedOrder = List<usize>.make()
-  s = usize.ZERO
-  while s < slotCount {
-    let slot = function.slot(s)
-    let sz = if slot.size == 0 { 8 } else { slot.size }
-    let align = maxU64(8, slot.alignment)
-    if !slotIvMut[s].hasStart || !slotIvMut[s].hasEnd || slotIvMut[s].start > slotIvMut[s].end {
-      usedBytes = alignUp(usedBytes + sz, align)
-      slotOffMut[s] = 0 - u64.wrappingToI32(usedBytes)
-    } else {
-      run List<usize>.append(&mut markedOrder, s)
-    }
-    s = s + usize.ONE
-  }
-  // Insertion-sort marked slots by start point (typically small, O(N) when already in order).
-  let orderMut = List<usize>.asMutSlice(&mut markedOrder)
-  let mut k = usize.ONE
-  while k < orderMut.length {
-    let key = orderMut[k]
-    let keyStart = slotIvMut[key].start
-    let mut j = k
-    while j > usize.ZERO && slotIvMut[orderMut[j - usize.ONE]].start > keyStart {
-      orderMut[j] = orderMut[j - usize.ONE]
-      j = j - usize.ONE
-    }
-    orderMut[j] = key
-    k = k + usize.ONE
-  }
-  let mut slotPool = List<ReusableSlot>.make()
-  k = usize.ZERO
-  while k < orderMut.length {
-    let idx = orderMut[k]
-    let slot = function.slot(idx)
-    let sz = if slot.size == 0 { 8 } else { slot.size }
-    let align = maxU64(8, slot.alignment)
-    let iv = slotIvMut[idx]
-    let pool = List<ReusableSlot>.asMutSlice(&mut slotPool)
-    let mut best = usize.MAX
-    let mut bestSize = u64.MAX
-    let mut pIdx = usize.ZERO
-    while pIdx < pool.length {
-      if pool[pIdx].freeAfter < iv.start && pool[pIdx].size >= sz && pool[pIdx].align >= align && pool[pIdx].size < bestSize {
-        best = pIdx
-        bestSize = pool[pIdx].size
-      }
-      pIdx = pIdx + usize.ONE
-    }
-    if best != usize.MAX {
-      slotOffMut[idx] = pool[best].rbpOffset
-      pool[best].freeAfter = iv.end
-    } else {
-      usedBytes = alignUp(usedBytes + sz, align)
-      let off = 0 - u64.wrappingToI32(usedBytes)
-      slotOffMut[idx] = off
-      run List<ReusableSlot>.append(&mut slotPool, ReusableSlot {rbpOffset: off, size: sz, align: align, freeAfter: iv.end})
-    }
-    k = k + usize.ONE
-  }
-
-  // Resolve folded `rbp`-relative offsets for `SlotAddress` and constant `Offset` chains.
-  let mut valueSlotBase = run List<i32>.makeWithCapacity(valueCount)
-  v = usize.ZERO
-  while v < valueCount {
-    let mut sb: i32 = 0
-    let si = slotIdxMut[v]
-    if si != usize.MAX && si < slotCount && slotOffMut[si] < 0 {
-      let total = i32.toI64(slotOffMut[si]) + slotDispMut[v]
-      if total < 0 && total >= -2147483648 {
-        sb = i64.wrappingToI32(total)
-      }
-    }
-    run List<i32>.append(&mut valueSlotBase, sb)
-    v = v + usize.ONE
-  }
-  let valSlotBaseSlice = List<i32>.asSlice(&valueSlotBase)
-
-  // 3. Allocate stack home slots only for live SSA values that were neither assigned a callee-saved
-  //    GPR nor folded into a constant `rbp`-relative slot base.
   let mut valueOffsets = run List<i32>.makeWithCapacity(valueCount)
   v = usize.ZERO
   while v < valueCount {
     run List<i32>.append(&mut valueOffsets, 0)
     v = v + usize.ONE
   }
-  let valOffMut = List<i32>.asMutSlice(&mut valueOffsets)
 
-  let mut liveVals = List<usize>.make()
+  let slotIvSlice = List<Interval>.asSlice(&slotIv)
+  let slotUsedSlice = List<u8>.asSlice(&slotUsed)
+  let foldedKindSlice = List<u8>.asSlice(&foldedAddrKind)
+  let fusedCondSlice = List<u8>.asSlice(&fusedBranchCond)
+  let fusedCallStoresSlice = List<u8>.asSlice(&fusedCallStores)
+  let mut valPool = List<ReusableSlot>.make()
+
+  // Tier 1: Hot 8-byte MIR slots (`sz <= 8 && align <= 8`), unmarked then marked.
+  let mut marked8 = List<usize>.make()
+  s = usize.ZERO
+  while s < slotCount {
+    if slotUsedSlice[s] != 0 {
+      let slot = function.slot(s)
+      let sz = if slot.size == 0 { 8 } else { slot.size }
+      let align = maxU64(8, slot.alignment)
+      if sz <= 8 && align <= 8 {
+        if !slotIvSlice[s].hasStart || !slotIvSlice[s].hasEnd || slotIvSlice[s].start > slotIvSlice[s].end {
+          usedBytes = alignUp(usedBytes + sz, align)
+          let so = List<i32>.asMutSlice(&mut slotOffsets)
+          so[s] = 0 - u64.wrappingToI32(usedBytes)
+        } else {
+          run List<usize>.append(&mut marked8, s)
+        }
+      }
+    }
+    s = s + usize.ONE
+  }
+  run allocMarkedSlotTier(function, &mut marked8, slotIvSlice, &mut slotOffsets, &mut usedBytes)
+
+  // Tier 2: Hot 8-byte non-slot, non-fused spilled SSA values.
+  let mut liveVals8 = List<usize>.make()
   v = usize.ZERO
   while v < valueCount {
-    if valSizeSlice[v] > usize.ZERO && valRegsMut[v] == regNone() && valXmmsMut[v] == regNone() && valSlotBaseSlice[v] == 0 && valIvSlice[v].start <= valIvSlice[v].end {
-      run List<usize>.append(&mut liveVals, v)
+    let skipUnusedArg = function.value(usize.toU64(v)).definition == Definition.Argument && valUsesSlice[v] == usize.ZERO
+    let skipPre = slotIdxSlice[v] != usize.MAX || fusedLoadBytesMut[v] != 0 || fusedCallStoresSlice[v] != 0 || foldedKindSlice[v] != 0 || fusedCondSlice[v] != 0
+    if !skipUnusedArg && !skipPre && valSizeSlice[v] == 8 && valRegsMut[v] == regNone() && valXmmsMut[v] == regNone() && valIvSlice[v].start <= valIvSlice[v].end {
+      run List<usize>.append(&mut liveVals8, v)
     }
     v = v + usize.ONE
   }
-  // Sort non-constant spilled values by interval start point.
-  let lvMut = List<usize>.asMutSlice(&mut liveVals)
-  k = usize.ONE
-  while k < lvMut.length {
-    let key = lvMut[k]
-    let keyStart = valIvSlice[key].start
-    let mut j = k
-    while j > usize.ZERO && valIvSlice[lvMut[j - usize.ONE]].start > keyStart {
-      lvMut[j] = lvMut[j - usize.ONE]
-      j = j - usize.ONE
-    }
-    lvMut[j] = key
-    k = k + usize.ONE
-  }
-  let mut valPool = List<ReusableSlot>.make()
-  k = usize.ZERO
-  while k < lvMut.length {
-    let idx = lvMut[k]
-    let sz = usize.toU64(valSizeSlice[idx])
-    let align: u64 = if sz >= 16 { 16 } else { 8 }
-    let iv = valIvSlice[idx]
-    let pool = List<ReusableSlot>.asMutSlice(&mut valPool)
-    let mut reused = usize.MAX
-    let mut pIdx = usize.ZERO
-    while pIdx < pool.length {
-      if pool[pIdx].freeAfter < iv.start && pool[pIdx].size == sz && pool[pIdx].align >= align {
-        reused = pIdx
-        break
+  run allocSpilledValTier(&mut liveVals8, valSizeSlice, valIvSlice, &mut valueOffsets, &mut valPool, &mut usedBytes)
+
+  // Tier 3: Hot 16-byte MIR slots (`sz <= 16 && align <= 16`), unmarked then marked.
+  let mut marked16 = List<usize>.make()
+  s = usize.ZERO
+  while s < slotCount {
+    if slotUsedSlice[s] != 0 && List<i32>.asSlice(&slotOffsets)[s] == 0 {
+      let slot = function.slot(s)
+      let sz = if slot.size == 0 { 8 } else { slot.size }
+      let align = maxU64(8, slot.alignment)
+      if sz <= 16 && align <= 16 {
+        if !slotIvSlice[s].hasStart || !slotIvSlice[s].hasEnd || slotIvSlice[s].start > slotIvSlice[s].end {
+          usedBytes = alignUp(usedBytes + sz, align)
+          let so = List<i32>.asMutSlice(&mut slotOffsets)
+          so[s] = 0 - u64.wrappingToI32(usedBytes)
+        } else {
+          run List<usize>.append(&mut marked16, s)
+        }
       }
-      pIdx = pIdx + usize.ONE
     }
-    if reused != usize.MAX {
-      valOffMut[idx] = pool[reused].rbpOffset
-      pool[reused].freeAfter = iv.end
-    } else {
-      usedBytes = alignUp(usedBytes + sz, align)
-      let off = 0 - u64.wrappingToI32(usedBytes)
-      valOffMut[idx] = off
-      run List<ReusableSlot>.append(&mut valPool, ReusableSlot {rbpOffset: off, size: sz, align: align, freeAfter: iv.end})
+    s = s + usize.ONE
+  }
+  run allocMarkedSlotTier(function, &mut marked16, slotIvSlice, &mut slotOffsets, &mut usedBytes)
+
+  // Tier 4: Hot 16-byte non-slot, non-fused spilled SSA values.
+  let mut liveVals16 = List<usize>.make()
+  v = usize.ZERO
+  while v < valueCount {
+    let skipUnusedArg = function.value(usize.toU64(v)).definition == Definition.Argument && valUsesSlice[v] == usize.ZERO
+    let skipPre = slotIdxSlice[v] != usize.MAX || fusedLoadBytesMut[v] != 0 || fusedCallStoresSlice[v] != 0 || foldedKindSlice[v] != 0 || fusedCondSlice[v] != 0
+    if !skipUnusedArg && !skipPre && valSizeSlice[v] == 16 && valRegsMut[v] == regNone() && valXmmsMut[v] == regNone() && valIvSlice[v].start <= valIvSlice[v].end {
+      run List<usize>.append(&mut liveVals16, v)
     }
-    k = k + usize.ONE
+    v = v + usize.ONE
+  }
+  run allocSpilledValTier(&mut liveVals16, valSizeSlice, valIvSlice, &mut valueOffsets, &mut valPool, &mut usedBytes)
+
+  // Tier 5: Medium/Large and over-aligned MIR slots (`sz > 16 || align > 16`).
+  let mut markedLarge = List<usize>.make()
+  s = usize.ZERO
+  while s < slotCount {
+    if slotUsedSlice[s] != 0 && List<i32>.asSlice(&slotOffsets)[s] == 0 {
+      let slot = function.slot(s)
+      let sz = if slot.size == 0 { 8 } else { slot.size }
+      let align = maxU64(8, slot.alignment)
+      if !slotIvSlice[s].hasStart || !slotIvSlice[s].hasEnd || slotIvSlice[s].start > slotIvSlice[s].end {
+        if sz <= 64 && align <= 16 {
+          usedBytes = alignUp(usedBytes + sz, align)
+          let so = List<i32>.asMutSlice(&mut slotOffsets)
+          so[s] = 0 - u64.wrappingToI32(usedBytes)
+        }
+      } else {
+        run List<usize>.append(&mut markedLarge, s)
+      }
+    }
+    s = s + usize.ONE
+  }
+  s = usize.ZERO
+  while s < slotCount {
+    if slotUsedSlice[s] != 0 && List<i32>.asSlice(&slotOffsets)[s] == 0 {
+      let slot = function.slot(s)
+      let sz = if slot.size == 0 { 8 } else { slot.size }
+      let align = maxU64(8, slot.alignment)
+      if !slotIvSlice[s].hasStart || !slotIvSlice[s].hasEnd || slotIvSlice[s].start > slotIvSlice[s].end {
+        usedBytes = alignUp(usedBytes + sz, align)
+        let so = List<i32>.asMutSlice(&mut slotOffsets)
+        so[s] = 0 - u64.wrappingToI32(usedBytes)
+      }
+    }
+    s = s + usize.ONE
+  }
+  run allocMarkedSlotTier(function, &mut markedLarge, slotIvSlice, &mut slotOffsets, &mut usedBytes)
+
+  // Step 6: Resolve folded `rbp`-relative offsets for `SlotAddress` and constant `Offset` chains,
+  // and finalize `rbp`-relative displacements for fused `Load(slot) -> Call` values.
+  let slotOffSlice = List<i32>.asSlice(&slotOffsets)
+  let mut valueSlotBase = run List<i32>.makeWithCapacity(valueCount)
+  let mut fusedLoadOffsets = run List<i32>.makeWithCapacity(valueCount)
+  v = usize.ZERO
+  while v < valueCount {
+    let mut sb: i32 = 0
+    let si = slotIdxSlice[v]
+    if si != usize.MAX && si < slotCount && slotOffSlice[si] < 0 {
+      let total = i32.toI64(slotOffSlice[si]) + slotDispSlice[v]
+      if total < 0 && total >= -2147483648 {
+        sb = i64.wrappingToI32(total)
+      }
+    }
+    run List<i32>.append(&mut valueSlotBase, sb)
+
+    let mut flOff: i32 = 0
+    if fusedLoadBytesMut[v] != 0 {
+      let fsi = fusedLoadSlotMut[v]
+      if fsi != usize.MAX && fsi < slotCount && slotOffSlice[fsi] < 0 {
+        let total = i32.toI64(slotOffSlice[fsi]) + fusedLoadDispMut[v]
+        if total < 0 && total >= -2147483648 {
+          flOff = i64.wrappingToI32(total)
+        } else {
+          fusedLoadBytesMut[v] = 0
+        }
+      } else {
+        fusedLoadBytesMut[v] = 0
+      }
+    }
+    run List<i32>.append(&mut fusedLoadOffsets, flOff)
+    v = v + usize.ONE
+  }
+  let valSlotBaseSlice = List<i32>.asSlice(&valueSlotBase)
+  let fusedLoadBytesSlice = List<u8>.asSlice(&fusedLoadBytes)
+
+  // Tier 6: Wide (`valSize > 16`) and any fallback spilled SSA values not yet allocated.
+  let mut liveValsRest = List<usize>.make()
+  v = usize.ZERO
+  while v < valueCount {
+    if List<i32>.asSlice(&valueOffsets)[v] == 0 {
+      let skipUnusedArg = function.value(usize.toU64(v)).definition == Definition.Argument && valUsesSlice[v] == usize.ZERO
+      let skipFused = fusedLoadBytesSlice[v] != 0 || fusedCallStoresSlice[v] != 0 || foldedKindSlice[v] != 0 || fusedCondSlice[v] != 0
+      if !skipUnusedArg && !skipFused && valSizeSlice[v] > usize.ZERO && valRegsMut[v] == regNone() && valXmmsMut[v] == regNone() && valSlotBaseSlice[v] == 0 && valIvSlice[v].start <= valIvSlice[v].end {
+        run List<usize>.append(&mut liveValsRest, v)
+      }
+    }
+    v = v + usize.ONE
+  }
+  run allocSpilledValTier(&mut liveValsRest, valSizeSlice, valIvSlice, &mut valueOffsets, &mut valPool, &mut usedBytes)
+
+  // Tier 7: Reserve 176-byte SysV variadic register-save area if needed (16-byte aligned).
+  let mut regSaveOffset: i32 = 0
+  if hasVaStart {
+    usedBytes = alignUp(usedBytes + 176, 16)
+    regSaveOffset = 0 - u64.wrappingToI32(usedBytes)
   }
 
   // Round total frame below saved `rbp` up to a multiple of 16 bytes.
@@ -1004,6 +1645,14 @@ pub effect fn plan(function: &SsaFunction) -> FramePlan ! OutOfMemoryError ? &mu
     subRspBytes: subRspBytes,
     hasDynamicSlot: hasDynamicSlot,
     hasInlineAsm: hasInlineAsm,
+    fusedLoadBytes: move fusedLoadBytes,
+    fusedLoadOffsets: move fusedLoadOffsets,
+    fusedCallStores: move fusedCallStores,
+    foldedAddrKind: move foldedAddrKind,
+    foldedAddrBase: move foldedAddrBase,
+    foldedAddrIndex: move foldedAddrIndex,
+    foldedAddrScale: move foldedAddrScale,
+    foldedAddrDisp: move foldedAddrDisp,
   }
 }
 
@@ -1022,33 +1671,65 @@ fn hasPointInRange(pts: &[usize], lo: usize, hi: usize) -> bool {
 // Conservative check: returns false ONLY for instructions guaranteed never to clobber caller-saved
 // GPRs (`r8`, `r9`, `rsi`, `rdi`) in `X86Emit`.
 fn instClobbersCallerGp(function: &SsaFunction, instId: usize) -> bool {
-  if instSupportsXmmVec(function, instId) { return false }
   let inst = function.instruction(instId)
+  if let Operation.Call {..} = inst.operation { return true }
+  if let Operation.CallIndirect {..} = inst.operation { return true }
+  if instSupportsXmmVec(function, instId) { return false }
   let kind = inst.kind
   let ops = function.operandsOf(instId)
   return match inst.operation {
     Operation.SlotStart {..} => false
     Operation.SlotEnd {..} => false
     Operation.SlotAddress {..} => false
+    Operation.FrameAddress => false
+    Operation.DynamicSlot {..} => false
+    Operation.VaEnd => false
+    Operation.Fence => false
     Operation.Offset {..} => false
     Operation.Index => false
+    Operation.CopyBytes {size} => size > 64
+    Operation.Fill {size, ..} => size > 64
     Operation.Binary {operation} => {
-      if kind.isVector() || kind.isFloat() || kind.bits > 64 { return true }
+      if kind.isVector() || kind.bits > 64 { return true }
+      if kind.isFloat() {
+        return operation == Binary.URem || operation == Binary.SRem
+      }
       return operation == Binary.SDiv || operation == Binary.SRem || operation == Binary.UDiv || operation == Binary.URem
     }
-    Operation.Negate => kind.isVector() || kind.isFloat() || kind.bits > 64
+    Operation.Negate => kind.isVector() || kind.bits > 64
+    Operation.Overflow {..} => kind.isVector() || kind.bits > 64
     Operation.Rotate {..} => kind.isVector() || kind.bits > 64
+    Operation.Count {..} => kind.isVector() || kind.bits > 64
+    Operation.Extreme {..} => kind.isVector() || kind.bits > 64
+    Operation.SquareRoot => kind.isVector()
     Operation.Compare {..} => {
       if ops.length < 2 { return true }
       let ok = function.value(ops[0]).kind
-      return ok.isVector() || ok.isFloat() || ok.bits > 64
+      return ok.isVector() || ok.bits > 64
     }
-    Operation.Select => kind.isVector() || kind.isFloat() || kind.bits > 64
-    Operation.Load {..} => kind.isVector() || kind.isFloat() || kind.bits > 64
+    Operation.Select => kind.isVector() || kind.bits > 64
+    Operation.Load {..} => {
+      if kind.isVector() {
+        let sz = kind.storeSize()
+        return sz != usize.ZERO && sz != 1 && sz != 2 && sz != 4 && sz != 8 && sz != 16 && sz != 32
+      }
+      return kind.bits > 64
+    }
+    Operation.AtomicLoad => {
+      if kind.isVector() {
+        let sz = kind.storeSize()
+        return sz != usize.ZERO && sz != 1 && sz != 2 && sz != 4 && sz != 8 && sz != 16 && sz != 32
+      }
+      return kind.bits > 64
+    }
     Operation.Store {..} => {
       if ops.length < 2 { return true }
       let vk = function.value(ops[0]).kind
-      return vk.isVector() || vk.isFloat() || vk.bits > 64
+      if vk.isVector() {
+        let sz = vk.storeSize()
+        return sz != usize.ZERO && sz != 1 && sz != 2 && sz != 4 && sz != 8 && sz != 16 && sz != 32
+      }
+      return vk.bits > 64
     }
     Operation.Cast {operation} => {
       if operation == Cast.Bitcast || kind.isVector() || kind.isFloat() || kind.bits > 64 { return true }
@@ -1060,8 +1741,169 @@ fn instClobbersCallerGp(function: &SsaFunction, instId: usize) -> bool {
   }
 }
 
+// Returns true when `instId` is a `Call`/`CallIndirect` whose Pass 2 (outgoing stack args) never
+// executes `rep movsb` (no `byval` args and no stack-passed vectors with size outside
+// `{0, 1, 2, 4, 8, 16, 32}`), so caller-saved GPR values ending at this call remain intact until
+// Pass 4's parallel GP move resolver reads them.
+fn callSafeEndGp(function: &SsaFunction, instId: usize) -> bool {
+  let inst = function.instruction(instId)
+  let mut indirect = false
+  let mut abiIdx = usize.MAX
+  match inst.operation {
+    Operation.Call {abi, ..} => { abiIdx = abi }
+    Operation.CallIndirect {abi} => { indirect = true abiIdx = abi }
+    _ => { return false }
+  }
+  let ops = function.operandsOf(instId)
+  let argStart = if indirect { usize.ONE } else { usize.ZERO }
+  let argCount = if ops.length > argStart { ops.length - argStart } else { usize.ZERO }
+  let hasAbi = abiIdx != usize.MAX
+  let paramCount = if hasAbi { function.callAbi(abiIdx).parameterCount } else { usize.ZERO }
+  let mut fpCount = usize.ZERO
+  let mut a = usize.ZERO
+  while a < argCount {
+    let pAbi = if hasAbi && a < paramCount { function.callParameterAbisOf(abiIdx)[a] } else { ParameterAbi.plain() }
+    if pAbi.byvalSize > 0 { return false }
+    let k = function.value(ops[argStart + a]).kind
+    if k.isVector() {
+      let sz = k.storeSize()
+      if sz <= 16 && fpCount < 8 {
+        fpCount = fpCount + usize.ONE
+      } else if sz != usize.ZERO && sz != 1 && sz != 2 && sz != 4 && sz != 8 && sz != 16 && sz != 32 {
+        return false
+      }
+    } else if k.isFloat() {
+      if fpCount < 8 { fpCount = fpCount + usize.ONE }
+    }
+    a = a + usize.ONE
+  }
+  return true
+}
+
+// Maps SysV GP argument index `0..5` to its matching caller-saved GP pool register (`rdi=7`,
+// `rsi=6`, `r8=8`, `r9=9`), or `regNone()` for scratch-reserved `rdx`/`rcx`.
+fn sysvCallerHint(gpIdx: usize) -> u8 {
+  if gpIdx == usize.ZERO { return 7 }
+  if gpIdx == usize.ONE { return 6 }
+  if gpIdx == 4 { return 8 }
+  if gpIdx == 5 { return 9 }
+  return regNone()
+}
+
+// Records SysV caller-saved GP register preference hints for `cls == 0` arguments of a safe call.
+fn recordCallGpHints(function: &SsaFunction, instId: usize, pref: &mut List<u8>) -> () {
+  let prefMut = List<u8>.asMutSlice(&mut pref.*)
+  let inst = function.instruction(instId)
+  let mut indirect = false
+  let mut abiIdx = usize.MAX
+  match inst.operation {
+    Operation.Call {abi, ..} => { abiIdx = abi }
+    Operation.CallIndirect {abi} => { indirect = true abiIdx = abi }
+    _ => { return () }
+  }
+  let ops = function.operandsOf(instId)
+  let argStart = if indirect { usize.ONE } else { usize.ZERO }
+  let argCount = if ops.length > argStart { ops.length - argStart } else { usize.ZERO }
+  let hasAbi = abiIdx != usize.MAX
+  let paramCount = if hasAbi { function.callAbi(abiIdx).parameterCount } else { usize.ZERO }
+  let mut gpIdx = usize.ZERO
+  let mut a = usize.ZERO
+  while a < argCount && gpIdx < 6 {
+    let pAbi = if hasAbi && a < paramCount { function.callParameterAbisOf(abiIdx)[a] } else { ParameterAbi.plain() }
+    let opVal = ops[argStart + a]
+    let k = function.value(opVal).kind
+    if pAbi.byvalSize == 0 && !k.isVector() && !k.isFloat() {
+      if k.bits > 64 {
+        if gpIdx + 2 <= 6 { gpIdx = gpIdx + 2 }
+      } else {
+        let hint = sysvCallerHint(gpIdx)
+        if hint != regNone() {
+          let opIdx = u64.toUsize(opVal)
+          if opIdx < prefMut.length && prefMut[opIdx] == regNone() {
+            prefMut[opIdx] = hint
+          }
+        }
+        gpIdx = gpIdx + usize.ONE
+      }
+    }
+    a = a + usize.ONE
+  }
+}
+
+// Returns true when `inst` is guaranteed never to write memory, mutate `rsp`, or execute a call,
+// memory barrier, `SlotEnd`, or inline assembly (safe for a local-slot `Load` to sink past).
+fn instCannotWriteMemory(inst: Instruction) -> bool {
+  return match inst.operation {
+    Operation.SlotStart {..} => true
+    Operation.SlotAddress {..} => true
+    Operation.FrameAddress => true
+    Operation.Offset {..} => true
+    Operation.Index => true
+    Operation.Load {..} => true
+    Operation.Binary {..} => true
+    Operation.Negate => true
+    Operation.Compare {..} => true
+    Operation.Select => true
+    Operation.Cast {..} => true
+    Operation.Overflow {..} => true
+    Operation.Saturate {..} => true
+    Operation.Rotate {..} => true
+    Operation.Count {..} => true
+    Operation.Extreme {..} => true
+    Operation.FusedMultiplyAdd => true
+    Operation.SquareRoot => true
+    Operation.Splat {..} => true
+    Operation.Extract => true
+    Operation.Insert => true
+    Operation.Shuffle {..} => true
+    Operation.Reduce {..} => true
+    _ => false
+  }
+}
+
+// Returns true when `inst` is guaranteed to emit zero machine instructions (preserving `rax`
+// between a fused `Call` and its immediately following local-slot `Store`).
+fn isZeroEmitSlotAddrInst(
+  function: &SsaFunction,
+  inst: Instruction,
+  slotCount: usize,
+  slotIdxMut: &[usize],
+  slotDispMut: &[i64],
+) -> bool {
+  return match inst.operation {
+    Operation.SlotStart {..} => true
+    Operation.SlotEnd {..} => true
+    Operation.SlotAddress {slot} => {
+      if inst.result == none() || slot >= slotCount { return false }
+      let rIdx = u64.toUsize(inst.result)
+      return rIdx < slotIdxMut.length && slotIdxMut[rIdx] == slot
+    }
+    Operation.Offset {..} => {
+      if inst.result == none() { return false }
+      let rIdx = u64.toUsize(inst.result)
+      if rIdx >= slotIdxMut.length { return false }
+      let si = slotIdxMut[rIdx]
+      if si == usize.MAX || si >= slotCount { return false }
+      let sSzRaw = function.slot(si).size
+      let sSz: u64 = if sSzRaw == 0 { 8 } else { sSzRaw }
+      return slotDispMut[rIdx] >= 0 && slotDispMut[rIdx] < u64.wrappingToI64(sSz)
+    }
+    Operation.Index => {
+      if inst.result == none() { return false }
+      let rIdx = u64.toUsize(inst.result)
+      if rIdx >= slotIdxMut.length { return false }
+      let si = slotIdxMut[rIdx]
+      if si == usize.MAX || si >= slotCount { return false }
+      let sSzRaw = function.slot(si).size
+      let sSz: u64 = if sSzRaw == 0 { 8 } else { sSzRaw }
+      return slotDispMut[rIdx] >= 0 && slotDispMut[rIdx] < u64.wrappingToI64(sSz)
+    }
+    _ => false
+  }
+}
+
 // Returns true when `instId` may clobber caller-saved XMM registers `xmm4..xmm15` (i.e. makes a
-// function call, runs inline asm, or calls a 128-bit division/memmove runtime helper).
+// function call, runs inline asm, or calls a libm/128-bit division/memmove runtime helper).
 fn instClobbersCallerXmm(function: &SsaFunction, instId: usize) -> bool {
   let inst = function.instruction(instId)
   return match inst.operation {
@@ -1069,10 +1911,14 @@ fn instClobbersCallerXmm(function: &SsaFunction, instId: usize) -> bool {
     Operation.CallIndirect {..} => true
     Operation.InlineAsm {..} => true
     Operation.VaStart => true
-    Operation.CopyBytes {size} => size != 0 && size != 8 && size != 16 && size != 32 && size != 64
+    Operation.FusedMultiplyAdd => true
+    Operation.CopyBytes {size} => size > 64
     Operation.CopyCounted => true
     Operation.FillCounted => true
     Operation.Binary {operation} => {
+      if inst.kind.isFloat() && (operation == Binary.URem || operation == Binary.SRem) {
+        return true
+      }
       if !inst.kind.isVector() && inst.kind.bits > 64 {
         return operation == Binary.UDiv || operation == Binary.SDiv || operation == Binary.URem || operation == Binary.SRem
       }
@@ -1118,18 +1964,14 @@ fn instSupportsXmmVec(function: &SsaFunction, instId: usize) -> bool {
       if !inst.kind.isVector() || inst.kind.storeSize() != 16 || !inst.kind.isInteger() { return false }
       let b = inst.kind.bits
       if b != 8 && b != 16 && b != 32 && b != 64 { return false }
-      if operation == Binary.Add || operation == Binary.Sub || operation == Binary.And || operation == Binary.Or || operation == Binary.Xor { return true }
-      if ops.length >= 2 && uniformVecConst(function, ops[1]) < usize.toU64(b) {
-        if (operation == Binary.Shl || operation == Binary.LShr) && (b == 16 || b == 32 || b == 64) { return true }
-        if operation == Binary.AShr && (b == 16 || b == 32) { return true }
-      }
-      return false
+      return operation == Binary.Add || operation == Binary.Sub
+        || operation == Binary.And || operation == Binary.Or || operation == Binary.Xor
+        || operation == Binary.Shl || operation == Binary.LShr || operation == Binary.AShr
     }
     Operation.Rotate {..} => {
       if !inst.kind.isVector() || inst.kind.storeSize() != 16 || !inst.kind.isInteger() { return false }
       let b = inst.kind.bits
-      if b != 16 && b != 32 && b != 64 { return false }
-      return ops.length >= 2 && uniformVecConst(function, ops[1]) < 64
+      return b == 8 || b == 16 || b == 32 || b == 64
     }
     Operation.Compare {..} => {
       if ops.length < 2 { return false }
@@ -1159,6 +2001,18 @@ fn instSupportsXmmVec(function: &SsaFunction, instId: usize) -> bool {
         return mask[0] < 4 && mask[1] < 4 && mask[2] < 4 && mask[3] < 4
       }
       return false
+    }
+    Operation.Call {..} => true
+    Operation.CallIndirect {..} => true
+    Operation.ArchIntrinsic {..} => {
+      if !inst.kind.isVector() || inst.kind.storeSize() != 16 || !inst.kind.isInteger() { return false }
+      let mut j = usize.ZERO
+      while j < ops.length {
+        let ok = function.value(ops[j]).kind
+        if !ok.isVector() || ok.storeSize() != 16 { return false }
+        j = j + usize.ONE
+      }
+      return true
     }
     _ => false
   }
@@ -1197,23 +2051,24 @@ fn recordValUse(
 
 // Returns true when candidate `a` has strictly lower priority than candidate `b` (for max-heap
 // extraction that produces descending-priority order).
-fn candLess(a: usize, b: usize, weights: &[u64], ivs: &[Interval]) -> bool {
+fn candLess(a: usize, b: usize, weights: &[u64], ivs: &[Interval], bonus: &[u8]) -> bool {
   if weights[a] != weights[b] { return weights[a] < weights[b] }
   let spanA = ivs[a].end - ivs[a].start
   let spanB = ivs[b].end - ivs[b].start
   if spanA != spanB { return spanA > spanB }
+  if bonus.length > usize.ZERO && bonus[a] != bonus[b] { return bonus[a] < bonus[b] }
   return a > b
 }
 
 // In-place O(N log N) heapsort placing highest-priority candidates first.
-fn heapSortCandidates(list: &mut List<usize>, weights: &[u64], ivs: &[Interval]) -> () {
+fn heapSortCandidates(list: &mut List<usize>, weights: &[u64], ivs: &[Interval], bonus: &[u8]) -> () {
   let n = List<usize>.length(&list.*)
   if n < 2 { return () }
   // Build min-heap (smallest priority at root) so popping into the back leaves highest priority first.
   let mut start = n / 2
   while start > usize.ZERO {
     start = start - usize.ONE
-    siftDownMin(&mut list.*, start, n, weights, ivs)
+    siftDownMin(&mut list.*, start, n, weights, ivs, bonus)
   }
   let mut end = n
   while end > usize.ONE {
@@ -1222,21 +2077,21 @@ fn heapSortCandidates(list: &mut List<usize>, weights: &[u64], ivs: &[Interval])
     let tmp = cands[usize.ZERO]
     cands[usize.ZERO] = cands[end]
     cands[end] = tmp
-    siftDownMin(&mut list.*, usize.ZERO, end, weights, ivs)
+    siftDownMin(&mut list.*, usize.ZERO, end, weights, ivs, bonus)
   }
 }
 
-fn siftDownMin(list: &mut List<usize>, rootStart: usize, end: usize, weights: &[u64], ivs: &[Interval]) -> () {
+fn siftDownMin(list: &mut List<usize>, rootStart: usize, end: usize, weights: &[u64], ivs: &[Interval], bonus: &[u8]) -> () {
   let cands = List<usize>.asMutSlice(&mut list.*)
   let mut root = rootStart
   while root * 2 + usize.ONE < end {
     let left = root * 2 + usize.ONE
     let right = left + usize.ONE
     let mut smallest = root
-    if candLess(cands[left], cands[smallest], weights, ivs) {
+    if candLess(cands[left], cands[smallest], weights, ivs, bonus) {
       smallest = left
     }
-    if right < end && candLess(cands[right], cands[smallest], weights, ivs) {
+    if right < end && candLess(cands[right], cands[smallest], weights, ivs, bonus) {
       smallest = right
     }
     if smallest == root { return () }
@@ -1304,4 +2159,143 @@ fn alignUp(value: u64, align: u64) -> u64 {
 fn maxU64(a: u64, b: u64) -> u64 {
   if a >= b { return a }
   return b
+}
+
+// Returns true when `blkId` (never entry block 0) is an `Exit.Trap` block or an unconditional
+// `Exit.Jump` trampoline chain (<= 4 hops, cycle-guarded) terminating unconditionally in `Exit.Trap`.
+fn isColdTrapBlock(function: &SsaFunction, blockCount: usize, blkId: usize) -> bool {
+  if blkId == usize.ZERO || blkId >= blockCount { return false }
+  let mut cur = blkId
+  let mut hops = usize.ZERO
+  while hops <= 4 {
+    if cur == usize.ZERO || cur >= blockCount { return false }
+    let blk = function.block(cur)
+    if blk.exit == Exit.Trap { return true }
+    if blk.exit != Exit.Jump { return false }
+    let edges = List<Edge>.asSlice(&blk.edges)
+    if edges.length != usize.ONE { return false }
+    let next = edges[usize.ZERO].block
+    if next == cur { return false }
+    cur = next
+    hops = hops + usize.ONE
+  }
+  return false
+}
+
+// Returns true when a `Load`/`Store` of `kind` uses `resolveAddrMem` in `X86Emit` and can consume
+// a folded `[base + disp]` / `[base + index*scale + disp]` addressing mode.
+fn canFoldAddrConsumer(kind: Kind) -> bool {
+  if kind.isUnit() { return false }
+  if kind.isVector() {
+    let sz = kind.storeSize()
+    return sz == 1 || sz == 2 || sz == 4 || sz == 8 || sz == 16
+  }
+  return kind.bits <= 64
+}
+
+// Sorts marked MIR stack slots in `markedOrder` by start point and allocates them with greedy
+// interval coloring inside this tier.
+effect fn allocMarkedSlotTier(
+  function: &SsaFunction,
+  markedOrder: &mut List<usize>,
+  slotIvSlice: &[Interval],
+  slotOffsets: &mut List<i32>,
+  usedBytes: &mut u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slotOffMut = List<i32>.asMutSlice(&mut slotOffsets.*)
+  let orderMut = List<usize>.asMutSlice(&mut markedOrder.*)
+  let mut k = usize.ONE
+  while k < orderMut.length {
+    let key = orderMut[k]
+    let keyStart = slotIvSlice[key].start
+    let mut j = k
+    while j > usize.ZERO && slotIvSlice[orderMut[j - usize.ONE]].start > keyStart {
+      orderMut[j] = orderMut[j - usize.ONE]
+      j = j - usize.ONE
+    }
+    orderMut[j] = key
+    k = k + usize.ONE
+  }
+  let mut slotPool = List<ReusableSlot>.make()
+  k = usize.ZERO
+  while k < orderMut.length {
+    let idx = orderMut[k]
+    let slot = function.slot(idx)
+    let sz = if slot.size == 0 { 8 } else { slot.size }
+    let align = maxU64(8, slot.alignment)
+    let iv = slotIvSlice[idx]
+    let pool = List<ReusableSlot>.asMutSlice(&mut slotPool)
+    let mut best = usize.MAX
+    let mut bestSize = u64.MAX
+    let mut pIdx = usize.ZERO
+    while pIdx < pool.length {
+      if pool[pIdx].freeAfter < iv.start && pool[pIdx].size >= sz && pool[pIdx].align >= align && pool[pIdx].size < bestSize {
+        best = pIdx
+        bestSize = pool[pIdx].size
+      }
+      pIdx = pIdx + usize.ONE
+    }
+    if best != usize.MAX {
+      slotOffMut[idx] = pool[best].rbpOffset
+      pool[best].freeAfter = iv.end
+    } else {
+      usedBytes.* = alignUp(usedBytes.* + sz, align)
+      let off = 0 - u64.wrappingToI32(usedBytes.*)
+      slotOffMut[idx] = off
+      run List<ReusableSlot>.append(&mut slotPool, ReusableSlot {rbpOffset: off, size: sz, align: align, freeAfter: iv.end})
+    }
+    k = k + usize.ONE
+  }
+}
+
+// Sorts spilled SSA values in `liveVals` by start point and interval-colors their stack home slots.
+effect fn allocSpilledValTier(
+  liveVals: &mut List<usize>,
+  valSizeSlice: &[usize],
+  valIvSlice: &[Interval],
+  valueOffsets: &mut List<i32>,
+  valPool: &mut List<ReusableSlot>,
+  usedBytes: &mut u64,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let valOffMut = List<i32>.asMutSlice(&mut valueOffsets.*)
+  let lvMut = List<usize>.asMutSlice(&mut liveVals.*)
+  let mut k = usize.ONE
+  while k < lvMut.length {
+    let key = lvMut[k]
+    let keyStart = valIvSlice[key].start
+    let mut j = k
+    while j > usize.ZERO && valIvSlice[lvMut[j - usize.ONE]].start > keyStart {
+      lvMut[j] = lvMut[j - usize.ONE]
+      j = j - usize.ONE
+    }
+    lvMut[j] = key
+    k = k + usize.ONE
+  }
+  k = usize.ZERO
+  while k < lvMut.length {
+    let idx = lvMut[k]
+    let sz = usize.toU64(valSizeSlice[idx])
+    let align: u64 = if sz >= 16 { 16 } else { 8 }
+    let iv = valIvSlice[idx]
+    let pool = List<ReusableSlot>.asMutSlice(&mut valPool.*)
+    let mut reused = usize.MAX
+    let mut pIdx = usize.ZERO
+    while pIdx < pool.length {
+      if pool[pIdx].freeAfter < iv.start && pool[pIdx].size == sz && pool[pIdx].align >= align {
+        reused = pIdx
+        break
+      }
+      pIdx = pIdx + usize.ONE
+    }
+    if reused != usize.MAX {
+      valOffMut[idx] = pool[reused].rbpOffset
+      pool[reused].freeAfter = iv.end
+    } else {
+      usedBytes.* = alignUp(usedBytes.* + sz, align)
+      let off = 0 - u64.wrappingToI32(usedBytes.*)
+      valOffMut[idx] = off
+      run List<ReusableSlot>.append(&mut valPool.*, ReusableSlot {rbpOffset: off, size: sz, align: align, freeAfter: iv.end})
+    }
+    k = k + usize.ONE
+  }
 }
