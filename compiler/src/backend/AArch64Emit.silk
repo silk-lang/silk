@@ -117,6 +117,7 @@ struct Emitter {
   fixedStackBytes: u64,
   unwind: UnwindInfo,
   symbol: Bytes,
+  currentBlock: usize,
 }
 
 struct GpMove {
@@ -133,6 +134,22 @@ struct GpMove {
 }
 
 impl Copy for GpMove {}
+
+struct VecMove {
+  // 0 = physical NEON/FP reg (`srcReg`), 1 = stack slot (`[fp + srcOff]`), 2 = constant (`srcVal`),
+  // 3 = zero. `width` is `4` (`f32`), `8` (`f64`), or `16` (`isVec128`).
+  srcKind: u8,
+  srcVal: u64,
+  srcReg: u8,
+  srcOff: i64,
+  dstIsReg: bool,
+  dstReg: u8,
+  dstOff: i64,
+  width: usize,
+  done: bool,
+}
+
+impl Copy for VecMove {}
 
 /// Emits Darwin ARM64 (`aarch64-apple-darwin`) machine code for `function` under `symbol` and
 /// optional C export alias `exported`.
@@ -208,6 +225,7 @@ pub effect fn emitWithSeen(function: &SsaFunction, symbol: &[u8], exported: &[u8
     fixedStackBytes: 0,
     unwind: UnwindInfo.frameOnly(),
     symbol: run Bytes.copy(symbol),
+    currentBlock: usize.ZERO,
   }
 
   if naked {
@@ -236,13 +254,14 @@ pub effect fn emitWithSeen(function: &SsaFunction, symbol: &[u8], exported: &[u8
     if blk.startPlace != 0 {
       run recordLocation(&mut em, blk.startPlace)
     }
-    let fusedCmp = findFusedCompareInst(&em, function, b)
+    let fusedNot = findFusedNotInst(&em, function, b)
+    let fusedCmp = findFusedCompareInst(&em, function, b, fusedNot)
     let fusedBitTest = findFusedBitTestInst(&em, function, b, fusedCmp)
-    run emitBlockInstructions(&mut em, function, b, fusedCmp, fusedBitTest)
+    run emitBlockInstructions(&mut em, function, b, fusedNot, fusedCmp, fusedBitTest)
     if blk.place != 0 {
       run recordLocation(&mut em, blk.place)
     }
-    run emitExit(&mut em, function, b, nextBlk, naked, fusedCmp, fusedBitTest)
+    run emitExit(&mut em, function, b, nextBlk, naked, fusedNot, fusedCmp, fusedBitTest)
     ordIdx = ordIdx + usize.ONE
   }
 
@@ -289,7 +308,15 @@ effect fn validateSupportedScope(_function: &SsaFunction, _symbol: &[u8]) -> ()
   return ()
 }
 
-fn findFusedCompareInst(em: &Emitter, function: &SsaFunction, blockIdx: usize) -> usize {
+fn fusedNotOperand(function: &SsaFunction, instIdx: usize) -> u64 {
+  let ops = function.operandsOf(instIdx)
+  if ops.length < 2 { return none() }
+  if function.isBits(ops[1]) && (function.constantOf(ops[1]).low & 1) == 1 { return ops[0] }
+  if function.isBits(ops[0]) && (function.constantOf(ops[0]).low & 1) == 1 { return ops[1] }
+  return none()
+}
+
+fn findFusedNotInst(em: &Emitter, function: &SsaFunction, blockIdx: usize) -> usize {
   let blk = function.block(blockIdx)
   if blk.exit != Exit.Branch || blk.value == none() { return usize.MAX }
   let uses = List<usize>.asSlice(&em.frame.valueUses)
@@ -303,6 +330,36 @@ fn findFusedCompareInst(em: &Emitter, function: &SsaFunction, blockIdx: usize) -
     let inst = function.instruction(instIdx)
     if !inst.removed {
       if inst.result != blk.value { return usize.MAX }
+      if let Operation.Binary {operation} = inst.operation {
+        if operation == Binary.Xor && !inst.kind.isVector() && inst.kind.bits == 1 {
+          if fusedNotOperand(function, instIdx) != none() {
+            return instIdx
+          }
+        }
+      }
+      return usize.MAX
+    }
+  }
+  return usize.MAX
+}
+
+fn findFusedCompareInst(em: &Emitter, function: &SsaFunction, blockIdx: usize, fusedNot: usize) -> usize {
+  let blk = function.block(blockIdx)
+  if blk.exit != Exit.Branch || blk.value == none() { return usize.MAX }
+  let targetVal = if fusedNot != usize.MAX { fusedNotOperand(function, fusedNot) } else { blk.value }
+  if targetVal == none() { return usize.MAX }
+  let uses = List<usize>.asSlice(&em.frame.valueUses)
+  let condIdx = u64.toUsize(targetVal)
+  if condIdx >= uses.length || uses[condIdx] != usize.ONE { return usize.MAX }
+  let insts = List<usize>.asSlice(&blk.instructions)
+  let mut k = insts.length
+  while k > usize.ZERO {
+    k = k - usize.ONE
+    let instIdx = insts[k]
+    if instIdx == fusedNot { continue }
+    let inst = function.instruction(instIdx)
+    if !inst.removed {
+      if inst.result != targetVal { return usize.MAX }
       if let Operation.Compare {..} = inst.operation {
         let ops = function.operandsOf(instIdx)
         if ops.length >= 2 {
@@ -1555,6 +1612,13 @@ fn slotOff(em: &Emitter, slot: usize) -> i64 {
   return List<i64>.asSlice(&em.frame.slotOffsets)[slot]
 }
 
+fn valNeonMask(em: &Emitter, val: u64) -> bool {
+  if val == none() { return false }
+  let idx = u64.toUsize(val)
+  let ms = List<u8>.asSlice(&em.frame.valueNeonMask)
+  return idx < ms.length && ms[idx] != 0
+}
+
 fn dstRegOrScratch(em: &Emitter, val: u64, scratch: u8) -> u8 {
   let r = valReg(em, val)
   if r != AArch64Frame.regNone() { return r }
@@ -1738,18 +1802,57 @@ effect fn storeFloat(em: &mut Emitter, value: u64, srcV: u8, double: bool) -> ()
   return run emitBaseDispStoreFp(&mut em.*, if double { 8 } else { 4 }, srcV, AArch64Encode.fp(), off)
 }
 
-effect fn normalizeInt(em: &mut Emitter, reg: u8, bits: usize, signed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
-  if bits >= 64 || bits == usize.ZERO { return () }
-  if signed {
-    if bits == 8 { return run AArch64Encode.sxtb(&mut em.code, true, reg, reg) }
-    if bits == 16 { return run AArch64Encode.sxth(&mut em.code, true, reg, reg) }
-    if bits == 32 { return run AArch64Encode.sxtw(&mut em.code, reg, reg) }
-    return run AArch64Encode.sbfm(&mut em.code, true, reg, reg, 0, usize.toU8(bits - usize.ONE))
+effect fn normalizeIntTo(em: &mut Emitter, dst: u8, src: u8, bits: usize, signed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if bits >= 64 || bits == usize.ZERO {
+    if dst != src { return run AArch64Encode.movRr64(&mut em.code, dst, src) }
+    return ()
   }
-  if bits == 8 { return run AArch64Encode.uxtb(&mut em.code, reg, reg) }
-  if bits == 16 { return run AArch64Encode.uxth(&mut em.code, reg, reg) }
-  if bits == 32 { return run AArch64Encode.movRr32(&mut em.code, reg, reg) }
-  return run AArch64Encode.ubfm(&mut em.code, true, reg, reg, 0, usize.toU8(bits - usize.ONE))
+  if signed {
+    if bits == 8 { return run AArch64Encode.sxtb(&mut em.code, true, dst, src) }
+    if bits == 16 { return run AArch64Encode.sxth(&mut em.code, true, dst, src) }
+    if bits == 32 { return run AArch64Encode.sxtw(&mut em.code, dst, src) }
+    return run AArch64Encode.sbfm(&mut em.code, true, dst, src, 0, usize.toU8(bits - usize.ONE))
+  }
+  if bits == 8 { return run AArch64Encode.uxtb(&mut em.code, dst, src) }
+  if bits == 16 { return run AArch64Encode.uxth(&mut em.code, dst, src) }
+  if bits == 32 { return run AArch64Encode.movRr32(&mut em.code, dst, src) }
+  return run AArch64Encode.ubfm(&mut em.code, true, dst, src, 0, usize.toU8(bits - usize.ONE))
+}
+
+effect fn normalizeInt(em: &mut Emitter, reg: u8, bits: usize, signed: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run normalizeIntTo(&mut em.*, reg, reg, bits, signed)
+}
+
+fn isKnownZeroExtended(function: &SsaFunction, value: u64, bits: usize) -> bool {
+  if value == none() || bits >= 64 || bits == usize.ZERO { return false }
+  let info = function.value(value)
+  if info.definition == Definition.Constant { return false }
+  let prod = function.producerOf(value)
+  if prod == usize.MAX { return false }
+  let inst = function.instruction(prod)
+  return match inst.operation {
+    Operation.Load {..} => !inst.kind.isVector() && !inst.kind.isFloat() && inst.kind.bits <= bits
+    Operation.Compare {..} => !inst.kind.isVector()
+    Operation.Reduce {..} => !inst.kind.isVector() && !inst.kind.isFloat() && inst.kind.bits <= bits
+    Operation.Cast {operation} => {
+      if operation == Cast.Trunc || operation == Cast.ZExt {
+        return !inst.kind.isVector() && !inst.kind.isFloat() && inst.kind.bits <= bits
+      }
+      return false
+    }
+    Operation.Binary {operation} => {
+      if operation == Binary.And && !inst.kind.isVector() && !inst.kind.isFloat() && inst.kind.bits <= bits {
+        let ops = function.operandsOf(prod)
+        if ops.length >= 2 {
+          let maxM = maskBits(u64.MAX, bits)
+          if function.isBits(ops[1]) && function.constantOf(ops[1]).low <= maxM { return true }
+          if function.isBits(ops[0]) && function.constantOf(ops[0]).low <= maxM { return true }
+        }
+      }
+      return false
+    }
+    _ => false
+  }
 }
 
 fn maskBits(value: u64, bits: usize) -> u64 {
@@ -1764,11 +1867,11 @@ fn isConstantZeroBits(function: &SsaFunction, value: u64, bits: usize) -> bool {
 
 // ---- Instruction Dispatch & Peephole Fusions ----
 
-fn nextActiveInst(function: &SsaFunction, insts: &[usize], after: usize, fusedCmp: usize, fusedBitTest: usize) -> usize {
+fn nextActiveInst(function: &SsaFunction, insts: &[usize], after: usize, fusedNot: usize, fusedCmp: usize, fusedBitTest: usize) -> usize {
   let mut k = after + usize.ONE
   while k < insts.length {
     let idx = insts[k]
-    if idx != fusedCmp && idx != fusedBitTest && !function.instruction(idx).removed {
+    if idx != fusedNot && idx != fusedCmp && idx != fusedBitTest && !function.instruction(idx).removed {
       return k
     }
     k = k + usize.ONE
@@ -1792,24 +1895,525 @@ fn isStandardScalarWidth(kind: Kind) -> bool {
   return b == 1 || b == 2 || b == 4 || b == 8
 }
 
+fn matchShiftConst(function: &SsaFunction, val: u64, wantOp: Binary, wantAmt: u64) -> u64 {
+  if val == none() { return none() }
+  let prod = function.producerOf(val)
+  if prod == usize.MAX { return none() }
+  let inst = function.instruction(prod)
+  if inst.removed { return none() }
+  if let Operation.Binary {operation} = inst.operation {
+    if operation == wantOp {
+      let ops = function.operandsOf(prod)
+      if ops.length >= 2 && function.isBits(ops[1]) && function.constantOf(ops[1]).low == wantAmt {
+        return ops[0]
+      }
+    }
+  }
+  return none()
+}
+
+fn matchAndConst(function: &SsaFunction, val: u64, wantMask: u64) -> u64 {
+  if val == none() { return none() }
+  let prod = function.producerOf(val)
+  if prod == usize.MAX { return none() }
+  let inst = function.instruction(prod)
+  if inst.removed { return none() }
+  if let Operation.Binary {operation} = inst.operation {
+    if operation == Binary.And {
+      let ops = function.operandsOf(prod)
+      if ops.length >= 2 {
+        if function.isBits(ops[1]) && function.constantOf(ops[1]).low == wantMask { return ops[0] }
+        if function.isBits(ops[0]) && function.constantOf(ops[0]).low == wantMask { return ops[1] }
+      }
+    }
+  }
+  return none()
+}
+
+fn collectOr4(function: &SsaFunction, val: u64, out: &mut [u64; 4], count: &mut usize, depth: usize) -> bool {
+  if count.* >= 4 { return false }
+  if depth < 3 {
+    let prod = function.producerOf(val)
+    if prod != usize.MAX {
+      let inst = function.instruction(prod)
+      if !inst.removed {
+        if let Operation.Binary {operation} = inst.operation {
+          if operation == Binary.Or {
+            let ops = function.operandsOf(prod)
+            if ops.length >= 2 {
+              return collectOr4(function, ops[0], &mut out, &mut count, depth + usize.ONE)
+                && collectOr4(function, ops[1], &mut out, &mut count, depth + usize.ONE)
+            }
+          }
+        }
+      }
+    }
+  }
+  if count.* >= 4 { return false }
+  out[count.*] = val
+  count.* = count.* + usize.ONE
+  return true
+}
+
+fn matchBswap32(function: &SsaFunction, val: u64) -> u64 {
+  if val == none() { return none() }
+  let vk = function.value(val).kind
+  if vk.isVector() || vk.isFloat() || vk.bits != 32 { return none() }
+  let prod = function.producerOf(val)
+  if prod == usize.MAX { return none() }
+  let inst = function.instruction(prod)
+  if inst.removed { return none() }
+  if let Operation.Binary {operation} = inst.operation {
+    if operation != Binary.Or { return none() }
+  } else {
+    return none()
+  }
+  let mut terms: [u64; 4] = [none(), none(), none(), none()]
+  let mut count = usize.ZERO
+  if !collectOr4(function, val, &mut terms, &mut count, usize.ZERO) || count != 4 {
+    return none()
+  }
+  let mut laneMask: u8 = 0
+  let mut src = none()
+  let mut i = usize.ZERO
+  while i < 4 {
+    let t = terms[i]
+    let mut laneBit: u8 = 0
+    let mut cand = none()
+    // Byte 0 -> Byte 3: `Shl(x, 24)` or `Shl(And(x, 0xFF), 24)`.
+    let s24 = matchShiftConst(function, t, Binary.Shl, 24)
+    if s24 != none() {
+      let inner = matchAndConst(function, s24, 0xFF)
+      cand = if inner != none() { inner } else { s24 }
+      laneBit = 8
+    }
+    // Byte 3 -> Byte 0: `LShr(x, 24)` or `And(LShr(x, 24), 0xFF)`.
+    if laneBit == 0 {
+      let r24 = matchShiftConst(function, t, Binary.LShr, 24)
+      if r24 != none() {
+        cand = r24
+        laneBit = 1
+      } else {
+        let a = matchAndConst(function, t, 0xFF)
+        if a != none() {
+          let r24b = matchShiftConst(function, a, Binary.LShr, 24)
+          if r24b != none() {
+            cand = r24b
+            laneBit = 1
+          }
+        }
+      }
+    }
+    // Byte 1 -> Byte 2: `And(Shl(x, 8), 0x00FF0000)` or `Shl(And(x, 0x0000FF00), 8)`.
+    if laneBit == 0 {
+      let a = matchAndConst(function, t, 0x00FF0000)
+      if a != none() {
+        let s8 = matchShiftConst(function, a, Binary.Shl, 8)
+        if s8 != none() {
+          cand = s8
+          laneBit = 4
+        }
+      } else {
+        let s8 = matchShiftConst(function, t, Binary.Shl, 8)
+        if s8 != none() {
+          let a2 = matchAndConst(function, s8, 0x0000FF00)
+          if a2 != none() {
+            cand = a2
+            laneBit = 4
+          }
+        }
+      }
+    }
+    // Byte 2 -> Byte 1: `And(LShr(x, 8), 0x0000FF00)` or `LShr(And(x, 0x00FF0000), 8)`.
+    if laneBit == 0 {
+      let a = matchAndConst(function, t, 0x0000FF00)
+      if a != none() {
+        let r8 = matchShiftConst(function, a, Binary.LShr, 8)
+        if r8 != none() {
+          cand = r8
+          laneBit = 2
+        }
+      } else {
+        let r8 = matchShiftConst(function, t, Binary.LShr, 8)
+        if r8 != none() {
+          let a2 = matchAndConst(function, r8, 0x00FF0000)
+          if a2 != none() {
+            cand = a2
+            laneBit = 2
+          }
+        }
+      }
+    }
+    if laneBit == 0 || cand == none() { return none() }
+    if src == none() { src = cand }
+    else if src != cand { return none() }
+    laneMask = laneMask | laneBit
+    i = i + usize.ONE
+  }
+  if laneMask == 15 { return src }
+  return none()
+}
+
+fn matchCastFrom(function: &SsaFunction, val: u64, wantOp: Cast, wantSrcBits: usize) -> u64 {
+  if val == none() { return none() }
+  let prod = function.producerOf(val)
+  if prod == usize.MAX { return none() }
+  let inst = function.instruction(prod)
+  if inst.removed { return none() }
+  if let Operation.Cast {operation} = inst.operation {
+    if operation == wantOp {
+      let ops = function.operandsOf(prod)
+      if ops.length >= usize.ONE {
+        let sk = function.value(ops[0]).kind
+        if !sk.isVector() && !sk.isFloat() && sk.bits == wantSrcBits {
+          return ops[0]
+        }
+      }
+    }
+  }
+  return none()
+}
+
+struct Bswap64Match {
+  src: u64,
+  truncA: u64,
+  truncB: u64,
+}
+
+impl Copy for Bswap64Match {}
+
+fn matchBswap64Pair(function: &SsaFunction, hiSide: u64, loSide: u64) -> Bswap64Match {
+  let empty = Bswap64Match {src: none(), truncA: none(), truncB: none()}
+  // `hiSide = Shl(ZExt(bswap32(Trunc(x))), 32)`
+  // `loSide = ZExt(bswap32(Trunc(LShr(x, 32))))`
+  let hiSh = matchShiftConst(function, hiSide, Binary.Shl, 32)
+  if hiSh == none() { return empty }
+  let hiZ = matchCastFrom(function, hiSh, Cast.ZExt, 32)
+  if hiZ == none() { return empty }
+  let hiSwapped = matchBswap32(function, hiZ)
+  if hiSwapped == none() { return empty }
+  let x1 = matchCastFrom(function, hiSwapped, Cast.Trunc, 64)
+  if x1 == none() { return empty }
+
+  let loZ = matchCastFrom(function, loSide, Cast.ZExt, 32)
+  if loZ == none() { return empty }
+  let loSwapped = matchBswap32(function, loZ)
+  if loSwapped == none() { return empty }
+  let loTrunc = matchCastFrom(function, loSwapped, Cast.Trunc, 64)
+  if loTrunc == none() { return empty }
+  let x2 = matchShiftConst(function, loTrunc, Binary.LShr, 32)
+  if x2 != x1 { return empty }
+  return Bswap64Match {src: x1, truncA: hiSwapped, truncB: loSwapped}
+}
+
+fn matchBswap64(function: &SsaFunction, val: u64) -> Bswap64Match {
+  let empty = Bswap64Match {src: none(), truncA: none(), truncB: none()}
+  if val == none() { return empty }
+  let vk = function.value(val).kind
+  if vk.isVector() || vk.isFloat() || vk.bits != 64 { return empty }
+  let prod = function.producerOf(val)
+  if prod == usize.MAX { return empty }
+  let inst = function.instruction(prod)
+  if inst.removed { return empty }
+  if let Operation.Binary {operation} = inst.operation {
+    if operation != Binary.Or { return empty }
+    let ops = function.operandsOf(prod)
+    if ops.length < 2 { return empty }
+    let r1 = matchBswap64Pair(function, ops[0], ops[1])
+    if r1.src != none() { return r1 }
+    return matchBswap64Pair(function, ops[1], ops[0])
+  }
+  return empty
+}
+
+fn findInstInBlockBefore(insts: &[usize], limit: usize, targetInst: usize) -> usize {
+  let mut j = limit
+  while j > usize.ZERO {
+    j = j - usize.ONE
+    if insts[j] == targetInst { return j }
+  }
+  return usize.MAX
+}
+
+fn markBswapDeadFixed(
+  function: &SsaFunction,
+  insts: &[usize],
+  valueUses: &[usize],
+  val: u64,
+  stopVal: u64,
+  allow4A: u64,
+  allow4B: u64,
+  limitPos: usize,
+  deadBuf: &mut [usize; 32],
+  deadCount: &mut usize,
+  earliestStopUse: &mut usize,
+) -> () {
+  if val == none() || val == stopVal { return () }
+  let vIdx = u64.toUsize(val)
+  if vIdx >= valueUses.length { return () }
+  let isAllowed4 = (val == allow4A || val == allow4B) && valueUses[vIdx] <= 4
+  if valueUses[vIdx] != usize.ONE && !isAllowed4 { return () }
+  let prod = function.producerOf(val)
+  if prod == usize.MAX { return () }
+  let pos = findInstInBlockBefore(insts, limitPos, prod)
+  if pos == usize.MAX { return () }
+  let mut k = usize.ZERO
+  while k < deadCount.* {
+    if deadBuf[k] == pos { return () }
+    k = k + usize.ONE
+  }
+  if deadCount.* >= 32 { return () }
+  deadBuf[deadCount.*] = pos
+  deadCount.* = deadCount.* + usize.ONE
+  let ops = function.operandsOf(prod)
+  let mut opIdx = usize.ZERO
+  while opIdx < ops.length {
+    if ops[opIdx] == stopVal {
+      if pos < earliestStopUse.* { earliestStopUse.* = pos }
+    } else {
+      markBswapDeadFixed(function, insts, valueUses, ops[opIdx], stopVal, allow4A, allow4B, pos, &mut deadBuf, &mut deadCount, &mut earliestStopUse)
+    }
+    opIdx = opIdx + usize.ONE
+  }
+}
+
+fn isBswapSrcPreserved(
+  em: &Emitter,
+  function: &SsaFunction,
+  insts: &[usize],
+  srcVal: u64,
+  fromPos: usize,
+  toPos: usize,
+  skipSlice: &mut [u8],
+  deadBuf: &[usize; 32],
+  deadCount: usize,
+) -> bool {
+  if srcVal == none() { return false }
+  let info = function.value(srcVal)
+  if info.definition == Definition.Constant { return true }
+  if valSlotBase(em, srcVal) != 0 { return true }
+  let rSrc = valReg(em, srcVal)
+  let offSrc = valOff(em, srcVal)
+  if rSrc == AArch64Frame.regNone() && offSrc == 0 { return false }
+  let mut j = fromPos
+  while j < toPos {
+    let mut isDead = skipSlice[j] != 0
+    if !isDead {
+      let mut d = usize.ZERO
+      while d < deadCount {
+        if deadBuf[d] == j { isDead = true break }
+        d = d + usize.ONE
+      }
+    }
+    if !isDead {
+      let inst = function.instruction(insts[j])
+      if !inst.removed {
+        // Conservatively reject if a non-skipped caller-clobbering op sits between `fromPos` and `toPos`.
+        if rSrc != AArch64Frame.regNone() && rSrc < 15 {
+          let mayClobber = match inst.operation {
+            Operation.Call {..} => true
+            Operation.CallIndirect {..} => true
+            Operation.InlineAsm {..} => true
+            Operation.CopyBytes {..} => true
+            Operation.Fill {..} => true
+            Operation.CopyCounted => true
+            Operation.FillCounted => true
+            _ => false
+          }
+          if mayClobber { return false }
+        }
+        if inst.result != none() {
+          let rc = inst.resultCount()
+          let mut rIdx = usize.ZERO
+          while rIdx < rc {
+            let rv = inst.result + usize.toU64(rIdx)
+            if rSrc != AArch64Frame.regNone() {
+              if valReg(em, rv) == rSrc { return false }
+            } else if valReg(em, rv) == AArch64Frame.regNone() && valOff(em, rv) == offSrc {
+              return false
+            }
+            rIdx = rIdx + usize.ONE
+          }
+        }
+      }
+    }
+    j = j + usize.ONE
+  }
+  return true
+}
+
 effect fn emitBlockInstructions(
   em: &mut Emitter,
   function: &SsaFunction,
   blockIdx: usize,
+  fusedNot: usize,
   fusedCmp: usize,
   fusedBitTest: usize,
 ) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  em.currentBlock = blockIdx
   let blk = function.block(blockIdx)
   let insts = List<usize>.asSlice(&blk.instructions)
+
+  // Fast pre-scan for `bswap64` / `bswap32` (`u64.byteSwap` / `u32.byteSwap`) -> single `rev`!
+  let mut hasBswap = false
+  let mut scanI = usize.ZERO
+  while scanI < insts.length {
+    let sInst = function.instruction(insts[scanI])
+    if !sInst.removed && sInst.result != none() && !sInst.kind.isVector() && !sInst.kind.isFloat() && (sInst.kind.bits == 32 || sInst.kind.bits == 64) {
+      if let Operation.Binary {operation: Binary.Or} = sInst.operation {
+        if (sInst.kind.bits == 64 && matchBswap64(function, sInst.result).src != none())
+          || (sInst.kind.bits == 32 && matchBswap32(function, sInst.result) != none()) {
+          hasBswap = true
+          break
+        }
+      }
+    }
+    scanI = scanI + usize.ONE
+  }
+
+  let mut skipList = List<u8>.make()
+  let mut bswapSrcList = List<u64>.make()
+  if hasBswap {
+    skipList = run List<u8>.makeWithCapacity(insts.length)
+    bswapSrcList = run List<u64>.makeWithCapacity(insts.length)
+    let mut k = usize.ZERO
+    while k < insts.length {
+      run List<u8>.append(&mut skipList, 0)
+      run List<u64>.append(&mut bswapSrcList, none())
+      k = k + usize.ONE
+    }
+    let skipMut = List<u8>.asMutSlice(&mut skipList)
+    let bswapMut = List<u64>.asMutSlice(&mut bswapSrcList)
+    k = insts.length
+    while k > usize.ZERO {
+      k = k - usize.ONE
+      if skipMut[k] != 0 { continue }
+      let candIdx = insts[k]
+      let candInst = function.instruction(candIdx)
+      if candInst.removed || candInst.result == none() || candIdx == fusedNot || candIdx == fusedCmp || candIdx == fusedBitTest { continue }
+      if candInst.kind.isVector() || candInst.kind.isFloat() { continue }
+      if candInst.kind.bits != 64 && candInst.kind.bits != 32 { continue }
+      if let Operation.Binary {operation: Binary.Or} = candInst.operation {
+        let mut srcVal = none()
+        let mut allow4A = none()
+        let mut allow4B = none()
+        if candInst.kind.bits == 64 {
+          let m64 = matchBswap64(function, candInst.result)
+          srcVal = m64.src
+          allow4A = m64.truncA
+          allow4B = m64.truncB
+        } else {
+          srcVal = matchBswap32(function, candInst.result)
+        }
+        if srcVal != none() {
+          let mut deadBuf: [usize; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+          let mut deadCount = usize.ZERO
+          let mut earliestUse = k
+          let rootOps = function.operandsOf(candIdx)
+          if rootOps.length >= 2 {
+            let vUses = List<usize>.asSlice(&em.frame.valueUses)
+            markBswapDeadFixed(function, insts, vUses, rootOps[0], srcVal, allow4A, allow4B, k, &mut deadBuf, &mut deadCount, &mut earliestUse)
+            markBswapDeadFixed(function, insts, vUses, rootOps[1], srcVal, allow4A, allow4B, k, &mut deadBuf, &mut deadCount, &mut earliestUse)
+          }
+          // Start liveness check after `srcVal`'s own definition if defined earlier in this block.
+          let mut fromPos = if earliestUse < k { earliestUse } else { usize.ZERO }
+          let srcProd = function.producerOf(srcVal)
+          if srcProd != usize.MAX {
+            let defPos = findInstInBlockBefore(insts, k, srcProd)
+            if defPos != usize.MAX && defPos + usize.ONE > fromPos {
+              fromPos = defPos + usize.ONE
+            }
+          }
+          if isBswapSrcPreserved(&em.*, function, insts, srcVal, fromPos, k, &mut skipMut, &deadBuf, deadCount) {
+            bswapMut[k] = srcVal
+            let mut d = usize.ZERO
+            while d < deadCount {
+              skipMut[deadBuf[d]] = 1
+              d = d + usize.ONE
+            }
+          }
+        }
+      }
+    }
+  }
+  let skipSlice = List<u8>.asSlice(&skipList)
+  let bswapSlice = List<u64>.asSlice(&bswapSrcList)
+
   let mut i = usize.ZERO
   while i < insts.length {
+    if hasBswap && skipSlice[i] != 0 {
+      i = i + usize.ONE
+      continue
+    }
     let instIdx = insts[i]
     let inst = function.instruction(instIdx)
-    if !inst.removed && instIdx != fusedCmp && instIdx != fusedBitTest {
-      let nextI = nextActiveInst(function, insts, i, fusedCmp, fusedBitTest)
-      if nextI != usize.MAX {
+    if !inst.removed && instIdx != fusedNot && instIdx != fusedCmp && instIdx != fusedBitTest {
+      if hasBswap && bswapSlice[i] != none() {
+        if inst.place != 0 { run recordLocation(&mut em.*, inst.place) }
+        let sReg = run regOrLoad(&mut em.*, function, bswapSlice[i], AArch64Frame.scratchGpVal())
+        let dst = dstRegOrScratch(&em.*, inst.result, AArch64Frame.scratchGpVal())
+        run AArch64Encode.rev(&mut em.code, inst.kind.bits == 64, dst, sReg)
+        run storeGp(&mut em.*, inst.result, dst)
+        i = i + usize.ONE
+        continue
+      }
+
+      let nextI = nextActiveInst(function, insts, i, fusedNot, fusedCmp, fusedBitTest)
+      if nextI != usize.MAX && (!hasBswap || (skipSlice[nextI] == 0 && bswapSlice[nextI] == none())) {
         let nextIdx = insts[nextI]
         let nextInst = function.instruction(nextIdx)
+
+        // 0. Fused `Offset(base, off1)` or `Index(base, const64)` + `Load`/`Store { offset: off2 }` -> `[base, #(off1+off2)]`.
+        if inst.result != none() && valSlotBase(&em.*, inst.result) == 0 && List<usize>.asSlice(&em.frame.valueUses)[u64.toUsize(inst.result)] == usize.ONE {
+          let mut hasConstPtrOff = false
+          let mut ptrBase = none()
+          let mut ptrOff: u64 = 0
+          if let Operation.Offset {offset: off1} = inst.operation {
+            let pOps = function.operandsOf(instIdx)
+            if pOps.length >= usize.ONE && off1 <= 0x7FFFFFFFFFFFFFFF {
+              hasConstPtrOff = true
+              ptrBase = pOps[0]
+              ptrOff = off1
+            }
+          } else if let Operation.Index = inst.operation {
+            let pOps = function.operandsOf(instIdx)
+            if pOps.length >= 2 && function.value(pOps[1]).kind.bits == 64 && function.isBits(pOps[1]) {
+              let c = function.constantOf(pOps[1])
+              if c.high == 0 && c.low <= 0x7FFFFFFFFFFFFFFF {
+                hasConstPtrOff = true
+                ptrBase = pOps[0]
+                ptrOff = c.low
+              }
+            }
+          }
+          if hasConstPtrOff {
+            if let Operation.Load {offset: off2, ..} = nextInst.operation {
+              let nOps = function.operandsOf(nextIdx)
+              if nOps.length >= usize.ONE && nOps[0] == inst.result {
+                if let Option<u64>.Some {value: totalOff} = u64.checkedAdd(ptrOff, off2) {
+                  if totalOff <= 0x7FFFFFFFFFFFFFFF {
+                    if nextInst.place != 0 { run recordLocation(&mut em.*, nextInst.place) }
+                    run emitLoad(&mut em.*, function, ptrBase, totalOff, nextInst.kind, nextInst.result)
+                    i = nextI + usize.ONE
+                    continue
+                  }
+                }
+              }
+            } else if let Operation.Store {offset: off2, ..} = nextInst.operation {
+              let nOps = function.operandsOf(nextIdx)
+              if nOps.length >= 2 && nOps[1] == inst.result && nOps[0] != inst.result {
+                if let Option<u64>.Some {value: totalOff} = u64.checkedAdd(ptrOff, off2) {
+                  if totalOff <= 0x7FFFFFFFFFFFFFFF {
+                    if nextInst.place != 0 { run recordLocation(&mut em.*, nextInst.place) }
+                    run emitStore(&mut em.*, function, nOps[0], ptrBase, totalOff)
+                    i = nextI + usize.ONE
+                    continue
+                  }
+                }
+              }
+            }
+          }
+        }
 
         // 1. Fused integer `Mul` + `Add`/`Sub` -> `madd` / `msub`.
         if let Operation.Binary {operation: mulOp} = inst.operation {
@@ -1893,7 +2497,7 @@ effect fn emitBlockInstructions(
         }
 
         // 4. Fused 3-op (`Shl` / `ZExt` / `SExt`) + `Index` + `Load`/`Store { offset: 0 }`.
-        let next2I = nextActiveInst(function, insts, nextI, fusedCmp, fusedBitTest)
+        let next2I = nextActiveInst(function, insts, nextI, fusedNot, fusedCmp, fusedBitTest)
         if next2I != usize.MAX && inst.result != none() && List<usize>.asSlice(&em.frame.valueUses)[u64.toUsize(inst.result)] == usize.ONE {
           let next2Idx = insts[next2I]
           let next2Inst = function.instruction(next2Idx)
@@ -2091,7 +2695,9 @@ effect fn emitScaledRegOffStore(
     return run AArch64Encode.strFpRegOff(&mut em.code, w, srcV, baseReg, idxReg, extend, scaled)
   }
   let bytes = kind.elementBytes()
-  let srcReg = if bytes == 1 && kind.bits == 1 {
+  let srcReg = if isConstantZeroBits(function, val, kind.bits) {
+    AArch64Encode.xzr()
+  } else if bytes == 1 && kind.bits == 1 {
     run loadGp(&mut em.*, function, val, AArch64Frame.scratchGpVal())
     run normalizeInt(&mut em.*, AArch64Frame.scratchGpVal(), 1, false)
     AArch64Frame.scratchGpVal()
@@ -2449,7 +3055,9 @@ effect fn emitStore(em: &mut Emitter, function: &SsaFunction, val: u64, addrVal:
   if bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8 {
     return run emitOddWidthStore(&mut em.*, function, val, addrVal, offset, bytes)
   }
-  let srcReg = if kind.bits < bytes * 8 {
+  let srcReg = if isConstantZeroBits(function, val, kind.bits) {
+    AArch64Encode.xzr()
+  } else if kind.bits < bytes * 8 {
     run loadGp(&mut em.*, function, val, AArch64Frame.scratchGpVal())
     run normalizeInt(&mut em.*, AArch64Frame.scratchGpVal(), kind.bits, false)
     AArch64Frame.scratchGpVal()
@@ -2492,20 +3100,56 @@ effect fn emitDynamicSlot(em: &mut Emitter, function: &SsaFunction, sizeVal: u64
 effect fn emitCopyBytes(em: &mut Emitter, function: &SsaFunction, dstVal: u64, srcVal: u64, size: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if size == 0 { return () }
-  if size == 8 || size == 16 || size == 32 || size == 64 {
-    // Load all bytes before storing (overlap-safe) using only `x15..x17` and `v28..v31`.
+  if size <= 64 {
+    // Overlap-safe inline copy using ONLY `x15..x17` and `v28..v31` (ALL loads before ANY stores).
     // Load `srcVal` before `dstVal` so `scratchGpAddr` (`x17`) is not clobbered by large spill offsets.
     let dstReg = AArch64Frame.scratchGpAddr()
     let srcReg = AArch64Frame.scratchGpCycle()
+    let tmp = AArch64Frame.scratchGpVal()
     run loadGp(&mut em.*, function, srcVal, srcReg)
     run loadGp(&mut em.*, function, dstVal, dstReg)
+    let v0 = AArch64Frame.scratchVecPair0()
+    let v1 = AArch64Frame.scratchVecPair1()
+    let v2 = AArch64Frame.scratchVecMask()
+    let v3 = AArch64Frame.scratchVecTmp()
+    if size == 1 {
+      run AArch64Encode.ldrbImm(&mut em.code, tmp, srcReg, 0)
+      return run AArch64Encode.strbImm(&mut em.code, tmp, dstReg, 0)
+    }
+    if size == 2 {
+      run AArch64Encode.ldrhImm(&mut em.code, tmp, srcReg, 0)
+      return run AArch64Encode.strhImm(&mut em.code, tmp, dstReg, 0)
+    }
+    if size == 3 {
+      run AArch64Encode.ldrbImm(&mut em.code, tmp, srcReg, 0)
+      run AArch64Encode.fmovGpToFp(&mut em.code, false, v0, tmp)
+      run AArch64Encode.ldurh(&mut em.code, tmp, srcReg, 1)
+      run AArch64Encode.sturh(&mut em.code, tmp, dstReg, 1)
+      run AArch64Encode.fmovFpToGp(&mut em.code, false, tmp, v0)
+      return run AArch64Encode.strbImm(&mut em.code, tmp, dstReg, 0)
+    }
+    if size == 4 {
+      run AArch64Encode.ldr32Imm(&mut em.code, tmp, srcReg, 0)
+      return run AArch64Encode.str32Imm(&mut em.code, tmp, dstReg, 0)
+    }
+    if size <= 7 {
+      let tail = u64.toI64(size - 4)
+      run AArch64Encode.ldrFpImm(&mut em.code, 4, v0, srcReg, 0)
+      run emitBaseDispLoadFp(&mut em.*, 4, v1, srcReg, tail)
+      run AArch64Encode.strFpImm(&mut em.code, 4, v0, dstReg, 0)
+      return run emitBaseDispStoreFp(&mut em.*, 4, v1, dstReg, tail)
+    }
     if size == 8 {
-      let tmp = AArch64Frame.scratchGpVal()
       run AArch64Encode.ldr64Imm(&mut em.code, tmp, srcReg, 0)
       return run AArch64Encode.str64Imm(&mut em.code, tmp, dstReg, 0)
     }
-    let v0 = AArch64Frame.scratchVecPair0()
-    let v1 = AArch64Frame.scratchVecPair1()
+    if size <= 15 {
+      let tail = u64.toI64(size - 8)
+      run AArch64Encode.ldrFpImm(&mut em.code, 8, v0, srcReg, 0)
+      run emitBaseDispLoadFp(&mut em.*, 8, v1, srcReg, tail)
+      run AArch64Encode.strFpImm(&mut em.code, 8, v0, dstReg, 0)
+      return run emitBaseDispStoreFp(&mut em.*, 8, v1, dstReg, tail)
+    }
     if size == 16 {
       run AArch64Encode.ldrFpImm(&mut em.code, 16, v0, srcReg, 0)
       return run AArch64Encode.strFpImm(&mut em.code, 16, v0, dstReg, 0)
@@ -2514,12 +3158,67 @@ effect fn emitCopyBytes(em: &mut Emitter, function: &SsaFunction, dstVal: u64, s
       run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, srcReg, 0)
       return run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, dstReg, 0)
     }
-    let v2 = AArch64Frame.scratchVecMask()
-    let v3 = AArch64Frame.scratchVecTmp()
+    if size < 32 {
+      let tail = u64.toI64(size - 16)
+      run AArch64Encode.ldrFpImm(&mut em.code, 16, v0, srcReg, 0)
+      run emitBaseDispLoadFp(&mut em.*, 16, v1, srcReg, tail)
+      run AArch64Encode.strFpImm(&mut em.code, 16, v0, dstReg, 0)
+      return run emitBaseDispStoreFp(&mut em.*, 16, v1, dstReg, tail)
+    }
+    if size <= 48 {
+      let tail = u64.toI64(size - 16)
+      run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, srcReg, 0)
+      run emitBaseDispLoadFp(&mut em.*, 16, v2, srcReg, tail)
+      run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, dstReg, 0)
+      return run emitBaseDispStoreFp(&mut em.*, 16, v2, dstReg, tail)
+    }
+    if size == 64 {
+      run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, srcReg, 0)
+      run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v2, v3, srcReg, 32)
+      run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, dstReg, 0)
+      return run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v2, v3, dstReg, 32)
+    }
+    let tail = u64.toI64(size - 16)
     run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, srcReg, 0)
-    run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v2, v3, srcReg, 32)
+    run AArch64Encode.ldrFpImm(&mut em.code, 16, v2, srcReg, 32)
+    run emitBaseDispLoadFp(&mut em.*, 16, v3, srcReg, tail)
     run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, dstReg, 0)
-    return run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v2, v3, dstReg, 32)
+    run AArch64Encode.strFpImm(&mut em.code, 16, v2, dstReg, 32)
+    return run emitBaseDispStoreFp(&mut em.*, 16, v3, dstReg, tail)
+  }
+  // Disjoint stack-slot copies up to 256 bytes: unroll 32-byte NEON pairs inline without calling `memmove`.
+  if size <= 256 {
+    let sbDst = valSlotBase(&em.*, dstVal)
+    let sbSrc = valSlotBase(&em.*, srcVal)
+    if sbDst != 0 && sbSrc != 0 {
+      let szI = u64.toI64(size)
+      if sbDst + szI <= sbSrc || sbSrc + szI <= sbDst {
+        let dstReg = AArch64Frame.scratchGpAddr()
+        let srcReg = AArch64Frame.scratchGpCycle()
+        run loadGp(&mut em.*, function, srcVal, srcReg)
+        run loadGp(&mut em.*, function, dstVal, dstReg)
+        let v0 = AArch64Frame.scratchVecPair0()
+        let v1 = AArch64Frame.scratchVecPair1()
+        let mut off: u64 = 0
+        while off + 32 <= size {
+          let oI = u64.wrappingToI32(off)
+          run AArch64Encode.ldpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, srcReg, oI)
+          run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, v0, v1, dstReg, oI)
+          off = off + 32
+        }
+        if off + 16 <= size {
+          run AArch64Encode.ldrFpImm(&mut em.code, 16, v0, srcReg, off)
+          run AArch64Encode.strFpImm(&mut em.code, 16, v0, dstReg, off)
+          off = off + 16
+        }
+        if off < size {
+          let tail = u64.toI64(size - 16)
+          run emitBaseDispLoadFp(&mut em.*, 16, v0, srcReg, tail)
+          run emitBaseDispStoreFp(&mut em.*, 16, v0, dstReg, tail)
+        }
+        return ()
+      }
+    }
   }
   run loadGp(&mut em.*, function, dstVal, AArch64Encode.x0())
   run loadGp(&mut em.*, function, srcVal, AArch64Encode.x1())
@@ -2531,22 +3230,50 @@ effect fn emitCopyBytes(em: &mut Emitter, function: &SsaFunction, dstVal: u64, s
 effect fn emitFill(em: &mut Emitter, function: &SsaFunction, dstVal: u64, fillByte: u8, size: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if size == 0 { return () }
-  if size == 8 || size == 16 || size == 32 || size == 64 {
+  if size <= 256 {
     let dstReg = AArch64Frame.scratchGpAddr()
     let vTmp = AArch64Frame.scratchVecTmp()
     run loadGp(&mut em.*, function, dstVal, dstReg)
-    run AArch64Encode.moviByte(&mut em.code, vTmp, fillByte)
-    if size == 8 {
-      return run AArch64Encode.strFpImm(&mut em.code, 8, vTmp, dstReg, 0)
+    if size < 16 {
+      let srcGp = if fillByte == 0 {
+        AArch64Encode.xzr()
+      } else {
+        let b64 = u8.toU64(fillByte)
+        let rep = b64 | u64.shiftLeft(b64, 8) | u64.shiftLeft(b64, 16) | u64.shiftLeft(b64, 24)
+        let rep64 = rep | u64.shiftLeft(rep, 32)
+        run AArch64Encode.movImm64(&mut em.code, AArch64Frame.scratchGpVal(), rep64)
+        AArch64Frame.scratchGpVal()
+      }
+      if size == 1 { return run AArch64Encode.strbImm(&mut em.code, srcGp, dstReg, 0) }
+      if size == 2 { return run AArch64Encode.strhImm(&mut em.code, srcGp, dstReg, 0) }
+      if size == 3 {
+        run AArch64Encode.strhImm(&mut em.code, srcGp, dstReg, 0)
+        return run AArch64Encode.strbImm(&mut em.code, srcGp, dstReg, 2)
+      }
+      if size == 4 { return run AArch64Encode.str32Imm(&mut em.code, srcGp, dstReg, 0) }
+      if size <= 7 {
+        run AArch64Encode.str32Imm(&mut em.code, srcGp, dstReg, 0)
+        return run emitBaseDispStoreGp(&mut em.*, 4, srcGp, dstReg, u64.toI64(size - 4))
+      }
+      if size == 8 { return run AArch64Encode.str64Imm(&mut em.code, srcGp, dstReg, 0) }
+      run AArch64Encode.str64Imm(&mut em.code, srcGp, dstReg, 0)
+      return run emitBaseDispStoreGp(&mut em.*, 8, srcGp, dstReg, u64.toI64(size - 8))
     }
-    if size == 16 {
-      return run AArch64Encode.strFpImm(&mut em.code, 16, vTmp, dstReg, 0)
+    if fillByte == 0 { run AArch64Encode.moviZero(&mut em.code, vTmp) }
+    else { run AArch64Encode.moviByte(&mut em.code, vTmp, fillByte) }
+    let mut off: u64 = 0
+    while off + 32 <= size {
+      run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, vTmp, vTmp, dstReg, u64.wrappingToI32(off))
+      off = off + 32
     }
-    if size == 32 {
-      return run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, vTmp, vTmp, dstReg, 0)
+    if off + 16 <= size {
+      run AArch64Encode.strFpImm(&mut em.code, 16, vTmp, dstReg, off)
+      off = off + 16
     }
-    run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, vTmp, vTmp, dstReg, 0)
-    return run AArch64Encode.stpFp(&mut em.code, 16, PairMode.SignedOffset, vTmp, vTmp, dstReg, 32)
+    if off < size {
+      run emitBaseDispStoreFp(&mut em.*, 16, vTmp, dstReg, u64.toI64(size - 16))
+    }
+    return ()
   }
   run loadGp(&mut em.*, function, dstVal, AArch64Encode.x0())
   run AArch64Encode.movz(&mut em.code, false, AArch64Encode.x1(), u8.toU16(fillByte), 0)
@@ -2612,7 +3339,7 @@ effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind:
       lhs = right
       rhs = left
     }
-    if function.isBits(rhs) && (bits == 32 || bits == 64) {
+    if function.isBits(rhs) && bits <= 64 {
       let c = maskBits(function.constantOf(rhs).low, bits)
       if c <= 4095 {
         let lhsReg = run regOrLoad(&mut em.*, function, lhs, AArch64Frame.scratchGpVal())
@@ -2622,6 +3349,7 @@ effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind:
         } else {
           run AArch64Encode.subImm(&mut em.code, wide, dst, lhsReg, u64.wrappingToU16(c), false)
         }
+        if bits < 64 && bits != 32 { run normalizeInt(&mut em.*, dst, bits, false) }
         return run storeGp(&mut em.*, result, dst)
       }
       if (c & 0xFFF) == 0 && c <= 16773120 {
@@ -2633,7 +3361,21 @@ effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind:
         } else {
           run AArch64Encode.subImm(&mut em.code, wide, dst, lhsReg, hi12, true)
         }
+        if bits < 64 && bits != 32 { run normalizeInt(&mut em.*, dst, bits, false) }
         return run storeGp(&mut em.*, result, dst)
+      }
+      if bits == 32 || bits == 64 {
+        let negC = if wide { u64.wrappingSubtract(0, c) } else { u64.wrappingSubtract(0, c) & 0xFFFFFFFF }
+        if negC >= 1 && negC <= 4095 {
+          let lhsReg = run regOrLoad(&mut em.*, function, lhs, AArch64Frame.scratchGpVal())
+          let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+          if op == Binary.Add {
+            run AArch64Encode.subImm(&mut em.code, wide, dst, lhsReg, u64.wrappingToU16(negC), false)
+          } else {
+            run AArch64Encode.addImm(&mut em.code, wide, dst, lhsReg, u64.wrappingToU16(negC), false)
+          }
+          return run storeGp(&mut em.*, result, dst)
+        }
       }
     }
   }
@@ -2646,16 +3388,125 @@ effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind:
       lhs = right
       rhs = left
     }
-    if function.isBits(rhs) && (bits == 32 || bits == 64) {
+    if function.isBits(rhs) && bits <= 64 {
       let c = maskBits(function.constantOf(rhs).low, bits)
       if let Option<u32>.Some {value: imm13} = AArch64Encode.encodeLogicalImm(wide, c) {
         let lhsReg = run regOrLoad(&mut em.*, function, lhs, AArch64Frame.scratchGpVal())
         let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
-        if op == Binary.And { run AArch64Encode.andImmEncoded(&mut em.code, wide, dst, lhsReg, imm13) }
-        else if op == Binary.Or { run AArch64Encode.orrImmEncoded(&mut em.code, wide, dst, lhsReg, imm13) }
-        else { run AArch64Encode.eorImmEncoded(&mut em.code, wide, dst, lhsReg, imm13) }
+        if op == Binary.And {
+          run AArch64Encode.andImmEncoded(&mut em.code, wide, dst, lhsReg, imm13)
+        } else if op == Binary.Or {
+          run AArch64Encode.orrImmEncoded(&mut em.code, wide, dst, lhsReg, imm13)
+          if bits < 64 && bits != 32 { run normalizeInt(&mut em.*, dst, bits, false) }
+        } else {
+          run AArch64Encode.eorImmEncoded(&mut em.code, wide, dst, lhsReg, imm13)
+          if bits < 64 && bits != 32 { run normalizeInt(&mut em.*, dst, bits, false) }
+        }
         return run storeGp(&mut em.*, result, dst)
       }
+    }
+  }
+
+  // Power-of-two Mul -> shift fast path.
+  if op == Binary.Mul && (bits == 32 || bits == 64) {
+    let mut lhs = left
+    let mut rhs = right
+    if !function.isBits(rhs) && function.isBits(lhs) {
+      lhs = right
+      rhs = left
+    }
+    if function.isBits(rhs) {
+      let c = maskBits(function.constantOf(rhs).low, bits)
+      if c == 0 {
+        let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+        run AArch64Encode.movz(&mut em.code, wide, dst, 0, 0)
+        return run storeGp(&mut em.*, result, dst)
+      }
+      if c == 1 {
+        let lhsReg = run regOrLoad(&mut em.*, function, lhs, AArch64Frame.scratchGpVal())
+        let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+        if wide { if dst != lhsReg { run AArch64Encode.movRr64(&mut em.code, dst, lhsReg) } }
+        else { run AArch64Encode.movRr32(&mut em.code, dst, lhsReg) }
+        return run storeGp(&mut em.*, result, dst)
+      }
+      if (c & (c - 1)) == 0 {
+        let sh = u32.wrappingToU8(u64.trailingZeros(c))
+        let lhsReg = run regOrLoad(&mut em.*, function, lhs, AArch64Frame.scratchGpVal())
+        let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+        run AArch64Encode.lslImm(&mut em.code, wide, dst, lhsReg, sh)
+        return run storeGp(&mut em.*, result, dst)
+      }
+    }
+  }
+
+  // Constant unsigned division/remainder strength reduction (`lsr`/`and` for powers of 2,
+  // exact Granlund-Montgomery `umulh` + `sub` + `add lsr #1` + `lsr` (+ `msub`) for `3 <= d < 2^63`).
+  if (op == Binary.UDiv || op == Binary.URem) && (bits == 32 || bits == 64) && function.isBits(right) {
+    let d = maskBits(function.constantOf(right).low, bits)
+    if d == 1 {
+      let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+      if op == Binary.UDiv {
+        let lhsReg = run regOrLoad(&mut em.*, function, left, AArch64Frame.scratchGpVal())
+        if wide { if dst != lhsReg { run AArch64Encode.movRr64(&mut em.code, dst, lhsReg) } }
+        else { run AArch64Encode.movRr32(&mut em.code, dst, lhsReg) }
+      } else {
+        run AArch64Encode.movz(&mut em.code, wide, dst, 0, 0)
+      }
+      return run storeGp(&mut em.*, result, dst)
+    }
+    if d >= 2 && (d & (d - 1)) == 0 {
+      let lhsReg = run regOrLoad(&mut em.*, function, left, AArch64Frame.scratchGpVal())
+      let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+      if op == Binary.UDiv {
+        let sh = u32.wrappingToU8(u64.trailingZeros(d))
+        run AArch64Encode.lsrImm(&mut em.code, wide, dst, lhsReg, sh)
+        return run storeGp(&mut em.*, result, dst)
+      }
+      if run AArch64Encode.tryAndImm(&mut em.code, wide, dst, lhsReg, d - 1) {
+        return run storeGp(&mut em.*, result, dst)
+      }
+    }
+    if d >= 3 && d < 0x8000000000000000 {
+      let l = 64 - u32.toUsize(u64.leadingZeros(d - 1))
+      let rem0 = u64.shiftLeft(1, usize.toU64(l)) - d
+      let mut qMagic: u64 = 0
+      let mut rRem: u64 = rem0
+      let mut bit: usize = 64
+      while bit > usize.ZERO {
+        bit = bit - usize.ONE
+        let carry = (rRem & 0x8000000000000000) != 0
+        rRem = u64.shiftLeft(rRem, 1)
+        if carry || rRem >= d {
+          rRem = u64.wrappingSubtract(rRem, d)
+          qMagic = qMagic | u64.shiftLeft(1, usize.toU64(bit))
+        }
+      }
+      let magic = u64.wrappingAdd(qMagic, 1)
+      let rawLhs = run regOrLoad(&mut em.*, function, left, AArch64Frame.scratchGpVal())
+      let lhsReg = if wide {
+        rawLhs
+      } else {
+        run AArch64Encode.movRr32(&mut em.code, AArch64Frame.scratchGpVal(), rawLhs)
+        AArch64Frame.scratchGpVal()
+      }
+      let dst = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchGpVal() }
+      let t0 = AArch64Frame.scratchGpCycle()
+      let t1 = AArch64Frame.scratchGpAddr()
+      run AArch64Encode.movImm64(&mut em.code, t0, magic)
+      run AArch64Encode.umulh(&mut em.code, t1, lhsReg, t0)
+      run AArch64Encode.subReg(&mut em.code, true, t0, lhsReg, t1, ShiftKind.Lsl, 0)
+      run AArch64Encode.addReg(&mut em.code, true, t1, t1, t0, ShiftKind.Lsr, 1)
+      let shift2 = usize.toU8(l - usize.ONE)
+      if op == Binary.UDiv {
+        if shift2 != 0 { run AArch64Encode.lsrImm(&mut em.code, true, dst, t1, shift2) }
+        else { run AArch64Encode.movRr64(&mut em.code, dst, t1) }
+        return run storeGp(&mut em.*, result, dst)
+      }
+      if shift2 != 0 { run AArch64Encode.lsrImm(&mut em.code, true, t0, t1, shift2) }
+      else { run AArch64Encode.movRr64(&mut em.code, t0, t1) }
+      run AArch64Encode.movImm64(&mut em.code, t1, d)
+      run AArch64Encode.msub(&mut em.code, wide, dst, t0, t1, lhsReg)
+      return run storeGp(&mut em.*, result, dst)
     }
   }
 
@@ -2690,15 +3541,20 @@ effect fn emitBinary(em: &mut Emitter, function: &SsaFunction, op: Binary, kind:
       }
       return run storeGp(&mut em.*, result, dst)
     }
-    if dst != lhsReg { run AArch64Encode.movRr64(&mut em.code, dst, lhsReg) }
     if op == Binary.Shl {
-      if amt != 0 { run AArch64Encode.lslImm(&mut em.code, true, dst, dst, amt) }
+      if amt != 0 { run AArch64Encode.lslImm(&mut em.code, true, dst, lhsReg, amt) }
+      else if dst != lhsReg { run AArch64Encode.movRr64(&mut em.code, dst, lhsReg) }
       run normalizeInt(&mut em.*, dst, bits, false)
     } else if op == Binary.LShr {
-      run normalizeInt(&mut em.*, dst, bits, false)
-      if amt != 0 { run AArch64Encode.lsrImm(&mut em.code, true, dst, dst, amt) }
+      if isKnownZeroExtended(function, left, bits) {
+        if amt != 0 { run AArch64Encode.lsrImm(&mut em.code, true, dst, lhsReg, amt) }
+        else if dst != lhsReg { run AArch64Encode.movRr64(&mut em.code, dst, lhsReg) }
+      } else {
+        run normalizeIntTo(&mut em.*, dst, lhsReg, bits, false)
+        if amt != 0 { run AArch64Encode.lsrImm(&mut em.code, true, dst, dst, amt) }
+      }
     } else {
-      run normalizeInt(&mut em.*, dst, bits, true)
+      run normalizeIntTo(&mut em.*, dst, lhsReg, bits, true)
       if amt != 0 { run AArch64Encode.asrImm(&mut em.code, true, dst, dst, amt) }
       run normalizeInt(&mut em.*, dst, bits, false)
     }
@@ -3115,7 +3971,7 @@ effect fn emitScalarIntCmpFlags(em: &mut Emitter, function: &SsaFunction, predIn
   let mut left = leftIn
   let mut right = rightIn
   let bits = function.value(left).kind.bits
-  if (bits == 32 || bits == 64) && !function.isBits(right) && function.isBits(left) {
+  if bits <= 64 && !function.isBits(right) && function.isBits(left) {
     left = rightIn
     right = leftIn
     pred = swapIntPred(predIn)
@@ -3144,18 +4000,44 @@ effect fn emitScalarIntCmpFlags(em: &mut Emitter, function: &SsaFunction, predIn
   let signed = isSignedPred(pred)
   let lTmp = AArch64Frame.scratchGpVal()
   let rTmp = AArch64Frame.scratchGpCycle()
-  run loadGp(&mut em.*, function, left, lTmp)
-  run normalizeInt(&mut em.*, lTmp, bits, signed)
-  if function.isBits(right) && !signed {
-    let c = maskBits(function.constantOf(right).low, bits)
-    if c <= 4095 {
-      run AArch64Encode.cmpImm(&mut em.code, true, lTmp, u64.wrappingToU16(c), false)
-      return cc
+  let lRaw = run regOrLoad(&mut em.*, function, left, lTmp)
+  let lReg = if !signed && isKnownZeroExtended(function, left, bits) {
+    lRaw
+  } else {
+    run normalizeIntTo(&mut em.*, lTmp, lRaw, bits, signed)
+    lTmp
+  }
+  if function.isBits(right) {
+    let rawC = maskBits(function.constantOf(right).low, bits)
+    if !signed {
+      if rawC <= 4095 {
+        run AArch64Encode.cmpImm(&mut em.code, true, lReg, u64.wrappingToU16(rawC), false)
+        return cc
+      }
+    } else if bits >= 2 {
+      let signBit = u64.shiftLeft(1, usize.toU64(bits - usize.ONE))
+      if (rawC & signBit) == 0 {
+        if rawC <= 4095 {
+          run AArch64Encode.cmpImm(&mut em.code, true, lReg, u64.wrappingToU16(rawC), false)
+          return cc
+        }
+      } else {
+        let mag = maskBits(u64.wrappingSubtract(0, rawC), bits)
+        if mag >= 1 && mag <= 4095 {
+          run AArch64Encode.cmnImm(&mut em.code, true, lReg, u64.wrappingToU16(mag), false)
+          return cc
+        }
+      }
     }
   }
-  run loadGp(&mut em.*, function, right, rTmp)
-  run normalizeInt(&mut em.*, rTmp, bits, signed)
-  run AArch64Encode.cmpReg(&mut em.code, true, lTmp, rTmp)
+  let rRaw = run regOrLoad(&mut em.*, function, right, rTmp)
+  let rReg = if !signed && isKnownZeroExtended(function, right, bits) {
+    rRaw
+  } else {
+    run normalizeIntTo(&mut em.*, rTmp, rRaw, bits, signed)
+    rTmp
+  }
+  run AArch64Encode.cmpReg(&mut em.code, true, lReg, rReg)
   return cc
 }
 
@@ -3293,8 +4175,7 @@ effect fn emitCast(em: &mut Emitter, function: &SsaFunction, op: Cast, dstKind: 
       }
       let dst = dstRegOrScratch(&em.*, result, AArch64Frame.scratchGpVal())
       let sReg = run regOrLoad(&mut em.*, function, src, dst)
-      if dst != sReg { run AArch64Encode.movRr64(&mut em.code, dst, sReg) }
-      run normalizeInt(&mut em.*, dst, dstKind.bits, false)
+      run normalizeIntTo(&mut em.*, dst, sReg, dstKind.bits, false)
       return run storeGp(&mut em.*, result, dst)
     }
     Cast.ZExt => {
@@ -3306,8 +4187,11 @@ effect fn emitCast(em: &mut Emitter, function: &SsaFunction, op: Cast, dstKind: 
       }
       let dst = dstRegOrScratch(&em.*, result, AArch64Frame.scratchGpVal())
       let sReg = run regOrLoad(&mut em.*, function, src, dst)
-      if dst != sReg { run AArch64Encode.movRr64(&mut em.code, dst, sReg) }
-      run normalizeInt(&mut em.*, dst, srcKind.bits, false)
+      if isKnownZeroExtended(function, src, srcKind.bits) {
+        if dst != sReg { run AArch64Encode.movRr64(&mut em.code, dst, sReg) }
+      } else {
+        run normalizeIntTo(&mut em.*, dst, sReg, srcKind.bits, false)
+      }
       return run storeGp(&mut em.*, result, dst)
     }
     Cast.SExt => {
@@ -3319,23 +4203,22 @@ effect fn emitCast(em: &mut Emitter, function: &SsaFunction, op: Cast, dstKind: 
       }
       let dst = dstRegOrScratch(&em.*, result, AArch64Frame.scratchGpVal())
       let sReg = run regOrLoad(&mut em.*, function, src, dst)
-      if dst != sReg { run AArch64Encode.movRr64(&mut em.code, dst, sReg) }
-      run normalizeInt(&mut em.*, dst, srcKind.bits, true)
-      run normalizeInt(&mut em.*, dst, dstKind.bits, false)
+      run normalizeIntTo(&mut em.*, dst, sReg, srcKind.bits, true)
+      if dstKind.bits < 64 {
+        run normalizeInt(&mut em.*, dst, dstKind.bits, false)
+      }
       return run storeGp(&mut em.*, result, dst)
     }
     Cast.IntToPtr => {
       let dst = dstRegOrScratch(&em.*, result, AArch64Frame.scratchGpVal())
       let sReg = run regOrLoad(&mut em.*, function, src, dst)
-      if dst != sReg { run AArch64Encode.movRr64(&mut em.code, dst, sReg) }
-      run normalizeInt(&mut em.*, dst, srcKind.bits, false)
+      run normalizeIntTo(&mut em.*, dst, sReg, srcKind.bits, false)
       return run storeGp(&mut em.*, result, dst)
     }
     Cast.PtrToInt => {
       let dst = dstRegOrScratch(&em.*, result, AArch64Frame.scratchGpVal())
       let sReg = run regOrLoad(&mut em.*, function, src, dst)
-      if dst != sReg { run AArch64Encode.movRr64(&mut em.code, dst, sReg) }
-      run normalizeInt(&mut em.*, dst, dstKind.bits, false)
+      run normalizeIntTo(&mut em.*, dst, sReg, dstKind.bits, false)
       return run storeGp(&mut em.*, result, dst)
     }
     Cast.FPTrunc => {
@@ -4895,9 +5778,11 @@ effect fn emitExit(
   blockIdx: usize,
   nextBlk: usize,
   naked: bool,
+  fusedNot: usize,
   fusedCmp: usize,
   fusedBitTest: usize,
 ) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  em.currentBlock = blockIdx
   let blk = function.block(blockIdx)
   let edges = List<Edge>.asSlice(&blk.edges)
   match blk.exit {
@@ -4964,9 +5849,13 @@ effect fn emitExit(
             brImm = 0
             brWide64 = lhsKind.bits == 64
           } else {
-            run loadGp(&mut em.*, function, testedVal, AArch64Frame.scratchGpVal())
-            run normalizeInt(&mut em.*, AArch64Frame.scratchGpVal(), lhsKind.bits, false)
-            brReg = AArch64Frame.scratchGpVal()
+            let tRaw = run regOrLoad(&mut em.*, function, testedVal, AArch64Frame.scratchGpVal())
+            if isKnownZeroExtended(function, testedVal, lhsKind.bits) {
+              brReg = tRaw
+            } else {
+              run normalizeIntTo(&mut em.*, AArch64Frame.scratchGpVal(), tRaw, lhsKind.bits, false)
+              brReg = AArch64Frame.scratchGpVal()
+            }
             brKind = if pred == Predicate.Eq { 3 } else { 4 }
             brImm = 0
             brWide64 = true
@@ -4977,10 +5866,22 @@ effect fn emitExit(
           brImm = cc
         }
       } else {
-        brReg = run regOrLoad(&mut em.*, function, blk.value, AArch64Frame.scratchGpVal())
+        let condVal = if fusedNot != usize.MAX {
+          let notInst = function.instruction(fusedNot)
+          if notInst.place != 0 { run recordLocation(&mut em.*, notInst.place) }
+          fusedNotOperand(function, fusedNot)
+        } else {
+          blk.value
+        }
+        brReg = run regOrLoad(&mut em.*, function, condVal, AArch64Frame.scratchGpVal())
         brKind = 1
         brImm = 0
         brWide64 = false
+      }
+      if fusedNot != usize.MAX {
+        let inv = invertBrKind(brKind, brImm)
+        brKind = inv.brKind
+        brImm = inv.imm
       }
 
       let trueHasCopies = List<u64>.length(&edges[0].arguments) > usize.ZERO
@@ -5476,6 +6377,170 @@ effect fn emitParallelGpMoves(em: &mut Emitter, function: &SsaFunction, args: &[
   return ()
 }
 
+effect fn emitSingleVecMove(em: &mut Emitter, function: &SsaFunction, mv: VecMove) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  // Never touches `scratchVecTmp` (`v31`), which may hold a live cycle-break value.
+  let tmpV = AArch64Frame.scratchVecMask()
+  let fp = AArch64Encode.fp()
+  let isVec = mv.width == 16
+  let isDouble = mv.width == 8
+  if mv.dstIsReg {
+    if mv.srcKind == 0 {
+      if mv.srcReg != mv.dstReg {
+        if isVec { return run AArch64Encode.movVec(&mut em.code, mv.dstReg, mv.srcReg) }
+        return run AArch64Encode.fmovFpRr(&mut em.code, isDouble, mv.dstReg, mv.srcReg)
+      }
+      return ()
+    }
+    if mv.srcKind == 1 {
+      return run emitBaseDispLoadFp(&mut em.*, mv.width, mv.dstReg, fp, mv.srcOff)
+    }
+    if mv.srcKind == 2 {
+      if isVec { return run loadVec128(&mut em.*, function, mv.srcVal, mv.dstReg) }
+      return run loadFloat(&mut em.*, function, mv.srcVal, mv.dstReg, AArch64Frame.scratchGpVal())
+    }
+    if isVec { return run AArch64Encode.moviZero(&mut em.code, mv.dstReg) }
+    return run AArch64Encode.fmovGpToFp(&mut em.code, isDouble, mv.dstReg, AArch64Encode.xzr())
+  }
+  if mv.srcKind == 0 {
+    return run emitBaseDispStoreFp(&mut em.*, mv.width, mv.srcReg, fp, mv.dstOff)
+  }
+  if mv.srcKind == 1 {
+    run emitBaseDispLoadFp(&mut em.*, mv.width, tmpV, fp, mv.srcOff)
+    return run emitBaseDispStoreFp(&mut em.*, mv.width, tmpV, fp, mv.dstOff)
+  }
+  if mv.srcKind == 2 {
+    if isVec { run loadVec128(&mut em.*, function, mv.srcVal, tmpV) }
+    else { run loadFloat(&mut em.*, function, mv.srcVal, tmpV, AArch64Frame.scratchGpVal()) }
+    return run emitBaseDispStoreFp(&mut em.*, mv.width, tmpV, fp, mv.dstOff)
+  }
+  if isVec { run AArch64Encode.moviZero(&mut em.code, tmpV) }
+  else { run AArch64Encode.fmovGpToFp(&mut em.code, isDouble, tmpV, AArch64Encode.xzr()) }
+  return run emitBaseDispStoreFp(&mut em.*, mv.width, tmpV, fp, mv.dstOff)
+}
+
+effect fn emitParallelVecMoves(em: &mut Emitter, function: &SsaFunction, args: &[u64], params: &[u64]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let cycleVec = AArch64Frame.scratchVecTmp()
+  let mut moves = run List<VecMove>.makeWithCapacity(args.length)
+  let mut i = usize.ZERO
+  while i < args.length {
+    let dstParam = params[i]
+    let dstKind = function.value(dstParam).kind
+    let isVec = AArch64Frame.isVec128(dstKind)
+    let isScalarFp = !dstKind.isVector() && dstKind.isFloat()
+    if isVec || isScalarFp {
+      let width: usize = if isVec { 16 } else if dstKind.bits == 64 { 8 } else { 4 }
+      let dstReg = valVec(&em.*, dstParam)
+      let dstOff = valOff(&em.*, dstParam)
+      if dstReg != AArch64Frame.regNone() || dstOff != 0 {
+        let dstIsReg = dstReg != AArch64Frame.regNone()
+        let srcVal = args[i]
+        let srcInfo = function.value(srcVal)
+        let mut srcKind: u8 = 3
+        let mut srcReg: u8 = AArch64Frame.regNone()
+        let mut srcOff: i64 = 0
+        if srcInfo.definition == Definition.Constant {
+          srcKind = 2
+        } else {
+          let sr = valVec(&em.*, srcVal)
+          if sr != AArch64Frame.regNone() {
+            srcKind = 0
+            srcReg = sr
+          } else {
+            let so = valOff(&em.*, srcVal)
+            if so != 0 {
+              srcKind = 1
+              srcOff = so
+            }
+          }
+        }
+        let isNoOp = (dstIsReg && srcKind == 0 && srcReg == dstReg) || (!dstIsReg && srcKind == 1 && srcOff == dstOff)
+        if !isNoOp {
+          run List<VecMove>.append(&mut moves, VecMove {
+            srcKind: srcKind, srcVal: srcVal, srcReg: srcReg, srcOff: srcOff,
+            dstIsReg: dstIsReg, dstReg: dstReg, dstOff: dstOff, width: width, done: false,
+          })
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+
+  let ms = List<VecMove>.asMutSlice(&mut moves)
+  let mut remaining = ms.length
+  while remaining > usize.ZERO {
+    let mut ready = usize.MAX
+    let mut k = usize.ZERO
+    while k < ms.length {
+      if !ms[k].done {
+        let mut blocked = false
+        let mut m = usize.ZERO
+        while m < ms.length {
+          if m != k && !ms[m].done {
+            if ms[k].dstIsReg {
+              if ms[m].srcKind == 0 && ms[m].srcReg == ms[k].dstReg {
+                blocked = true
+                break
+              }
+            } else {
+              if ms[m].srcKind == 1 && ms[m].srcOff == ms[k].dstOff {
+                blocked = true
+                break
+              }
+            }
+          }
+          m = m + usize.ONE
+        }
+        if !blocked {
+          ready = k
+          break
+        }
+      }
+      k = k + usize.ONE
+    }
+
+    if ready != usize.MAX {
+      let mv = ms[ready]
+      ms[ready].done = true
+      remaining = remaining - usize.ONE
+      run emitSingleVecMove(&mut em.*, function, mv)
+    } else {
+      let mut pick = usize.ZERO
+      while pick < ms.length && (ms[pick].done || ms[pick].srcKind > 1) {
+        pick = pick + usize.ONE
+      }
+      if pick >= ms.length {
+        pick = usize.ZERO
+        while pick < ms.length && ms[pick].done { pick = pick + usize.ONE }
+      }
+      let mv = ms[pick]
+      if mv.dstIsReg {
+        run AArch64Encode.movVec(&mut em.code, cycleVec, mv.dstReg)
+      } else {
+        run emitBaseDispLoadFp(&mut em.*, mv.width, cycleVec, AArch64Encode.fp(), mv.dstOff)
+      }
+      ms[pick].done = true
+      remaining = remaining - usize.ONE
+      run emitSingleVecMove(&mut em.*, function, mv)
+      let mut m = usize.ZERO
+      while m < ms.length {
+        if !ms[m].done {
+          if mv.dstIsReg && ms[m].srcKind == 0 && ms[m].srcReg == mv.dstReg {
+            ms[m].srcKind = 0
+            ms[m].srcReg = cycleVec
+          } else if !mv.dstIsReg && ms[m].srcKind == 1 && ms[m].srcOff == mv.dstOff {
+            ms[m].srcKind = 0
+            ms[m].srcReg = cycleVec
+          }
+        }
+        m = m + usize.ONE
+      }
+    }
+  }
+  return ()
+}
+
 effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let args = List<u64>.asSlice(&edge.arguments)
@@ -5484,18 +6549,51 @@ effect fn emitEdgeCopies(em: &mut Emitter, function: &SsaFunction, edge: &Edge) 
   if args.length == usize.ONE {
     return run copyValueToParam(&mut em.*, function, args[0], params[0])
   }
-  let mut allGp = true
+  let mut canParallel = true
+  let mut hasGp = false
+  let mut hasVec = false
   let mut i = usize.ZERO
   while i < args.length {
     let k = function.value(params[i]).kind
-    if !k.isUnit() && (k.isVector() || k.isFloat() || k.bits > 64) {
-      allGp = false
-      break
+    if !k.isUnit() {
+      if !k.isVector() && !k.isFloat() && k.bits <= 64 {
+        hasGp = true
+      } else if AArch64Frame.isVec128(k) || (!k.isVector() && k.isFloat() && (k.bits == 32 || k.bits == 64)) {
+        hasVec = true
+      } else {
+        canParallel = false
+        break
+      }
     }
     i = i + usize.ONE
   }
-  if allGp {
-    return run emitParallelGpMoves(&mut em.*, function, args, params)
+  if canParallel {
+    if !hasVec {
+      return run emitParallelGpMoves(&mut em.*, function, args, params)
+    }
+    if !hasGp {
+      return run emitParallelVecMoves(&mut em.*, function, args, params)
+    }
+    let mut gpArgs = List<u64>.make()
+    let mut gpParams = List<u64>.make()
+    let mut vecArgs = List<u64>.make()
+    let mut vecParams = List<u64>.make()
+    i = usize.ZERO
+    while i < args.length {
+      let k = function.value(params[i]).kind
+      if !k.isUnit() {
+        if !k.isVector() && !k.isFloat() && k.bits <= 64 {
+          run List<u64>.append(&mut gpArgs, args[i])
+          run List<u64>.append(&mut gpParams, params[i])
+        } else {
+          run List<u64>.append(&mut vecArgs, args[i])
+          run List<u64>.append(&mut vecParams, params[i])
+        }
+      }
+      i = i + usize.ONE
+    }
+    run emitParallelGpMoves(&mut em.*, function, List<u64>.asSlice(&gpArgs), List<u64>.asSlice(&gpParams))
+    return run emitParallelVecMoves(&mut em.*, function, List<u64>.asSlice(&vecArgs), List<u64>.asSlice(&vecParams))
   }
 
   // Mixed GP / FP / i128 / vector edge fallback: stage all values on `sp` (16-byte aligned).
@@ -5738,6 +6836,22 @@ effect fn loadVec128(em: &mut Emitter, function: &SsaFunction, value: u64, dstV:
     }
     return ()
   }
+  // Rematerialize spilled `Splat(0)` on any `isVec128` or `Splat(constByte)` on `v16xi8` in 1 cycle (`movi`).
+  if AArch64Frame.isVec128(info.kind) {
+    let prod = function.producerOf(value)
+    if prod != usize.MAX {
+      if let Operation.Splat {..} = function.instruction(prod).operation {
+        let sOps = function.operandsOf(prod)
+        if sOps.length >= usize.ONE && function.isBits(sOps[0]) {
+          let low = function.constantOf(sOps[0]).low
+          if low == 0 { return run AArch64Encode.moviZero(&mut em.code, dstV) }
+          if info.kind.bits == 8 {
+            return run AArch64Encode.moviByte(&mut em.code, dstV, u64.wrappingToU8(low))
+          }
+        }
+      }
+    }
+  }
   let off = valOff(&em.*, value)
   if off == 0 {
     return run AArch64Encode.moviZero(&mut em.code, dstV)
@@ -5767,6 +6881,30 @@ effect fn storeVec128(em: &mut Emitter, result: u64, srcV: u8) -> () ! OutOfMemo
   let off = valOff(&em.*, result)
   if off == 0 { return () }
   return run emitBaseDispStoreFp(&mut em.*, 16, srcV, AArch64Encode.fp(), off)
+}
+
+effect fn loadNeonMask128(em: &mut Emitter, function: &SsaFunction, value: u64, dstV: u8) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition == Definition.Constant {
+    let c = function.constantOf(value)
+    if (c.low & 1) != 0 {
+      return run AArch64Encode.moviByte(&mut em.code, dstV, 0xFF)
+    }
+    return run AArch64Encode.moviZero(&mut em.code, dstV)
+  }
+  return run loadVec128(&mut em.*, function, value, dstV)
+}
+
+effect fn neonMaskRegOrLoad128(em: &mut Emitter, function: &SsaFunction, value: u64, scratchV: u8) -> u8
+! OutOfMemoryError ? &mut Allocator {
+  let info = function.value(value)
+  if info.definition != Definition.Constant {
+    let homeV = valVec(&em.*, value)
+    if homeV != AArch64Frame.regNone() { return homeV }
+  }
+  run loadNeonMask128(&mut em.*, function, value, scratchV)
+  return scratchV
 }
 
 effect fn vectorAddr(em: &mut Emitter, function: &SsaFunction, value: u64, dstGp: u8) -> ()
@@ -6216,6 +7354,20 @@ effect fn emitVectorBinary(
   result: u64,
 ) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let sz = kind.storeSize()
+  // Native 128-bit NEON-resident mask bitwise ops (`and.16b` / `orr.16b` / `eor.16b`).
+  if valNeonMask(&em.*, result) && (op == Binary.And || op == Binary.Or || op == Binary.Xor) {
+    let rDst = valVec(&em.*, result)
+    let dstOff = valOff(&em.*, result)
+    if rDst == AArch64Frame.regNone() && dstOff == 0 { return () }
+    let vL = run neonMaskRegOrLoad128(&mut em.*, function, left, AArch64Frame.scratchVecPair0())
+    let vR = run neonMaskRegOrLoad128(&mut em.*, function, right, AArch64Frame.scratchVecPair1())
+    let dstV = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchVecTmp() }
+    if op == Binary.And { run AArch64Encode.vecAnd(&mut em.code, dstV, vL, vR) }
+    else if op == Binary.Or { run AArch64Encode.vecOrr(&mut em.code, dstV, vL, vR) }
+    else { run AArch64Encode.vecEor(&mut em.code, dstV, vL, vR) }
+    return run storeVec128(&mut em.*, result, dstV)
+  }
+
   // Fast scalar bitwise operations for bit-packed `mask<N>` vectors (`bits == 1`, `N <= 64`).
   if kind.bits == 1 && kind.elements <= 64 && (sz == 1 || sz == 2 || sz == 4 || sz == 8)
     && (op == Binary.And || op == Binary.Or || op == Binary.Xor) {
@@ -6470,8 +7622,14 @@ effect fn emitVectorCompare(
   right: u64,
   result: u64,
 ) -> () ! OutOfMemoryError ? &mut Allocator {
+  let isNeonMask = valNeonMask(&em.*, result)
+  let rDst = valVec(&em.*, result)
   let dstOff = valOff(&em.*, result)
-  if dstOff == 0 { return () }
+  if isNeonMask {
+    if rDst == AArch64Frame.regNone() && dstOff == 0 { return () }
+  } else if dstOff == 0 {
+    return ()
+  }
   let maskKind = opKind.flags()
 
   // Native 128-bit NEON fast path for all six 128-bit vector shapes (`v16xi8`, `v8xi16`, `v4xi32`, `v2xi64`, `v4xf32`, `v2xf64`).
@@ -6480,7 +7638,11 @@ effect fn emitVectorCompare(
     let laneBytes = opKind.bits / 8
     let vL = run vecRegOrLoad128(&mut em.*, function, left, AArch64Frame.scratchVecPair0())
     let vR = run vecRegOrLoad128(&mut em.*, function, right, AArch64Frame.scratchVecPair1())
-    let resV = AArch64Frame.scratchVecTmp()
+    let resV = if isNeonMask && rDst != AArch64Frame.regNone() && rDst != vL && rDst != vR {
+      rDst
+    } else {
+      AArch64Frame.scratchVecTmp()
+    }
     let tmpV = AArch64Frame.scratchVecMask()
     if opKind.isInteger() {
       match pred {
@@ -6550,6 +7712,9 @@ effect fn emitVectorCompare(
           run AArch64Encode.vecNot(&mut em.code, resV, resV)
         }
       }
+    }
+    if isNeonMask {
+      return run storeVec128(&mut em.*, result, resV)
     }
     let outGp = AArch64Frame.scratchGpVal()
     run emitNeonMaskExtractToGp(&mut em.*, laneBytes, resV, outGp)
@@ -6663,6 +7828,15 @@ effect fn emitVectorSelect(
       return run storeVec128(&mut em.*, result, dstV)
     }
     if condKind.bits == 1 && condKind.elements == kind.elements {
+      if valNeonMask(&em.*, cond) {
+        let dstV = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchVecTmp() }
+        let vY = run vecRegOrLoad128(&mut em.*, function, yes, AArch64Frame.scratchVecPair0())
+        let vN = run vecRegOrLoad128(&mut em.*, function, no, AArch64Frame.scratchVecPair1())
+        let maskV = if dstV != vY && dstV != vN { dstV } else { AArch64Frame.scratchVecMask() }
+        run loadNeonMask128(&mut em.*, function, cond, maskV)
+        run AArch64Encode.vecBsl(&mut em.code, maskV, vY, vN)
+        return run storeVec128(&mut em.*, result, maskV)
+      }
       let laneBytes = kind.bits / 8
       let maskV = AArch64Frame.scratchVecMask()
       run emitExpandMaskToNeon(&mut em.*, function, cond, laneBytes, maskV)
@@ -6957,10 +8131,20 @@ effect fn emitVectorRotate(
       } else {
         let shlAmt = u64.wrappingToU8(if left { k } else { width - k })
         let shrAmt = u64.wrappingToU8(width - u8.toU64(shlAmt))
-        let tmpV = AArch64Frame.scratchVecPair1()
-        run AArch64Encode.vecUshrImm(&mut em.code, laneBytes, tmpV, vSrc, shrAmt)
-        run AArch64Encode.vecShlImm(&mut em.code, laneBytes, dstV, vSrc, shlAmt)
-        run AArch64Encode.vecOrr(&mut em.code, dstV, dstV, tmpV)
+        if laneBytes == 4 && shlAmt == 16 {
+          run AArch64Encode.vecRev32(&mut em.code, 2, dstV, vSrc)
+        } else if laneBytes == 8 && shlAmt == 32 {
+          run AArch64Encode.vecRev64(&mut em.code, 4, dstV, vSrc)
+        } else if laneBytes == 2 && shlAmt == 8 {
+          run AArch64Encode.vecRev16(&mut em.code, dstV, vSrc)
+        } else {
+          // 2-instruction NEON rotate: `shl workV, vSrc, #shlAmt` + `sri workV, vSrc, #shrAmt`.
+          // `workV` must not alias `vSrc` because `sri` reads `vSrc` after `shl` writes `workV`.
+          let workV = if dstV != vSrc { dstV } else { AArch64Frame.scratchVecTmp() }
+          run AArch64Encode.vecShlImm(&mut em.code, laneBytes, workV, vSrc, shlAmt)
+          run AArch64Encode.vecSriImm(&mut em.code, laneBytes, workV, vSrc, shrAmt)
+          return run storeVec128(&mut em.*, result, workV)
+        }
       }
       return run storeVec128(&mut em.*, result, dstV)
     }
@@ -7181,6 +8365,26 @@ effect fn emitVectorFma(
 
 effect fn emitSplat(em: &mut Emitter, function: &SsaFunction, kind: Kind, scalar: u64, result: u64) -> ()
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
+  if valNeonMask(&em.*, result) {
+    let rDst = valVec(&em.*, result)
+    let dstOff = valOff(&em.*, result)
+    if rDst == AArch64Frame.regNone() && dstOff == 0 { return () }
+    let dstV = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchVecTmp() }
+    if function.isBits(scalar) {
+      if (function.constantOf(scalar).low & 1) != 0 {
+        run AArch64Encode.moviByte(&mut em.code, dstV, 0xFF)
+      } else {
+        run AArch64Encode.moviZero(&mut em.code, dstV)
+      }
+    } else {
+      let sGp = run regOrLoad(&mut em.*, function, scalar, AArch64Frame.scratchGpVal())
+      let ignored = run AArch64Encode.tryTstImm(&mut em.code, true, sGp, 1)
+      drop ignored
+      run AArch64Encode.csetm(&mut em.code, false, AArch64Frame.scratchGpVal(), AArch64Encode.ccNe())
+      run AArch64Encode.dupGp(&mut em.code, 1, dstV, AArch64Frame.scratchGpVal())
+    }
+    return run storeVec128(&mut em.*, result, dstV)
+  }
   if AArch64Frame.isVec128(kind) {
     let rDst = valVec(&em.*, result)
     let dstOff = valOff(&em.*, result)
@@ -7190,6 +8394,10 @@ effect fn emitSplat(em: &mut Emitter, function: &SsaFunction, kind: Kind, scalar
     if kind.isFloat() {
       let srcV = run fpRegOrLoad(&mut em.*, function, scalar, AArch64Frame.scratchVecPair0(), AArch64Frame.scratchGpVal())
       run AArch64Encode.dupElem(&mut em.code, laneBytes, dstV, srcV, 0)
+    } else if function.isBits(scalar) && function.constantOf(scalar).low == 0 {
+      run AArch64Encode.moviZero(&mut em.code, dstV)
+    } else if kind.bits == 8 && function.isBits(scalar) {
+      run AArch64Encode.moviByte(&mut em.code, dstV, u64.wrappingToU8(function.constantOf(scalar).low))
     } else {
       let srcGp = run regOrLoad(&mut em.*, function, scalar, AArch64Frame.scratchGpVal())
       run AArch64Encode.dupGp(&mut em.code, laneBytes, dstV, srcGp)
@@ -7335,9 +8543,125 @@ effect fn emitShuffle(
       }
       lane = lane + usize.ONE
     }
+    let dstV = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchVecTmp() }
+    // Recognize contiguous 16-byte slide `[k, k+1, ..., k+15]` -> single `movVec` or `ext.16b`!
+    let startByte = idxBuf[0]
+    if startByte <= 16 {
+      let mut isContig = true
+      let mut b = usize.ONE
+      while b < 16 {
+        if idxBuf[b] != startByte + usize.toU8(b) {
+          isContig = false
+          break
+        }
+        b = b + usize.ONE
+      }
+      if isContig {
+        if startByte == 0 {
+          run loadVec128(&mut em.*, function, first, dstV)
+          return run storeVec128(&mut em.*, result, dstV)
+        }
+        if startByte == 16 {
+          run loadVec128(&mut em.*, function, second, dstV)
+          return run storeVec128(&mut em.*, result, dstV)
+        }
+        let vA = run vecRegOrLoad128(&mut em.*, function, first, AArch64Frame.scratchVecPair0())
+        let vB = run vecRegOrLoad128(&mut em.*, function, second, AArch64Frame.scratchVecPair1())
+        run AArch64Encode.vecExt(&mut em.code, dstV, vA, vB, startByte)
+        return run storeVec128(&mut em.*, result, dstV)
+      }
+    }
+    // Recognize single-vector byte rotation `[k, ..., 15, 0, ..., k-1]` (e.g., `u64x2.shuffle(x, x, [1, 0])`) -> `ext.16b dst, vA, vA, #k`!
+    if !usesSecond && startByte >= 1 && startByte < 16 {
+      let mut isRot = true
+      let mut b = usize.ONE
+      while b < 16 {
+        if idxBuf[b] != ((startByte + usize.toU8(b)) & 15) {
+          isRot = false
+          break
+        }
+        b = b + usize.ONE
+      }
+      if isRot {
+        let vA = run vecRegOrLoad128(&mut em.*, function, first, AArch64Frame.scratchVecPair0())
+        run AArch64Encode.vecExt(&mut em.code, dstV, vA, vA, startByte)
+        return run storeVec128(&mut em.*, result, dstV)
+      }
+    }
+    // Recognize single-vector byte/lane reverses without any rodata load or `tbl`:
+    // - 16-byte reverse `[15..0]` -> `rev64.16b` + `ext.16b #8` (AES-CTR / GHASH)
+    // - per-64-bit / per-32-bit / per-16-bit byte reverse, and 32-bit word swap in 64-bit lanes.
+    if !usesSecond {
+      let mut isRev128 = true
+      let mut isRev64B = true
+      let mut isRev32B = true
+      let mut isRev16B = true
+      let mut isRev64W = true
+      let mut b = usize.ZERO
+      while b < 16 {
+        let bu = usize.toU8(b)
+        let v = idxBuf[b]
+        if v != 15 - bu { isRev128 = false }
+        if v != (bu ^ 7) { isRev64B = false }
+        if v != (bu ^ 3) { isRev32B = false }
+        if v != (bu ^ 1) { isRev16B = false }
+        if v != (bu ^ 4) { isRev64W = false }
+        b = b + usize.ONE
+      }
+      if isRev128 || isRev64B || isRev32B || isRev16B || isRev64W {
+        let vA = run vecRegOrLoad128(&mut em.*, function, first, AArch64Frame.scratchVecPair0())
+        if isRev128 {
+          run AArch64Encode.vecRev64(&mut em.code, 1, dstV, vA)
+          run AArch64Encode.vecExt(&mut em.code, dstV, dstV, dstV, 8)
+        } else if isRev64B {
+          run AArch64Encode.vecRev64(&mut em.code, 1, dstV, vA)
+        } else if isRev32B {
+          run AArch64Encode.vecRev32(&mut em.code, 1, dstV, vA)
+        } else if isRev16B {
+          run AArch64Encode.vecRev16(&mut em.code, dstV, vA)
+        } else {
+          run AArch64Encode.vecRev64(&mut em.code, 4, dstV, vA)
+        }
+        return run storeVec128(&mut em.*, result, dstV)
+      }
+    }
+    // Recognize two-vector 64-bit zips (`zip1.2d` / `zip2.2d` in either operand order — GHASH!).
+    if usesSecond {
+      let mut isZip1AB = true
+      let mut isZip1BA = true
+      let mut isZip2AB = true
+      let mut isZip2BA = true
+      let mut b = usize.ZERO
+      while b < 16 {
+        let bu = usize.toU8(b)
+        let v = idxBuf[b]
+        let z1ab = if b < 8 { bu } else { bu + 8 }
+        let z1ba = if b < 8 { bu + 16 } else { bu - 8 }
+        let z2ab = if b < 8 { bu + 8 } else { bu + 16 }
+        let z2ba = if b < 8 { bu + 24 } else { bu }
+        if v != z1ab { isZip1AB = false }
+        if v != z1ba { isZip1BA = false }
+        if v != z2ab { isZip2AB = false }
+        if v != z2ba { isZip2BA = false }
+        b = b + usize.ONE
+      }
+      if isZip1AB || isZip1BA || isZip2AB || isZip2BA {
+        let vA = run vecRegOrLoad128(&mut em.*, function, first, AArch64Frame.scratchVecPair0())
+        let vB = run vecRegOrLoad128(&mut em.*, function, second, AArch64Frame.scratchVecPair1())
+        if isZip1AB {
+          run AArch64Encode.vecZip1(&mut em.code, 8, dstV, vA, vB)
+        } else if isZip1BA {
+          run AArch64Encode.vecZip1(&mut em.code, 8, dstV, vB, vA)
+        } else if isZip2AB {
+          run AArch64Encode.vecZip2(&mut em.code, 8, dstV, vA, vB)
+        } else {
+          run AArch64Encode.vecZip2(&mut em.code, 8, dstV, vB, vA)
+        }
+        return run storeVec128(&mut em.*, result, dstV)
+      }
+    }
     let idxV = AArch64Frame.scratchVecMask()
     run loadRodata16Vec(&mut em.*, idxV, Bytes.asSlice(&idxBytes))
-    let dstV = if rDst != AArch64Frame.regNone() { rDst } else { AArch64Frame.scratchVecTmp() }
     if !usesSecond {
       let srcV = run vecRegOrLoad128(&mut em.*, function, first, AArch64Frame.scratchVecPair0())
       run AArch64Encode.vecTbl(&mut em.code, dstV, srcV, idxV)
@@ -7385,6 +8709,45 @@ effect fn emitShuffle(
   return ()
 }
 
+fn isSoleUseZeroCompare(em: &Emitter, function: &SsaFunction, value: u64) -> bool {
+  if value == none() { return false }
+  let vIdx = u64.toUsize(value)
+  let uses = List<usize>.asSlice(&em.frame.valueUses)
+  if vIdx >= uses.length || uses[vIdx] != usize.ONE { return false }
+  let prod = function.producerOf(value)
+  if prod == usize.MAX { return false }
+  let blkIdx = em.currentBlock
+  if blkIdx >= function.blockCount() { return false }
+  let blk = function.block(blkIdx)
+  let insts = List<usize>.asSlice(&blk.instructions)
+  let mut seen = false
+  let mut i = usize.ZERO
+  while i < insts.length {
+    let idx = insts[i]
+    if idx == prod {
+      seen = true
+    } else if seen {
+      let inst = function.instruction(idx)
+      if !inst.removed {
+        if let Operation.Compare {predicate} = inst.operation {
+          if predicate == Predicate.Eq || predicate == Predicate.Ne {
+            let ops = function.operandsOf(idx)
+            if ops.length >= 2 {
+              let bits = function.value(value).kind.bits
+              if (ops[0] == value && isConstantZeroBits(function, ops[1], bits))
+                || (ops[1] == value && isConstantZeroBits(function, ops[0], bits)) {
+                return true
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+  return false
+}
+
 effect fn emitReduce(
   em: &mut Emitter,
   function: &SsaFunction,
@@ -7397,6 +8760,22 @@ effect fn emitReduce(
   let vecKind = function.value(vecVal).kind
   let isFloat = kind.isFloat()
   let vecSz = vecKind.storeSize()
+
+  // Native 128-bit NEON-resident mask `any` (`Or`) and `all` (`And`) reductions (`umaxv`/`uminv` + `umov` + `and #1`).
+  if initVal == none() && !isFloat && valNeonMask(&em.*, vecVal) && (which == Reduction.Or || which == Reduction.And) {
+    let dst = dstRegOrScratch(&em.*, result, AArch64Frame.scratchGpVal())
+    let vSrc = run neonMaskRegOrLoad128(&mut em.*, function, vecVal, AArch64Frame.scratchVecPair0())
+    let tmpV = AArch64Frame.scratchVecTmp()
+    if which == Reduction.Or {
+      run AArch64Encode.vecUmaxv(&mut em.code, 1, tmpV, vSrc)
+    } else {
+      run AArch64Encode.vecUminv(&mut em.code, 1, tmpV, vSrc)
+    }
+    run AArch64Encode.umov(&mut em.code, 1, dst, tmpV, 0)
+    let ignored = run AArch64Encode.tryAndImm(&mut em.code, false, dst, dst, 1)
+    drop ignored
+    return run storeGp(&mut em.*, result, dst)
+  }
 
   // Fast scalar `any` (`Or`) and `all` (`And`) reductions on bit-packed `mask<N>` vectors.
   if initVal == none() && !isFloat && vecKind.bits == 1 && vecKind.elements <= 64
@@ -7458,6 +8837,13 @@ effect fn emitReduce(
         return run storeGp(&mut em.*, result, dst)
       }
       if which == Reduction.And || which == Reduction.Or || which == Reduction.Xor || which == Reduction.Mul {
+        // When `Reduce(Or)` on `v16xi8`/`v8xi16`/`v4xi32` is only compared against `0`,
+        // `umaxv` is 0 iff all lanes are 0 (2 insns instead of 10!).
+        if which == Reduction.Or && isSoleUseZeroCompare(&em.*, function, result) {
+          run AArch64Encode.vecUmaxv(&mut em.code, laneBytes, tmpV, vSrc)
+          run AArch64Encode.umov(&mut em.code, laneBytes, dst, tmpV, 0)
+          return run storeGp(&mut em.*, result, dst)
+        }
         // Tree-reduce 16 bytes -> `laneBytes` inside `v31` using `ext` + vector op (zero memory!).
         let tmp2 = AArch64Frame.scratchVecPair1()
         run AArch64Encode.movVec(&mut em.code, tmpV, vSrc)
