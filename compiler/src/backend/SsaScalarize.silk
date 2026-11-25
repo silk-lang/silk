@@ -1,0 +1,524 @@
+//! Scalarizes closed small fixed-width vector graphs (2 to 4 lanes of 32- or 64-bit scalars, plus
+//! matching comparison flag vectors) into ordinary scalar SSA operations.
+//!
+//! # When to use
+//! Run [`lower`] on targets without native 128-bit SIMD (such as baseline WebAssembly without
+//! `simd128`), after `SsaPackedBytes.lower` and before the final scalar optimization rounds.
+//! Turning `u32x4` / `u64x2` / `f32x4` / `f64x2` graphs into scalar SSA turns `Splat` constants
+//! into immediates, eliminates `Shuffle`/`Extract`/`Insert` copies completely, and lets downstream
+//! value numbering and stackification operate on every lane.
+
+import backend.SsaFunction {
+  Binary,
+  Cast,
+  Definition,
+  Edge,
+  Extreme,
+  Kind,
+  Operation,
+  Reduction,
+  SsaFunction,
+  none,
+}
+import backend.SsaGraph {SsaGraph}
+import silk.collections.list {List}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.num.u64
+import silk.num.usize
+
+fn isScalarizableKind(kind: Kind) -> bool {
+  if !kind.isVector() || kind.isAddress() { return false }
+  if kind.elements < 2 || kind.elements > 4 { return false }
+  return kind.bits == 32 || kind.bits == 64 || kind.bits == usize.ONE
+}
+
+fn isMemoryVectorKind(kind: Kind) -> bool {
+  return isScalarizableKind(kind) && kind.bits >= 32
+}
+
+fn isZeroVectorConstant(function: &SsaFunction, value: u64) -> bool {
+  if !function.isBits(value) { return false }
+  let c = function.constantOf(value)
+  return c.low == 0 && c.high == 0
+}
+
+fn canScalarizeProducer(function: &SsaFunction, id: usize) -> bool {
+  let inst = function.instruction(id)
+  if inst.removed || inst.result == none() || inst.resultCount() != usize.ONE { return false }
+  let kind = inst.kind
+  if !isScalarizableKind(kind) { return false }
+  let ops = function.operandsOf(id)
+  return match inst.operation {
+    Operation.Load {offset, ..} => isMemoryVectorKind(kind) && offset <= 4294967264
+    Operation.Splat {count} => count == kind.elements && ops.length == usize.ONE && !function.kindOf(ops[usize.ZERO]).isVector()
+    Operation.Shuffle {count, ..} => {
+      if count != kind.elements || ops.length != 2 { false }
+      else {
+        let ak = function.kindOf(ops[usize.ZERO])
+        let bk = function.kindOf(ops[usize.ONE])
+        ak.equals(bk) && isScalarizableKind(ak) && ak.element().equals(kind.element())
+      }
+    }
+    Operation.Insert => ops.length == 3 && function.isBits(ops[2])
+    Operation.Binary {..} => ops.length == 2
+    Operation.Negate => ops.length == usize.ONE
+    Operation.Compare {..} => ops.length == 2 && isScalarizableKind(function.kindOf(ops[usize.ZERO])) && function.kindOf(ops[usize.ZERO]).elements == kind.elements
+    Operation.Select => {
+      if ops.length != 3 { false }
+      else {
+        let ck = function.kindOf(ops[usize.ZERO])
+        let scalarFlag = !ck.isVector() && ck.isInteger() && ck.bits == usize.ONE
+        scalarFlag || (isScalarizableKind(ck) && ck.elements == kind.elements)
+      }
+    }
+    Operation.Cast {operation} => {
+      if ops.length != usize.ONE { false }
+      else {
+        let sk = function.kindOf(ops[usize.ZERO])
+        isScalarizableKind(sk) && sk.elements == kind.elements && (operation != Cast.Bitcast || sk.bits == kind.bits)
+      }
+    }
+    Operation.Rotate {..} => ops.length == 2
+    Operation.Count {..} => ops.length == usize.ONE
+    Operation.Extreme {..} => ops.length == 2
+    Operation.Saturate {..} => ops.length == 2
+    Operation.SquareRoot => ops.length == usize.ONE
+    Operation.FusedMultiplyAdd => ops.length == 3
+    _ => false
+  }
+}
+
+fn canScalarizeConsumer(function: &SsaFunction, id: usize) -> bool {
+  let inst = function.instruction(id)
+  if inst.removed { return true }
+  let ops = function.operandsOf(id)
+  return match inst.operation {
+    Operation.Store {offset, ..} => ops.length == 2 && isMemoryVectorKind(function.kindOf(ops[usize.ZERO])) && offset <= 4294967264
+    Operation.Extract => ops.length == 2 && function.isBits(ops[usize.ONE]) && !inst.kind.isVector()
+    Operation.Reduce {which} => {
+      if ops.length < usize.ONE || ops.length > 2 || !isScalarizableKind(function.kindOf(ops[usize.ZERO])) { false }
+      else {
+        which == Reduction.Add || which == Reduction.Mul || which == Reduction.And || which == Reduction.Or || which == Reduction.Xor
+          || which == Reduction.FloatAdd || which == Reduction.FloatMul || which == Reduction.FloatMinimum || which == Reduction.FloatMaximum
+          || which == Reduction.SignedMinimum || which == Reduction.SignedMaximum || which == Reduction.UnsignedMinimum || which == Reduction.UnsignedMaximum
+      }
+    }
+    _ => canScalarizeProducer(function, id)
+  }
+}
+
+fn markValueIneligible(eligible: &mut List<bool>, value: u64, changed: &mut bool) -> () {
+  if value == none() { return () }
+  let idx = u64.toUsize(value)
+  if idx < List<bool>.length(&eligible.*) && List<bool>.get(&eligible.*, idx) {
+    List<bool>.set(&mut eligible.*, idx, false)
+    changed.* = true
+  }
+  return ()
+}
+
+effect fn laneOf(
+  function: &mut SsaFunction,
+  lanes: &[u64],
+  value: u64,
+  lane: usize,
+) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let kind = function.kindOf(value)
+  if !kind.isVector() { return value }
+  if function.isBits(value) { return run function.constant(kind.element(), 0) }
+  return lanes[u64.toUsize(value) * 4 + lane]
+}
+
+/// Scalarizes closed small fixed-width vector graphs in `function`; answers whether it changed
+/// anything.
+pub effect fn lower(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let valueCount = function.valueCount()
+  if valueCount == usize.ZERO { return false }
+  let mut anyCandidate = false
+  let mut eligible = run List<bool>.makeWithCapacity(valueCount)
+  let mut v = usize.ZERO
+  while v < valueCount {
+    let val = usize.toU64(v)
+    let kind = function.kindOf(val)
+    let mut ok = false
+    if isScalarizableKind(kind) {
+      let info = function.value(val)
+      if info.definition == Definition.Constant {
+        ok = isZeroVectorConstant(&function.*, val)
+      } else if info.definition == Definition.Parameter {
+        ok = graph.reaches(info.owner)
+      } else if info.definition != Definition.Argument {
+        let prod = function.producerOf(val)
+        if prod != usize.MAX && graph.reaches(function.instruction(prod).block) {
+          ok = canScalarizeProducer(&function.*, prod)
+        }
+      }
+    }
+    if ok && !function.isConstant(val) { anyCandidate = true }
+    run List<bool>.append(&mut eligible, ok)
+    v = v + usize.ONE
+  }
+  if !anyCandidate { return false }
+
+  // Fixed-point closure: a vector value stays eligible iff every producer and consumer in its
+  // connected component (including block parameters and edges) is eligible.
+  let blockCount = function.blockCount()
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut b = usize.ZERO
+    while b < blockCount {
+      let blk = function.block(b)
+      let reachable = graph.reaches(b)
+      let listed = List<usize>.asSlice(&blk.instructions)
+      let mut i = usize.ZERO
+      while i < listed.length {
+        let id = listed[i]
+        i = i + usize.ONE
+        let inst = function.instruction(id)
+        if inst.removed { continue }
+        let ops = function.operandsOf(id)
+        let resEligible = inst.result != none() && u64.toUsize(inst.result) < valueCount && List<bool>.get(&eligible, u64.toUsize(inst.result))
+        let opOk = reachable && canScalarizeConsumer(&function.*, id)
+        if !opOk {
+          markValueIneligible(&mut eligible, inst.result, &mut changed)
+          let mut k = usize.ZERO
+          while k < ops.length {
+            if function.kindOf(ops[k]).isVector() { markValueIneligible(&mut eligible, ops[k], &mut changed) }
+            k = k + usize.ONE
+          }
+        } else {
+          // If the instruction produces a vector whose result became ineligible, or any vector
+          // operand is ineligible, mark the result and all vector operands ineligible.
+          let mut bad = inst.result != none() && function.kindOf(inst.result).isVector() && !resEligible
+          let mut k = usize.ZERO
+          while k < ops.length {
+            if function.kindOf(ops[k]).isVector() {
+              let opIdx = u64.toUsize(ops[k])
+              if opIdx >= valueCount || !List<bool>.get(&eligible, opIdx) { bad = true }
+            }
+            k = k + usize.ONE
+          }
+          if bad {
+            markValueIneligible(&mut eligible, inst.result, &mut changed)
+            k = usize.ZERO
+            while k < ops.length {
+              if function.kindOf(ops[k]).isVector() { markValueIneligible(&mut eligible, ops[k], &mut changed) }
+              k = k + usize.ONE
+            }
+          }
+        }
+      }
+      // Exits never take scalarized vectors.
+      markValueIneligible(&mut eligible, blk.value, &mut changed)
+      markValueIneligible(&mut eligible, blk.secondValue, &mut changed)
+      markValueIneligible(&mut eligible, blk.thirdValue, &mut changed)
+      markValueIneligible(&mut eligible, blk.fourthValue, &mut changed)
+      // Edges tie argument eligibility to target parameter eligibility.
+      let edges = List<Edge>.asSlice(&blk.edges)
+      let mut e = usize.ZERO
+      while e < edges.length {
+        let dst = edges[e].block
+        let dstParams = List<u64>.asSlice(&function.block(dst).parameters)
+        let args = List<u64>.asSlice(&edges[e].arguments)
+        let mut p = usize.ZERO
+        while p < args.length && p < dstParams.length {
+          let arg = args[p]
+          let parameter = dstParams[p]
+          if function.kindOf(parameter).isVector() {
+            let argOk = reachable && u64.toUsize(arg) < valueCount && List<bool>.get(&eligible, u64.toUsize(arg))
+            let paramOk = graph.reaches(dst) && u64.toUsize(parameter) < valueCount && List<bool>.get(&eligible, u64.toUsize(parameter))
+            if !argOk || !paramOk {
+              markValueIneligible(&mut eligible, arg, &mut changed)
+              markValueIneligible(&mut eligible, parameter, &mut changed)
+            }
+          }
+          p = p + usize.ONE
+        }
+        e = e + usize.ONE
+      }
+      b = b + usize.ONE
+    }
+  }
+
+  let mut liveCount = usize.ZERO
+  v = usize.ZERO
+  while v < valueCount {
+    let val = usize.toU64(v)
+    if List<bool>.get(&eligible, v) && !function.isConstant(val) { liveCount = liveCount + usize.ONE }
+    v = v + usize.ONE
+  }
+  if liveCount == usize.ZERO { return false }
+
+  // Allocate lane table: 4 scalar SSA values per original SSA value.
+  let mut lanes = run List<u64>.makeWithCapacity(valueCount * 4)
+  run List<u64>.appendRepeated(&mut lanes, none(), valueCount * 4)
+  let mut replacements = run List<u64>.makeWithCapacity(valueCount)
+  run List<u64>.appendRepeated(&mut replacements, none(), valueCount)
+
+  // Track original parameter counts per block so we can expand edges and drop old vector params.
+  let mut origParamCounts = run List<usize>.makeWithCapacity(blockCount)
+  let mut b = usize.ZERO
+  while b < blockCount {
+    let params = List<u64>.asSlice(&function.block(b).parameters)
+    let origLen = params.length
+    run List<usize>.append(&mut origParamCounts, origLen)
+    let mut p = usize.ZERO
+    while p < origLen {
+      let parameter = List<u64>.get(&function.block(b).parameters, p)
+      if u64.toUsize(parameter) < valueCount && List<bool>.get(&eligible, u64.toUsize(parameter)) {
+        let kind = function.kindOf(parameter)
+        let elem = kind.element()
+        let n = kind.elements
+        let mut lane = usize.ZERO
+        while lane < n {
+          let scalarParam = run function.addParameter(b, elem)
+          List<u64>.set(&mut lanes, u64.toUsize(parameter) * 4 + lane, scalarParam)
+          lane = lane + usize.ONE
+        }
+      }
+      p = p + usize.ONE
+    }
+    b = b + usize.ONE
+  }
+
+  // Emit scalar instructions in reverse postorder so definitions always precede uses.
+  let order = graph.reversePostorder()
+  let mut step = usize.ZERO
+  while step < order.length {
+    let block = order[step]
+    step = step + usize.ONE
+    let mut pos = usize.ZERO
+    while pos < List<usize>.length(&function.block(block).instructions) {
+      let id = List<usize>.get(&function.block(block).instructions, pos)
+      let inst = function.instruction(id)
+      if inst.removed { pos = pos + usize.ONE continue }
+      let res = inst.result
+      let resEligible = res != none() && u64.toUsize(res) < valueCount && List<bool>.get(&eligible, u64.toUsize(res))
+      if resEligible {
+        let kind = inst.kind
+        let elem = kind.element()
+        let n = kind.elements
+        let place = inst.place
+        let mut opCopy = List<u64>.make()
+        run List<u64>.appendSlice(&mut opCopy, function.operandsOf(id))
+        let ops = List<u64>.asSlice(&opCopy)
+        let mut inserted = usize.ZERO
+        match inst.operation {
+          Operation.Splat {..} => {
+            let mut lane = usize.ZERO
+            while lane < n {
+              List<u64>.set(&mut lanes, u64.toUsize(res) * 4 + lane, ops[usize.ZERO])
+              lane = lane + usize.ONE
+            }
+          }
+          Operation.Shuffle {start, count} => {
+            let mut maskCopy = List<u64>.make()
+            run List<u64>.appendSlice(&mut maskCopy, function.immediatesAt(start, count))
+            let mask = List<u64>.asSlice(&maskCopy)
+            let firstCount = usize.toU64(function.kindOf(ops[usize.ZERO]).elements)
+            let mut lane = usize.ZERO
+            while lane < n {
+              let pick = mask[lane]
+              let mut val = none()
+              if pick == u64.MAX {
+                val = run function.constant(elem, 0)
+              } else if pick < firstCount {
+                val = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ZERO], u64.toUsize(pick))
+              } else {
+                val = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ONE], u64.toUsize(pick - firstCount))
+              }
+              List<u64>.set(&mut lanes, u64.toUsize(res) * 4 + lane, val)
+              lane = lane + usize.ONE
+            }
+          }
+          Operation.Insert => {
+            let idx = u64.toUsize(function.constantOf(ops[2]).low)
+            let mut lane = usize.ZERO
+            while lane < n {
+              let val = if lane == idx {
+                ops[usize.ONE]
+              } else {
+                run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ZERO], lane)
+              }
+              List<u64>.set(&mut lanes, u64.toUsize(res) * 4 + lane, val)
+              lane = lane + usize.ONE
+            }
+          }
+          Operation.Load {offset, alignment} => {
+            let stride = elem.elementBytes()
+            let laneAlign = if alignment < stride { alignment } else { stride }
+            let mut lane = usize.ZERO
+            while lane < n {
+              let off = offset + usize.toU64(lane * stride)
+              let lv = run function.insertInstruction(block, pos + inserted, Operation.Load {offset: off, alignment: laneAlign}, elem, &[ops[usize.ZERO]], place)
+              List<u64>.set(&mut lanes, u64.toUsize(res) * 4 + lane, lv)
+              inserted = inserted + usize.ONE
+              lane = lane + usize.ONE
+            }
+          }
+          _ => {
+            let mut lane = usize.ZERO
+            while lane < n {
+              let mut laneArgs = run List<u64>.makeWithCapacity(ops.length)
+              let mut k = usize.ZERO
+              while k < ops.length {
+                let lv = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[k], lane)
+                run List<u64>.append(&mut laneArgs, lv)
+                k = k + usize.ONE
+              }
+              let lv = run function.insertInstruction(block, pos + inserted, inst.operation, elem, List<u64>.asSlice(&laneArgs), place)
+              List<u64>.set(&mut lanes, u64.toUsize(res) * 4 + lane, lv)
+              inserted = inserted + usize.ONE
+              lane = lane + usize.ONE
+            }
+          }
+        }
+        function.remove(id)
+        pos = pos + inserted + usize.ONE
+        continue
+      }
+
+      // Consumers of eligible vectors that produce scalars or nothing.
+      let mut consumesEligible = false
+      let rawOps = function.operandsOf(id)
+      if rawOps.length > usize.ZERO && u64.toUsize(rawOps[usize.ZERO]) < valueCount && List<bool>.get(&eligible, u64.toUsize(rawOps[usize.ZERO])) {
+        consumesEligible = true
+      }
+      if consumesEligible {
+        let place = inst.place
+        let mut opCopy = List<u64>.make()
+        run List<u64>.appendSlice(&mut opCopy, function.operandsOf(id))
+        let ops = List<u64>.asSlice(&opCopy)
+        let mut inserted = usize.ZERO
+        match inst.operation {
+          Operation.Store {offset, alignment} => {
+            let vk = function.kindOf(ops[usize.ZERO])
+            let stride = vk.element().elementBytes()
+            let laneAlign = if alignment < stride { alignment } else { stride }
+            let n = vk.elements
+            let mut lane = usize.ZERO
+            while lane < n {
+              let lv = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ZERO], lane)
+              let off = offset + usize.toU64(lane * stride)
+              drop run function.insertInstruction(block, pos + inserted, Operation.Store {offset: off, alignment: laneAlign}, Kind.unit(), &[lv, ops[usize.ONE]], place)
+              inserted = inserted + usize.ONE
+              lane = lane + usize.ONE
+            }
+            function.remove(id)
+          }
+          Operation.Extract => {
+            let vk = function.kindOf(ops[usize.ZERO])
+            let idx = u64.toUsize(function.constantOf(ops[usize.ONE]).low)
+            let lv = if idx < vk.elements {
+              run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ZERO], idx)
+            } else {
+              run function.constant(inst.kind, 0)
+            }
+            List<u64>.set(&mut replacements, u64.toUsize(res), lv)
+            function.remove(id)
+          }
+          Operation.Reduce {which} => {
+            let vk = function.kindOf(ops[usize.ZERO])
+            let n = vk.elements
+            let elem = inst.kind
+            let mut acc = none()
+            let mut lane = usize.ZERO
+            if ops.length == 2 {
+              acc = ops[usize.ONE]
+            } else {
+              acc = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ZERO], usize.ZERO)
+              lane = usize.ONE
+            }
+            let op = match which {
+              Reduction.Add => Operation.Binary {operation: Binary.Add}
+              Reduction.Mul => Operation.Binary {operation: Binary.Mul}
+              Reduction.And => Operation.Binary {operation: Binary.And}
+              Reduction.Or => Operation.Binary {operation: Binary.Or}
+              Reduction.Xor => Operation.Binary {operation: Binary.Xor}
+              Reduction.FloatAdd => Operation.Binary {operation: Binary.Add}
+              Reduction.FloatMul => Operation.Binary {operation: Binary.Mul}
+              Reduction.FloatMinimum => Operation.Extreme {which: Extreme.FloatMinimum}
+              Reduction.FloatMaximum => Operation.Extreme {which: Extreme.FloatMaximum}
+              Reduction.SignedMinimum => Operation.Extreme {which: Extreme.SignedMinimum}
+              Reduction.SignedMaximum => Operation.Extreme {which: Extreme.SignedMaximum}
+              Reduction.UnsignedMinimum => Operation.Extreme {which: Extreme.UnsignedMinimum}
+              Reduction.UnsignedMaximum => Operation.Extreme {which: Extreme.UnsignedMaximum}
+            }
+            while lane < n {
+              let lv = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), ops[usize.ZERO], lane)
+              acc = run function.insertInstruction(block, pos + inserted, op, elem, &[acc, lv], place)
+              inserted = inserted + usize.ONE
+              lane = lane + usize.ONE
+            }
+            List<u64>.set(&mut replacements, u64.toUsize(res), acc)
+            function.remove(id)
+          }
+          _ => {}
+        }
+        pos = pos + inserted + usize.ONE
+        continue
+      }
+      pos = pos + usize.ONE
+    }
+  }
+
+  // Append scalar edge arguments for every scalarized target block parameter.
+  b = usize.ZERO
+  while b < blockCount {
+    if graph.reaches(b) {
+      let edgeCount = List<Edge>.length(&function.block(b).edges)
+      let mut e = usize.ZERO
+      while e < edgeCount {
+        let dst = List<Edge>.asSlice(&function.block(b).edges)[e].block
+        let origLen = List<usize>.get(&origParamCounts, dst)
+        let mut p = usize.ZERO
+        while p < origLen {
+          let parameter = List<u64>.get(&function.block(dst).parameters, p)
+          if u64.toUsize(parameter) < valueCount && List<bool>.get(&eligible, u64.toUsize(parameter)) {
+            let arg = List<u64>.get(&List<Edge>.asSlice(&function.block(b).edges)[e].arguments, p)
+            let n = function.kindOf(parameter).elements
+            let mut lane = usize.ZERO
+            while lane < n {
+              let lv = run laneOf(&mut function.*, List<u64>.asSlice(&lanes), arg, lane)
+              run function.appendArgument(b, e, lv)
+              lane = lane + usize.ONE
+            }
+          }
+          p = p + usize.ONE
+        }
+        e = e + usize.ONE
+      }
+    }
+    b = b + usize.ONE
+  }
+
+  // Drop the replaced vector block parameters (and their original edge arguments).
+  b = usize.ZERO
+  while b < blockCount {
+    let origLen = List<usize>.get(&origParamCounts, b)
+    let totalParams = List<u64>.length(&function.block(b).parameters)
+    if totalParams > origLen {
+      let mut dropped = run List<bool>.makeWithCapacity(totalParams)
+      let mut p = usize.ZERO
+      while p < totalParams {
+        let mut dropIt = false
+        if p < origLen {
+          let parameter = List<u64>.get(&function.block(b).parameters, p)
+          dropIt = u64.toUsize(parameter) < valueCount && List<bool>.get(&eligible, u64.toUsize(parameter))
+        }
+        run List<bool>.append(&mut dropped, dropIt)
+        p = p + usize.ONE
+      }
+      function.dropParameters(b, List<bool>.asSlice(&dropped), graph.predecessorsOf(b))
+    }
+    b = b + usize.ONE
+  }
+
+  while List<u64>.length(&replacements) < function.valueCount() {
+    run List<u64>.append(&mut replacements, none())
+  }
+  function.substitute(&mut replacements)
+  function.sweep()
+  return true
+}
