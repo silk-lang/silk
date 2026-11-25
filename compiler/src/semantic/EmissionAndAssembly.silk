@@ -55,6 +55,7 @@ import backend.Mir {
   Reference as MirReference,
   Block as MirBlock,
   Callee as MirCallee,
+  Statement as MirStatement,
   Terminator as MirTerminator,
   MirFunction,
 }
@@ -548,18 +549,21 @@ effect fn observeLlvmGap(resolver: &mut Resolver, subject: usize) -> ()
 }
 
 // How hard the direct backend optimizes: not at all in an unoptimized build, else for size or
-// speed as the build asked.
-fn directLevel(resolver: &Resolver, key: &InstanceKey) -> SsaLevel {
+// speed as the build (or `@optimizeSize`) asked.
+fn directLevel(resolver: &Resolver, key: &InstanceKey, optimizeSize: bool) -> SsaLevel {
   let identity = InstanceKey.identity(key)
   let declaration = DeclarationId.copyShared(&identity)
   match moduleMode(resolver, DeclarationId.moduleId(&declaration)) {
     PackageMode.None => { return SsaLevel.None }
     PackageMode.Size => { return SsaLevel.Size }
-    PackageMode.Speed => { return SsaLevel.Speed }
+    PackageMode.Speed => {
+      if optimizeSize { return SsaLevel.Size }
+      return SsaLevel.Speed
+    }
     PackageMode.Default => ()
   }
   if resolver.fastPathIr { return SsaLevel.None }
-  if resolver.directSize { return SsaLevel.Size }
+  if resolver.directSize || optimizeSize { return SsaLevel.Size }
   return SsaLevel.Speed
 }
 
@@ -655,7 +659,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
         &input.suspension,
         resolver.threads,
         hostExport,
-        directLevel(resolver, &function.key),
+        directLevel(resolver, &function.key, function.optimizeSize),
         resolver.verifyMir,
         &seen,
       )
@@ -670,7 +674,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
         &input.suspension,
         resolver.threads,
         hostExport,
-        directLevel(resolver, &function.key),
+        directLevel(resolver, &function.key, function.optimizeSize),
         resolver.verifyMir,
         &seen,
       )
@@ -684,7 +688,7 @@ effect fn emitInstance(resolver: &Resolver, function: &MirFunction, input: &Emis
       &input.suspension,
       resolver.threads,
       hostExport,
-      directLevel(resolver, &function.key),
+      directLevel(resolver, &function.key, function.optimizeSize),
       resolver.verifyMir,
       hasCpuFeature(resolver, b"simd128"),
     )
@@ -2430,10 +2434,70 @@ struct EmitJob {
   llvmSlot: usize,
   emissionSlot: usize,
   mirIndex: usize,
+  weight: usize,
   hostExport: bool,
 }
 
 impl Copy for EmitJob {}
+
+fn emitJobWeight(function: &MirFunction) -> usize {
+  let blocks = List<MirBlock>.asSlice(&function.blocks)
+  let mut weight = blocks.length
+  let mut b = usize.ZERO
+  while b < blocks.length {
+    weight = weight + List<MirStatement>.length(&blocks[b].statements)
+    b = b + usize.ONE
+  }
+  return weight
+}
+
+// Sorts `jobs` in descending `weight` order (longest processing time first) so heavy functions
+// start immediately across workers instead of forming a single-thread straggler tail.
+fn sortEmitJobsDescending(jobs: &mut [EmitJob]) -> () {
+  let n = jobs.length
+  if n < 2 { return () }
+  // Build min-heap (smallest weight at root) so popping into the back leaves descending order.
+  let mut start = n / 2
+  while start > usize.ZERO {
+    start = start - usize.ONE
+    let mut root = start
+    while true {
+      let left = root * 2 + usize.ONE
+      if left >= n { break }
+      let mut smallest = root
+      if jobs[left].weight < jobs[smallest].weight { smallest = left }
+      let right = left + usize.ONE
+      if right < n && jobs[right].weight < jobs[smallest].weight { smallest = right }
+      if smallest == root { break }
+      let tmp = jobs[root]
+      jobs[root] = jobs[smallest]
+      jobs[smallest] = tmp
+      root = smallest
+    }
+  }
+  let mut end = n - usize.ONE
+  while end > usize.ZERO {
+    let top = jobs[usize.ZERO]
+    jobs[usize.ZERO] = jobs[end]
+    jobs[end] = top
+    let mut root = usize.ZERO
+    while true {
+      let left = root * 2 + usize.ONE
+      if left >= end { break }
+      let mut smallest = root
+      if jobs[left].weight < jobs[smallest].weight { smallest = left }
+      let right = left + usize.ONE
+      if right < end && jobs[right].weight < jobs[smallest].weight { smallest = right }
+      if smallest == root { break }
+      let tmp = jobs[root]
+      jobs[root] = jobs[smallest]
+      jobs[smallest] = tmp
+      root = smallest
+    }
+    end = end - usize.ONE
+  }
+  return ()
+}
 
 // Read-only pointers and disjoint output array shared across NativeThread workers during `preEmitBatch`.
 // Safety: `preEmitBatch` joins every spawned thread before mutating or freeing any referenced storage,
@@ -2541,6 +2605,7 @@ effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit], minJob
   let mut seen = List<bool>.make()
   run List<bool>.appendRepeated(&mut seen, false, llvmCount)
   let mut jobs = List<EmitJob>.make()
+  let mut totalWeight = usize.ZERO
   let mut at = usize.ZERO
   while at < pending.length {
     if let PendingEmit.First {key, prepared, ..} = &pending[at] {
@@ -2563,10 +2628,13 @@ effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit], minJob
             let functions = List<MirFunction>.asSlice(&thisStore.resolver.mirValues)
             List<bool>.set(&mut seen, llvmSlot, true)
             let hostExport = isHostExport(&thisStore.resolver, &functions[mirIndex])
+            let weight = emitJobWeight(&functions[mirIndex])
+            totalWeight = totalWeight + weight
             run List<EmitJob>.append(&mut jobs, EmitJob {
               llvmSlot: llvmSlot,
               emissionSlot: emissionSlot,
               mirIndex: mirIndex,
+              weight: weight,
               hostExport: hostExport,
             })
           }
@@ -2576,8 +2644,10 @@ effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit], minJob
     at = at + usize.ONE
   }
   let jobCount = List<EmitJob>.length(&jobs)
-  if jobCount < 2 || jobCount < minJobs { return () }
+  if jobCount < 2 || (minJobs > usize.ZERO && jobCount < minJobs && totalWeight < 512) { return () }
+  sortEmitJobsDescending(List<EmitJob>.asMutSlice(&mut jobs))
   let mut workers = thisStore.walkWorkers
+  if thisStore.walkFrontier > usize.ZERO && totalWeight < 256 && workers > 2 { workers = 2 }
   if workers > jobCount { workers = jobCount }
   let mut outcomes = List<PreEmitOutcome>.make()
   run List<PreEmitOutcome>.reserveExact(&mut outcomes, jobCount)
