@@ -103,6 +103,9 @@ struct Emitter {
   uses: List<usize>,
   userBlock: List<usize>,
   userPosition: List<usize>,
+  firstBlock: List<usize>,
+  firstPosition: List<usize>,
+  sameBlockUses: List<usize>,
   deferred: List<bool>,
   readsFrom: List<usize>,
   effectsBefore: List<usize>,
@@ -265,6 +268,14 @@ fn noteUse(emitter: &mut Emitter, value: u64, block: usize, position: usize) -> 
   if value == none() { return () }
   let at = u64.toUsize(value)
   let seen = List<usize>.get(&emitter.uses, at)
+  if seen == usize.ZERO {
+    List<usize>.set(&mut emitter.firstBlock, at, block)
+    List<usize>.set(&mut emitter.firstPosition, at, position)
+  }
+  if block != usize.MAX && block == List<usize>.get(&emitter.firstBlock, at) {
+    let inBlk = List<usize>.get(&emitter.sameBlockUses, at)
+    List<usize>.set(&mut emitter.sameBlockUses, at, inBlk + usize.ONE)
+  }
   List<usize>.set(&mut emitter.uses, at, seen + usize.ONE)
   List<usize>.set(&mut emitter.userBlock, at, block)
   List<usize>.set(&mut emitter.userPosition, at, position)
@@ -277,6 +288,9 @@ effect fn countUses(emitter: &mut Emitter, function: &SsaFunction, sequence: &[u
   run List<usize>.appendRepeated(&mut emitter.uses, usize.ZERO, values)
   run List<usize>.appendRepeated(&mut emitter.userBlock, usize.MAX, values)
   run List<usize>.appendRepeated(&mut emitter.userPosition, usize.MAX, values)
+  run List<usize>.appendRepeated(&mut emitter.firstBlock, usize.MAX, values)
+  run List<usize>.appendRepeated(&mut emitter.firstPosition, usize.MAX, values)
+  run List<usize>.appendRepeated(&mut emitter.sameBlockUses, usize.ZERO, values)
   run List<bool>.appendRepeated(&mut emitter.deferred, false, values)
   run List<usize>.appendRepeated(&mut emitter.readsFrom, usize.MAX, values)
   let mut step = usize.ZERO
@@ -463,12 +477,51 @@ fn defers(emitter: &Emitter, instruction: Instruction, block: usize, position: u
   return List<usize>.get(&emitter.effectsBefore, user) == List<usize>.get(&emitter.effectsBefore, from + usize.ONE)
 }
 
+// Whether the multi-use result of `instruction` at `position` of `block` can be sunk to its first
+// use in `block` and emitted with `local.tee`, eliminating a `local.set` + `local.get` pair.
+fn defersTee(emitter: &Emitter, function: &SsaFunction, instruction: Instruction, block: usize, position: usize, from: usize) -> bool {
+  if !emitter.trees || instruction.result == none() || !oneLane(instruction.kind, emitter.simd128) { return false }
+  if instruction.operation.hasSideEffects() || instruction.resultCount() != usize.ONE { return false }
+  let result = u64.toUsize(instruction.result)
+  if List<usize>.get(&emitter.uses, result) < 2 { return false }
+  if List<usize>.get(&emitter.firstBlock, result) != block { return false }
+  let first = List<usize>.get(&emitter.firstPosition, result)
+  let listed = List<usize>.asSlice(&function.block(block).instructions)
+  if first <= position || first > listed.length { return false }
+  let inBlock = List<usize>.get(&emitter.sameBlockUses, result)
+  if first < listed.length {
+    let firstId = listed[first]
+    let firstInst = function.instruction(firstId)
+    if !takesDeferred(function, firstId, firstInst, emitter.simd128) { return false }
+    // `Offset` may fold a local and `Cast` may be a no-op returning its operand without pushing.
+    match firstInst.operation {
+      Operation.Offset {..} => { return false }
+      Operation.Cast {..} => { return false }
+      _ => {}
+    }
+    // When `result` has later uses in the same block, `firstInst` must execute in place (not be
+    // deferred past them).
+    if inBlock >= 2 {
+      if !firstInst.operation.hasSideEffects() && firstInst.result != none() {
+        let fRes = u64.toUsize(firstInst.result)
+        if List<usize>.get(&emitter.firstBlock, fRes) == block { return false }
+      }
+    }
+  }
+  if from == usize.MAX { return true }
+  // When `inBlock == 1` and `first` might itself defer to block exit, guard against side effects
+  // all the way to `listed.length`.
+  let limit = if inBlock == usize.ONE && first < listed.length { listed.length } else { first }
+  return List<usize>.get(&emitter.effectsBefore, limit) == List<usize>.get(&emitter.effectsBefore, from + usize.ONE)
+}
+
 effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph, trees: bool, simd128: bool) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if !function.secondResultKind.isUnit() { run WasmObject.unsupported(b"multi-value return", function.name()) }
   let bits = function.addressBits
   let sequence = graph.reversePostorder()
   let mut emitter = Emitter {values: List<u64>.make(), blocks: List<usize>.make(), slots: List<u64>.make(), addressBits: bits, place: 0,
     trees: trees, simd128: simd128, uses: List<usize>.make(), userBlock: List<usize>.make(), userPosition: List<usize>.make(),
+    firstBlock: List<usize>.make(), firstPosition: List<usize>.make(), sameBlockUses: List<usize>.make(),
     deferred: List<bool>.make(), readsFrom: List<usize>.make(), effectsBefore: List<usize>.make(), hoistArm: List<usize>.make()}
   run List<u64>.appendRepeated(&mut emitter.values, none(), function.valueCount())
   run List<u64>.appendRepeated(&mut emitter.slots, none(), function.slotCount())
@@ -622,6 +675,7 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
   let mut result = none()
   let mut second = none()
   let mut deferring = false
+  let mut deferringTee = false
   let mut from = usize.MAX
   if emitter.trees {
     let used = function.operandsOf(number)
@@ -633,9 +687,9 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
         at = at + usize.ONE
       }
     } else {
-      // The instruction's code holds what its deferred operands' does.
+      // The instruction's code holds what its still-deferred operands' does.
       while at < used.length {
-        if used[at] != none() && List<bool>.get(&emitter.deferred, u64.toUsize(used[at])) {
+        if used[at] != none() && List<bool>.get(&emitter.deferred, u64.toUsize(used[at])) && WasmBody.isDeferred(&body.*, of[at]) {
           let earliest = List<usize>.get(&emitter.readsFrom, u64.toUsize(used[at]))
           if earliest < from { from = earliest }
         }
@@ -644,6 +698,10 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
     }
     if from == usize.MAX && (instruction.operation.readsState() || function.mayTrap(number)) { from = position }
     deferring = defers(&emitter.*, instruction, block, position, from)
+    if !deferring {
+      deferringTee = defersTee(&emitter.*, function, instruction, block, position, from)
+      deferring = deferringTee
+    }
     if deferring { WasmBody.beginDeferred(&mut body.*) }
   }
   match instruction.operation {
@@ -779,7 +837,7 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
     List<u64>.set(&mut emitter.values, u64.toUsize(instruction.result), result)
     if second != none() { List<u64>.set(&mut emitter.values, u64.toUsize(instruction.result) + usize.ONE, second) }
     if emitter.trees {
-      if deferring && run WasmBody.endDeferred(&mut body.*, result) {
+      if deferring && run WasmBody.endDeferred(&mut body.*, result, deferringTee) {
         List<bool>.set(&mut emitter.deferred, u64.toUsize(instruction.result), true)
         List<usize>.set(&mut emitter.readsFrom, u64.toUsize(instruction.result), from)
       } else {
