@@ -1,0 +1,2073 @@
+//! Incremental cache image adoption, leaf placement, and image serialization.
+
+import semantic.ErasureIndex {ErasureIndex}
+import semantic.Types {Types}
+import backend.Coroutine {Facts as CoroutineFacts}
+import backend.Gap {Gap as BackendGap}
+import backend.InstanceText {InstanceText as InstanceDefinition}
+import hir.Intern {StringTable, Symbol}
+import lexer.Span {Span}
+import semantic.RuntimeEncoding
+import semantic.RejectionImage
+import semantic.DeclarationId {DeclarationId}
+import semantic.SourceInputs as Inputs {Selector as SourceSelector}
+import semantic.DeclarationTable
+import semantic.StableKey
+import semantic.CacheImage
+import semantic.BuildRecord
+import semantic.StaticTemplate
+import semantic.ModuleId {ModuleId}
+import semantic.PackageGraph {PackageGraph}
+import semantic.Retention {Root as RetentionRoot}
+import semantic.ModuleIndex {ModuleIndex}
+import semantic.InternIndex {InternIndex}
+import semantic.ContentHash {ContentHash}
+import semantic.Query {Cycle, Query}
+import semantic.DependencyGraph as Graph {Dependee, UnitState}
+import semantic.Rejection {Rejection}
+import semantic.SourceIndex {IndexedSource, NoRejection, SourceIndex}
+import semantic.SourceRevision {Observation}
+import silk.mem.allocator {Allocator, OutOfMemoryError}
+import silk.collections.bytes {Bytes}
+import silk.core.effect {Effect}
+import silk.collections.hash {Word}
+import silk.core.option {Option}
+import silk.core.result {Result}
+import silk.mem.shared {Shared}
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.num.u64
+import silk.collections.list {List}
+import silk.collections.slice {Slice}
+import semantic.SemanticModel {
+  Answer,
+  DeclarationCheckResult,
+  DeferredStaticTemplate,
+  Family,
+  Key,
+  Request,
+  ScopedKey,
+  Sweep,
+  UncheckedBody,
+  UncheckedDeclaration,
+  declarationFamily,
+}
+import semantic.ResolverState {
+  DeclarationMemo,
+  DigestSet,
+  EscapeImage,
+  EscapeMemo,
+  EscapeRecordRoot,
+  ExactSet,
+  ModuleCheckMemo,
+  Resolver,
+  appendCheckedModule,
+}
+import semantic.SemanticInputs {
+  BackendInstance,
+  captureInput,
+  demandSource,
+  internKey,
+  internModule,
+  reconcileSources,
+  same,
+  selectRequest,
+  settleSourceInputs,
+  sourceOf,
+}
+import semantic.QueryEngine {
+  captureRequest,
+  captureResolution,
+  holdsUnit,
+  resolvedModule,
+  summaryFingerprint,
+}
+import semantic.Implementations {knownModuleOrdinal}
+import semantic.ConformanceProve {Discovery}
+import semantic.EmissionAndAssembly {
+  CapturedBuild,
+  CapturedEntry,
+  HeldPack,
+  ReplayState,
+  buildEntryKey,
+  buildPackKey,
+  buildRecordKey,
+  buildRootKind,
+  buildSummaryKey,
+  digestBytes,
+  digestOfBytes,
+  escapeEntryKey,
+  escapeRecordKey,
+  imageEscapeRecord,
+  rootIdentity,
+}
+import semantic.CheckAndEscapes {keepDeclaration, listedOrdinal, recordLoaded}
+import semantic.Semantic {Semantic}
+
+// Whether an outdated `unit` is current after all: no source file or input it consumed changed
+// since it was last verified, and every unit result it consumed, brought up to date in the order
+// the unit consumed them, kept the answer it had then. A unit that is not outdated, or whose
+// verification needs a unit that is running, is not verified.
+// Whether a family's `name` and `member` are zero, a count, or a written position in syntax its
+// key's declaration already names, so they mean the same in every store.
+fn plainFields(family: Family) -> bool {
+  return family == Family.Import || family == Family.Alias || family == Family.Identity || family == Family.Members
+    || family == Family.Contract || family == Family.Operations || family == Family.OperatorInterfaces
+    || family == Family.Tests || family == Family.Implementations || family == Family.ImplementationShapes
+    || family == Family.ImplementationHead || family == Family.InherentMembers || family == Family.ImplementationMembers
+    || family == Family.Coherence || family == Family.BodyPremises
+    || family == Family.Variance || family == Family.DropObservation || family == Family.Signature
+    || family == Family.OperationUnder || family == Family.Witnesses || family == Family.Constant
+    || family == Family.ParameterSchema || family == Family.ParameterDefault || family == Family.Initializer
+    || family == Family.Condition || family == Family.ProfileInput || family == Family.StaticRouting
+    || family == Family.ModuleCheck
+}
+
+// The stable bytes of one unit's scoped key: its family, its scope, and each field encoded
+// through what it indexes (module path, declaration content, name spelling), never an ordinal of
+// this store. None when a field indexes a table with no stable form yet: type applications,
+// selected applications, backend instances, LLVM inputs, origin plans and condition contexts.
+// Such a unit is not persisted, and is recomputed when demanded.
+pub effect fn stableUnit(resolver: &Resolver, unit: usize) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  if unit >= List<ScopedKey>.length(&resolver.keys) { return Option<Bytes>.none() }
+  let scoped = List<ScopedKey>.get(&resolver.keys, unit)
+  let key = scoped.key
+  if scoped.origin.slot != u32.MAX || scoped.condition != usize.MAX { return Option<Bytes>.none() }
+  let named = key.family == Family.Name || key.family == Family.InherentMember
+  let body = key.family == Family.Body && key.member == usize.ZERO
+  if !plainFields(key.family) && !named && !body { return Option<Bytes>.none() }
+  let modules = List<ModuleId>.asSlice(&resolver.modules)
+  let mut output = Bytes.make()
+  run RuntimeEncoding.word(&mut output, u8.toU64(Family.value(key.family)))
+  // The profile is the store's selected one, which the cache's stamp names, or none.
+  if scoped.profile == usize.ZERO || scoped.profile == usize.MAX {
+    run RuntimeEncoding.word(&mut output, 0)
+  } else if scoped.profile == resolver.profileSlot {
+    run RuntimeEncoding.word(&mut output, 1)
+  } else {
+    return Option<Bytes>.none()
+  }
+  // The application is not named: a unit that reads it records the read as a request input
+  // (`recordApplicationRead`), so a unit that does not is the same whichever package roots the
+  // build.
+  if key.module >= modules.length { return Option<Bytes>.none() }
+  run StableKey.module(&mut output, &modules[key.module])
+  if declarationFamily(key.family) && key.declaration != usize.MAX {
+    let identity = match move DeclarationTable.identity(&resolver.declarations, key.declaration) {
+      Option<&DeclarationId>.Some {value} => value
+      Option<&DeclarationId>.None => { return Option<Bytes>.none() }
+    }
+    run RuntimeEncoding.word(&mut output, 1)
+    run StableKey.declaration(&mut output, identity)
+  } else {
+    run RuntimeEncoding.word(&mut output, 0)
+    run RuntimeEncoding.word(&mut output, usize.toU64(key.declaration))
+  }
+  if named {
+    run RuntimeEncoding.field(&mut output, StringTable.get(&resolver.names, Symbol {index: key.name}))
+  } else {
+    run RuntimeEncoding.word(&mut output, usize.toU64(key.name))
+  }
+  run RuntimeEncoding.word(&mut output, usize.toU64(key.member))
+  if key.external { run RuntimeEncoding.word(&mut output, 1) } else { run RuntimeEncoding.word(&mut output, 0) }
+  return Option<Bytes>.some(move output)
+}
+
+// The stable bytes of one source input: its module and its selector, with a declaration handle
+// written as the declaration it was interned for. None for an input whose handle was never issued.
+pub effect fn stableInput(resolver: &Resolver, input: usize) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let inputs = List<Inputs.Input>.asSlice(&resolver.sourceInputs.inputs)
+  if input >= inputs.length { return Option<Bytes>.none() }
+  let modules = List<ModuleId>.asSlice(&resolver.modules)
+  if inputs[input].module >= modules.length { return Option<Bytes>.none() }
+  let mut output = Bytes.make()
+  run StableKey.module(&mut output, &modules[inputs[input].module])
+  let handle = Inputs.handle(&inputs[input].selector)
+  let mut identity = Option<&DeclarationId>.none()
+  if handle != usize.MAX { identity = DeclarationTable.identity(&resolver.declarations, handle) }
+  if !run StableKey.selector(&mut output, &inputs[input].selector, move identity) { return Option<Bytes>.none() }
+  return Option<Bytes>.some(move output)
+}
+
+// A source input read back from its stable bytes: its module ordinal and its selector in this
+// store, with a declaration selector's identity interned at its current position. None when the
+// bytes are not an input, or its declaration is not in its module's current source.
+pub struct PlacedInput {
+  pub module: usize,
+  pub selector: SourceSelector,
+}
+
+pub effect fn placeStableInput(resolver: &mut Resolver, bytes: &[u8], unchanged: bool, recorded: usize) -> Option<PlacedInput>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  return run placeStableInputIn(&mut resolver.*, bytes, unchanged, recorded, usize.MAX)
+}
+
+// `placeStableInput` for an input of a file already placed as module `known` (or `usize.MAX`).
+// An input of an unchanged file names the declaration at its recorded position, so one a leaf
+// before it already interned there is taken without building its identity or its module's.
+effect fn placeStableInputIn(resolver: &mut Resolver, bytes: &[u8], unchanged: bool, recorded: usize, known: usize) -> Option<PlacedInput>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  if known != usize.MAX && unchanged && recorded != usize.MAX {
+    let mut skim = StableKey.reader()
+    StableKey.skipModule(bytes, &mut skim)
+    if let Option<StableKey.ReadSelector>.Some {value: read} = move run StableKey.readSelectorDeferred(bytes, &mut skim) {
+      let StableKey.ReadSelector {selector, declaration, ..} = move read
+      if StableKey.finished(bytes, &skim) {
+        if declaration.end == declaration.start {
+          return Option<PlacedInput>.some(PlacedInput {module: known, selector: move selector})
+        }
+        let cached = DeclarationTable.cached(&resolver.declarations, known, recorded)
+        if cached != usize.MAX {
+          return Option<PlacedInput>.some(PlacedInput {module: known, selector: StableKey.withHandle(move selector, cached)})
+        }
+      }
+    }
+  }
+  let mut reader = StableKey.reader()
+  // An input names its file's module, which `known` already holds: reuse it for the input and
+  // for its declaration rather than build equal copies.
+  let mut held = Option<ModuleId>.none()
+  if known != usize.MAX { held = Option<ModuleId>.some(ModuleId.copy(&List<ModuleId>.asSlice(&resolver.modules)[known])) }
+  let module = match move held {
+    Option<ModuleId>.Some {value: file} => match move run StableKey.readModuleIn(bytes, &mut reader, &file) {
+      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.None => { return Option<PlacedInput>.none() }
+    }
+    Option<ModuleId>.None => match move run StableKey.readModule(bytes, &mut reader) {
+      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.None => { return Option<PlacedInput>.none() }
+    }
+  }
+  let read = match move run StableKey.readSelectorDeferred(bytes, &mut reader) {
+    Option<StableKey.ReadSelector>.Some {value} => move value
+    Option<StableKey.ReadSelector>.None => { return Option<PlacedInput>.none() }
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<PlacedInput>.none() }
+  let ordinal = run internModule(&mut resolver.*, &module)
+  let StableKey.ReadSelector {selector, declaration, ..} = move read
+  let mut identity = Option<DeclarationId>.none()
+  if declaration.end != declaration.start {
+    identity = run StableKey.declarationInModule(bytes, declaration, &module)
+    if let Option<DeclarationId>.None = &identity { return Option<PlacedInput>.none() }
+  }
+  let declared = match move identity {
+    Option<DeclarationId>.Some {value} => move value
+    Option<DeclarationId>.None => { return Option<PlacedInput>.some(PlacedInput {module: ordinal, selector: move selector}) }
+  }
+  // A file with the bytes the image recorded indexes its declarations where it did then.
+  if recorded != usize.MAX && unchanged {
+    let handle = run DeclarationTable.intern(&mut resolver.declarations, ordinal, recorded, &declared)
+    return Option<PlacedInput>.some(PlacedInput {module: ordinal, selector: StableKey.withHandle(move selector, handle)})
+  }
+  // A module this build does not load is not read, which would read outside the build's
+  // preloaded import graph; no declaration of it has a handle.
+  let observed = run SourceIndex.captureObservation(&resolver.source, &module)
+  if !Observation.isPresent(&observed) { return Option<PlacedInput>.none() }
+  let answer = run demandSource(&mut resolver.*, &module)
+  let mut handle = usize.MAX
+  if let Option<&IndexedSource>.Some {value: indexed} = move SourceIndex.source(&resolver.source, &answer, &module) {
+    if let Option<usize>.Some {value: indexedAt} = move ModuleIndex.ordinalOf(IndexedSource.moduleIndex(indexed), &declared) {
+      handle = run DeclarationTable.intern(&mut resolver.declarations, ordinal, indexedAt, &declared)
+    }
+  }
+  if handle == usize.MAX { return Option<PlacedInput>.none() }
+  return Option<PlacedInput>.some(PlacedInput {module: ordinal, selector: StableKey.withHandle(move selector, handle)})
+}
+
+/// What [`Semantic.adoptCache`] reused from a cache image.
+// Where each leaf of an image stands now, as `Semantic.adoptFrom` places it: its dependee, or
+// `usize.MAX` when it changed; whether each changed leaf records only where a span sits; and how
+// many changed.
+pub struct LeafPlacement {
+  pub placed: List<usize>,
+  pub positional: List<bool>,
+  pub unplaced: usize,
+  pub changed: usize,
+}
+
+/// Whether `image` holds the escape check or escape walk of a check, which only `checkDeclarations`
+/// leaves: a build's own image holds module checks and its record, and a build that adopted a
+/// check's image carries the check's escape checks/walks into the one it writes.
+pub fn recordsEscapeWalks(image: &CacheImage.Image) -> bool {
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let key = Bytes.asSlice(&roots[at].key)
+    if let Option<&[u8]>.Some {..} = rootIdentity(key, 3) { return true }
+    let mut keyReader = StableKey.reader()
+    if StableKey.readWord(key, &mut keyReader) == u8.toU64(Family.value(Family.ModuleCheck)) {
+      let mut answerReader = StableKey.reader()
+      let flags = StableKey.readWord(Bytes.asSlice(&roots[at].answer), &mut answerReader)
+      if !StableKey.failed(&answerReader) && u64.bitAnd(flags, 3) == 1 { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `image` holds a build record, which a replay reads with its node's edges.
+fn recordsBuild(image: &CacheImage.Image) -> bool {
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut exact = Span.make(usize.ZERO, usize.ZERO)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact) == 1 { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The most inline summaries one node of an adopted image may wait on (`summaryConditions`); a
+// node that would wait on more is stale.
+const conditionLimit: usize = 32
+
+// What each node of an adopted image waits on when it is stale only through inline summaries: the
+// summary roots (`imageSummaries`) whose answers decide it, by node. A node is green, stale, or
+// conditional, waiting on at least one such root; it is green again exactly when each of those
+// roots' summaries answers as it did (`summaryAgrees`).
+pub struct SummaryConditions {
+  pub stale: List<bool>,
+  pub ends: List<usize>,
+  pub roots: List<usize>,
+}
+
+impl SummaryConditions {
+  // Conditions of no node: every node they are asked about is unconditional.
+  pub fn make() -> SummaryConditions {
+    return SummaryConditions {stale: List<bool>.make(), ends: List<usize>.make(), roots: List<usize>.make()}
+  }
+
+  // Whether `node` waits on summaries alone.
+  pub fn conditional(self: &Self, node: usize) -> bool {
+    return node < List<bool>.length(&self.stale) && !List<bool>.get(&self.stale, node)
+      && SummaryConditions.of(self, node).length > usize.ZERO
+  }
+
+  // The summary roots `node` waits on, in no particular order; empty for a green node.
+  pub fn of(self: &Self, node: usize) -> &[usize] {
+    let ends = List<usize>.asSlice(&self.ends)
+    let mut start = usize.ZERO
+    if node > usize.ZERO { start = ends[node - usize.ONE] }
+    return Slice.view<usize>(List<usize>.asSlice(&self.roots), start, ends[node] - start)
+  }
+}
+
+// The conditions of each node of `image`, adopted unlinked with `units` its green nodes and
+// `placed` where its leaves stand. A node that names a changed leaf, or a stale node that is not
+// a summary's, is stale. A stale node that a summary root rests on (`imageSummaries`) gives the
+// nodes that name it that root to wait on instead of its own staleness: their unit read only the
+// summary's answer, so it lowers as it did while that answer holds. Any other node waits on what
+// the nodes it names wait on.
+effect fn summaryConditions(image: &CacheImage.Image, units: &[usize], placed: &[usize]) -> SummaryConditions
+  ! OutOfMemoryError ? &mut Allocator {
+  let nodes = CacheImage.nodeCount(image)
+  let mut summaryRoot = List<usize>.make()
+  run List<usize>.appendRepeated(&mut summaryRoot, usize.MAX, nodes)
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut found = false
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let summary = Option<&[u8]>.isSome(&rootIdentity(Bytes.asSlice(&roots[at].key), 6))
+    if summary && List<usize>.get(&summaryRoot, roots[at].node) == usize.MAX {
+      List<usize>.set(&mut summaryRoot, roots[at].node, at)
+      found = true
+    }
+    at = at + usize.ONE
+  }
+  let mut conditions = SummaryConditions.make()
+  let leaves = CacheImage.leaves(image)
+  at = usize.ZERO
+  while !found && at < leaves.length {
+    if leaves[at].input && leaves[at].selector == 16 { found = true }
+    at = at + usize.ONE
+  }
+  if !found { return move conditions }
+  run List<bool>.reserveExact(&mut conditions.stale, nodes)
+  run List<usize>.reserveExact(&mut conditions.ends, nodes)
+  let mut node = usize.ZERO
+  while node < nodes {
+    let start = List<usize>.length(&conditions.roots)
+    let mut stale = false
+    if units[node] == usize.MAX {
+      let edges = CacheImage.edgesOf(image, node)
+      let mut edge = usize.ZERO
+      while edge < edges.length && !stale {
+        let named = CacheImage.target(edges[edge])
+        edge = edge + usize.ONE
+        if !CacheImage.namesNode(edges[edge - usize.ONE]) {
+          if placed[named] == usize.MAX && leaves[named].input && leaves[named].selector == 16 {
+            stale = !run waitOn(&mut conditions.roots, start, roots.length + named)
+          } else { stale = placed[named] == usize.MAX && !positionalLeaf(&leaves[named]) }
+          continue
+        }
+        if units[named] != usize.MAX { continue }
+        if List<usize>.get(&summaryRoot, named) != usize.MAX {
+          stale = !run waitOn(&mut conditions.roots, start, List<usize>.get(&summaryRoot, named))
+        } else if List<bool>.get(&conditions.stale, named) {
+          stale = true
+        } else {
+          let ends = List<usize>.asSlice(&conditions.ends)
+          let mut from = usize.ZERO
+          if named > usize.ZERO { from = ends[named - usize.ONE] }
+          let to = ends[named]
+          while from < to && !stale {
+            let root = List<usize>.get(&conditions.roots, from)
+            stale = !run waitOn(&mut conditions.roots, start, root)
+            from = from + usize.ONE
+          }
+        }
+      }
+    }
+    // A stale node waits on nothing.
+    if stale { List<usize>.truncate(&mut conditions.roots, start) }
+    run List<bool>.append(&mut conditions.stale, stale)
+    run List<usize>.append(&mut conditions.ends, List<usize>.length(&conditions.roots))
+    node = node + usize.ONE
+  }
+  return move conditions
+}
+
+// Adds `root` to the roots a node waits on, `roots` from `start` on, unless it is there; false
+// when that would make more than `conditionLimit`.
+effect fn waitOn(roots: &mut List<usize>, start: usize, root: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<usize>.asSlice(&roots.*)
+  let mut at = start
+  while at < listed.length {
+    if listed[at] == root { return true }
+    at = at + usize.ONE
+  }
+  if listed.length - start >= conditionLimit { return false }
+  run List<usize>.append(&mut roots.*, root)
+  return true
+}
+
+pub struct Adopted {
+  /// Module checks reused without sweeping.
+  pub roots: usize,
+  /// Module checks whose sources changed, or that this store names by another key.
+  pub stale: usize,
+  /// Units adopted current.
+  pub nodes: usize,
+  /// Source files and inputs that read differently now.
+  pub changedLeaves: usize,
+}
+
+// Whether `leaf` records only where a span sits: a location in a declaration, or a source
+// prefix. Such an input guards the spans a value or report holds, never what is checked.
+fn positionalLeaf(leaf: &CacheImage.Leaf) -> bool {
+  return leaf.input && (leaf.selector == 9 || leaf.selector == 10)
+}
+
+// Whether the input `leaf`, of a file that reads as the image recorded (placed as module
+// `fileModule`), reads as it did too, as `placeLeaf` finds without capturing it again. A
+// resolution or a request fact is captured again: it reads manifests, which no file leaf records.
+fn unchangedLeaf(leaf: &CacheImage.Leaf, fileModule: usize) -> bool {
+  return fileModule != usize.MAX && !CacheImage.alwaysPlaced(leaf)
+}
+
+// The placement `adoptCache` gives an unlinked store's input that reads as the image recorded
+// (`unchangedLeaf`): unchanged, with no input of the store behind it.
+fn unplacedInput() -> usize { return usize.MAX - usize.ONE }
+
+// The unplaced inputs of an adopted image (`unplacedInput`): each one's stable key digest, the
+// module whose file it reads and that file's digest then, and the value it recorded.
+pub struct CarriedInputs {
+  pub lookup: InternIndex,
+  pub keys: List<ContentHash>,
+  pub modules: List<usize>,
+  pub files: List<ContentHash>,
+  pub digests: List<ContentHash>,
+  pub texts: List<ContentHash>,
+}
+
+impl CarriedInputs {
+  pub fn digestAt(self: &Self, at: usize) -> ContentHash { return List<ContentHash>.get(&self.digests, at) }
+  pub fn textAt(self: &Self, at: usize) -> ContentHash { return List<ContentHash>.get(&self.texts, at) }
+}
+
+pub fn noCarriedInputs() -> CarriedInputs {
+  return CarriedInputs {lookup: InternIndex.make(), keys: List<ContentHash>.make(), modules: List<usize>.make(),
+    files: List<ContentHash>.make(), digests: List<ContentHash>.make(), texts: List<ContentHash>.make()}
+}
+
+// Keeps the input leaf `leaf`, whose stable key is `key` and whose file, of module `module`, read
+// `file` and reads so still, for `carriedInput`.
+effect fn carryInput(carried: &mut CarriedInputs, key: &[u8], leaf: &CacheImage.Leaf, module: usize, file: ContentHash) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let digest = ContentHash.of(key)
+  run InternIndex.record(&mut carried.lookup, digest.low)
+  run List<ContentHash>.append(&mut carried.keys, digest)
+  run List<usize>.append(&mut carried.modules, module)
+  run List<ContentHash>.append(&mut carried.files, file)
+  run List<ContentHash>.append(&mut carried.digests, leaf.digest)
+  run List<ContentHash>.append(&mut carried.texts, leaf.text)
+}
+
+// The carried input (`carryInput`) that `selector` of `module`, whose ordinal is `ordinal`, names
+// while its file still reads as it did, or `usize.MAX`. Its recorded value is what a capture would
+// read, as `placeLeaf` takes it for an input of an unchanged file.
+pub effect fn carriedInput(resolver: &mut Resolver, module: &ModuleId, ordinal: usize, selector: &SourceSelector) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  if List<ContentHash>.length(&resolver.carried.keys) == usize.ZERO { return usize.MAX }
+  // A resolution or request input reads the manifests or the request, which no image leaf vouches for.
+  if let SourceSelector.Resolution {..} = &selector.* { return usize.MAX }
+  if let SourceSelector.Request {..} = &selector.* { return usize.MAX }
+  let mut key = Bytes.make()
+  run StableKey.module(&mut key, module)
+  let handle = Inputs.handle(selector)
+  let mut identity = Option<&DeclarationId>.none()
+  if handle != usize.MAX { identity = DeclarationTable.identity(&resolver.declarations, handle) }
+  if !run StableKey.selector(&mut key, selector, move identity) { return usize.MAX }
+  let digest = ContentHash.of(Bytes.asSlice(&key))
+  let mut at = InternIndex.first(&resolver.carried.lookup, digest.low)
+  while at != usize.MAX {
+    if ContentHash.equals(List<ContentHash>.get(&resolver.carried.keys, at), digest)
+      && List<usize>.get(&resolver.carried.modules, at) == ordinal {
+      let file = List<ContentHash>.get(&resolver.carried.files, at)
+      let current = run Effect.result(sourceDigest(&mut resolver.*, module))
+      let mut now = ContentHash {high: 0, low: 0}
+      match move current {
+        Result<ContentHash, Cycle | OutOfMemoryError>.Success {value} => { now = value }
+        Result<ContentHash, Cycle | OutOfMemoryError>.Failure {error} => match move error {
+          Cycle {} => { return usize.MAX }
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        }
+      }
+      if ContentHash.equals(now, file) { return at }
+      return usize.MAX
+    }
+    at = InternIndex.after(&resolver.carried.lookup, at)
+  }
+  return usize.MAX
+}
+
+// Where a unit stands while a cache image is built: not yet reached, reached and not finished,
+// or unfit for the image because it reaches a unit that is not current or a leaf with no stable
+// form. Any other value is the unit's node.
+fn unreached() -> usize { return usize.MAX }
+
+fn entered() -> usize { return usize.MAX - usize.ONE }
+
+pub fn unfit() -> usize { return usize.MAX - 2 }
+
+// The image under construction, with the node or leaf each unit and dependee became.
+pub struct ImageBuild {
+  pub image: CacheImage.Image,
+  pub nodes: List<usize>,
+  pub files: List<usize>,
+  pub inputs: List<usize>,
+  // The module of each file leaf, for its digest once the walk ends.
+  pub fileModules: List<usize>,
+}
+
+// What `cacheImage` leaves for `imageCarriedChecks`: what each unit and dependee became, and the
+// checks it could not write, some of which rest on a check an unlinked adoption reused.
+pub struct PendingImage {
+  pub nodes: List<usize>,
+  pub files: List<usize>,
+  pub inputs: List<usize>,
+  pub fileModules: List<usize>,
+  pub checks: List<PendingCheck>,
+}
+
+// A replayed escape check that reports: its unit, the node of what its replay demanded and the
+// files its reports point into, and its answer.
+pub struct ReplayReport {
+  pub unit: usize,
+  pub node: usize,
+  pub answer: Bytes,
+}
+
+pub struct PendingCheck {
+  pub unit: usize,
+  pub answer: Bytes,
+  pub sites: List<ModuleId>,
+}
+
+effect fn slotFor(slots: &mut List<usize>, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while List<usize>.length(&slots.*) <= at { run List<usize>.append(&mut slots.*, unreached()) }
+}
+
+// The leaf of one consumed file or input, added on first use, or `unfit` when it has no stable form.
+effect fn imageLeaf(resolver: &Resolver, build: &mut ImageBuild, dependee: Dependee) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return match &dependee {
+    Dependee.SourceFile {module} => {
+      run slotFor(&mut build.files, module)
+      let known = List<usize>.get(&build.files, module)
+      if known != unreached() { return known }
+      let modules = List<ModuleId>.asSlice(&resolver.modules)
+      let mut key = Bytes.make()
+      run StableKey.module(&mut key, &modules[module])
+      let leaf = run CacheImage.addLeaf(&mut build.image, false, move key, ContentHash {high: 0, low: 0}, usize.MAX, usize.MAX,
+        ContentHash {high: 0, low: 0})
+      run List<usize>.append(&mut build.fileModules, module)
+      List<usize>.set(&mut build.files, module, leaf)
+      return leaf
+    }
+    Dependee.SourceInput {input, ..} => {
+      run slotFor(&mut build.inputs, input)
+      let known = List<usize>.get(&build.inputs, input)
+      if known != unreached() { return known }
+      let mut found = unfit()
+      if let Option<Bytes>.Some {value: key} = move run stableInput(&resolver.*, input) {
+        // The file of the input's module rides along, so an adoption that finds the file
+        // unchanged takes the input's digest without capturing it again.
+        let file = run imageLeaf(resolver, &mut build.*, Dependee.SourceFile {module: List<Inputs.Input>.asSlice(&resolver.sourceInputs.inputs)[input].module})
+        let values = List<Inputs.Input>.asSlice(&resolver.sourceInputs.inputs)
+        let handle = Inputs.handle(&values[input].selector)
+        let mut position = usize.MAX
+        if handle != usize.MAX { position = DeclarationTable.position(&resolver.declarations, handle) }
+        found = run CacheImage.addLeaf(&mut build.image, true, move key, values[input].digest, position, file, values[input].text)
+      }
+      List<usize>.set(&mut build.inputs, input, found)
+      return found
+    }
+    Dependee.MirDispatch {..} => unfit()
+    Dependee.UnitResult {..} => unfit()
+  }
+}
+
+// Adds every unit `root` reaches to the image, children first, and returns `root`'s node, or
+// `unfit` when it reaches a unit that is not current or a leaf with no stable form.
+pub effect fn imageUnit(resolver: &Resolver, build: &mut ImageBuild, root: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run slotFor(&mut build.nodes, root)
+  if List<usize>.get(&build.nodes, root) != unreached() { return List<usize>.get(&build.nodes, root) }
+  // Each frame keeps the unit and the next of its edges to look at, so every edge is passed once.
+  let mut stack = List<usize>.make()
+  let mut cursors = List<usize>.make()
+  run List<usize>.append(&mut stack, root)
+  run List<usize>.append(&mut cursors, Graph.firstEdgeOf(&resolver.graph, root))
+  List<usize>.set(&mut build.nodes, root, entered())
+  let mut edges = List<usize>.make()
+  while List<usize>.length(&stack) > usize.ZERO {
+    let top = List<usize>.length(&stack) - usize.ONE
+    let unit = List<usize>.get(&stack, top)
+    // Enter the next child not reached yet; the unit finishes once every child has.
+    let mut pending = unreached()
+    let mut edge = List<usize>.get(&cursors, top)
+    while edge != usize.MAX && pending == unreached() {
+      let consumed = Graph.dependeeOf(&resolver.graph, edge)
+      if let Dependee.UnitResult {unit: child} = &consumed {
+        run slotFor(&mut build.nodes, child)
+        if List<usize>.get(&build.nodes, child) == unreached() { pending = child }
+      }
+      edge = Graph.nextEdgeOf(&resolver.graph, edge)
+    }
+    List<usize>.set(&mut cursors, top, edge)
+    if pending != unreached() {
+      List<usize>.set(&mut build.nodes, pending, entered())
+      run List<usize>.append(&mut stack, pending)
+      run List<usize>.append(&mut cursors, Graph.firstEdgeOf(&resolver.graph, pending))
+      continue
+    }
+    drop List<usize>.remove(&mut stack, top)
+    drop List<usize>.remove(&mut cursors, top)
+    let mut fit = Graph.state(&resolver.graph, unit) == UnitState.UpToDate
+    edges = List<usize>.make()
+    edge = Graph.firstEdgeOf(&resolver.graph, unit)
+    while edge != usize.MAX && fit {
+      let dependee = Graph.dependeeOf(&resolver.graph, edge)
+      if let Dependee.UnitResult {unit: child} = &dependee {
+        let node = List<usize>.get(&build.nodes, child)
+        // A child still entered closes a cycle; neither is fit.
+        if node >= unfit() { fit = false } else { run List<usize>.append(&mut edges, CacheImage.nodeEdge(node)) }
+      } else {
+        let leaf = run imageLeaf(&resolver.*, &mut build.*, dependee)
+        if leaf == unfit() { fit = false } else { run List<usize>.append(&mut edges, CacheImage.leafEdge(leaf)) }
+      }
+      edge = Graph.nextEdgeOf(&resolver.graph, edge)
+    }
+    if fit {
+      let node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+      List<usize>.set(&mut build.nodes, unit, node)
+    } else {
+      List<usize>.set(&mut build.nodes, unit, unfit())
+    }
+  }
+  return List<usize>.get(&build.nodes, root)
+}
+
+// Adds to `edges` the node of each Layout unit the EmissionInputs unit `emission` demanded: the
+// layouts its definition's text is emitted against, the supplied ones and those of its foreign
+// signatures. False when one of them, or `emission` itself, is unfit for the image.
+//
+// The definition's own LlvmText unit names an immutable content subject and reads nothing, so a
+// root resting on it and the MIR alone stays green when only an element's layout changed, and a
+// later build reuses code with the old stride (silk-lang/silk#2468). The EmissionInputs unit
+// itself reads more than its text needs, such as what places a gap and what its callees' signature
+// content rests on, so a root resting on it would lower again after edits that leave the
+// definition as it was; the root rests on the layouts it read instead.
+effect fn emittedLayoutEdges(resolver: &Resolver, build: &mut ImageBuild, emission: usize, edges: &mut List<usize>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if emission == usize.MAX || Graph.state(&resolver.graph, emission) != UnitState.UpToDate { return false }
+  let mut edge = Graph.firstEdgeOf(&resolver.graph, emission)
+  while edge != usize.MAX {
+    let consumed = Graph.dependeeOf(&resolver.graph, edge)
+    if let Dependee.UnitResult {unit: child} = &consumed {
+      if List<ScopedKey>.get(&resolver.keys, child).key.family == Family.Layout {
+        let node = run imageUnit(resolver, &mut build.*, child)
+        if node >= unfit() { return false }
+        let named = CacheImage.nodeEdge(node)
+        if !holdsUnit(List<usize>.asSlice(&edges.*), named) { run List<usize>.append(&mut edges.*, named) }
+      }
+    }
+    edge = Graph.nextEdgeOf(&resolver.graph, edge)
+  }
+  return true
+}
+
+// The answer of a module check root that reported nothing: whether it is a sweep (0) or an
+// escape check (1), then the concrete bodies it names, then no rejections and no deferred
+// templates.
+effect fn checkAnswer(kind: u64, concrete: &[DeclarationId], discoveryScope: ContentHash) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut answer = run checkHead(kind, concrete)
+  run RuntimeEncoding.word(&mut answer, 0)
+  run RuntimeEncoding.word(&mut answer, 0)
+  if u64.bitAnd(kind, 3) == 1 {
+    run RuntimeEncoding.word(&mut answer, discoveryScope.high)
+    run RuntimeEncoding.word(&mut answer, discoveryScope.low)
+  }
+  return move answer
+}
+
+effect fn checkHead(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut answer = Bytes.make()
+  run RuntimeEncoding.word(&mut answer, kind)
+  run RuntimeEncoding.word(&mut answer, usize.toU64(concrete.length))
+  let mut at = usize.ZERO
+  while at < concrete.length {
+    run StableKey.declaration(&mut answer, &concrete[at])
+    at = at + usize.ONE
+  }
+  return move answer
+}
+
+// The answer of a module check root that reports `rejections` and, for a sweep, defers the
+// static templates `deferred`; none when a rejection holds what an image does not carry
+// (`RejectionImage.encode`). `sites` gains the module of each site they name.
+effect fn reportingAnswer(kind: u64, concrete: &[DeclarationId], rejections: &[Shared<Rejection>], deferred: &[DeferredStaticTemplate],
+  discoveryScope: ContentHash, sites: &mut List<ModuleId>) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut answer = run checkHead(kind, concrete)
+  run RuntimeEncoding.word(&mut answer, usize.toU64(rejections.length))
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    if !run RejectionImage.encode(&mut answer, &rejections[at], &mut sites.*) { return Option<Bytes>.none() }
+    at = at + usize.ONE
+  }
+  run RuntimeEncoding.word(&mut answer, usize.toU64(deferred.length))
+  at = usize.ZERO
+  while at < deferred.length {
+    run StableKey.declaration(&mut answer, &deferred[at].declaration)
+    run RuntimeEncoding.word(&mut answer, StaticTemplate.reasonCode(deferred[at].reason))
+    at = at + usize.ONE
+  }
+  if u64.bitAnd(kind, 3) == 1 {
+    run RuntimeEncoding.word(&mut answer, discoveryScope.high)
+    run RuntimeEncoding.word(&mut answer, discoveryScope.low)
+  }
+  return Option<Bytes>.some(move answer)
+}
+
+// Writes the root of `unit` with `answer`, or gives `answer` back when the unit is unfit. A root
+// that reports rests on the file of each module in `sites` too: its spans are offsets into them.
+effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, answer: Bytes, sites: &[ModuleId]) -> Option<Bytes>
+! OutOfMemoryError ? &mut Allocator {
+  let key = match move run stableUnit(&resolver.*, unit) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Bytes>.none() }
+  }
+  let unitNode = run imageUnit(&resolver.*, &mut build.*, unit)
+  if unitNode >= unfit() { return Option<Bytes>.some(move answer) }
+  let node = run sitedNode(&resolver.*, &mut build.*, unitNode, sites)
+  if node == usize.MAX { return Option<Bytes>.none() }
+  run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node, answer: move answer})
+  return Option<Bytes>.none()
+}
+
+// `node`, or when `sites` names modules, a node resting on it and on the file of each, which a
+// report's spans point into; `usize.MAX` when one of them is not a module of this store.
+effect fn sitedNode(resolver: &Resolver, build: &mut ImageBuild, node: usize, sites: &[ModuleId]) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  if sites.length == usize.ZERO { return node }
+  let mut edges = List<usize>.make()
+  run List<usize>.append(&mut edges, CacheImage.nodeEdge(node))
+  let mut at = usize.ZERO
+  while at < sites.length {
+    let module = knownModuleOrdinal(&resolver.*, &sites[at])
+    if module == usize.MAX { return usize.MAX }
+    let edge = CacheImage.leafEdge(run imageLeaf(&resolver.*, &mut build.*, Dependee.SourceFile {module: module}))
+    if !holdsUnit(List<usize>.asSlice(&edges), edge) { run List<usize>.append(&mut edges, edge) }
+    at = at + usize.ONE
+  }
+  return run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+}
+
+// The digest of one module's source bytes, or zero when the module has no source.
+// The digest of `module`'s bytes in the held revision, read without parsing them.
+pub effect fn sourceDigest(resolver: &mut Resolver, module: &ModuleId) -> ContentHash ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let observed = run SourceIndex.captureObservation(&resolver.source, module)
+  if let Option<ContentHash>.Some {value} = move Observation.contentDigest(&observed) { return value }
+  return ContentHash {high: 0, low: 0}
+}
+
+// The digest an image records for an input known to read otherwise than its node read it
+// (`imageCarriedFiles`). No captured value hashes to it.
+fn changedInput() -> ContentHash {
+  return CacheImage.changedDigest()
+}
+
+// The current dependee one image leaf names, or `usize.MAX` when what it read changed: a file
+// leaf's module ordinal, or an input leaf's input, interned with its value when this store has not
+// captured it yet. `fileModule` is the module of the file leaf an input leaf names when that file
+// reads the same, or `usize.MAX`.
+effect fn placeLeaf(resolver: &mut Resolver, leaf: &CacheImage.Leaf, key: &[u8], fileModule: usize) -> usize ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let unchangedFile = fileModule != usize.MAX
+  if leaf.input && ContentHash.equals(leaf.digest, changedInput()) { return usize.MAX }
+  if !leaf.input {
+    let mut reader = StableKey.reader()
+    let module = match move run StableKey.readModule(key, &mut reader) {
+      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.None => { return usize.MAX }
+    }
+    if !StableKey.finished(key, &reader) { return usize.MAX }
+    let digest = run sourceDigest(&mut resolver.*, &module)
+    if !ContentHash.equals(digest, leaf.digest) { return usize.MAX }
+    return run internModule(&mut resolver.*, &module)
+  }
+  let placed = match move run placeStableInputIn(&mut resolver.*, key, unchangedFile, leaf.position, fileModule) {
+    Option<PlacedInput>.Some {value} => move value
+    Option<PlacedInput>.None => { return usize.MAX }
+  }
+  // A cache can be opened before the build roots are known. Membership-dependent definitions
+  // wait on this leaf until the walk has closed the member sets.
+  if let SourceSelector.ErasureMembers {contract} = &placed.selector {
+    // The registry is empty in a program with no registrations. Its definitions wait
+    // on the membership fingerprint, even when only source positions moved.
+    if same(Bytes.asSlice(&contract), ErasureIndex.ambientSelector()) && ContentHash.equals(leaf.digest, ContentHash.of(b"C")) {
+      return usize.MAX
+    }
+    // An adopted sweep can reach an erased operation before it reparses the module that
+    // writes its contract. Discover the current members before reusing that sweep.
+    resolver.writtenErasure = true
+    return usize.MAX
+  }
+  let known = Inputs.find(&resolver.sourceInputs, placed.module, &placed.selector)
+  // A read of a file whose bytes are those the image recorded reads what it read then. A resolution
+  // reads the manifests instead, which the image does not record.
+  let resolution = match &placed.selector { SourceSelector.Resolution {..} => true SourceSelector.Request {..} => true _ => false }
+  if !resolution && unchangedFile {
+    if known != usize.MAX { return known }
+    return run Inputs.add(&mut resolver.sourceInputs, placed.module, move placed.selector, leaf.digest, leaf.text)
+  }
+  let module = resolvedModule(&resolver.*, placed.module)
+  // A module this build does not load is not read: its inputs count as changed, and a demand of
+  // its source would read outside the build's preloaded import graph.
+  let observed = run SourceIndex.captureObservation(&resolver.source, &module)
+  if !Observation.isPresent(&observed) { return usize.MAX }
+  // A resolution is captured again without loading the module, which no-op builds never parse.
+  let mut value = Bytes.make()
+  let mut text = ContentHash {high: 0, low: 0}
+  if let SourceSelector.Resolution {path} = &placed.selector {
+    value = run captureResolution(&resolver.*, &module, Bytes.asSlice(&path))
+  } else if let SourceSelector.Request {fact} = &placed.selector {
+    value = run captureRequest(&resolver.*, Bytes.asSlice(&fact))
+  } else {
+    let answer = run demandSource(&mut resolver.*, &module)
+    let mut position = usize.MAX
+    let handle = Inputs.handle(&placed.selector)
+    if handle != usize.MAX { position = DeclarationTable.position(&resolver.declarations, handle) }
+    text = Inputs.text(&placed.selector, sourceOf(&resolver.*, &answer, &module), position)
+    // A declaration whose own tokens read as they did when the input was captured reads the same.
+    if !ContentHash.equals(text, ContentHash {high: 0, low: 0}) && ContentHash.equals(text, leaf.text) {
+      if known != usize.MAX { return known }
+      return run Inputs.add(&mut resolver.sourceInputs, placed.module, move placed.selector, leaf.digest, text)
+    }
+    value = run captureInput(&resolver.*, &module, &placed.selector, &answer, position)
+  }
+  let digest = ContentHash.of(Bytes.asSlice(&value))
+  if !ContentHash.equals(digest, leaf.digest) { return usize.MAX }
+  if known != usize.MAX { return known }
+  return run Inputs.add(&mut resolver.sourceInputs, placed.module, move placed.selector, digest, text)
+}
+
+// The module, name and member of a module check's stable key, as `stableUnit` wrote it.
+pub struct CheckKey {
+  pub module: ModuleId,
+  pub name: usize,
+  pub member: usize,
+}
+
+pub effect fn readCheckKey(bytes: &[u8]) -> Option<CheckKey> ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = StableKey.reader()
+  let family = StableKey.readWord(bytes, &mut reader)
+  if family != u8.toU64(Family.value(Family.ModuleCheck)) { return Option<CheckKey>.none() }
+  drop StableKey.readWord(bytes, &mut reader)
+  let module = match move run StableKey.readModule(bytes, &mut reader) {
+    Option<ModuleId>.Some {value} => move value
+    Option<ModuleId>.None => { return Option<CheckKey>.none() }
+  }
+  drop StableKey.readWord(bytes, &mut reader)
+  drop StableKey.readWord(bytes, &mut reader)
+  let name = StableKey.readWord(bytes, &mut reader)
+  let member = StableKey.readWord(bytes, &mut reader)
+  drop StableKey.readWord(bytes, &mut reader)
+  if !StableKey.finished(bytes, &reader) { return Option<CheckKey>.none() }
+  return Option<CheckKey>.some(CheckKey {module: move module, name: u64.toUsize(name), member: u64.toUsize(member)})
+}
+
+// The concrete bodies a module check root's answer names, and what it checks: a sweep (0), an
+// escape check (1), or one declaration of a sweep, which names that declaration and is a concrete
+// body (3) or not (2).
+pub struct CheckAnswer {
+  pub kind: u64,
+  pub nonParking: bool,
+  pub summaryTrivial: bool,
+  pub discoveryScope: ContentHash,
+  pub concrete: List<DeclarationId>,
+  pub rejections: List<Shared<Rejection>>,
+  // The static templates a sweep deferred, which `deferredStaticTemplates` reports.
+  pub deferred: List<DeferredStaticTemplate>,
+}
+
+// Where the stable key of a declaration check (`ModuleCheck` name 6) names its module; empty for
+// any other key.
+pub fn declarationRootModule(key: &[u8]) -> Span {
+  let none = Span.make(usize.ZERO, usize.ZERO)
+  let mut reader = StableKey.reader()
+  let family = StableKey.readWord(key, &mut reader)
+  if StableKey.failed(&reader) || family != u8.toU64(Family.value(Family.ModuleCheck)) { return none }
+  drop StableKey.readWord(key, &mut reader)
+  let start = StableKey.offset(&reader)
+  StableKey.skipModule(key, &mut reader)
+  let end = StableKey.offset(&reader)
+  drop StableKey.readWord(key, &mut reader)
+  drop StableKey.readWord(key, &mut reader)
+  let name = StableKey.readWord(key, &mut reader)
+  if StableKey.failed(&reader) || name != 6 { return none }
+  return Span.make(start, end)
+}
+
+// A copy of the answer of root `root` of the adopted image `image`; empty without one.
+pub effect fn adoptedAnswer(image: &Option<CacheImage.Image>, root: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if let Option<CacheImage.Image>.Some {value} = &image.* {
+    return run Bytes.copy(Bytes.asSlice(&List<CacheImage.Root>.asSlice(&value.roots)[root].answer))
+  }
+  return Bytes.make()
+}
+
+// A check's concrete bodies mostly belong to its own module, `checked`, which they share rather
+// than each building a copy.
+pub effect fn readCheckAnswer(bytes: &[u8], checked: Option<&ModuleId>) -> Option<CheckAnswer> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut reader = StableKey.reader()
+  // The low two bits identify the check. Bit 2 restores a provider proof; bit 3 marks a summary-trivial declaration.
+  let flags = StableKey.readWord(bytes, &mut reader)
+  let kind = u64.bitAnd(flags, 3)
+  let count = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || flags > 15 || (kind > 1 && count != 1) { return Option<CheckAnswer>.none() }
+  let mut concrete = List<DeclarationId>.make()
+  let mut at: u64 = 0
+  while at < count {
+    let read = match checked {
+      Option<&ModuleId>.Some {value: module} => run StableKey.readDeclarationIn(bytes, &mut reader, module)
+      Option<&ModuleId>.None => run StableKey.readDeclaration(bytes, &mut reader)
+    }
+    match move read {
+      Option<DeclarationId>.Some {value} => { run List<DeclarationId>.append(&mut concrete, move value) }
+      Option<DeclarationId>.None => { return Option<CheckAnswer>.none() }
+    }
+    at = at + 1
+  }
+  // A declaration's answer is written only when it reported nothing.
+  let reported = StableKey.readWord(bytes, &mut reader)
+  if kind > 1 && reported != 0 { return Option<CheckAnswer>.none() }
+  let mut rejections = List<Shared<Rejection>>.make()
+  at = 0
+  while at < reported {
+    match move run RejectionImage.decode(bytes, &mut reader) {
+      Option<Rejection>.Some {value} => { run List<Shared<Rejection>>.append(&mut rejections, run Shared<Rejection>.make(move value)) }
+      Option<Rejection>.None => { return Option<CheckAnswer>.none() }
+    }
+    at = at + 1
+  }
+  // Only a sweep defers templates.
+  let deferredCount = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || (kind != 0 && deferredCount != 0) { return Option<CheckAnswer>.none() }
+  let mut deferred = List<DeferredStaticTemplate>.make()
+  at = 0
+  while at < deferredCount {
+    let read = match checked {
+      Option<&ModuleId>.Some {value: module} => run StableKey.readDeclarationIn(bytes, &mut reader, module)
+      Option<&ModuleId>.None => run StableKey.readDeclaration(bytes, &mut reader)
+    }
+    let declaration = match move read {
+      Option<DeclarationId>.Some {value} => move value
+      Option<DeclarationId>.None => { return Option<CheckAnswer>.none() }
+    }
+    let reason = match move StaticTemplate.reasonOf(StableKey.readWord(bytes, &mut reader)) {
+      Option<StaticTemplate.Reason>.Some {value} => value
+      Option<StaticTemplate.Reason>.None => { return Option<CheckAnswer>.none() }
+    }
+    run List<DeferredStaticTemplate>.append(&mut deferred, DeferredStaticTemplate {declaration: move declaration, reason: reason})
+    at = at + 1
+  }
+  let mut discoveryScope = ContentHash {high: 0, low: 0}
+  if kind == 1 {
+    let high = StableKey.readWord(bytes, &mut reader)
+    let low = StableKey.readWord(bytes, &mut reader)
+    if StableKey.failed(&reader) { return Option<CheckAnswer>.none() }
+    discoveryScope = ContentHash {high: high, low: low}
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<CheckAnswer>.none() }
+  return Option<CheckAnswer>.some(CheckAnswer {kind: kind, nonParking: u64.bitAnd(flags, 4) != 0,
+    summaryTrivial: u64.bitAnd(flags, 8) != 0, discoveryScope: discoveryScope,
+    concrete: move concrete, rejections: move rejections, deferred: move deferred})
+}
+
+/// As [`adoptCache`], keeping `image`, which [`adoptedImage`] gives back for the image this
+/// store writes next to carry its reused checks from.
+pub effect fn adoptImage(thisStore: &mut Semantic, request: &Request, image: CacheImage.Image, linked: bool) -> Adopted
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut held = move image
+  // An image whose nodes do not read is not adopted.
+  return match move run adoptFrom(&mut thisStore.*, request, &mut held, linked) {
+    Option<Adopted>.Some {value} => {
+      thisStore.heldImage = Option<CacheImage.Image>.some(move held)
+      move value
+    }
+    Option<Adopted>.None => Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
+  }
+}
+
+// Whether `scope` matches this store's non-zero check or build image scope.
+fn scopeMatches(resolver: &Resolver, scope: ContentHash) -> bool {
+  if ContentHash.equals(scope, ContentHash {high: 0, low: 0}) { return false }
+  return ContentHash.equals(scope, resolver.checkImageScope)
+    || ContentHash.equals(scope, resolver.buildImageScope)
+}
+
+// Whether a selector-16 leaf records an empty ambient service registry (`b"C"` for the ambient
+// selector). Any other selector-16 leaf names a non-empty ambient registry or an erased `&any I`
+// contract, so adopting it must retain `writtenErasure = true`.
+effect fn isEmptyAmbientLeaf(leaf: &CacheImage.Leaf, key: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !ContentHash.equals(leaf.digest, ContentHash.of(b"C")) { return false }
+  let mut reader = StableKey.reader()
+  StableKey.skipModule(key, &mut reader)
+  if let Option<StableKey.ReadSelector>.Some {value: read} = move run StableKey.readSelectorDeferred(key, &mut reader) {
+    if let SourceSelector.ErasureMembers {contract} = &read.selector {
+      return same(Bytes.asSlice(&contract), ErasureIndex.ambientSelector())
+    }
+  }
+  return false
+}
+
+// Whether a file leaf's module is simply not loaded in this store's source index (for example, a
+// sibling target's module carried by `withSiblingBuild`), as opposed to a loaded module whose
+// bytes changed.
+effect fn isUnloadedFileLeaf(resolver: &Resolver, key: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = StableKey.reader()
+  let module = match move run StableKey.readModule(key, &mut reader) {
+    Option<ModuleId>.Some {value} => move value
+    Option<ModuleId>.None => { return false }
+  }
+  if !StableKey.finished(key, &reader) { return false }
+  let observed = run SourceIndex.captureObservation(&resolver.source, &module)
+  return !Observation.isPresent(&observed)
+}
+
+// Adopts `image`, or none when its nodes, which it reads only when a leaf changed or the store
+// is linked or a build record needs them (`CacheImage.readNodes`), do not read.
+pub effect fn adoptFrom(thisStore: &mut Semantic, request: &Request, image: &mut CacheImage.Image, linked: bool) -> Option<Adopted>
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  run selectRequest(&mut thisStore.resolver, request)
+  run reconcileSources(&mut thisStore.resolver)
+  // An unlinked store whose anchors all stand where the image recorded them finds every leaf
+  // unchanged without reading the others (`placeAnchors`).
+  if !linked && !CacheImage.leavesRead(&image.*) && run placeAnchors(&mut thisStore.*, &image.*) {
+    if recordsBuild(&image.*) {
+      if !run CacheImage.readNodes(&mut image.*) { return Option<Adopted>.none() }
+    }
+    let unchanged = LeafPlacement {placed: List<usize>.make(), positional: List<bool>.make(), unplaced: usize.ZERO, changed: usize.ZERO}
+    return Option<Adopted>.some(run adoptNodes(&mut thisStore.*, &image.*, linked, move unchanged))
+  }
+  // Placing a leaf again finds what an anchor placed (`placeLeaf`).
+  if !run CacheImage.readLeaves(&mut image.*) { return Option<Adopted>.none() }
+  let placement = run placeImageLeaves(&mut thisStore.*, &image.*, linked)
+  if linked || placement.unplaced > usize.ZERO || recordsBuild(&image.*) {
+    if !run CacheImage.readNodes(&mut image.*) { return Option<Adopted>.none() }
+  }
+  return Option<Adopted>.some(run adoptNodes(&mut thisStore.*, &image.*, linked, move placement))
+}
+
+// Whether the anchors of `image`, whose other leaves are not read, all stand where the image
+// recorded them, placed as `placeImageLeaves` places them: files first, then inputs, each in
+// index order. Every other leaf is an input of an unchanged file that is not always placed
+// (`CacheImage.alwaysPlaced`), which an unlinked store takes as unchanged without placing it.
+pub effect fn placeAnchors(thisStore: &mut Semantic, image: &CacheImage.Image) -> bool ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let anchors = CacheImage.anchors(image)
+  let mut placed = List<usize>.make()
+  run List<usize>.appendRepeated(&mut placed, usize.MAX, anchors.length)
+  let mut at = usize.ZERO
+  while at < anchors.length {
+    if !anchors[at].leaf.input {
+      let found = run placeLeaf(&mut thisStore.resolver, &anchors[at].leaf, CacheImage.anchorKey(&anchors[at]), usize.MAX)
+      if found == usize.MAX { return false }
+      List<usize>.set(&mut placed, at, found)
+    }
+    at = at + usize.ONE
+  }
+  let mut sawNonEmptyErasure = false
+  at = usize.ZERO
+  while at < anchors.length {
+    if anchors[at].leaf.input {
+      let leaf = &anchors[at].leaf
+      if leaf.selector == 16 && scopeMatches(&thisStore.resolver, leaf.text) {
+        if !run isEmptyAmbientLeaf(leaf, CacheImage.anchorKey(&anchors[at])) {
+          sawNonEmptyErasure = true
+        }
+        at = at + usize.ONE
+        continue
+      }
+      let mut fileModule = usize.MAX
+      if anchors[at].leaf.file != usize.MAX { fileModule = List<usize>.get(&placed, CacheImage.anchorIndex(anchors, anchors[at].leaf.file)) }
+      let found = run placeLeaf(&mut thisStore.resolver, &anchors[at].leaf, CacheImage.anchorKey(&anchors[at]), fileModule)
+      if found == usize.MAX { return false }
+    }
+    at = at + usize.ONE
+  }
+  if sawNonEmptyErasure { thisStore.resolver.writtenErasure = true }
+  return true
+}
+
+// Where each leaf of `image` stands now (`placeLeaf`), and whether each changed one records only
+// where a span sits (`positionalLeaf`).
+pub effect fn placeImageLeaves(thisStore: &mut Semantic, image: &CacheImage.Image, linked: bool) -> LeafPlacement
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let leaves = CacheImage.leaves(image)
+  let mut unplaced = usize.ZERO
+  let mut changed = usize.ZERO
+  let mut placed = List<usize>.make()
+  let mut unloadedFiles = List<bool>.make()
+  // Files first: an input read from a file that reads as the image recorded is unchanged too.
+  // Another leaf of the same module can record other bytes: a carried input names the file it
+  // was read from, which an edit since can have changed.
+  // Only the keys of the leaves placed are read (`CacheImage.keyAt`).
+  let mut keys = CacheImage.keyCursor()
+  let mut at = usize.ZERO
+  while at < leaves.length {
+    let mut dependee = usize.MAX
+    let mut unloaded = false
+    if !leaves[at].input {
+      let key = run CacheImage.keyAt(image, &mut keys, at)
+      dependee = run placeLeaf(&mut thisStore.resolver, &leaves[at], key, usize.MAX)
+      if dependee == usize.MAX { unloaded = run isUnloadedFileLeaf(&thisStore.resolver, key) }
+    }
+    run List<usize>.append(&mut placed, dependee)
+    run List<bool>.append(&mut unloadedFiles, unloaded)
+    at = at + usize.ONE
+  }
+  // Whether each changed leaf records only where a span sits (`positionalLeaf`).
+  let mut positional = List<bool>.make()
+  run List<bool>.appendRepeated(&mut positional, false, leaves.length)
+  at = usize.ZERO
+  while at < leaves.length {
+    if leaves[at].input {
+      let file = leaves[at].file
+      let mut fileModule = usize.MAX
+      let mut fileUnloaded = false
+      if file != usize.MAX {
+        fileModule = List<usize>.get(&placed, file)
+        fileUnloaded = List<bool>.get(&unloadedFiles, file)
+      }
+      if fileUnloaded {
+        unplaced = unplaced + usize.ONE
+      } else if !linked && leaves[at].selector == 16 && scopeMatches(&thisStore.resolver, leaves[at].text) {
+        let key = run CacheImage.keyAt(image, &mut keys, at)
+        if !run isEmptyAmbientLeaf(&leaves[at], key) {
+          thisStore.resolver.writtenErasure = true
+        }
+        List<usize>.set(&mut placed, at, unplacedInput())
+      } else if !linked && unchangedLeaf(&leaves[at], fileModule) {
+        // An unlinked store records no edge to an input, so an input that reads as the image
+        // recorded needs no input of its own here: a check that runs again captures what it reads.
+        // Its key is not read either.
+        List<usize>.set(&mut placed, at, unplacedInput())
+        run carryInput(&mut thisStore.resolver.carried, run CacheImage.keyAt(image, &mut keys, at), &leaves[at], fileModule,
+          leaves[file].digest)
+      } else {
+        List<usize>.set(&mut placed, at, run placeLeaf(&mut thisStore.resolver, &leaves[at], run CacheImage.keyAt(image, &mut keys, at), fileModule))
+        if List<usize>.get(&placed, at) == usize.MAX {
+          List<bool>.set(&mut positional, at, positionalLeaf(&leaves[at]))
+          unplaced = unplaced + usize.ONE
+          changed = changed + usize.ONE
+        }
+      }
+    } else if List<usize>.get(&placed, at) == usize.MAX {
+      unplaced = unplaced + usize.ONE
+      if !List<bool>.get(&unloadedFiles, at) { changed = changed + usize.ONE }
+    }
+    at = at + usize.ONE
+  }
+  return LeafPlacement {placed: move placed, positional: move positional, unplaced: unplaced, changed: changed}
+}
+
+// Adopts the nodes and roots of `image` whose leaves stand as `placement` finds them.
+pub effect fn adoptNodes(thisStore: &mut Semantic, image: &CacheImage.Image, linked: bool, placement: LeafPlacement) -> Adopted
+  ! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let LeafPlacement {placed, positional, unplaced, changed} = move placement
+  let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: changed}
+  let mut at = usize.ZERO
+  let mut units = List<usize>.make()
+  // Whether a node reads the same once positions are set aside: every leaf it reaches reads as
+  // the image recorded, or records only where a span sits (`positionalLeaf`).
+  let mut settled = List<bool>.make()
+  let nodes = CacheImage.nodeCount(image)
+  // In an unlinked store with every leaf reading as the image recorded, every node is green.
+  if !linked && unplaced == usize.ZERO {
+    run List<usize>.reserveExact(&mut units, nodes)
+    run List<bool>.appendRepeated(&mut settled, true, nodes)
+    while at < nodes {
+      run List<usize>.append(&mut units, at)
+      at = at + usize.ONE
+    }
+  }
+  while at < nodes {
+    let edges = CacheImage.edgesOf(image, at)
+    let mut green = true
+    let mut still = true
+    let mut edge = usize.ZERO
+    while edge < edges.length && still {
+      let named = CacheImage.target(edges[edge])
+      if CacheImage.namesNode(edges[edge]) {
+        green = green && List<usize>.get(&units, named) != usize.MAX
+        still = List<bool>.get(&settled, named)
+      } else if List<usize>.get(&placed, named) == usize.MAX {
+        green = false
+        still = List<bool>.get(&positional, named)
+      }
+      edge = edge + usize.ONE
+    }
+    run List<bool>.append(&mut settled, still)
+    let mut unit = usize.MAX
+    if green && !linked {
+      // Any value but `usize.MAX` marks the node green.
+      unit = at
+    } else if green {
+      let word = run internKey(&mut thisStore.resolver, Key {family: Family.ModuleCheck, module: usize.ZERO, name: 2,
+        declaration: usize.MAX, member: at, external: false})
+      unit = u64.toUsize(word.value)
+      run Graph.startRun(&mut thisStore.resolver.graph, unit)
+      edge = usize.ZERO
+      while edge < edges.length {
+        let named = CacheImage.target(edges[edge])
+        if CacheImage.namesNode(edges[edge]) {
+          run Graph.record(&mut thisStore.resolver.graph, unit, Dependee.UnitResult {unit: List<usize>.get(&units, named)})
+        } else if CacheImage.leaves(image)[named].input {
+          let input = List<usize>.get(&placed, named)
+          let module = List<Inputs.Input>.asSlice(&thisStore.resolver.sourceInputs.inputs)[input].module
+          run Graph.record(&mut thisStore.resolver.graph, unit, Dependee.SourceInput {input: input, module: module})
+        } else {
+          run Graph.record(&mut thisStore.resolver.graph, unit, Dependee.SourceFile {module: List<usize>.get(&placed, named)})
+        }
+        edge = edge + usize.ONE
+      }
+      drop run Graph.finishRun(&mut thisStore.resolver.graph, unit, Option<ContentHash>.none())
+      adopted.nodes = adopted.nodes + usize.ONE
+    }
+    run List<usize>.append(&mut units, unit)
+    at = at + usize.ONE
+  }
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut conditions = SummaryConditions.make()
+  if !linked && unplaced > usize.ZERO {
+    conditions = run summaryConditions(image, List<usize>.asSlice(&units), List<usize>.asSlice(&placed))
+  }
+  // The build record and the definitions of a build walk sit beside the checks; a build
+  // replays them (`replayBuild`).
+  let mut recordRoot = usize.MAX
+  let mut greenDefinitions = List<usize>.make()
+  let mut conditionalDefinitions = List<usize>.make()
+  let mut packRoots = List<usize>.make()
+  thisStore.resolver.packs = List<HeldPack>.make()
+  // Escape walk records sit beside them too; a check replays them (`replayEscapes`). A linked
+  // store sees later revisions, which the image's green nodes do not describe.
+  thisStore.escapeImage = EscapeImage.make()
+  at = usize.ZERO
+  while at < roots.length {
+    let root = &roots[at]
+    at = at + usize.ONE
+    let node = List<usize>.get(&units, root.node)
+    let mut exact = Span.make(usize.ZERO, usize.ZERO)
+    let kind = buildRootKind(Bytes.asSlice(&root.key), &mut exact)
+    if kind == 1 {
+      if node != usize.MAX { recordRoot = at - usize.ONE }
+      continue
+    }
+    // Definitions with embedded site labels or debug locations read Origin and Layout inputs,
+    // which are not positionalLeaf inputs: moving their sites must regenerate their text.
+    // Other definitions can be reused when only diagnostic span projections moved.
+    if kind == 2 {
+      if node != usize.MAX || (!linked && List<bool>.get(&settled, root.node)) {
+        run List<usize>.append(&mut greenDefinitions, at - usize.ONE)
+      } else if SummaryConditions.conditional(&conditions, root.node) {
+        run List<usize>.append(&mut conditionalDefinitions, at - usize.ONE)
+      }
+      continue
+    }
+    if kind == 6 { continue }
+    // A pack's text is held only with the body the cache offered for it.
+    if kind == 5 {
+      if node != usize.MAX {
+        run List<usize>.append(&mut packRoots, at - usize.ONE)
+        if !linked && thisStore.resolver.packing { run holdPack(&mut thisStore.*, at - usize.ONE, Bytes.asSlice(&root.answer)) }
+      }
+      continue
+    }
+    // An escape record and its entries hold no position either: an entry keeps its summary's
+    // digest and the exact keys it reaches, and a replay finds every site from the anchors of
+    // the source it reads now.
+    if kind == 3 || kind == 4 || kind == 7 {
+      // A cached check can precede the first parse of the dependency that writes the erased
+      // type. Its immutable MIR variants still require discovery in this store.
+      if kind == 7 { thisStore.resolver.writtenErasure = true }
+      if (node != usize.MAX || List<bool>.get(&settled, root.node)) && !linked {
+        let named = StableKey.view(Bytes.asSlice(&root.key), exact)
+        if kind == 3 || kind == 7 {
+          run List<EscapeRecordRoot>.append(&mut thisStore.escapeImage.records, EscapeRecordRoot {unit: exact, root: at - usize.ONE})
+        } else if run DigestSet.add(&mut thisStore.escapeImage.entries, digestOfBytes(named)) {
+          run List<usize>.append(&mut thisStore.escapeImage.roots, at - usize.ONE)
+        }
+      }
+      continue
+    }
+    // An unlinked store reads a declaration's check root only when a sweep of its module runs:
+    // a sweep that is reused reads none of them.
+    if !linked && (node != usize.MAX || List<bool>.get(&settled, root.node)) {
+      let module = declarationRootModule(Bytes.asSlice(&root.key))
+      if module.end > module.start {
+        run InternIndex.record(&mut thisStore.pendingLookup, InternIndex.hashBytes(0, StableKey.view(Bytes.asSlice(&root.key), module)))
+        run List<usize>.append(&mut thisStore.pendingRoots, at - usize.ONE)
+        run List<usize>.append(&mut thisStore.carriedUnits, usize.MAX)
+        run List<usize>.append(&mut thisStore.carriedRoots, at - usize.ONE)
+        adopted.roots = adopted.roots + usize.ONE
+        continue
+      }
+    }
+    let key = run readCheckKey(Bytes.asSlice(&root.key))
+    let answer = match &key {
+      Option<CheckKey>.Some {value: checked} => run readCheckAnswer(Bytes.asSlice(&root.answer), Option<&ModuleId>.some(&checked.module))
+      Option<CheckKey>.None => run readCheckAnswer(Bytes.asSlice(&root.answer), Option<&ModuleId>.none())
+    }
+    let mut reused = false
+    // A check root holds no position but the spans it reports, which rest on the whole files
+    // they point into (`sitedNode`). So an unlinked store reuses it when only where other spans
+    // sit moved, as when a line is inserted above it. A linked store needs each node current.
+    let positioned = !linked && List<bool>.get(&settled, root.node)
+    let loadedRoot = match &key {
+      Option<CheckKey>.Some {value} => SourceIndex.presents(&thisStore.resolver.source, &value.module)
+      Option<CheckKey>.None => true
+    }
+    if let Option<CheckKey>.Some {value: check} = move key {
+      if let Option<CheckAnswer>.Some {value: kept} = move answer {
+        if node != usize.MAX || positioned {
+          let mut resting = node
+          if !linked { resting = usize.MAX }
+          reused = run adoptCheck(&mut thisStore.*, resting, Bytes.asSlice(&root.key), move check, move kept)
+        }
+      }
+    }
+    if reused {
+      adopted.roots = adopted.roots + usize.ONE
+      if !linked { run List<usize>.append(&mut thisStore.carriedRoots, at - usize.ONE) }
+    } else if loadedRoot { adopted.stale = adopted.stale + usize.ONE }
+  }
+  thisStore.replay = Option<ReplayState>.none()
+  if recordRoot != usize.MAX {
+    thisStore.replay = run ReplayState.read(image, recordRoot, List<usize>.asSlice(&greenDefinitions),
+      List<usize>.asSlice(&conditionalDefinitions), &conditions, List<HeldPack>.asSlice(&thisStore.resolver.packs), move packRoots)
+  }
+  return move adopted
+}
+
+// Holds the pack the image root at `root` describes with the body offered for it, when one was.
+pub effect fn holdPack(thisStore: &mut Semantic, root: usize, answer: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let pack = match move run BuildRecord.decodePack(answer) {
+    Option<BuildRecord.Pack>.Some {value} => move value
+    Option<BuildRecord.Pack>.None => { return () }
+  }
+  let members = List<BuildRecord.Member>.asSlice(&pack.members)
+  let mut end = usize.ZERO
+  if members.length > usize.ZERO { end = members[members.length - usize.ONE].offset + members[members.length - usize.ONE].length }
+  let offered = List<BuildRecord.PackBody>.asSlice(&thisStore.resolver.offeredBodies)
+  let mut at = usize.ZERO
+  while at < offered.length {
+    if ContentHash.equals(offered[at].digest, pack.digest) && Bytes.length(&offered[at].bytes) >= end {
+      let taken = List<BuildRecord.PackBody>.remove(&mut thisStore.resolver.offeredBodies, at)
+      run List<HeldPack>.append(&mut thisStore.resolver.packs, HeldPack {root: root, pack: move pack, body: move taken.bytes})
+      return ()
+    }
+    at = at + usize.ONE
+  }
+}
+
+// Makes one root's module check current, resting on its adopted node unless that is
+// `usize.MAX`, with the memo its answer holds; false when this store names that check by
+// another key, or already holds its memo.
+pub effect fn adoptCheck(thisStore: &mut Semantic, node: usize, written: &[u8], check: CheckKey, kept: CheckAnswer) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let module = run internModule(&mut thisStore.resolver, &check.module)
+  let word = run internKey(&mut thisStore.resolver, Key {family: Family.ModuleCheck, module: module, name: check.name,
+    declaration: usize.MAX, member: check.member, external: false})
+  let unit = u64.toUsize(word.value)
+  let same = match move run stableUnit(&thisStore.resolver, unit) {
+    Option<Bytes>.Some {value} => same(Bytes.asSlice(&value), written)
+    Option<Bytes>.None => false
+  }
+  if !same || Graph.state(&thisStore.resolver.graph, unit) != UnitState.Absent { return false }
+  run Graph.startRun(&mut thisStore.resolver.graph, unit)
+  if node != usize.MAX { run Graph.record(&mut thisStore.resolver.graph, unit, Dependee.UnitResult {unit: node}) }
+  else { run List<usize>.append(&mut thisStore.carriedUnits, unit) }
+  drop run Graph.finishRun(&mut thisStore.resolver.graph, unit, Option<ContentHash>.none())
+  let CheckAnswer {kind, nonParking, summaryTrivial, discoveryScope, concrete, rejections, deferred} = move kept
+  if nonParking { run appendCheckedModule(&mut thisStore.resolver.nonParkingCallers, module) }
+  if kind > 1 {
+    let mut named = move concrete
+    run keepDeclaration(&mut thisStore.*, unit, List<DeclarationId>.remove(&mut named, usize.ZERO), kind == 3, node == usize.MAX, summaryTrivial)
+  } else if kind == 1 {
+    run List<EscapeMemo>.append(&mut thisStore.escapeMemos, EscapeMemo {unit: unit, discovery: usize.MAX, discoveryScope: discoveryScope,
+      concrete: move concrete, result: DeclarationCheckResult {rejections: move rejections, gaps: List<Shared<BackendGap>>.make(),
+        unchecked: List<UncheckedDeclaration>.make()}, captured: Option<CapturedBuild>.none(), reads: usize.MAX})
+  } else {
+    let mut sweep = Sweep.make()
+    sweep.concrete = move concrete
+    sweep.rejections = move rejections
+    run List<ModuleCheckMemo>.append(&mut thisStore.moduleMemos, ModuleCheckMemo {unit: unit, sweep: move sweep,
+      deferred: move deferred, unchecked: List<UncheckedBody>.make()})
+  }
+  return true
+}
+
+/// Identifies a standalone declaration check or build before its cache opens. An unchanged check
+/// or build can reuse its erasure membership snapshots and check-scope discovery proofs once the
+/// image's ordinary source and request anchors agree.
+pub effect fn selectCheckImage(thisStore: &mut Semantic, application: &ModuleId, runtime: &Option<ModuleId>, checked: &[ModuleId],
+  rootPackage: &[ModuleId]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut base = run Semantic.stampIdentity(&thisStore.*)
+  run Bytes.append(&mut base, &ContentHash.digits(run SourceIndex.sourceFingerprint(&thisStore.resolver.source)))
+  run PackageGraph.appendIdentity(&thisStore.resolver.packages, &mut base)
+  let traceFact = run captureRequest(&thisStore.resolver, b"trace-directive")
+  run RuntimeEncoding.field(&mut base, Bytes.asSlice(&traceFact))
+  if let Option<Discovery>.Some {value: discovery} = &thisStore.resolver.discovery {
+    run Bytes.append(&mut base, b"+")
+    run StableKey.module(&mut base, &discovery.root)
+    run RuntimeEncoding.field(&mut base, Bytes.asSlice(&discovery.directory))
+    let exports = List<ModuleId>.asSlice(&discovery.exports)
+    run RuntimeEncoding.word(&mut base, usize.toU64(exports.length))
+    let mut exportAt = usize.ZERO
+    while exportAt < exports.length {
+      run StableKey.module(&mut base, &exports[exportAt])
+      exportAt = exportAt + usize.ONE
+    }
+  } else {
+    run Bytes.append(&mut base, b"-")
+  }
+  run StableKey.module(&mut base, application)
+  if let Option<ModuleId>.Some {value} = &runtime.* {
+    run Bytes.append(&mut base, b"+")
+    run StableKey.module(&mut base, &value)
+  } else { run Bytes.append(&mut base, b"-") }
+  run RuntimeEncoding.word(&mut base, usize.toU64(checked.length))
+  let mut at = usize.ZERO
+  while at < checked.length {
+    run StableKey.module(&mut base, &checked[at])
+    at = at + usize.ONE
+  }
+  let mut checkBytes = run Bytes.copy(b"check")
+  run Bytes.append(&mut checkBytes, Bytes.asSlice(&base))
+  let checkScope = ContentHash.of(Bytes.asSlice(&checkBytes))
+  let mut buildBytes = run Bytes.copy(b"build")
+  run Bytes.append(&mut buildBytes, Bytes.asSlice(&base))
+  run RuntimeEncoding.word(&mut buildBytes, usize.toU64(rootPackage.length))
+  at = usize.ZERO
+  while at < rootPackage.length {
+    run StableKey.module(&mut buildBytes, &rootPackage[at])
+    at = at + usize.ONE
+  }
+  let support = List<ModuleId>.asSlice(&thisStore.resolver.support)
+  run RuntimeEncoding.word(&mut buildBytes, usize.toU64(support.length))
+  at = usize.ZERO
+  while at < support.length {
+    run StableKey.module(&mut buildBytes, &support[at])
+    at = at + usize.ONE
+  }
+  let linkOnly = List<ModuleId>.asSlice(&thisStore.resolver.linkOnlySupport)
+  run RuntimeEncoding.word(&mut buildBytes, usize.toU64(linkOnly.length))
+  at = usize.ZERO
+  while at < linkOnly.length {
+    run StableKey.module(&mut buildBytes, &linkOnly[at])
+    at = at + usize.ONE
+  }
+  let retained = List<RetentionRoot>.asSlice(&thisStore.resolver.retention)
+  run RuntimeEncoding.word(&mut buildBytes, usize.toU64(retained.length))
+  at = usize.ZERO
+  while at < retained.length {
+    run StableKey.module(&mut buildBytes, &retained[at].module)
+    run RuntimeEncoding.field(&mut buildBytes, Bytes.asSlice(&retained[at].declaration))
+    at = at + usize.ONE
+  }
+  let buildScope = ContentHash.of(Bytes.asSlice(&buildBytes))
+  thisStore.resolver.checkImageScope = checkScope
+  thisStore.resolver.buildImageScope = buildScope
+  thisStore.resolver.activeImageScope = checkScope
+}
+
+/// The roots of `image` a build replays from: its build record, the definitions and packs it
+/// names, and the inline summaries.
+pub effect fn buildRoots(image: &CacheImage.Image) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  let mut kept = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let mut exact = Span.make(usize.ZERO, usize.ZERO)
+    let kind = buildRootKind(Bytes.asSlice(&roots[at].key), &mut exact)
+    if kind == 1 || kind == 2 || kind == 5 || kind == 6 { run List<usize>.append(&mut kept, at) }
+    at = at + usize.ONE
+  }
+  return move kept
+}
+
+/// The image of this store's module checks for a cache on disk: each current module sweep and
+/// escape check, as a root, with every unit and source read it rests on and the rejections it
+/// reports, which also rest on the files their spans point into. A check that left a gap or an
+/// unchecked body, or reported what an image does not carry (`RejectionImage.encode`), is left
+/// out and runs again in the next process. So is a check an unlinked `adoptCache` reused: it
+/// rests on nothing here, and its image carries it (`CacheImage.carry` with `Adopted.carried`).
+pub effect fn cacheImage(thisStore: &mut Semantic) -> CacheImage.Image ! Cycle | OutOfMemoryError ? &mut Allocator {
+  // Input digests and the file digests beside them must describe the same bytes.
+  run reconcileSources(&mut thisStore.resolver)
+  run settleSourceInputs(&mut thisStore.resolver)
+  let mut build = ImageBuild {image: CacheImage.make(), nodes: List<usize>.make(), files: List<usize>.make(),
+    inputs: List<usize>.make(), fileModules: List<usize>.make()}
+  // A reused check rests on nothing here, so a check resting on it waits for its carried node.
+  let reused = List<usize>.asSlice(&thisStore.carriedUnits)
+  let mut at = usize.ZERO
+  while at < reused.length {
+    // A declaration check still unread has no unit (`pendingRoots`).
+    if reused[at] != usize.MAX {
+      run slotFor(&mut build.nodes, reused[at])
+      List<usize>.set(&mut build.nodes, reused[at], unfit())
+    }
+    at = at + usize.ONE
+  }
+  let mut pending = List<PendingCheck>.make()
+  let sweeps = List<ModuleCheckMemo>.asSlice(&thisStore.moduleMemos)
+  at = usize.ZERO
+  while at < sweeps.length {
+    let memo = &sweeps[at]
+    at = at + usize.ONE
+    if List<Shared<BackendGap>>.length(&memo.sweep.gaps) > usize.ZERO
+      || List<UncheckedDeclaration>.length(&memo.sweep.unchecked) > usize.ZERO
+      || List<UncheckedBody>.length(&memo.unchecked) > usize.ZERO
+      || holdsUnit(List<usize>.asSlice(&thisStore.carriedUnits), memo.unit) {
+      continue
+    }
+    let mut sites = List<ModuleId>.make()
+    let owner = List<ScopedKey>.get(&thisStore.resolver.keys, memo.unit).key.module
+    let kind: u64 = if listedOrdinal(List<usize>.asSlice(&thisStore.resolver.nonParkingCallers), owner) { 4 } else { 0 }
+    let answer = match move run reportingAnswer(kind, List<DeclarationId>.asSlice(&memo.sweep.concrete),
+      List<Shared<Rejection>>.asSlice(&memo.sweep.rejections), List<DeferredStaticTemplate>.asSlice(&memo.deferred),
+      ContentHash {high: 0, low: 0}, &mut sites) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { continue }
+    }
+    if let Option<Bytes>.Some {value} = move run imageRoot(&thisStore.resolver, &mut build, memo.unit, move answer, List<ModuleId>.asSlice(&sites)) {
+      run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: move sites})
+    }
+  }
+  let declarations = List<DeclarationMemo>.asSlice(&thisStore.declarationMemos)
+  at = usize.ZERO
+  while at < declarations.length {
+    let memo = &declarations[at]
+    at = at + usize.ONE
+    if memo.unit == usize.MAX || memo.carried { continue }
+    let mut kind: u64 = 2
+    if memo.concrete { kind = 3 }
+    let module = knownModuleOrdinal(&thisStore.resolver, DeclarationId.moduleId(&memo.identity))
+    if listedOrdinal(List<usize>.asSlice(&thisStore.resolver.nonParkingCallers), module) { kind = kind + 4 }
+    if memo.summaryTrivial { kind = kind + 8 }
+    let mut named = List<DeclarationId>.make()
+    run List<DeclarationId>.append(&mut named, DeclarationId.copy(&memo.identity))
+    let answer = run checkAnswer(kind, List<DeclarationId>.asSlice(&named), ContentHash {high: 0, low: 0})
+    if let Option<Bytes>.Some {value} = move run imageRoot(&thisStore.resolver, &mut build, memo.unit, move answer, &[]) {
+      run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: List<ModuleId>.make()})
+    }
+  }
+  let escapes = List<EscapeMemo>.asSlice(&thisStore.escapeMemos)
+  let mut reports = List<ReplayReport>.make()
+  at = usize.ZERO
+  while at < escapes.length {
+    let memo = &escapes[at]
+    at = at + usize.ONE
+    // A replay ran no unit of its own; its root rests on the image's record and entries
+    // (`imageReplayedChecks`), and when it reports, on what it demanded as well.
+    if memo.reads != usize.MAX {
+      if List<Shared<Rejection>>.length(&memo.result.rejections) == usize.ZERO
+        || List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
+        || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO {
+        continue
+      }
+      let mut sites = List<ModuleId>.make()
+      let answer = match move run reportingAnswer(1, List<DeclarationId>.asSlice(&memo.concrete),
+        List<Shared<Rejection>>.asSlice(&memo.result.rejections), &[], memo.discoveryScope, &mut sites) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { continue }
+      }
+      let readsNode = run imageUnit(&thisStore.resolver, &mut build, memo.reads)
+      if readsNode >= unfit() { continue }
+      let node = run sitedNode(&thisStore.resolver, &mut build, readsNode, List<ModuleId>.asSlice(&sites))
+      if node == usize.MAX { continue }
+      run List<ReplayReport>.append(&mut reports, ReplayReport {unit: memo.unit, node: node, answer: move answer})
+      continue
+    }
+    if List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
+      || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO
+      || holdsUnit(List<usize>.asSlice(&thisStore.carriedUnits), memo.unit) {
+      continue
+    }
+    let mut sites = List<ModuleId>.make()
+    let answer = match move run reportingAnswer(1, List<DeclarationId>.asSlice(&memo.concrete),
+      List<Shared<Rejection>>.asSlice(&memo.result.rejections), &[], memo.discoveryScope, &mut sites) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { continue }
+    }
+    if let Option<Bytes>.Some {value} = move run imageRoot(&thisStore.resolver, &mut build, memo.unit, move answer, List<ModuleId>.asSlice(&sites)) {
+      run List<PendingCheck>.append(&mut pending, PendingCheck {unit: memo.unit, answer: move value, sites: move sites})
+    }
+  }
+  thisStore.replayReports = move reports
+  // The last build's record and each definition it lowered, on the units it rests on. The
+  // definitions a replay took from the image this store read, and a record no build here
+  // replaced, stay in that image, which the written one carries them from.
+  thisStore.carriedBuild = List<usize>.make()
+  if let Option<CapturedBuild>.Some {value: captured} = &thisStore.capturedBuild {
+    let entries = List<CapturedEntry>.asSlice(&captured.entries)
+    let recorded = List<BuildRecord.Entry>.asSlice(&captured.record.entries)
+    at = usize.ZERO
+    while at < entries.length {
+      let entry = &entries[at]
+      let exact = recorded[at].exact
+      at = at + usize.ONE
+      if entry.carried != usize.MAX {
+        run List<usize>.append(&mut thisStore.carriedBuild, entry.carried)
+        continue
+      }
+      if recorded[at - usize.ONE].alias != usize.MAX { continue }
+      // An instance that emits no definition still names its references: its root rests on its
+      // MIR alone and holds no answer.
+      let mirNode = run imageUnit(&thisStore.resolver, &mut build, entry.mirUnit)
+      if mirNode >= unfit() { continue }
+      let mut node = usize.MAX
+      let mut answer = Bytes.make()
+      let mut edges = List<usize>.make()
+      run List<usize>.append(&mut edges, CacheImage.nodeEdge(mirNode))
+      // A suspendable instance of a frame walk rests on its frame variant's MIR, which it was
+      // emitted from, beside the MIR outside any frame its frame facts were read from.
+      if entry.frameUnit != usize.MAX {
+        let frameNode = run imageUnit(&thisStore.resolver, &mut build, entry.frameUnit)
+        if frameNode >= unfit() { continue }
+        run List<usize>.append(&mut edges, CacheImage.nodeEdge(frameNode))
+      }
+      if entry.value == usize.MAX {
+        node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+      } else {
+        // A definition also rests on every layout its text was emitted against, which its MIR
+        // need not read: a generic body indexes or views its element at the element's stride.
+        if !run emittedLayoutEdges(&thisStore.resolver, &mut build, entry.emissionUnit, &mut edges) { continue }
+        node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+        let values = List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues)
+        answer = run BuildRecord.encodeDefinition(&values[entry.value])
+      }
+      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildEntryKey(exact), node: node,
+        answer: move answer})
+    }
+    // Each pack the build assembled rests on nothing: a replay holds it only for the definitions
+    // it lists, each of which rests on its own units. A pack the build reused is carried.
+    let fresh = List<BuildRecord.Pack>.asSlice(&thisStore.packedBuild.fresh)
+    at = usize.ZERO
+    while at < fresh.length {
+      let node = run CacheImage.addNode(&mut build.image, &[])
+      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildPackKey(fresh[at].digest), node: node,
+        answer: run BuildRecord.encodePack(&fresh[at])})
+      at = at + usize.ONE
+    }
+    let kept = List<usize>.asSlice(&thisStore.packedBuild.kept)
+    at = usize.ZERO
+    while at < kept.length {
+      run List<usize>.append(&mut thisStore.carriedBuild, kept[at])
+      at = at + usize.ONE
+    }
+    // A replayed record is the one the image read holds, on the guard reads that image recorded.
+    if captured.carriedRecord != usize.MAX {
+      run List<usize>.append(&mut thisStore.carriedBuild, captured.carriedRecord)
+    } else {
+      let mut node = usize.MAX
+      if captured.guard == usize.MAX {
+        node = run CacheImage.addNode(&mut build.image, &[])
+      } else {
+        let guardNode = run imageUnit(&thisStore.resolver, &mut build, captured.guard)
+        if guardNode < unfit() { node = run CacheImage.addNode(&mut build.image, &[CacheImage.nodeEdge(guardNode)]) }
+      }
+      if node != usize.MAX {
+        run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: run buildRecordKey(), node: node,
+          answer: run BuildRecord.encode(&captured.record)})
+      }
+    }
+  } else if let Option<ReplayState>.Some {value: replay} = &thisStore.replay {
+    run List<usize>.append(&mut thisStore.carriedBuild, replay.recordRoot)
+    let held = List<usize>.asSlice(&replay.roots)
+    at = usize.ZERO
+    while at < held.length {
+      if held[at] != usize.MAX { run List<usize>.append(&mut thisStore.carriedBuild, held[at]) }
+      at = at + usize.ONE
+    }
+    let packRoots = List<usize>.asSlice(&replay.packRoots)
+    at = usize.ZERO
+    while at < packRoots.length {
+      run List<usize>.append(&mut thisStore.carriedBuild, packRoots[at])
+      at = at + usize.ONE
+    }
+  }
+  // The summaries the definitions just written read.
+  if let Option<CapturedBuild>.Some {..} = &thisStore.capturedBuild { run imageSummaries(&mut thisStore.*, &mut build) }
+  run carrySummaries(&mut thisStore.*)
+  run imageEscapes(&mut thisStore.*, &mut build)
+  run fileDigests(&mut thisStore.*, &mut build, usize.ZERO)
+  let ImageBuild {image, nodes, files, inputs, fileModules} = move build
+  thisStore.pendingImage = Option<PendingImage>.some(PendingImage {nodes: move nodes, files: move files, inputs: move inputs,
+    fileModules: move fileModules, checks: move pending})
+  return move image
+}
+
+// Adds a root for each inline summary unit the image holds a node for, which a caller lowered
+// outside any frame read, with the fingerprint of its answer (`fingerprintValue`). A later
+// adoption that finds the summary's node stale computes the summary again and compares
+// (`summaryAgrees`), so a definition whose MIR rests on that node and is stale only through such
+// summaries is still taken when each answers as it did (`summaryConditions`).
+pub effect fn imageSummaries(thisStore: &mut Semantic, build: &mut ImageBuild) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut unit = usize.ZERO
+  while unit < List<usize>.length(&build.nodes) {
+    let node = List<usize>.get(&build.nodes, unit)
+    let at = unit
+    unit = unit + usize.ONE
+    if node >= unfit() || List<ScopedKey>.get(&thisStore.resolver.keys, at).key.family != Family.InlineSummary { continue }
+    let variant = List<ScopedKey>.get(&thisStore.resolver.keys, at).key.name
+    let instances = List<BackendInstance>.asSlice(&thisStore.resolver.backendInstances)
+    if variant >= instances.length || !instances[variant].raw { continue }
+    if let Option<CoroutineFacts>.Some {..} = &instances[variant].suspension { continue }
+    let held = match move Query.completed(&mut thisStore.query, Word {value: usize.toU64(at)}) {
+      Option<Shared<Result<Answer, NoRejection>>>.Some {value} => move value
+      Option<Shared<Result<Answer, NoRejection>>>.None => { continue }
+    }
+    let fingerprint = Shared<Result<Answer, NoRejection>>.with<Option<ContentHash>>(&held, summaryFingerprint)
+    if let Option<ContentHash>.Some {value} = move fingerprint {
+      let key = run buildSummaryKey(&instances[variant].key, instances[variant].observing)
+      run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node,
+        answer: run digestBytes(value)})
+    }
+  }
+}
+
+// Adds to the roots the image written next carries from the image this store read each summary
+// root that a carried root reaches, so a definition carried again keeps the fingerprints its MIR
+// rests on (`imageSummaries`).
+pub effect fn carrySummaries(thisStore: &mut Semantic) -> () ! OutOfMemoryError ? &mut Allocator {
+  if List<usize>.length(&thisStore.carriedBuild) == usize.ZERO { return () }
+  let read = match &thisStore.heldImage {
+    Option<CacheImage.Image>.Some {value} => &value
+    Option<CacheImage.Image>.None => { return () }
+  }
+  if !CacheImage.nodesRead(read) { return () }
+  let reached = run CacheImage.reachedNodes(read, List<usize>.asSlice(&thisStore.carriedBuild))
+  let roots = List<CacheImage.Root>.asSlice(&read.roots)
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if Option<&[u8]>.isSome(&rootIdentity(Bytes.asSlice(&roots[at].key), 6)) && List<bool>.get(&reached, roots[at].node) {
+      run List<usize>.append(&mut thisStore.carriedBuild, at)
+    }
+    at = at + usize.ONE
+  }
+}
+
+// Fills the digest of each file leaf from the `from`th on with the bytes its module holds now,
+// read once the walk is done.
+pub effect fn fileDigests(thisStore: &mut Semantic, build: &mut ImageBuild, from: usize) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let files = List<usize>.length(&build.fileModules)
+  let mut file = from
+  while file < files {
+    let module = resolvedModule(&thisStore.resolver, List<usize>.get(&build.fileModules, file))
+    let leaf = List<usize>.get(&build.files, List<usize>.get(&build.fileModules, file))
+    let digest = run sourceDigest(&mut thisStore.resolver, &module)
+    let mut leaves = CacheImage.leavesMut(&mut build.image)
+    leaves[leaf].digest = digest
+    file = file + usize.ONE
+  }
+}
+
+/// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused and given
+/// `nodes`, the node of each check in `carried` order, the checks `cacheImage` could not write
+/// because they rest on a reused check: such a check rests on that check's carried node, so a
+/// module swept again after an edit keeps its root although it reused its other declarations.
+pub effect fn imageCarriedChecks(thisStore: &mut Semantic, image: &mut CacheImage.Image, nodes: &[usize]) -> ()
+  ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let held = match move Intrinsic.replace(thisStore.pendingImage, Option<PendingImage>.none()) {
+    Option<PendingImage>.Some {value} => move value
+    Option<PendingImage>.None => { return () }
+  }
+  let PendingImage {nodes: built, files, inputs, fileModules, checks} = move held
+  let mut build = ImageBuild {image: Intrinsic.replace(image.*, CacheImage.make()), nodes: move built, files: move files,
+    inputs: move inputs, fileModules: move fileModules}
+  // A unit unfit only for a reused check it reached is looked at again.
+  let mut slots = List<usize>.asMutSlice(&mut build.nodes)
+  let mut at = usize.ZERO
+  while at < slots.length {
+    if slots[at] == unfit() { slots[at] = unreached() }
+    at = at + usize.ONE
+  }
+  let reused = List<usize>.asSlice(&thisStore.carriedUnits)
+  at = usize.ZERO
+  while at < reused.length {
+    if reused[at] != usize.MAX {
+      run slotFor(&mut build.nodes, reused[at])
+      let mut node = unfit()
+      if at < nodes.length { node = nodes[at] }
+      List<usize>.set(&mut build.nodes, reused[at], node)
+    }
+    at = at + usize.ONE
+  }
+  let filled = List<usize>.length(&build.fileModules)
+  let mut waiting = move checks
+  while let Option<PendingCheck>.Some {value: check} = move List<PendingCheck>.pop(&mut waiting) {
+    drop run imageRoot(&thisStore.resolver, &mut build, check.unit, move check.answer, List<ModuleId>.asSlice(&check.sites))
+  }
+  run fileDigests(&mut thisStore.*, &mut build, filled)
+  image.* = move build.image
+}
+
+/// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused, the root of
+/// each escape check a replay made current (`replayEscapes`). The root rests on the walk's record
+/// and on the root of every entry the record names, so it stays green while a replay would
+/// agree again, and the next check takes it without replaying. The root of a replay that reports
+/// rests instead on the root of each entry the replay entered or kept, and on what it demanded
+/// and the files its reports point into, which `cacheImage` wrote: a broken body that lowers to
+/// nothing has no entry root, but its MIR is among what the replay demanded. A check whose
+/// record or entries `image` lacks is left out, and replays again.
+pub effect fn imageReplayedChecks(thisStore: &Semantic, image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+  let memos = List<EscapeMemo>.asSlice(&thisStore.escapeMemos)
+  let reports = List<ReplayReport>.asSlice(&thisStore.replayReports)
+  let mut replayed = List<usize>.make()
+  // The report each replayed check rests on, or `usize.MAX` for one that reports nothing.
+  let mut reporting = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < memos.length {
+    let clean = List<Shared<Rejection>>.length(&memos[at].result.rejections) == usize.ZERO
+      && List<Shared<BackendGap>>.length(&memos[at].result.gaps) == usize.ZERO
+    let mut report = usize.MAX
+    let mut listed = usize.ZERO
+    while listed < reports.length && report == usize.MAX {
+      if reports[listed].unit == memos[at].unit { report = listed }
+      listed = listed + usize.ONE
+    }
+    if let Option<CapturedBuild>.Some {value: captured} = &memos[at].captured {
+      if captured.carriedRecord != usize.MAX && (clean || report != usize.MAX) {
+        run List<usize>.append(&mut replayed, at)
+        run List<usize>.append(&mut reporting, report)
+      }
+    }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&replayed) == usize.ZERO { return () }
+  // Each root key's first root, which the replayed checks' nodes name.
+  let mut keys = ExactSet.make()
+  let mut nodes = List<usize>.make()
+  let roots = List<CacheImage.Root>.asSlice(&image.roots)
+  at = usize.ZERO
+  while at < roots.length {
+    if run ExactSet.add(&mut keys, Bytes.asSlice(&roots[at].key)) { run List<usize>.append(&mut nodes, roots[at].node) }
+    at = at + usize.ONE
+  }
+  let picked = List<usize>.asSlice(&replayed)
+  at = usize.ZERO
+  while at < picked.length {
+    let memo = &memos[picked[at]]
+    let report = List<usize>.get(&reporting, at)
+    at = at + usize.ONE
+    let stable = match move run stableUnit(&thisStore.resolver, memo.unit) {
+      Option<Bytes>.Some {value} => move value
+      Option<Bytes>.None => { continue }
+    }
+    if let Option<CapturedBuild>.Some {value: captured} = &memo.captured {
+      let mut edges = List<usize>.make()
+      let mut record = ExactSet.find(&keys, Bytes.asSlice(&run escapeRecordKey(Bytes.asSlice(&stable), false)))
+      if record == usize.MAX { record = ExactSet.find(&keys, Bytes.asSlice(&run escapeRecordKey(Bytes.asSlice(&stable), true))) }
+      if record == usize.MAX { continue }
+      run List<usize>.append(&mut edges, CacheImage.nodeEdge(List<usize>.get(&nodes, record)))
+      if report != usize.MAX { run List<usize>.append(&mut edges, CacheImage.nodeEdge(reports[report].node)) }
+      let entries = List<BuildRecord.Entry>.asSlice(&captured.record.entries)
+      let rested = List<CapturedEntry>.asSlice(&captured.entries)
+      let mut whole = true
+      let mut entry = usize.ZERO
+      while entry < entries.length && whole {
+        // A replay that reports leaves out an entry it neither entered nor kept: one below a
+        // broken body, which what it demanded decides.
+        let used = report == usize.MAX || rested[entry].mirUnit != usize.MAX || rested[entry].carried != usize.MAX
+        if entries[entry].leaf == 0 && used {
+          let found = ExactSet.find(&keys, Bytes.asSlice(&run escapeEntryKey(entries[entry].exact)))
+          if found == usize.MAX { whole = false } else { run List<usize>.append(&mut edges, CacheImage.nodeEdge(List<usize>.get(&nodes, found))) }
+        }
+        entry = entry + usize.ONE
+      }
+      if !whole { continue }
+      let node = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&edges))
+      let mut answer = Bytes.make()
+      if report != usize.MAX { answer = run Bytes.copy(Bytes.asSlice(&reports[report].answer)) }
+      else { answer = run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete), memo.discoveryScope) }
+      run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move stable, node: node, answer: move answer})
+    }
+  }
+}
+
+/// Points each input `image` carries at its module's file as it reads now, once `CacheImage.carry`
+/// has copied into it what this store reused. A carried input names the file leaf of the image it
+/// came from. When that file changed since and this store holds the input with the same digest,
+/// the input takes its declaration's position now and the file leaf of the bytes now, so the next
+/// adoption places it without indexing the module again. Otherwise it keeps its old file, which
+/// no longer reads the same, and the next adoption captures it again.
+pub effect fn imageCarriedFiles(thisStore: &mut Semantic, image: &mut CacheImage.Image) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
+  run settleSourceInputs(&mut thisStore.resolver)
+  // The leaf of each module's file as it reads now, by module ordinal, added when first needed.
+  let mut current = List<usize>.make()
+  let count = CacheImage.leafCount(&image.*)
+  // The same by the file leaf an input names, so an input of a module whose file reads as it did
+  // is passed over without reading its key.
+  let mut byFile = List<usize>.make()
+  run List<usize>.appendRepeated(&mut byFile, unreached(), count)
+  let mut at = usize.ZERO
+  while at < count {
+    let slot = at
+    at = at + usize.ONE
+    if !CacheImage.leaves(&image.*)[slot].input { continue }
+    let file = CacheImage.leaves(&image.*)[slot].file
+    if file != usize.MAX && file < count && List<usize>.get(&byFile, file) == file { continue }
+    let key = run Bytes.copy(CacheImage.key(&image.*, slot))
+    let digest = CacheImage.leaves(&image.*)[slot].digest
+    let mut reader = StableKey.reader()
+    let module = match move run StableKey.readModule(Bytes.asSlice(&key), &mut reader) {
+      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.None => { continue }
+    }
+    let ordinal = run internModule(&mut thisStore.resolver, &module)
+    run slotFor(&mut current, ordinal)
+    let mut now = List<usize>.get(&current, ordinal)
+    if now == unreached() {
+      let read = run sourceDigest(&mut thisStore.resolver, &module)
+      if file != usize.MAX && ContentHash.equals(CacheImage.leaves(&image.*)[file].digest, read) {
+        now = file
+      } else {
+        let mut fileKey = Bytes.make()
+        run StableKey.module(&mut fileKey, &module)
+        now = run CacheImage.addLeaf(&mut image.*, false, move fileKey, read, usize.MAX, usize.MAX, ContentHash {high: 0, low: 0})
+      }
+      List<usize>.set(&mut current, ordinal, now)
+    }
+    if file != usize.MAX && file < count { List<usize>.set(&mut byFile, file, now) }
+    if file == now { continue }
+    if file != usize.MAX && ContentHash.equals(CacheImage.leaves(&image.*)[file].digest,
+      CacheImage.leaves(&image.*)[now].digest) { continue }
+    let read = match move run StableKey.readSelector(Bytes.asSlice(&key), &mut reader) {
+      Option<StableKey.ReadSelector>.Some {value} => move value
+      Option<StableKey.ReadSelector>.None => { continue }
+    }
+    let StableKey.ReadSelector {selector, identity, ..} = move read
+    let mut position = usize.MAX
+    let mut handle = usize.MAX
+    if let Option<DeclarationId>.Some {value: declared} = &identity {
+      handle = DeclarationTable.find(&thisStore.resolver.declarations, &declared)
+      if handle == usize.MAX { continue }
+      position = DeclarationTable.position(&thisStore.resolver.declarations, handle)
+      if position == usize.MAX { continue }
+    }
+    let mut held = move selector
+    if handle != usize.MAX {
+      let named = move held
+      held = StableKey.withHandle(move named, handle)
+    }
+    let input = Inputs.find(&thisStore.resolver.sourceInputs, ordinal, &held)
+    if input == usize.MAX { continue }
+    let mut leaves = CacheImage.leavesMut(&mut image.*)
+    // An input that reads otherwise now, such as where a declaration below an edit sits, is
+    // marked changed, so the next adoption knows it without indexing the module again.
+    if !ContentHash.equals(List<Inputs.Input>.asSlice(&thisStore.resolver.sourceInputs.inputs)[input].digest, digest) {
+      leaves[slot].digest = changedInput()
+    }
+    leaves[slot].file = now
+    leaves[slot].position = position
+  }
+  run CacheImage.dropUnusedLeaves(&mut image.*)
+}
+
+// Writes each escape walk record a check here captured, with a root on the MIR of each entry a
+// walk here lowered. A record a replay took from the image this store read, each record no check
+// here replaced, and the green entries those records name that no walk here lowered stay in
+// that image, which the written one carries them from.
+pub effect fn imageEscapes(thisStore: &mut Semantic, build: &mut ImageBuild) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut written = DigestSet.make()
+  let mut named = DigestSet.make()
+  let mut carried = List<usize>.make()
+  let memos = List<EscapeMemo>.asSlice(&thisStore.escapeMemos)
+  let mut at = usize.ZERO
+  while at < memos.length {
+    let memo = &memos[at]
+    at = at + usize.ONE
+    if let Option<CapturedBuild>.Some {value: captured} = &memo.captured {
+      if let Option<Bytes>.Some {value: unit} = move run stableUnit(&thisStore.resolver, memo.unit) {
+        run imageEscapeRecord(&thisStore.resolver, &mut build.*, &captured, Bytes.asSlice(&unit), &mut written, &mut named, &mut carried)
+      }
+    }
+  }
+  let records = List<EscapeRecordRoot>.asSlice(&thisStore.escapeImage.records)
+  at = usize.ZERO
+  while at < records.length {
+    // A sibling program's record of a module this store holds no source of (`siblingModule`) is not
+    // this program's: the walk that started from it wrote its own.
+    if !run recordLoaded(&thisStore.*, &records[at]) {
+      at = at + usize.ONE
+      continue
+    }
+    run List<usize>.append(&mut carried, records[at].root)
+    let recorded = run adoptedAnswer(&thisStore.heldImage, records[at].root)
+    if let Option<BuildRecord.Record>.Some {value: record} = move run BuildRecord.decode(Bytes.asSlice(&recorded)) {
+      let entries = List<BuildRecord.Entry>.asSlice(&record.entries)
+      let mut entry = usize.ZERO
+      while entry < entries.length {
+        if entries[entry].leaf == 0 { drop run DigestSet.add(&mut named, entries[entry].exact) }
+        entry = entry + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let green = List<ContentHash>.asSlice(&thisStore.escapeImage.entries.values)
+  at = usize.ZERO
+  while at < green.length {
+    let exact = green[at]
+    if DigestSet.find(&named, exact) != usize.MAX && DigestSet.find(&written, exact) == usize.MAX {
+      run List<usize>.append(&mut carried, List<usize>.get(&thisStore.escapeImage.roots, at))
+    }
+    at = at + usize.ONE
+  }
+  let listed = List<usize>.asSlice(&carried)
+  at = usize.ZERO
+  while at < listed.length {
+    run List<usize>.append(&mut thisStore.carriedBuild, listed[at])
+    at = at + usize.ONE
+  }
+}

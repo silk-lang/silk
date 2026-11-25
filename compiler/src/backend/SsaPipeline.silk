@@ -48,6 +48,7 @@
 import backend.SsaControlFlow
 import backend.SsaDeadCode
 import backend.SsaFunction {SsaFunction}
+import backend.SsaGraph {SsaGraph}
 import backend.SsaIdioms
 import backend.SsaInduction
 import backend.SsaLoops
@@ -71,8 +72,8 @@ pub enum Level {
   Size,
 }
 
-/// The most rounds of the scalar passes one [`prepare`] runs.
-pub fn rounds() -> usize { return 4 }
+/// The most rounds of the scalar passes each phase of [`prepare`] runs.
+pub fn rounds() -> usize { return 2 }
 
 /// The largest copy or fill, in bytes, a build at `level` turns into loads and stores.
 pub fn copyLimit(level: Level) -> u64 {
@@ -102,62 +103,103 @@ pub effect fn prepare(function: &mut SsaFunction, level: Level, verify: bool, pa
   }
   drop run SsaMemory.expandCopies(&mut function.*, copyLimit(level))
   if verify { run SsaVerification.verify(&function.*, b"copy expansion") }
-  run SsaPromotion.promote(&mut function.*, true)
-  if verify { run SsaVerification.verify(&function.*, b"promotion") }
-  run scalarRounds(&mut function.*, verify)
+  let mut graph = run SsaGraph.of(&function.*)
+  if function.slotCount() > usize.ZERO {
+    run SsaPromotion.promote(&mut function.*, &graph, true)
+    if verify { run SsaVerification.verify(&function.*, b"promotion") }
+  }
+  // Phase 1: scalar simplification (max 2 rounds), maintaining an up-to-date `graph`.
+  let settled = run scalarRounds(&mut function.*, &mut graph, verify, rounds())
   // A slot whose address was itself held in a slot, as a spliced method's `self` is, looked
   // stored the first time; the rounds have put the address where each access reads it.
   let held = function.heldCount()
-  run SsaPromotion.promote(&mut function.*, true)
-  if verify { run SsaVerification.verify(&function.*, b"second promotion") }
-  if function.heldCount() != held { run scalarRounds(&mut function.*, verify) }
-  if run SsaIdioms.recognize(&mut function.*) {
-    if verify { run SsaVerification.verify(&function.*, b"loop idiom recognition") }
-    run scalarRounds(&mut function.*, verify)
+  if function.slotCount() > usize.ZERO {
+    run SsaPromotion.promote(&mut function.*, &graph, true)
+    if verify { run SsaVerification.verify(&function.*, b"second promotion") }
+  }
+  let mut dirty = !settled || function.heldCount() != held
+  // If second promotion exposed new values inside a loop, clean up once before loop passes.
+  if function.heldCount() != held && graph.hasBackEdge() {
+    let cleaned = run scalarRounds(&mut function.*, &mut graph, verify, usize.ONE)
+    dirty = !cleaned
+  }
+  if graph.hasBackEdge() {
+    if run SsaIdioms.recognize(&mut function.*) {
+      if verify { run SsaVerification.verify(&function.*, b"loop idiom recognition") }
+      graph = run SsaGraph.of(&function.*)
+      dirty = true
+    }
   }
   if level == Level.Speed {
-    let mut budget = SsaUnroll.loops()
-    while budget > usize.ZERO {
-      let unrolled = run SsaUnroll.unroll(&mut function.*, budget)
-      if unrolled == usize.ZERO { break }
-      budget = budget - unrolled
-      if verify { run SsaVerification.verify(&function.*, b"loop unrolling") }
-      // The copies have constant indices. Folding can also expose a constant bound for
-      // a nested loop, which the next batch can unroll within the same budget.
-      run SsaPromotion.promote(&mut function.*, true)
-      if verify { run SsaVerification.verify(&function.*, b"promotion after unrolling") }
-      run scalarRounds(&mut function.*, verify)
+    if graph.hasBackEdge() {
+      let mut budget = SsaUnroll.loops()
+      while budget > usize.ZERO && graph.hasBackEdge() {
+        let unrolled = run SsaUnroll.unroll(&mut function.*, budget)
+        if unrolled == usize.ZERO { break }
+        budget = budget - unrolled
+        if verify { run SsaVerification.verify(&function.*, b"loop unrolling") }
+        graph = run SsaGraph.of(&function.*)
+        // The copies have constant indices. Folding can also expose a constant bound for
+        // a nested loop, which the next batch can unroll within the same budget.
+        if function.slotCount() > usize.ZERO {
+          run SsaPromotion.promote(&mut function.*, &graph, true)
+          if verify { run SsaVerification.verify(&function.*, b"promotion after unrolling") }
+        }
+        dirty = true
+        if graph.hasBackEdge() {
+          drop run scalarRounds(&mut function.*, &mut graph, verify, usize.ONE)
+        }
+      }
     }
-    if run SsaLoops.hoist(&mut function.*) {
-      if verify { run SsaVerification.verify(&function.*, b"loop-invariant code motion") }
-      run scalarRounds(&mut function.*, verify)
+    if graph.hasBackEdge() {
+      if run SsaLoops.hoist(&mut function.*) {
+        if verify { run SsaVerification.verify(&function.*, b"loop-invariant code motion") }
+        graph = run SsaGraph.of(&function.*)
+        dirty = true
+      }
     }
     if run SsaMemory.shareIndices(&mut function.*) {
       if verify { run SsaVerification.verify(&function.*, b"indexed address sharing") }
-      run scalarRounds(&mut function.*, verify)
+      dirty = true
     }
-    if run SsaLoops.factorIndices(&mut function.*) {
-      if verify { run SsaVerification.verify(&function.*, b"loop address factoring") }
-      run scalarRounds(&mut function.*, verify)
+    if graph.hasBackEdge() {
+      if run SsaLoops.factorIndices(&mut function.*, &graph) {
+        if verify { run SsaVerification.verify(&function.*, b"loop address factoring") }
+        // Remove dead `(row + i) * width` uses of the counter so `scaleCounters` sees only scaled uses.
+        drop run SsaDeadCode.eliminate(&mut function.*, &graph)
+        if verify { run SsaVerification.verify(&function.*, b"dead code elimination") }
+        dirty = true
+      }
+      if run SsaInduction.scaleCounters(&mut function.*, &graph) {
+        if verify { run SsaVerification.verify(&function.*, b"scaled loop counters") }
+        dirty = true
+      }
     }
-    if run SsaInduction.scaleCounters(&mut function.*) {
-      if verify { run SsaVerification.verify(&function.*, b"scaled loop counters") }
-    }
-    if packBytes && run SsaPackedBytes.lower(&mut function.*) {
+    if packBytes && run SsaPackedBytes.lower(&mut function.*, &graph) {
       if verify { run SsaVerification.verify(&function.*, b"packed byte masks") }
-      run scalarRounds(&mut function.*, verify)
+      if graph.hasBackEdge() {
+        drop run SsaDeadCode.eliminate(&mut function.*, &graph)
+        if verify { run SsaVerification.verify(&function.*, b"dead code elimination") }
+      }
+      dirty = true
     }
-    if run SsaUnroll.pairIterations(&mut function.*) {
-      if verify { run SsaVerification.verify(&function.*, b"paired loop iterations") }
-      run scalarRounds(&mut function.*, verify)
-    }
-    if run SsaInduction.rotate(&mut function.*) {
-      if verify { run SsaVerification.verify(&function.*, b"counted loop rotation") }
-      run scalarRounds(&mut function.*, verify)
+    if graph.hasBackEdge() {
+      if run SsaUnroll.pairIterations(&mut function.*, &graph) {
+        if verify { run SsaVerification.verify(&function.*, b"paired loop iterations") }
+        dirty = true
+      }
+      if run SsaInduction.rotate(&mut function.*, &mut graph) {
+        if verify { run SsaVerification.verify(&function.*, b"counted loop rotation") }
+        dirty = true
+      }
     }
   }
+  // Phase 2: final scalar cleanup (max 2 rounds), skipped when Phase 1 settled and nothing changed.
+  if dirty {
+    drop run scalarRounds(&mut function.*, &mut graph, verify, rounds())
+  }
   if run SsaMemory.packStores(&mut function.*) {
-    drop run SsaDeadCode.eliminate(&mut function.*)
+    drop run SsaDeadCode.eliminate(&mut function.*, &graph)
     if verify { run SsaVerification.verify(&function.*, b"packed constant stores") }
   }
   return ()
@@ -169,23 +211,30 @@ fn sparse(function: &SsaFunction) -> bool {
   return function.instructionCount() > function.heldCount() * 2 + 256
 }
 
-effect fn scalarRounds(function: &mut SsaFunction, verify: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn scalarRounds(
+  function: &mut SsaFunction,
+  graph: &mut SsaGraph,
+  verify: bool,
+  limit: usize,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut round = usize.ZERO
   let mut settled = false
-  while round < rounds() {
+  while round < limit {
     if sparse(&function.*) {
       run function.pack()
       if verify { run SsaVerification.verify(&function.*, b"packing") }
     }
-    let mut changed = run SsaControlFlow.simplify(&mut function.*)
+    let cfChanged = run SsaControlFlow.simplify(&mut function.*)
     if verify { run SsaVerification.verify(&function.*, b"control flow simplification") }
-    if run SsaThreading.thread(&mut function.*) { changed = true }
+    let thChanged = run SsaThreading.thread(&mut function.*)
     if verify { run SsaVerification.verify(&function.*, b"jump threading") }
-    if run SsaMemory.forward(&mut function.*) { changed = true }
+    let mut changed = cfChanged || thChanged
+    if changed { graph.* = run SsaGraph.of(&function.*) }
+    if run SsaMemory.forward(&mut function.*, &graph.*) { changed = true }
     if verify { run SsaVerification.verify(&function.*, b"load forwarding") }
-    if run SsaValueNumbering.number(&mut function.*) { changed = true }
+    if run SsaValueNumbering.number(&mut function.*, &graph.*) { changed = true }
     if verify { run SsaVerification.verify(&function.*, b"value numbering") }
-    if run SsaDeadCode.eliminate(&mut function.*) { changed = true }
+    if run SsaDeadCode.eliminate(&mut function.*, &graph.*) { changed = true }
     if verify { run SsaVerification.verify(&function.*, b"dead code elimination") }
     if !changed {
       settled = true
@@ -194,9 +243,11 @@ effect fn scalarRounds(function: &mut SsaFunction, verify: bool) -> () ! OutOfMe
     round = round + usize.ONE
   }
   // A round that changed nothing left nothing to simplify.
-  if settled { return () }
+  if settled { return true }
   // The branches the last numbering decided.
-  drop run SsaControlFlow.simplify(&mut function.*)
+  if run SsaControlFlow.simplify(&mut function.*) {
+    graph.* = run SsaGraph.of(&function.*)
+  }
   if verify { run SsaVerification.verify(&function.*, b"control flow simplification") }
-  return ()
+  return false
 }
