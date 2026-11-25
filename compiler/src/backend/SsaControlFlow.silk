@@ -59,6 +59,7 @@ pub effect fn simplify(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? 
     if run threadJumps(&mut function.*) { now = true }
     if run threadBranches(&mut function.*) { now = true }
     if run fuseRanges(&mut function.*) { now = true }
+    if run fuseSwitches(&mut function.*) { now = true }
     if run joinBranches(&mut function.*) { now = true }
     if run function.compact() { now = true }
     if run mergeBlocks(&mut function.*) { now = true }
@@ -402,6 +403,129 @@ effect fn fuse(function: &mut SsaFunction, block: usize, inner: usize, inside: u
   let held = run function.insertInstruction(block, position, Operation.Compare {predicate: Predicate.Ule}, Kind.flag(), &[moved, span], place)
   run function.setBranch(block, held, within.block, List<u64>.asSlice(&within.arguments), without.block, List<u64>.asSlice(&without.arguments))
   return true
+}
+
+struct EqTest {
+  valid: bool,
+  value: u64,
+  bits: u64,
+  matchEdge: usize,
+}
+
+impl Copy for EqTest {}
+
+// Extracts `value == bits` (matchEdge = 0) or `value != bits` (matchEdge = 1) from a branch block.
+fn eqTestOf(function: &SsaFunction, block: usize) -> EqTest {
+  let bad = EqTest {valid: false, value: none(), bits: 0, matchEdge: usize.ZERO}
+  let found = function.block(block)
+  if found.exit != Exit.Branch { return bad }
+  let prod = function.producerOf(found.value)
+  if prod == usize.MAX { return bad }
+  let pred = match function.instruction(prod).operation {
+    Operation.Compare {predicate} => predicate
+    _ => { return bad }
+  }
+  if pred != Predicate.Eq && pred != Predicate.Ne { return bad }
+  let ops = function.operandsOf(prod)
+  if ops.length != 2 { return bad }
+  let mut val = ops[usize.ZERO]
+  let mut c = ops[usize.ONE]
+  if function.isBits(val) {
+    val = ops[usize.ONE]
+    c = ops[usize.ZERO]
+  }
+  if !function.isBits(c) || function.isBits(val) { return bad }
+  let kind = function.kindOf(val)
+  if !kind.isInteger() || kind.isVector() || kind.bits < 8 || kind.bits > 64 { return bad }
+  let matchEdge = if pred == Predicate.Eq { usize.ZERO } else { usize.ONE }
+  return EqTest {valid: true, value: val, bits: masked(function.constantOf(c).low, kind.bits), matchEdge: matchEdge}
+}
+
+fn hasCase(cases: &[u64], bits: u64) -> bool {
+  let mut i = usize.ZERO
+  while i < cases.length {
+    if cases[i] == bits { return true }
+    i = i + usize.ONE
+  }
+  return false
+}
+
+/// Fuses a chain of `if (x == c0) ... else if (x == c1) ... else if (x == c2) ...` equality
+/// branches (at least 3 cases) into a single `Exit.Switch` so backends can emit a jump table.
+pub effect fn fuseSwitches(function: &mut SsaFunction) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = function.blockCount()
+  let mut entered = run List<usize>.makeWithCapacity(count)
+  run List<usize>.appendRepeated(&mut entered, usize.ZERO, count)
+  let mut block = usize.ZERO
+  while block < count {
+    let edges = List<Edge>.asSlice(&function.block(block).edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let to = edges[edge].block
+      let before = List<usize>.get(&entered, to)
+      List<usize>.set(&mut entered, to, before + usize.ONE)
+      edge = edge + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let uses = run function.useCounts()
+  let mut changed = false
+  block = usize.ZERO
+  while block < count {
+    let first = eqTestOf(&function.*, block)
+    if first.valid {
+      let mut cases = List<u64>.make()
+      let mut caseEdges = List<Edge>.make()
+      run List<u64>.append(&mut cases, first.bits)
+      run List<Edge>.append(&mut caseEdges, run edgeCopy(&function.*, block, first.matchEdge))
+      let mut curBlock = block
+      let mut curElse = usize.ONE - first.matchEdge
+      let mut steps = usize.ZERO
+      while steps < 64 {
+        let next = List<Edge>.asSlice(&function.block(curBlock).edges)[curElse].block
+        if next == block || next == curBlock || next == usize.ZERO || List<usize>.get(&entered, next) != usize.ONE { break }
+        let nb = function.block(next)
+        if List<u64>.length(&nb.parameters) != usize.ZERO { break }
+        if nb.exit == Exit.Switch && List<usize>.length(&nb.instructions) == usize.ZERO && nb.value == first.value {
+          let nCases = List<u64>.asSlice(&nb.cases)
+          let mut ci = usize.ZERO
+          while ci < nCases.length {
+            let bits = masked(nCases[ci], function.kindOf(first.value).bits)
+            if !hasCase(List<u64>.asSlice(&cases), bits) {
+              run List<u64>.append(&mut cases, bits)
+              run List<Edge>.append(&mut caseEdges, run edgeCopy(&function.*, next, ci + usize.ONE))
+            }
+            ci = ci + usize.ONE
+          }
+          curBlock = next
+          curElse = usize.ZERO
+          break
+        }
+        if nb.exit != Exit.Branch || List<usize>.length(&nb.instructions) != usize.ONE { break }
+        let sole = List<usize>.get(&nb.instructions, usize.ZERO)
+        if function.instruction(sole).result != nb.value || u64.toUsize(nb.value) >= List<usize>.length(&uses)
+          || List<usize>.get(&uses, u64.toUsize(nb.value)) != usize.ONE { break }
+        let t = eqTestOf(&function.*, next)
+        if !t.valid || t.value != first.value { break }
+        if !hasCase(List<u64>.asSlice(&cases), t.bits) {
+          run List<u64>.append(&mut cases, t.bits)
+          run List<Edge>.append(&mut caseEdges, run edgeCopy(&function.*, next, t.matchEdge))
+        }
+        curBlock = next
+        curElse = usize.ONE - t.matchEdge
+        steps = steps + usize.ONE
+      }
+      if List<u64>.length(&cases) >= 3 {
+        let mut allEdges = run List<Edge>.makeWithCapacity(List<Edge>.length(&caseEdges) + usize.ONE)
+        run List<Edge>.append(&mut allEdges, run edgeCopy(&function.*, curBlock, curElse))
+        run List<Edge>.appendList(&mut allEdges, move caseEdges)
+        function.setSwitch(block, first.value, move cases, move allEdges)
+        changed = true
+      }
+    }
+    block = block + usize.ONE
+  }
+  return changed
 }
 
 // The edge a branch or switch of `block` always takes, or `usize.MAX`.

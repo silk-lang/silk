@@ -1,5 +1,5 @@
 //! Counted induction variables whose initial value, upper bound and unit increment are known.
-import backend.SsaFunction {Binary, Edge, Exit, Kind, Operation, Predicate, SsaFunction, masked, none}
+import backend.SsaFunction {Binary, Definition, Edge, Exit, Kind, Operation, Predicate, SsaFunction, masked, none}
 import backend.SsaGraph {SsaGraph}
 import silk.collections.list {List}
 import silk.core.option {Option}
@@ -167,24 +167,122 @@ pub effect fn scaleCounters(function: &mut SsaFunction, graph: &SsaGraph) -> boo
   return changed
 }
 
-// Whether the counter or guard is read where a last visit to the header would
-// have supplied the exit values. The loop can keep that visit if either is live.
-fn liveOnExit(function: &SsaFunction, graph: &SsaGraph, header: usize, body: usize, counter: u64, flag: u64) -> bool {
+// Whether `value` is defined before `block` (constant, argument, or in a block dominating `block`).
+fn availableAt(function: &SsaFunction, graph: &SsaGraph, value: u64, block: usize) -> bool {
+  let info = function.value(value)
+  if info.definition == Definition.Constant || info.definition == Definition.Argument { return true }
+  if info.definition == Definition.Parameter { return graph.dominates(info.owner, block) }
+  let prod = function.producerOf(value)
+  if prod == usize.MAX { return true }
+  return graph.dominates(function.instruction(prod).block, block)
+}
+
+// Finds a unit-step induction variable `counter < limit` where `limit` may be a runtime loop-invariant
+// value dominating the entry block.
+fn findDynamic(function: &SsaFunction, graph: &SsaGraph, block: usize) -> Option<Counter> {
+  let head = function.block(block)
+  if head.exit != Exit.Branch || List<u64>.length(&head.parameters) == usize.ZERO { return Option<Counter>.None }
+  let before = graph.predecessorsOf(block)
+  if block == usize.ZERO || before.length != 2 || before[usize.ZERO] == before[usize.ONE] { return Option<Counter>.None }
+  let test = function.producerOf(head.value)
+  if test == usize.MAX { return Option<Counter>.None }
+  let predicate = match function.instruction(test).operation {
+    Operation.Compare {predicate: found} => found
+    _ => { return Option<Counter>.None }
+  }
+  let args = function.operandsOf(test)
+  let parameters = List<u64>.asSlice(&head.parameters)
+  let mut side = usize.ZERO
+  while side < 2 {
+    let counter = args[side]
+    let limit = args[usize.ONE - side]
+    let kind = function.kindOf(counter)
+    if kind.isInteger() && !kind.isVector() && kind.bits <= 64 {
+      let mut index = usize.ZERO
+      while index < parameters.length && parameters[index] != counter { index = index + usize.ONE }
+      if index < parameters.length {
+        let mut arm = usize.MAX
+        if side == usize.ZERO {
+          if predicate == Predicate.Ult { arm = usize.ZERO } else if predicate == Predicate.Uge { arm = usize.ONE }
+        } else {
+          if predicate == Predicate.Ugt { arm = usize.ZERO } else if predicate == Predicate.Ule { arm = usize.ONE }
+        }
+        if arm != usize.MAX && graph.reaches(before[usize.ZERO]) && graph.reaches(before[usize.ONE]) {
+          let body = List<Edge>.asSlice(&head.edges)[arm].block
+          if body != usize.ZERO && body != block && graph.predecessorsOf(body).length == usize.ONE {
+            let mut latch = before[usize.ZERO]
+            let mut entry = before[usize.ONE]
+            if !graph.dominates(body, latch) { latch = before[usize.ONE] entry = before[usize.ZERO] }
+            if graph.dominates(body, latch) && !graph.dominates(block, entry) && availableAt(function, graph, limit, entry) {
+              let startEdge = function.block(entry).edgeTo(block)
+              let stepEdge = function.block(latch).edgeTo(block)
+              let initial = List<u64>.get(&List<Edge>.asSlice(&function.block(entry).edges)[startEdge].arguments, index)
+              let next = List<u64>.get(&List<Edge>.asSlice(&function.block(latch).edges)[stepEdge].arguments, index)
+              let producer = function.producerOf(next)
+              if producer != usize.MAX && availableAt(function, graph, initial, entry) {
+                let isUnitAdd = match function.instruction(producer).operation {
+                  Operation.Binary {operation: Binary.Add} => {
+                    let sum = function.operandsOf(producer)
+                    let leftStep = sum[usize.ZERO] == counter && function.isBits(sum[usize.ONE]) && function.constantOf(sum[usize.ONE]).low == 1
+                    let rightStep = sum[usize.ONE] == counter && function.isBits(sum[usize.ZERO]) && function.constantOf(sum[usize.ZERO]).low == 1
+                    leftStep || rightStep
+                  }
+                  _ => false
+                }
+                if isUnitAdd {
+                  return Option<Counter>.Some {value: Counter {value: counter, initial: initial, limit: limit, entry: entry, next: next, step: 1, latch: latch, arm: arm}}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    side = side + usize.ONE
+  }
+  return Option<Counter>.None
+}
+
+// Scans blocks outside `{header} ∪ dom(body)` for uses of `flag` or `values`.
+// Sets `liveInExit[k]` when `values[k]` is used in a block dominated by `exit`.
+// Returns `false` if rotation is blocked (`flag` is live outside, or a `values[k]` is live outside
+// `dom(exit)`, or live in `dom(exit)` when `exit` has other predecessors).
+fn scanExitUses(function: &SsaFunction, graph: &SsaGraph, header: usize, body: usize, exit: usize, values: &[u64], flag: u64,
+  liveInExit: &mut [bool]) -> bool {
+  let singleExitPred = graph.predecessorsOf(exit).length == usize.ONE
   let order = graph.reversePostorder()
   let mut b = usize.ZERO
   while b < order.length {
     let block = order[b]
     b = b + usize.ONE
     if block == header || graph.dominates(body, block) { continue }
+    let inExit = graph.dominates(exit, block)
     let found = function.block(block)
-    if found.value == counter || found.value == flag || found.secondValue == counter || found.secondValue == flag || found.thirdValue == counter || found.thirdValue == flag || found.fourthValue == counter || found.fourthValue == flag { return true }
+    if found.value == flag || found.secondValue == flag || found.thirdValue == flag || found.fourthValue == flag { return false }
+    let mut v = usize.ZERO
+    while v < values.length {
+      let val = values[v]
+      if found.value == val || found.secondValue == val || found.thirdValue == val || found.fourthValue == val {
+        if !inExit || !singleExitPred { return false }
+        liveInExit[v] = true
+      }
+      v = v + usize.ONE
+    }
     let listed = List<usize>.asSlice(&found.instructions)
     let mut i = usize.ZERO
     while i < listed.length {
       let operands = function.operandsOf(listed[i])
       let mut j = usize.ZERO
       while j < operands.length {
-        if operands[j] == counter || operands[j] == flag { return true }
+        if operands[j] == flag { return false }
+        v = usize.ZERO
+        while v < values.length {
+          if operands[j] == values[v] {
+            if !inExit || !singleExitPred { return false }
+            liveInExit[v] = true
+          }
+          v = v + usize.ONE
+        }
         j = j + usize.ONE
       }
       i = i + usize.ONE
@@ -195,39 +293,134 @@ fn liveOnExit(function: &SsaFunction, graph: &SsaGraph, header: usize, body: usi
       let args = List<u64>.asSlice(&edges[i].arguments)
       let mut j = usize.ZERO
       while j < args.length {
-        if args[j] == counter || args[j] == flag { return true }
+        if args[j] == flag { return false }
+        v = usize.ZERO
+        while v < values.length {
+          if args[j] == values[v] {
+            if !inExit || !singleExitPred { return false }
+            liveInExit[v] = true
+          }
+          v = v + usize.ONE
+        }
         j = j + usize.ONE
       }
       i = i + usize.ONE
     }
   }
-  return false
+  return true
 }
 
-/// Moves the guard of a nonempty counted loop to its back edge when the final
-/// header values are dead. The last iteration can then fall out of the loop.
+// Maps each argument in `raw` that matches `headerParams[k]` to `replacement[k]`.
+effect fn mapEdgeArgs(raw: &[u64], headerParams: &[u64], replacement: &[u64]) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = run List<u64>.makeWithCapacity(raw.length)
+  let mut i = usize.ZERO
+  while i < raw.length {
+    let mut val = raw[i]
+    let mut k = usize.ZERO
+    while k < headerParams.length {
+      if headerParams[k] == val { val = replacement[k] }
+      k = k + usize.ONE
+    }
+    run List<u64>.append(&mut out, val)
+    i = i + usize.ONE
+  }
+  return move out
+}
+
+/// Moves the guard of a counted loop (constant or dynamic invariant bound, single or multiple
+/// header parameters) to its back edge, promoting header parameters live in a single-predecessor
+/// exit region into exit block parameters. Dynamic-limit loops receive a preheader entry guard so
+/// the loop runs zero times when empty.
 pub effect fn rotate(function: &mut SsaFunction, graph: &mut SsaGraph) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut headers = List<usize>.make()
   run List<usize>.appendSlice(&mut headers, graph.reversePostorder())
   let mut changed = false
   while let Option<usize>.Some {value: header} = List<usize>.pop(&mut headers) {
     let head = function.block(header)
-    if List<u64>.length(&head.parameters) != usize.ONE || List<usize>.length(&head.instructions) != usize.ONE { continue }
-    let c = match find(&function.*, &graph.*, header) { Option<Counter>.Some {value} => value _ => { continue } }
-    if function.constantOf(c.initial).low >= function.constantOf(c.limit).low || function.block(c.latch).exit != Exit.Jump { continue }
+    if List<u64>.length(&head.parameters) == usize.ZERO || List<usize>.length(&head.instructions) != usize.ONE { continue }
+    let mut knownNonEmpty = false
+    let c = match find(&function.*, &graph.*, header) {
+      Option<Counter>.Some {value} => {
+        if function.constantOf(value.initial).low >= function.constantOf(value.limit).low { continue }
+        knownNonEmpty = true
+        value
+      }
+      Option<Counter>.None => match findDynamic(&function.*, &graph.*, header) {
+        Option<Counter>.Some {value} => {
+          if function.isBits(value.initial) && function.isBits(value.limit) {
+            if function.constantOf(value.initial).low >= function.constantOf(value.limit).low { continue }
+            knownNonEmpty = true
+          }
+          value
+        }
+        Option<Counter>.None => { continue }
+      }
+    }
+    if function.block(c.latch).exit != Exit.Jump { continue }
     let test = function.producerOf(head.value)
     if test != List<usize>.get(&head.instructions, usize.ZERO) { continue }
     let edges = List<Edge>.asSlice(&head.edges)
     let body = edges[c.arm].block
     let exit = edges[usize.ONE - c.arm].block
-    if List<u64>.length(&edges[usize.ONE - c.arm].arguments) != usize.ZERO || liveOnExit(&function.*, &graph.*, header, body, c.value, head.value) { continue }
-    let mut args = List<u64>.make()
-    run List<u64>.appendSlice(&mut args, List<u64>.asSlice(&edges[c.arm].arguments))
-    let at = List<usize>.length(&function.block(c.latch).instructions)
+    if exit == header || exit == c.entry || c.entry == header { continue }
+    if !knownNonEmpty && function.block(c.entry).exit != Exit.Jump { continue }
+    let mut exitUsesFlag = false
+    let rawExit = List<u64>.asSlice(&edges[usize.ONE - c.arm].arguments)
+    let mut ei = usize.ZERO
+    while ei < rawExit.length {
+      if rawExit[ei] == head.value { exitUsesFlag = true }
+      ei = ei + usize.ONE
+    }
+    if exitUsesFlag { continue }
+    let headerParams = List<u64>.asSlice(&head.parameters)
+    let mut liveInExit = run List<bool>.makeWithCapacity(headerParams.length)
+    run List<bool>.appendRepeated(&mut liveInExit, false, headerParams.length)
+    if !scanExitUses(&function.*, &graph.*, header, body, exit, headerParams, head.value, List<bool>.asMutSlice(&mut liveInExit)) { continue }
+    let mut bodyArgs = List<u64>.make()
+    run List<u64>.appendSlice(&mut bodyArgs, List<u64>.asSlice(&edges[c.arm].arguments))
+    let mut exitArgsCopy = List<u64>.make()
+    run List<u64>.appendSlice(&mut exitArgsCopy, rawExit)
+    let mut paramsCopy = List<u64>.make()
+    run List<u64>.appendSlice(&mut paramsCopy, headerParams)
+    let stepEdge = function.block(c.latch).edgeTo(header)
+    let mut backArgs = List<u64>.make()
+    run List<u64>.appendSlice(&mut backArgs, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(c.latch).edges)[stepEdge].arguments))
+    let mut latchExitArgs = run mapEdgeArgs(List<u64>.asSlice(&exitArgsCopy), List<u64>.asSlice(&paramsCopy), List<u64>.asSlice(&backArgs))
+    let mut entryArgs = List<u64>.make()
+    let mut entryExitArgs = List<u64>.make()
+    if !knownNonEmpty {
+      let startEdge = function.block(c.entry).edgeTo(header)
+      run List<u64>.appendSlice(&mut entryArgs, List<u64>.asSlice(&List<Edge>.asSlice(&function.block(c.entry).edges)[startEdge].arguments))
+      entryExitArgs = run mapEdgeArgs(List<u64>.asSlice(&exitArgsCopy), List<u64>.asSlice(&paramsCopy), List<u64>.asSlice(&entryArgs))
+    }
     let place = head.place
+    // Promote any header parameters live in `dom(exit)` into LCSSA block parameters on `exit`.
+    let mut pk = usize.ZERO
+    while pk < List<u64>.length(&paramsCopy) {
+      if List<bool>.get(&liveInExit, pk) {
+        let oldParam = List<u64>.get(&paramsCopy, pk)
+        let paramKind = function.kindOf(oldParam)
+        let exitParam = run function.addParameter(exit, paramKind)
+        run List<u64>.append(&mut latchExitArgs, List<u64>.get(&backArgs, pk))
+        if !knownNonEmpty { run List<u64>.append(&mut entryExitArgs, List<u64>.get(&entryArgs, pk)) }
+        let order = graph.reversePostorder()
+        let mut bi = usize.ZERO
+        while bi < order.length {
+          if graph.dominates(exit, order[bi]) { function.replaceInBlock(order[bi], oldParam, exitParam) }
+          bi = bi + usize.ONE
+        }
+      }
+      pk = pk + usize.ONE
+    }
+    if !knownNonEmpty {
+      let entryAt = List<usize>.length(&function.block(c.entry).instructions)
+      let enter = run function.insertInstruction(c.entry, entryAt, Operation.Compare {predicate: Predicate.Ult}, Kind.flag(), &[c.initial, c.limit], place)
+      run function.setBranch(c.entry, enter, header, List<u64>.asSlice(&entryArgs), exit, List<u64>.asSlice(&entryExitArgs))
+    }
+    let at = List<usize>.length(&function.block(c.latch).instructions)
     let again = run function.insertInstruction(c.latch, at, Operation.Compare {predicate: Predicate.Ult}, Kind.flag(), &[c.next, c.limit], place)
-    run function.setBranch(c.latch, again, header, &[c.next], exit, &[])
-    run function.setJump(header, body, List<u64>.asSlice(&args))
+    run function.setBranch(c.latch, again, header, List<u64>.asSlice(&backArgs), exit, List<u64>.asSlice(&latchExitArgs))
+    run function.setJump(header, body, List<u64>.asSlice(&bodyArgs))
     changed = true
     graph.* = run SsaGraph.of(&function.*)
   }
