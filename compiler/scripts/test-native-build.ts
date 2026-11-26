@@ -544,6 +544,68 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   assert.match(checkedBrokenRootTasks.stderr, /(^|\n)tasks\.silk:2:/)
   yield* fs.remove(join(aliased, 'tasks.silk'))
   yield* fs.remove(join(aliased, 'src/task_helper.silk'))
+  // `-p` / `--package` selects a single workspace member for custom tasks and `silk task --help`
+  // from either the workspace root or a sibling member, while rejecting multi-package selections.
+  const taskWorkspace = join(directory, 'task-workspace')
+  yield* fs.makeDirectory(join(taskWorkspace, 'alpha/src'), { recursive: true })
+  yield* fs.makeDirectory(join(taskWorkspace, 'beta/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(taskWorkspace, 'silk.toml'),
+    '[workspace]\nmembers = ["alpha", "beta"]\n',
+  )
+  yield* fs.writeFileString(
+    join(taskWorkspace, 'alpha/silk.toml'),
+    '[package]\nname = "alpha"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
+  )
+  yield* fs.writeFileString(join(taskWorkspace, 'alpha/src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+  yield* fs.writeFileString(
+    join(taskWorkspace, 'alpha/tasks.silk'),
+    [
+      'import silk.cli.command { Command, CommandLine }',
+      'import silk.cli.task { Task, TaskSet, TaskError }',
+      'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+      'import silk.text.string { String }',
+      'import silk.system.host_input { HostInput }',
+      'union Tasks { Ping }',
+      'impl CommandLine for Tasks {',
+      '  static fn command() -> Command<Tasks> {',
+      '    return Command<Tasks>.make("tasks", "Alpha tasks") |> Command.variant("Ping", "Ping alpha")',
+      '  }',
+      '}',
+      'impl TaskSet for Tasks {',
+      '  effect fn perform(self: Self) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {',
+      '    drop self',
+      '    fail TaskError { message: run String.copy("alpha pinged"), status: 31 }',
+      '  }',
+      '}',
+      'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
+      '',
+    ].join('\n'),
+  )
+  yield* fs.writeFileString(
+    join(taskWorkspace, 'beta/silk.toml'),
+    '[package]\nname = "beta"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
+  )
+  yield* fs.writeFileString(join(taskWorkspace, 'beta/src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+  const memberTask = yield* invoke(silk, ['task', '-p', 'alpha', '--stdlib', standardLibrary, 'ping'], taskWorkspace, requestEnv, 120_000)
+  assert.equal(memberTask.status, 31, memberTask.stderr)
+  assert.match(memberTask.stderr, /alpha pinged/)
+  const siblingTask = yield* invoke(silk, ['task', '--package=alpha', '--stdlib', standardLibrary, 'ping'], join(taskWorkspace, 'beta'), requestEnv, 120_000)
+  assert.equal(siblingTask.status, 31, siblingTask.stderr)
+  const memberHelp = yield* invoke(silk, ['task', '-p', 'alpha', '--stdlib', standardLibrary, '--help'], taskWorkspace, requestEnv, 120_000)
+  assert.equal(memberHelp.status, 0, memberHelp.stderr)
+  assert.match(memberHelp.stdout, /Ping alpha/)
+  const memberHelpJson = yield* invoke(silk, ['task', '-p', 'alpha', '--stdlib', standardLibrary, '--help=json'], taskWorkspace, requestEnv, 120_000)
+  assert.equal(memberHelpJson.status, 0, memberHelpJson.stderr)
+  const parsedMemberHelp = JSON.parse(memberHelpJson.stdout) as { commands: Array<{ name: string }> }
+  assert.ok(parsedMemberHelp.commands.some((entry) => entry.name === 'ping'), memberHelpJson.stdout)
+  const multiMemberTask = yield* invoke(silk, ['task', '-p', 'alpha', '-p', 'beta', '--stdlib', standardLibrary, 'ping'], taskWorkspace, requestEnv, 120_000)
+  assert.equal(multiMemberTask.status, 2, multiMemberTask.stderr)
+  assert.match(multiMemberTask.stderr, /a custom task needs one package; pass --package <name> or --manifest-path/)
+  const workspaceTask = yield* invoke(silk, ['task', '--workspace', '--stdlib', standardLibrary, 'ping'], taskWorkspace, requestEnv, 120_000)
+  assert.equal(workspaceTask.status, 2, workspaceTask.stderr)
+  const implicitWorkspaceTask = yield* invoke(silk, ['task', '--stdlib', standardLibrary, 'ping'], taskWorkspace, requestEnv, 120_000)
+  assert.equal(implicitWorkspaceTask.status, 2, implicitWorkspaceTask.stderr)
   // A tasks program takes its package's own native plan only once it reaches a module of the
   // package besides tasks.silk, the way a dependency's plan applies once reached: this package's C
   // calls a function nothing links, so its tasks program links only while it leaves that C out.
