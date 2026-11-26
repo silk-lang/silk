@@ -598,7 +598,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const memberHelpJson = yield* invoke(silk, ['task', '-p', 'alpha', '--stdlib', standardLibrary, '--help=json'], taskWorkspace, requestEnv, 120_000)
   assert.equal(memberHelpJson.status, 0, memberHelpJson.stderr)
   const parsedMemberHelp = JSON.parse(memberHelpJson.stdout) as { commands: Array<{ name: string }> }
-  assert.ok(parsedMemberHelp.commands.some((entry) => entry.name === 'ping'), memberHelpJson.stdout)
+  assert.ok(parsedMemberHelp.commands.some((entry) => entry.name === 'silk task ping'), memberHelpJson.stdout)
   const multiMemberTask = yield* invoke(silk, ['task', '-p', 'alpha', '-p', 'beta', '--stdlib', standardLibrary, 'ping'], taskWorkspace, requestEnv, 120_000)
   assert.equal(multiMemberTask.status, 2, multiMemberTask.stderr)
   assert.match(multiMemberTask.stderr, /a custom task needs one package; pass --package <name> or --manifest-path/)
