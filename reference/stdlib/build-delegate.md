@@ -401,6 +401,17 @@ pub error: Option<String>
 
 The failure to report, when the graph did not complete.
 
+<a id="Outcome.status"></a>
+
+### Field `status`
+
+```silk
+pub status: Option<i32>
+```
+
+The nonzero exit status to report with `error`, when a failed step ended with a specific
+status such as 2 for a compiler refusal.
+
 <a id="Outcome.artifacts"></a>
 
 ### Field `artifacts`
