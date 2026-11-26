@@ -28,6 +28,7 @@ import backend.SsaGraph {SsaGraph}
 import backend.SsaIdioms
 import backend.SsaInduction
 import backend.SsaPackedBytes
+import backend.SsaScalarize
 import backend.SsaLoops
 import backend.SsaMemory
 import backend.SsaPipeline
@@ -1437,8 +1438,8 @@ effect fn memoryClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &m
   run Testing.expect(run wellFormed(&repeated), "the repeated function passes the verifier")
   run Testing.expect(count(&repeated, Sort.Load, usize.MAX) == 2, "a repeated load is one load until a store may have changed it")
 
-  // A byte inside a wider constant a store wrote is that byte of the constant, low byte first;
-  // a byte of a stored argument is still loaded. The escaping call keeps both stores.
+  // A byte inside a wider constant or runtime integer a store wrote is forwarded without reloading.
+  // The escaping call keeps both stores.
   let byte = Kind.integer(8)
   let mut narrow = run SsaFunction.make(b"narrow", 32)
   let given = run narrow.argument(int)
@@ -1457,7 +1458,7 @@ effect fn memoryClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &m
   run narrow.finish()
   drop run forwardWithGraph(&mut narrow)
   run Testing.expect(run wellFormed(&narrow), "the narrowed function passes the verifier")
-  run Testing.expect(count(&narrow, Sort.Load, usize.MAX) == usize.ONE, "only the byte of the stored argument is still loaded")
+  run Testing.expect(count(&narrow, Sort.Load, usize.MAX) == usize.ZERO, "both the constant byte and the runtime argument byte forward via shift/trunc")
   let listed = List<usize>.asSlice(&narrow.block(body).instructions)
   let mut folded = none()
   let mut at = usize.ZERO
@@ -2663,7 +2664,10 @@ effect fn rotationClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? 
     if variant == 2 { run f.ret(i) } else { run f.ret(bound) }
     run f.finish()
     let changed = run rotateWithGraph(&mut f)
-    run Testing.expect(changed == (variant == usize.ZERO), "the entry must execute and the last header values must be dead")
+    run Testing.expect(changed == (variant == usize.ZERO || variant == 2), "entered loops rotate, promoting live exit values on single-predecessor exits")
+    if variant == 2 {
+      run Testing.expect(List<u64>.length(&f.block(done).parameters) == usize.ONE, "live header value becomes an exit block parameter")
+    }
     run Testing.expect(run wellFormed(&f), "the loop with its inverted exit condition passes verification")
     variant = variant + usize.ONE
   }
@@ -4029,4 +4033,434 @@ effect fn phase8MemoryAndUnrollClaims() -> () ! OutOfMemoryError | AssertionErro
   let unrolled = run SsaUnroll.unroll(&mut fu, SsaUnroll.loops())
   run Testing.expect(unrolled > usize.ZERO && run wellFormed(&fu),
     "counted loop with early exit using a loop-defined value unrolls cleanly via LCSSA exit promotion")
+}
+
+test effect fn p2BoundsSpeculateAndScalarize() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run p2PassClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn p2PassClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // 1. Shifted range `(b - 97) <= 25` learns `97 <= b <= 122`, removing checked `b - 71` underflow.
+  let u8K = Kind.integer(8)
+  let mut f1 = run SsaFunction.make(b"shifted_range", 32)
+  let b = run f1.argument(u8K)
+  f1.setResult(u8K)
+  let bEntry = run f1.newBlock()
+  let bIn = run f1.newBlock()
+  let bOut = run f1.newBlock()
+  let bTrap = run f1.newBlock()
+  let bOk = run f1.newBlock()
+  f1.startBlock(bEntry)
+  let c97 = run f1.integer(8, 97)
+  let c25 = run f1.integer(8, 25)
+  let shifted = run f1.binary(Binary.Sub, b, c97)
+  let inRange = run f1.compare(Predicate.Ule, shifted, c25)
+  run f1.branchIf(inRange, bIn, bOut)
+  f1.startBlock(bIn)
+  let c71 = run f1.integer(8, 71)
+  let diff = run f1.overflowing(Binary.Sub, false, b, c71)
+  run f1.branchIf(diff.overflow, bTrap, bOk)
+  f1.startBlock(bTrap)
+  run f1.trap()
+  f1.startBlock(bOk)
+  run f1.ret(diff.value)
+  f1.startBlock(bOut)
+  let z8 = run f1.integer(8, 0)
+  run f1.ret(z8)
+  run f1.finish()
+  run SsaPipeline.prepare(&mut f1, Level.Speed, true, true)
+  run Testing.expect(count(&f1, Sort.Overflow, usize.MAX) == usize.ZERO && run wellFormed(&f1),
+    "shifted range `(b - 97) <= 25` proves `b >= 97` and eliminates checked `b - 71` underflow")
+
+  // 2. Conjoined `And` branch learns both facts and `SlotAddress` is provably non-null.
+  let u32K = Kind.integer(32)
+  let mut f2 = run SsaFunction.make(b"and_and_slot_nonnull", 32)
+  let x2 = run f2.argument(u32K)
+  let y2 = run f2.argument(u32K)
+  f2.setResult(u32K)
+  let tEntry = run f2.newBlock()
+  let tIn = run f2.newBlock()
+  let tOut = run f2.newBlock()
+  let tTrap = run f2.newBlock()
+  let tOk = run f2.newBlock()
+  f2.startBlock(tEntry)
+  let slotAddr = run f2.slotOf(16, 4)
+  let c256 = run f2.integer(32, 256)
+  let z32a = run f2.integer(32, 0)
+  let lt = run f2.compare(Predicate.Ult, x2, c256)
+  let eqz = run f2.compare(Predicate.Eq, y2, z32a)
+  let both = run f2.binary(Binary.And, lt, eqz)
+  run f2.branchIf(both, tIn, tOut)
+  f2.startBlock(tIn)
+  let nullAddr = run f2.constant(Kind.address(32), 0)
+  let isNull = run f2.compare(Predicate.Eq, slotAddr, nullAddr)
+  let c1a = run f2.integer(32, 1)
+  let sum2 = run f2.overflowing(Binary.Add, false, x2, c1a)
+  let bad2 = run f2.binary(Binary.Or, isNull, sum2.overflow)
+  run f2.branchIf(bad2, tTrap, tOk)
+  f2.startBlock(tTrap)
+  run f2.trap()
+  f2.startBlock(tOk)
+  run f2.ret(sum2.value)
+  f2.startBlock(tOut)
+  run f2.ret(z32a)
+  run f2.finish()
+  run SsaPipeline.prepare(&mut f2, Level.Speed, true, true)
+  run Testing.expect(count(&f2, Sort.Overflow, usize.MAX) == usize.ZERO && run wellFormed(&f2),
+    "conjoined And learns operand bounds and SlotAddress proves non-null")
+
+  // 3. `SsaScalarize` turns a closed `u32x4` rotate+shuffle loop into scalar `u32` SSA.
+  let v4 = Kind.vector(u32K, 4)
+  let ptrK = Kind.address(32)
+  let mut f3 = run SsaFunction.make(b"scalarize_u32x4", 32)
+  let p = run f3.argument(ptrK)
+  f3.setResult(Kind.unit())
+  let sEntry = run f3.newBlock()
+  let sLoop = run f3.newBlock()
+  let sDone = run f3.newBlock()
+  let sI = run f3.addParameter(sLoop, u32K)
+  let sX = run f3.addParameter(sLoop, v4)
+  f3.startBlock(sEntry)
+  let initX = run f3.load(v4, p, 0, 4)
+  let z32 = run f3.integer(32, 0)
+  let c1 = run f3.integer(32, 1)
+  let c4 = run f3.integer(32, 4)
+  let c7 = run f3.integer(32, 7)
+  let s7 = run f3.splat(c7, 4)
+  run f3.jumpWith(sLoop, &[z32, initX])
+  f3.startBlock(sLoop)
+  let rot = run f3.rotate(true, sX, s7)
+  let shuf = run f3.shuffle(rot, rot, &[1, 2, 3, 0])
+  let nextI = run f3.binary(Binary.Add, sI, c1)
+  let cont = run f3.compare(Predicate.Ult, nextI, c4)
+  run f3.branchWith(cont, sLoop, &[nextI, shuf], sDone, &[])
+  f3.startBlock(sDone)
+  run f3.store(shuf, p, 0, 4)
+  run f3.ret(none())
+  run f3.finish()
+  let g3 = run SsaGraph.of(&f3)
+  let didScalarize = run SsaScalarize.lower(&mut f3, &g3)
+  let paramCount = List<u64>.length(&f3.block(sLoop).parameters)
+  let ok3 = run wellFormed(&f3)
+  run Testing.expect(didScalarize && ok3 && paramCount == 5,
+    "SsaScalarize lowers closed u32x4 loop (load, splat, rotate, shuffle, store, phi) to scalar u32 SSA")
+
+  // 4. Dropped unreachable blocks leave stale `Definition.Parameter` owners past `blockCount()`;
+  // `SsaScalarize.lower` must ignore them rather than indexing `graph.reaches(info.owner)` OOB.
+  let mut f4 = run SsaFunction.make(b"scalarize_dropped_block_param", 32)
+  let p4 = run f4.argument(ptrK)
+  let b4Entry = run f4.newBlock()
+  let b4Live = run f4.newBlock()
+  let b4Dead = run f4.newBlock()
+  drop run f4.addParameter(b4Dead, v4)
+  f4.startBlock(b4Entry)
+  run f4.jump(b4Live)
+  f4.startBlock(b4Live)
+  let v4Load = run f4.load(v4, p4, 0, 4)
+  run f4.store(v4Load, p4, 0, 4)
+  run f4.ret(none())
+  f4.startBlock(b4Dead)
+  run f4.ret(none())
+  run f4.finish()
+  drop run f4.compact()
+  let g4 = run SsaGraph.of(&f4)
+  drop run SsaScalarize.lower(&mut f4, &g4)
+  run Testing.expect(run wellFormed(&f4), "SsaScalarize ignores stale vector parameters from compacted dead blocks")
+}
+
+test effect fn p3DynamicLoopRotationAndSwitchFusion() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run p3Claims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn p3Claims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let u32K = Kind.integer(32)
+
+  // 1. Dynamic-limit loop with an accumulator parameter rotates to bottom-tested form with a preheader guard.
+  let mut f1 = run SsaFunction.make(b"dyn_rot", 32)
+  let n = run f1.argument(u32K)
+  f1.setResult(u32K)
+  let e1 = run f1.newBlock()
+  let h1 = run f1.newBlock()
+  let b1 = run f1.newBlock()
+  let d1 = run f1.newBlock()
+  let idx = run f1.addParameter(h1, u32K)
+  let acc = run f1.addParameter(h1, u32K)
+  f1.startBlock(e1)
+  let z1 = run f1.integer(32, 0)
+  run f1.jumpWith(h1, &[z1, z1])
+  f1.startBlock(h1)
+  let cond1 = run f1.compare(Predicate.Ult, idx, n)
+  run f1.branchWith(cond1, b1, &[], d1, &[])
+  f1.startBlock(b1)
+  let c1 = run f1.integer(32, 1)
+  let nextAcc = run f1.binary(Binary.Add, acc, idx)
+  let nextIdx = run f1.binary(Binary.Add, idx, c1)
+  run f1.jumpWith(h1, &[nextIdx, nextAcc])
+  f1.startBlock(d1)
+  run f1.ret(acc)
+  run f1.finish()
+  let mut g1 = run SsaGraph.of(&f1)
+  let rotated = run SsaInduction.rotate(&mut f1, &mut g1)
+  let ok1 = run wellFormed(&f1)
+  let entryIsBranch = f1.block(e1).exit == Exit.Branch
+  run Testing.expect(rotated && ok1 && entryIsBranch,
+    "dynamic-limit multi-param loop rotates with a preheader entry guard")
+
+  // 2. Chain of 3 equality branches on the same value fuses into a single `Exit.Switch`.
+  let mut f2 = run SsaFunction.make(b"fuse_sw", 32)
+  let x = run f2.argument(u32K)
+  f2.setResult(u32K)
+  let cStart = run f2.newBlock()
+  let cNext1 = run f2.newBlock()
+  let cNext2 = run f2.newBlock()
+  let t0 = run f2.newBlock()
+  let t1 = run f2.newBlock()
+  let t2 = run f2.newBlock()
+  let tDef = run f2.newBlock()
+  f2.startBlock(cStart)
+  let k0 = run f2.integer(32, 10)
+  let eq0 = run f2.compare(Predicate.Eq, x, k0)
+  run f2.branchIf(eq0, t0, cNext1)
+  f2.startBlock(cNext1)
+  let k1 = run f2.integer(32, 11)
+  let eq1 = run f2.compare(Predicate.Eq, x, k1)
+  run f2.branchIf(eq1, t1, cNext2)
+  f2.startBlock(cNext2)
+  let k2 = run f2.integer(32, 12)
+  let eq2 = run f2.compare(Predicate.Eq, x, k2)
+  run f2.branchIf(eq2, t2, tDef)
+  f2.startBlock(t0)
+  run f2.ret(k0)
+  f2.startBlock(t1)
+  run f2.ret(k1)
+  f2.startBlock(t2)
+  run f2.ret(k2)
+  f2.startBlock(tDef)
+  let kDef = run f2.integer(32, 0)
+  run f2.ret(kDef)
+  run f2.finish()
+  let fused = run SsaControlFlow.fuseSwitches(&mut f2)
+  drop run f2.compact()
+  let ok2 = run wellFormed(&f2)
+  let isSwitch = f2.block(cStart).exit == Exit.Switch
+  let caseCount = List<u64>.length(&f2.block(cStart).cases)
+  run Testing.expect(fused, "fuseSwitches returned true")
+  run Testing.expect(ok2, "fused switch passes wellFormed")
+  run Testing.expect(isSwitch && caseCount == 3, "chain of 3 equality branches fuses into a 3-case Switch")
+}
+
+test effect fn p6UncapturedExclusiveAliasingAndFieldPromotion() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run p6aClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn p6aClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let ptrK = Kind.address(32)
+  let u32K = Kind.integer(32)
+
+  // 1. Uncaptured `&mut State` holding a heap buffer pointer (`offset 0`) and counter field
+  // (`offset 4`): storing into `buf[i]` (a `BaseForm.Value` loaded from `state`) must NOT alias
+  // `state`, so `SsaLoops.hoist` both hoists `state.buf` and promotes `state.acc`.
+  let mut f = run SsaFunction.make(b"excl_loaded_buf", 32)
+  let st = run f.argument(ptrK)
+  let n = run f.argument(u32K)
+  run f.setExclusive(st)
+  run f.setReach(st, 8)
+  let entry = run f.newBlock()
+  let header = run f.newBlock()
+  let body = run f.newBlock()
+  let done = run f.newBlock()
+  let idx = run f.addParameter(header, u32K)
+  f.startBlock(entry)
+  let zero = run f.integer(32, 0)
+  run f.jumpWith(header, &[zero])
+  f.startBlock(header)
+  let cont = run f.compare(Predicate.Ult, idx, n)
+  run f.branchIf(cont, body, done)
+  f.startBlock(body)
+  let buf = run f.load(ptrK, st, 0, 4)
+  let acc = run f.load(u32K, st, 4, 4)
+  let four = run f.integer(32, 4)
+  let byteOff = run f.binary(Binary.Mul, idx, four)
+  let elemAddr = run f.indexed(buf, byteOff)
+  run f.store(acc, elemAddr, 0, 4)
+  let one = run f.integer(32, 1)
+  let nextAcc = run f.binary(Binary.Add, acc, one)
+  run f.store(nextAcc, st, 4, 4)
+  let nextIdx = run f.binary(Binary.Add, idx, one)
+  run f.jumpWith(header, &[nextIdx])
+  f.startBlock(done)
+  run f.ret(none())
+  run f.finish()
+  let hoisted = run SsaLoops.hoist(&mut f)
+  let ok = run wellFormed(&f)
+  let mut loopLoads = usize.ZERO
+  let mut loopStores = usize.ZERO
+  let bodyInsts = List<usize>.asSlice(&f.block(body).instructions)
+  let mut k = usize.ZERO
+  while k < bodyInsts.length {
+    let inst = f.instruction(bodyInsts[k])
+    if !inst.removed {
+      match inst.operation {
+        Operation.Load {..} => { loopLoads = loopLoads + usize.ONE }
+        Operation.Store {..} => { loopStores = loopStores + usize.ONE }
+        _ => {}
+      }
+    }
+    k = k + usize.ONE
+  }
+  run Testing.expect(hoisted && ok && loopLoads == usize.ZERO && loopStores == usize.ONE,
+    "uncaptured exclusive arg hoists loaded buf pointer and promotes state.acc across buf[i] store")
+
+  // 2. When the exclusive arg IS captured (stored to memory), a loaded pointer MAY alias it,
+  // so `SsaLoops.hoist` must NOT hoist or promote across the `buf[i]` store.
+  let mut f2 = run SsaFunction.make(b"excl_captured", 32)
+  let st2 = run f2.argument(ptrK)
+  let n2 = run f2.argument(u32K)
+  let sink = run f2.argument(ptrK)
+  run f2.setExclusive(st2)
+  run f2.setReach(st2, 8)
+  let e2 = run f2.newBlock()
+  let h2 = run f2.newBlock()
+  let b2 = run f2.newBlock()
+  let d2 = run f2.newBlock()
+  let idx2 = run f2.addParameter(h2, u32K)
+  f2.startBlock(e2)
+  run f2.store(st2, sink, 0, 4)
+  let zero2 = run f2.integer(32, 0)
+  run f2.jumpWith(h2, &[zero2])
+  f2.startBlock(h2)
+  let cont2 = run f2.compare(Predicate.Ult, idx2, n2)
+  run f2.branchIf(cont2, b2, d2)
+  f2.startBlock(b2)
+  let buf2 = run f2.load(ptrK, st2, 0, 4)
+  let acc2 = run f2.load(u32K, st2, 4, 4)
+  let one2 = run f2.integer(32, 1)
+  run f2.store(acc2, buf2, 0, 4)
+  let nextAcc2 = run f2.binary(Binary.Add, acc2, one2)
+  run f2.store(nextAcc2, st2, 4, 4)
+  let nextIdx2 = run f2.binary(Binary.Add, idx2, one2)
+  run f2.jumpWith(h2, &[nextIdx2])
+  f2.startBlock(d2)
+  run f2.ret(none())
+  run f2.finish()
+  drop run SsaLoops.hoist(&mut f2)
+  let mut loopLoads2 = usize.ZERO
+  let b2Insts = List<usize>.asSlice(&f2.block(b2).instructions)
+  k = usize.ZERO
+  while k < b2Insts.length {
+    let inst = f2.instruction(b2Insts[k])
+    if !inst.removed {
+      if let Operation.Load {..} = inst.operation { loopLoads2 = loopLoads2 + usize.ONE }
+    }
+    k = k + usize.ONE
+  }
+  run Testing.expect(loopLoads2 == 2,
+    "captured exclusive arg conservatively aliases loaded pointer and keeps loop loads")
+
+  // 3. Dominator-preserving merge forwarding: a load of field 0 before an if/else that only
+  // writes field 4 survives the merge block and eliminates the redundant reload.
+  let mut f3 = run SsaFunction.make(b"merge_forward", 32)
+  let st3 = run f3.argument(ptrK)
+  let cond3 = run f3.argument(Kind.flag())
+  run f3.setExclusive(st3)
+  run f3.setReach(st3, 8)
+  f3.setResult(u32K)
+  let e3 = run f3.newBlock()
+  let t3 = run f3.newBlock()
+  let el3 = run f3.newBlock()
+  let m3 = run f3.newBlock()
+  f3.startBlock(e3)
+  let first3 = run f3.load(u32K, st3, 0, 4)
+  run f3.branchIf(cond3, t3, el3)
+  f3.startBlock(t3)
+  let k1 = run f3.integer(32, 1)
+  run f3.store(k1, st3, 4, 4)
+  run f3.jump(m3)
+  f3.startBlock(el3)
+  let k2 = run f3.integer(32, 2)
+  run f3.store(k2, st3, 4, 4)
+  run f3.jump(m3)
+  f3.startBlock(m3)
+  let second3 = run f3.load(u32K, st3, 0, 4)
+  let sum3 = run f3.binary(Binary.Add, first3, second3)
+  run f3.ret(sum3)
+  run f3.finish()
+  let g3 = run SsaGraph.of(&f3)
+  let fwd3 = run SsaMemory.forward(&mut f3, &g3)
+  let mut mergeLoads = usize.ZERO
+  let m3Insts = List<usize>.asSlice(&f3.block(m3).instructions)
+  k = usize.ZERO
+  while k < m3Insts.length {
+    let inst = f3.instruction(m3Insts[k])
+    if !inst.removed {
+      if let Operation.Load {..} = inst.operation { mergeLoads = mergeLoads + usize.ONE }
+    }
+    k = k + usize.ONE
+  }
+  run Testing.expect(fwd3 && (run wellFormed(&f3)) && mergeLoads == usize.ZERO,
+    "dominator-preserving merge forwarding eliminates reload of untouched field across if/else")
+
+  // 4. `x < (x >> 5)` folds to `false` via `unsignedAtMost` in `SsaValueNumbering`.
+  let mut f4 = run SsaFunction.make(b"lshr_le", 32)
+  let x4 = run f4.argument(u32K)
+  f4.setResult(Kind.flag())
+  let e4 = run f4.newBlock()
+  f4.startBlock(e4)
+  let five = run f4.integer(32, 5)
+  let shr4 = run f4.binary(Binary.LShr, x4, five)
+  let lt4 = run f4.compare(Predicate.Ult, x4, shr4)
+  run f4.ret(lt4)
+  run f4.finish()
+  let g4 = run SsaGraph.of(&f4)
+  let num4 = run SsaValueNumbering.number(&mut f4, &g4)
+  let ret4 = f4.block(e4).value
+  run Testing.expect(num4 && f4.isBits(ret4) && f4.constantOf(ret4).low == 0,
+    "SsaValueNumbering proves x < (x >> 5) is always false")
+
+  // 5. `fuseSwitches` fuses mixed equality and small unsigned range tests into one `Exit.Switch`.
+  let mut f6 = run SsaFunction.make(b"fuse_range_sw", 32)
+  let c6 = run f6.argument(Kind.integer(8))
+  f6.setResult(u32K)
+  let b60 = run f6.newBlock()
+  let b61 = run f6.newBlock()
+  let b62 = run f6.newBlock()
+  let r60 = run f6.newBlock()
+  let r61 = run f6.newBlock()
+  let r62 = run f6.newBlock()
+  let r6d = run f6.newBlock()
+  f6.startBlock(b60)
+  let v224 = run f6.integer(8, 224)
+  let eq224 = run f6.compare(Predicate.Eq, c6, v224)
+  run f6.branchIf(eq224, r60, b61)
+  f6.startBlock(b61)
+  let v225 = run f6.integer(8, 225)
+  let sh61 = run f6.binary(Binary.Sub, c6, v225)
+  let v11 = run f6.integer(8, 11)
+  let le61 = run f6.compare(Predicate.Ule, sh61, v11)
+  run f6.branchIf(le61, r61, b62)
+  f6.startBlock(b62)
+  let v237 = run f6.integer(8, 237)
+  let eq237 = run f6.compare(Predicate.Eq, c6, v237)
+  run f6.branchIf(eq237, r62, r6d)
+  f6.startBlock(r60)
+  let out1 = run f6.integer(32, 1)
+  run f6.ret(out1)
+  f6.startBlock(r61)
+  let out2 = run f6.integer(32, 2)
+  run f6.ret(out2)
+  f6.startBlock(r62)
+  let out3 = run f6.integer(32, 3)
+  run f6.ret(out3)
+  f6.startBlock(r6d)
+  let out0 = run f6.integer(32, 0)
+  run f6.ret(out0)
+  run f6.finish()
+  let fused6 = run SsaControlFlow.fuseSwitches(&mut f6)
+  drop run f6.compact()
+  run Testing.expect(fused6 && (run wellFormed(&f6)) && f6.block(usize.ZERO).exit == Exit.Switch
+    && List<u64>.length(&f6.block(usize.ZERO).cases) == 14,
+    "fuseSwitches fuses mixed equality and small range tests into one 14-case Switch")
 }

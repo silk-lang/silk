@@ -236,8 +236,9 @@ fn overlaps(first: Place, size: u64, second: Place, otherSize: u64, bits: usize)
 }
 
 /// Whether `size` bytes at `first` and `otherSize` bytes at `second` may share a byte, given
-/// which slots `escaped`.
-pub fn mayAlias(first: Place, size: u64, second: Place, otherSize: u64, escaped: &[bool], bits: usize) -> bool {
+/// which slots `escaped` and which exclusive argument value IDs `captured` may have escaped into
+/// other pointers.
+pub fn mayAlias(first: Place, size: u64, second: Place, otherSize: u64, escaped: &[bool], captured: &[bool], bits: usize) -> bool {
   if first.form == BaseForm.Slot && second.form == BaseForm.Slot {
     if first.base != second.base { return false }
     return overlaps(first, size, second, otherSize, bits)
@@ -247,10 +248,17 @@ pub fn mayAlias(first: Place, size: u64, second: Place, otherSize: u64, escaped:
   if first.form == BaseForm.Slot { return escaped[u64.toUsize(first.base)] && !fromOutside(second.form) }
   if second.form == BaseForm.Slot { return escaped[u64.toUsize(second.base)] && !fromOutside(first.form) }
   if first.form == second.form && first.base == second.base { return overlaps(first, size, second, otherSize, bits) }
-  // What an exclusive argument reaches, no other argument and no symbol does.
-  if first.form == BaseForm.Exclusive && fromOutside(second.form) { return false }
-  if second.form == BaseForm.Exclusive && fromOutside(first.form) { return false }
+  // What an exclusive argument reaches, no other argument and no symbol does; when the argument
+  // itself is not captured in this function, no pointer loaded from memory or produced by an
+  // unrelated value can alias it either.
+  if first.form == BaseForm.Exclusive && (fromOutside(second.form) || isUncaptured(first.base, captured)) { return false }
+  if second.form == BaseForm.Exclusive && (fromOutside(first.form) || isUncaptured(second.base, captured)) { return false }
   return true
+}
+
+fn isUncaptured(base: u64, captured: &[bool]) -> bool {
+  let index = u64.toUsize(base)
+  return index < captured.length && !captured[index]
 }
 
 /// Whether an access of `size` bytes at `place` cannot trap: the bytes lie within what an
@@ -347,6 +355,138 @@ pub effect fn escapedSlots(function: &SsaFunction, graph: &SsaGraph) -> List<boo
     block = block + usize.ONE
   }
   return move escaped
+}
+
+/// Which exclusive arguments (`SsaFunction.isExclusive`) of `function` may have their address
+/// captured into another pointer value (stored to memory, cast, selected, passed along a block
+/// edge, or passed to a call that returns an address or also receives a stack slot address).
+/// Indexed by the argument's value ID; empty when `function` has no exclusive arguments.
+pub effect fn escapedExclusives(function: &SsaFunction, graph: &SsaGraph) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let args = List<u64>.asSlice(&function.arguments)
+  let mut maxId = usize.ZERO
+  let mut hasAny = false
+  let mut a = usize.ZERO
+  while a < args.length {
+    if function.isExclusive(args[a]) {
+      let id = u64.toUsize(args[a])
+      if !hasAny || id > maxId { maxId = id }
+      hasAny = true
+    }
+    a = a + usize.ONE
+  }
+  if !hasAny { return List<bool>.make() }
+  let mut captured = run List<bool>.makeWithCapacity(maxId + usize.ONE)
+  run List<bool>.appendRepeated(&mut captured, false, maxId + usize.ONE)
+  let valueCount = function.valueCount()
+  let mut derived = run List<usize>.makeWithCapacity(valueCount)
+  run List<usize>.appendRepeated(&mut derived, usize.MAX, valueCount)
+  a = usize.ZERO
+  while a < args.length {
+    if function.isExclusive(args[a]) {
+      let id = u64.toUsize(args[a])
+      if id < valueCount { List<usize>.set(&mut derived, id, id) }
+    }
+    a = a + usize.ONE
+  }
+  let sequence = graph.reversePostorder()
+  let mut step = usize.ZERO
+  while step < sequence.length {
+    let listed = List<usize>.asSlice(&function.block(sequence[step]).instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let found = function.instruction(listed[at])
+      if !found.removed {
+        match found.operation {
+          Operation.Offset {..} => {
+            let from = slotOf(&derived, function.operandsOf(listed[at])[usize.ZERO])
+            if from != usize.MAX { List<usize>.set(&mut derived, u64.toUsize(found.result), from) }
+          }
+          Operation.Index => {
+            let from = slotOf(&derived, function.operandsOf(listed[at])[usize.ZERO])
+            if from != usize.MAX { List<usize>.set(&mut derived, u64.toUsize(found.result), from) }
+          }
+          _ => {}
+        }
+      }
+      at = at + usize.ONE
+    }
+    step = step + usize.ONE
+  }
+  step = usize.ZERO
+  while step < sequence.length {
+    let found = function.block(sequence[step])
+    let listed = List<usize>.asSlice(&found.instructions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let instId = listed[at]
+      let inst = function.instruction(instId)
+      if !inst.removed {
+        let operation = inst.operation
+        let operands = function.operandsOf(instId)
+        let mut operand = usize.ZERO
+        while operand < operands.length {
+          let from = slotOf(&derived, operands[operand])
+          if from != usize.MAX && !addressUse(operation, operand) {
+            let mut safeCall = false
+            match operation {
+              Operation.Call {..} => {
+                if !inst.kind.isAddress() && !inst.kind.isVector() && !inst.secondKind.isAddress() && !inst.secondKind.isVector() {
+                  safeCall = true
+                  let mut other = usize.ZERO
+                  while other < operands.length {
+                    if other != operand && placeOf(function, operands[other], 0).form == BaseForm.Slot {
+                      safeCall = false
+                      break
+                    }
+                    other = other + usize.ONE
+                  }
+                }
+              }
+              Operation.CallIndirect {..} => {
+                if operand != usize.ZERO && !inst.kind.isAddress() && !inst.kind.isVector() && !inst.secondKind.isAddress() && !inst.secondKind.isVector() {
+                  safeCall = true
+                  let mut other = usize.ONE
+                  while other < operands.length {
+                    if other != operand && placeOf(function, operands[other], 0).form == BaseForm.Slot {
+                      safeCall = false
+                      break
+                    }
+                    other = other + usize.ONE
+                  }
+                }
+              }
+              _ => {}
+            }
+            if !safeCall { List<bool>.set(&mut captured, from, true) }
+          }
+          operand = operand + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+    let mut from = slotOf(&derived, found.value)
+    if from != usize.MAX { List<bool>.set(&mut captured, from, true) }
+    from = slotOf(&derived, found.secondValue)
+    if from != usize.MAX { List<bool>.set(&mut captured, from, true) }
+    from = slotOf(&derived, found.thirdValue)
+    if from != usize.MAX { List<bool>.set(&mut captured, from, true) }
+    from = slotOf(&derived, found.fourthValue)
+    if from != usize.MAX { List<bool>.set(&mut captured, from, true) }
+    let edges = List<Edge>.asSlice(&found.edges)
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let arguments = List<u64>.asSlice(&edges[edge].arguments)
+      let mut argument = usize.ZERO
+      while argument < arguments.length {
+        from = slotOf(&derived, arguments[argument])
+        if from != usize.MAX { List<bool>.set(&mut captured, from, true) }
+        argument = argument + usize.ONE
+      }
+      edge = edge + usize.ONE
+    }
+    step = step + usize.ONE
+  }
+  return move captured
 }
 
 fn slotOf(derived: &List<usize>, value: u64) -> usize {
@@ -661,6 +801,7 @@ struct Forwarding {
   killed: List<usize>,
   substitution: List<u64>,
   escaped: List<bool>,
+  captured: List<bool>,
   bits: usize,
   changed: bool,
 }
@@ -670,9 +811,10 @@ struct Forwarding {
 /// answers whether it changed anything.
 pub effect fn forward(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! OutOfMemoryError ? &mut Allocator {
   let escaped = run escapedSlots(&function.*, graph)
+  let captured = run escapedExclusives(&function.*, graph)
   let bypassed = run bypassTemporaryCopies(&mut function.*, List<bool>.asSlice(&escaped))
   let promotedRo = run promoteReadOnlyCopies(&mut function.*, List<bool>.asSlice(&escaped))
-  let mut state = Forwarding {reads: List<Read>.make(), killedReads: List<usize>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped,
+  let mut state = Forwarding {reads: List<Read>.make(), killedReads: List<usize>.make(), readFloor: usize.ZERO, held: List<Held>.make(), floor: usize.ZERO, killed: List<usize>.make(), substitution: List<u64>.make(), escaped: move escaped, captured: move captured,
     bits: function.addressBits, changed: bypassed || promotedRo}
   run List<u64>.appendRepeated(&mut state.substitution, none(), function.valueCount())
   // Entries: a block to enter, or `usize.MAX - mark` to leave the mark at that position.
@@ -722,8 +864,12 @@ pub effect fn forward(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! Ou
     run List<usize>.append(&mut marks, List<usize>.length(&state.killedReads))
     run List<usize>.append(&mut walk, usize.MAX - mark)
     if graph.predecessorsOf(block).length != usize.ONE {
-      state.floor = List<Held>.length(&state.held)
-      state.readFloor = List<Read>.length(&state.reads)
+      if block == usize.ZERO {
+        state.floor = List<Held>.length(&state.held)
+        state.readFloor = List<Read>.length(&state.reads)
+      } else if List<Held>.length(&state.held) > state.floor || List<Read>.length(&state.reads) > state.readFloor {
+        run killAcrossMerge(&mut state, &function.*, graph, block)
+      }
     }
     run forwardBlock(&mut state, &mut function.*, block)
     let children = graph.childrenOf(block)
@@ -739,6 +885,113 @@ pub effect fn forward(function: &mut SsaFunction, graph: &SsaGraph) -> bool ! Ou
   }
   let removed = run removeUnreadStores(&mut function.*, List<bool>.asSlice(&state.escaped))
   return state.changed || removed
+}
+
+// Invalidates visible held/read entries that any path from `block`'s immediate dominator to
+// `block` (including any loop back-edges into `block`) may overwrite, while preserving entries
+// from dominating blocks that no intervening path writes. Falls back to resetting the floors if
+// more than 64 intervening blocks are reached.
+effect fn killAcrossMerge(state: &mut Forwarding, function: &SsaFunction, graph: &SsaGraph, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let idom = graph.dominatorOf(block)
+  if idom == usize.MAX {
+    state.floor = List<Held>.length(&state.held)
+    state.readFloor = List<Read>.length(&state.reads)
+    return ()
+  }
+  let mut visited = List<usize>.make()
+  let mut stack = List<usize>.make()
+  let preds = graph.predecessorsOf(block)
+  let mut p = usize.ZERO
+  while p < preds.length {
+    let pred = preds[p]
+    p = p + usize.ONE
+    if pred == idom || !graph.reaches(pred) { continue }
+    let mut seen = false
+    let mut vi = usize.ZERO
+    while vi < List<usize>.length(&visited) {
+      if List<usize>.get(&visited, vi) == pred { seen = true break }
+      vi = vi + usize.ONE
+    }
+    if !seen {
+      run List<usize>.append(&mut visited, pred)
+      run List<usize>.append(&mut stack, pred)
+    }
+  }
+  let mut overflow = List<usize>.length(&visited) > 64
+  while !overflow && List<usize>.length(&stack) > usize.ZERO {
+    let top = List<usize>.length(&stack) - usize.ONE
+    let cur = List<usize>.get(&stack, top)
+    List<usize>.truncate(&mut stack, top)
+    let curPreds = graph.predecessorsOf(cur)
+    let mut cp = usize.ZERO
+    while cp < curPreds.length {
+      let pred = curPreds[cp]
+      cp = cp + usize.ONE
+      if pred == idom || !graph.reaches(pred) { continue }
+      let mut seen = false
+      let mut vi = usize.ZERO
+      while vi < List<usize>.length(&visited) {
+        if List<usize>.get(&visited, vi) == pred { seen = true break }
+        vi = vi + usize.ONE
+      }
+      if !seen {
+        if List<usize>.length(&visited) >= 64 {
+          overflow = true
+          break
+        }
+        run List<usize>.append(&mut visited, pred)
+        run List<usize>.append(&mut stack, pred)
+      }
+    }
+  }
+  if overflow {
+    state.floor = List<Held>.length(&state.held)
+    state.readFloor = List<Read>.length(&state.reads)
+    return ()
+  }
+  let mut clobbered = false
+  let mut vi = usize.ZERO
+  while vi < List<usize>.length(&visited) {
+    let b = List<usize>.get(&visited, vi)
+    vi = vi + usize.ONE
+    let listed = List<usize>.asSlice(&function.block(b).instructions)
+    let mut ii = usize.ZERO
+    while ii < listed.length {
+      let id = listed[ii]
+      ii = ii + usize.ONE
+      let inst = function.instruction(id)
+      if inst.removed { continue }
+      let ops = function.operandsOf(id)
+      match inst.operation {
+        Operation.Store {offset, ..} => {
+          let place = placeOf(function, resolved(&state.*, ops[usize.ONE]), offset)
+          let size = usize.toU64(function.kindOf(ops[usize.ZERO]).storeSize())
+          run killReads(&mut state.*, place, size)
+          run kill(&mut state.*, place, size)
+        }
+        Operation.CopyBytes {size} => {
+          let place = placeOf(function, resolved(&state.*, ops[usize.ZERO]), 0)
+          run killReads(&mut state.*, place, size)
+          run kill(&mut state.*, place, size)
+        }
+        Operation.Fill {size, ..} => {
+          let place = placeOf(function, resolved(&state.*, ops[usize.ZERO]), 0)
+          run killReads(&mut state.*, place, size)
+          run kill(&mut state.*, place, size)
+        }
+        Operation.SlotStart {slot} => { run killSlot(&mut state.*, slot) }
+        Operation.SlotEnd {slot} => { run killSlot(&mut state.*, slot) }
+        _ => {
+          if !clobbered && clobbers(inst.operation) {
+            run clobber(&mut state.*)
+            state.readFloor = List<Read>.length(&state.reads)
+            clobbered = true
+          }
+        }
+      }
+    }
+  }
+  return ()
 }
 
 fn resolved(state: &Forwarding, value: u64) -> u64 {
@@ -778,6 +1031,38 @@ struct Narrowed {
 
 impl Copy for Narrowed {}
 
+struct NarrowedValue {
+  source: u64,
+  sourceKind: Kind,
+  shiftBits: u64,
+  found: bool,
+}
+
+impl Copy for NarrowedValue {}
+
+fn narrowedValueAt(state: &Forwarding, function: &SsaFunction, place: Place, size: u64, kind: Kind) -> NarrowedValue {
+  let missing = NarrowedValue {source: none(), sourceKind: Kind.unit(), shiftBits: 0, found: false}
+  if !place.known || !kind.isInteger() || kind.isVector() || kind.bits > 64 || usize.toU64(kind.bits) != size * 8 { return missing }
+  let held = List<Held>.asSlice(&state.held)
+  let mut at = held.length
+  let mut seen = usize.ZERO
+  while at > state.floor && seen < window() {
+    at = at - usize.ONE
+    seen = seen + usize.ONE
+    let entry = held[at]
+    if entry.alive && entry.place.known && entry.place.form == place.form && entry.place.base == place.base
+      && entry.place.offset <= place.offset && place.offset - entry.place.offset <= entry.size && size <= entry.size - (place.offset - entry.place.offset)
+      && entry.kind.isInteger() && !entry.kind.isVector() && entry.kind.bits <= 64 && usize.toU64(entry.kind.bits) == entry.size * 8
+      && entry.kind.bits > kind.bits {
+      let value = resolved(state, entry.value)
+      if !function.isBits(value) {
+        return NarrowedValue {source: value, sourceKind: entry.kind, shiftBits: (place.offset - entry.place.offset) * 8, found: true}
+      }
+    }
+  }
+  return missing
+}
+
 fn narrowedAt(state: &Forwarding, function: &SsaFunction, place: Place, size: u64, kind: Kind) -> Narrowed {
   let missing = Narrowed {bits: u64.MAX, found: false}
   if !place.known || !kind.isInteger() || kind.isVector() || kind.bits > 64 { return missing }
@@ -813,7 +1098,7 @@ effect fn killReads(state: &mut Forwarding, place: Place, size: u64) -> () ! Out
     at = at - usize.ONE
     seen = seen + usize.ONE
     let entry = List<Read>.get(&state.reads, at)
-    if entry.alive && mayAlias(entry.place, usize.toU64(entry.kind.storeSize()), place, size, List<bool>.asSlice(&state.escaped), state.bits) {
+    if entry.alive && mayAlias(entry.place, usize.toU64(entry.kind.storeSize()), place, size, List<bool>.asSlice(&state.escaped), List<bool>.asSlice(&state.captured), state.bits) {
       let reads = List<Read>.asMutSlice(&mut state.reads)
       reads[at].alive = false
       run List<usize>.append(&mut state.killedReads, at)
@@ -830,7 +1115,7 @@ effect fn kill(state: &mut Forwarding, place: Place, size: u64) -> () ! OutOfMem
     at = at - usize.ONE
     seen = seen + usize.ONE
     let entry = List<Held>.get(&state.held, at)
-    if entry.alive && mayAlias(entry.place, entry.size, place, size, List<bool>.asSlice(&state.escaped), state.bits) {
+    if entry.alive && mayAlias(entry.place, entry.size, place, size, List<bool>.asSlice(&state.escaped), List<bool>.asSlice(&state.captured), state.bits) {
       let held = List<Held>.asMutSlice(&mut state.held)
       held[at].alive = false
       run List<usize>.append(&mut state.killed, at)
@@ -916,7 +1201,7 @@ effect fn bypassTemporaryCopies(function: &mut SsaFunction, escaped: &[bool]) ->
         let source = placeOf(&function.*, original, 0)
         if let Operation.CopyBytes {size: wrote} = function.instruction(prior).operation {
           if size == wrote && via.form == BaseForm.Slot && via.known && via.base == from.base && via.offset == from.offset
-            && !mayAlias(from, size, source, size, escaped, function.addressBits) && !mayAlias(from, size, to, size, escaped, function.addressBits) {
+            && !mayAlias(from, size, source, size, escaped, &[], function.addressBits) && !mayAlias(from, size, to, size, escaped, &[], function.addressBits) {
             function.setOperand(id, usize.ONE, original)
             function.remove(prior)
             changed = true
@@ -1101,7 +1386,7 @@ fn privateSlotContains(function: &SsaFunction, escaped: &[bool], place: Place, s
 }
 
 effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  let count = List<usize>.length(&function.block(block).instructions)
+  let mut count = List<usize>.length(&function.block(block).instructions)
   let mut lastCopy = usize.MAX
   let mut at = usize.ZERO
   while at < count {
@@ -1144,32 +1429,51 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
           List<u64>.set(&mut state.substitution, u64.toUsize(found.result), constant)
           function.remove(instruction)
           state.changed = true
-        } else if place.known {
-          if foldableOffset(&function.*, place, address, displacement, size) {
-            function.setOperand(instruction, usize.ZERO, place.base)
-            function.setOperation(instruction, Operation.Load {offset: place.offset, alignment: aligned})
-            state.changed = true
-          }
-          run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: found.kind, value: found.result, alive: true})
         } else {
-          // The same address value read again, with no write between that may alias it, reads
-          // the same bytes, wherever they are.
-          let address = resolved(&state.*, function.operandsOf(instruction)[usize.ZERO])
-          let reads = List<Read>.asSlice(&state.reads)
-          let mut earlier = none()
-          let mut read = reads.length
-          let mut seen = usize.ZERO
-          while read > state.readFloor && seen < window() && earlier == none() {
-            read = read - usize.ONE
-            seen = seen + usize.ONE
-            if reads[read].alive && reads[read].address == address && reads[read].offset == displacement && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
-          }
-          if earlier != none() {
-            List<u64>.set(&mut state.substitution, u64.toUsize(found.result), earlier)
+          let dynNarrowed = narrowedValueAt(&state.*, &function.*, place, size, found.kind)
+          if dynNarrowed.found {
+            let mut cur = dynNarrowed.source
+            let mut added = usize.ZERO
+            if dynNarrowed.shiftBits > 0 {
+              let shiftConst = run function.constant(dynNarrowed.sourceKind, dynNarrowed.shiftBits)
+              cur = run function.insertInstruction(block, at + added, Operation.Binary {operation: Binary.LShr}, dynNarrowed.sourceKind, &[cur, shiftConst], found.place)
+              added = added + usize.ONE
+            }
+            let truncVal = run function.insertInstruction(block, at + added, Operation.Cast {operation: Cast.Trunc}, found.kind, &[cur], found.place)
+            added = added + usize.ONE
+            while List<u64>.length(&state.substitution) < function.valueCount() { run List<u64>.append(&mut state.substitution, none()) }
+            List<u64>.set(&mut state.substitution, u64.toUsize(found.result), truncVal)
             function.remove(instruction)
+            at = at + added
+            count = count + added
             state.changed = true
+          } else if place.known {
+            if foldableOffset(&function.*, place, address, displacement, size) {
+              function.setOperand(instruction, usize.ZERO, place.base)
+              function.setOperation(instruction, Operation.Load {offset: place.offset, alignment: aligned})
+              state.changed = true
+            }
+            run List<Held>.append(&mut state.held, Held {place: place, size: size, kind: found.kind, value: found.result, alive: true})
           } else {
-            run List<Read>.append(&mut state.reads, Read {address: address, offset: displacement, kind: found.kind, value: found.result, place: place, alive: true})
+            // The same address value read again, with no write between that may alias it, reads
+            // the same bytes, wherever they are.
+            let address = resolved(&state.*, function.operandsOf(instruction)[usize.ZERO])
+            let reads = List<Read>.asSlice(&state.reads)
+            let mut earlier = none()
+            let mut read = reads.length
+            let mut seen = usize.ZERO
+            while read > state.readFloor && seen < window() && earlier == none() {
+              read = read - usize.ONE
+              seen = seen + usize.ONE
+              if reads[read].alive && reads[read].address == address && reads[read].offset == displacement && reads[read].kind.equals(found.kind) { earlier = reads[read].value }
+            }
+            if earlier != none() {
+              List<u64>.set(&mut state.substitution, u64.toUsize(found.result), earlier)
+              function.remove(instruction)
+              state.changed = true
+            } else {
+              run List<Read>.append(&mut state.reads, Read {address: address, offset: displacement, kind: found.kind, value: found.result, place: place, alive: true})
+            }
           }
         }
       }
@@ -1219,7 +1523,7 @@ effect fn forwardBlock(state: &mut Forwarding, function: &mut SsaFunction, block
         }
         lastCopy = usize.MAX
         let escaped = List<bool>.asSlice(&state.escaped)
-        if privateSlotContains(&function.*, escaped, place, size) && !mayAlias(from, size, place, size, escaped, function.addressBits) {
+        if privateSlotContains(&function.*, escaped, place, size) && !mayAlias(from, size, place, size, escaped, List<bool>.asSlice(&state.captured), function.addressBits) {
           lastCopy = instruction
         }
         run killReads(&mut state.*, place, size)
@@ -1392,7 +1696,7 @@ effect fn removeUnreadStores(function: &mut SsaFunction, escaped: &[bool]) -> bo
     let mut otherBlockReads = false
     let mut other = usize.ZERO
     while other < read.length {
-      if mayAlias(read[other], sizes[other], place, size, escaped, function.addressBits) {
+      if mayAlias(read[other], sizes[other], place, size, escaped, &[], function.addressBits) {
         unread = false
         if rBlocks[other] != found.block { otherBlockReads = true }
       }
@@ -1453,11 +1757,11 @@ fn isLocallyDeadStore(
       match inst.operation {
         Operation.Load {offset, ..} => {
           let rp = placeOf(function, ops[usize.ZERO], offset)
-          if mayAlias(rp, usize.toU64(inst.kind.storeSize()), place, size, escaped, function.addressBits) { return false }
+          if mayAlias(rp, usize.toU64(inst.kind.storeSize()), place, size, escaped, &[], function.addressBits) { return false }
         }
         Operation.CopyBytes {size: copied} => {
           let rp = placeOf(function, ops[usize.ONE], 0)
-          if mayAlias(rp, copied, place, size, escaped, function.addressBits) { return false }
+          if mayAlias(rp, copied, place, size, escaped, &[], function.addressBits) { return false }
           let wp = placeOf(function, ops[usize.ZERO], 0)
           if coversSlotRange(wp, copied, place, size) { return true }
         }
@@ -1506,14 +1810,14 @@ fn isLocallyDeadStore(
         }
         Operation.CopyBytes {size: copied} => {
           let rp = placeOf(function, ops[usize.ONE], 0)
-          if !killedSinceEntry && mayAlias(rp, copied, place, size, escaped, function.addressBits) { return false }
+          if !killedSinceEntry && mayAlias(rp, copied, place, size, escaped, &[], function.addressBits) { return false }
           let wp = placeOf(function, ops[usize.ZERO], 0)
           if coversSlotRange(wp, copied, place, size) { killedSinceEntry = true }
         }
         Operation.Load {offset, ..} => {
           if !killedSinceEntry {
             let rp = placeOf(function, ops[usize.ZERO], offset)
-            if mayAlias(rp, usize.toU64(inst.kind.storeSize()), place, size, escaped, function.addressBits) { return false }
+            if mayAlias(rp, usize.toU64(inst.kind.storeSize()), place, size, escaped, &[], function.addressBits) { return false }
           }
         }
         _ => {}

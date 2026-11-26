@@ -29,6 +29,7 @@ import backend.SsaFunction {
   Block,
   Cast,
   ConstantForm,
+  Definition,
   Edge,
   Exit,
   Form,
@@ -51,17 +52,22 @@ import silk.num.u64
 import silk.num.usize
 
 /// The `WasmBody` kind of SSA kind `kind` on a target whose addresses are `addressBits` wide: an
-/// address is an integer that wide.
-pub fn wasmKind(kind: SsaKind, addressBits: usize) -> Kind {
+/// address is an integer that wide. When `simd128` is true, 128-bit numeric vectors and 2/4/8/16-lane
+/// masks use a single native `v128` lane.
+pub fn wasmKind(kind: SsaKind, addressBits: usize, simd128: bool) -> Kind {
   if kind.isUnit() { return Kind.unit() }
   let mut element = Kind.integer(kind.bits)
   if kind.form == Form.Float { element = Kind.float(kind.bits) }
   if kind.form == Form.Address { element = Kind.integer(addressBits) }
-  if kind.isVector() { return Kind.vector(element, kind.elements) }
+  if kind.isVector() {
+    if simd128 { return Kind.simdVector(element, kind.elements) }
+    return Kind.vector(element, kind.elements)
+  }
   return element
 }
 
-/// The finished wasm body of `function`, for a memory threads share when `threaded`.
+/// The finished wasm body of `function`, for a memory threads share when `threaded`, and with
+/// WebAssembly 128-bit SIMD enabled when `simd128`.
 ///
 /// # Errors
 ///
@@ -70,10 +76,10 @@ pub fn wasmKind(kind: SsaKind, addressBits: usize) -> Kind {
 ///
 /// With `trees`, a value used once in its own block stays on the wasm stack where it can, and
 /// locals with disjoint live ranges can share a slot.
-pub effect fn emit(function: &SsaFunction, threaded: bool, trees: bool) -> Translated ! Unsupported | OutOfMemoryError ? &mut Allocator {
+pub effect fn emit(function: &SsaFunction, threaded: bool, trees: bool, simd128: bool) -> Translated ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let graph = run SsaGraph.of(function)
-  let mut body = run Body.make(function.name(), function.addressBits == 64, threaded)
-  run emitInto(&mut body, function, &graph, trees)
+  let mut body = run Body.make(function.name(), function.addressBits == 64, threaded, simd128)
+  run emitInto(&mut body, function, &graph, trees, simd128)
   return run WasmBody.finish(&mut body, trees)
 }
 
@@ -93,12 +99,168 @@ struct Emitter {
   addressBits: usize,
   place: u64,
   trees: bool,
+  simd128: bool,
   uses: List<usize>,
   userBlock: List<usize>,
   userPosition: List<usize>,
+  firstBlock: List<usize>,
+  firstPosition: List<usize>,
+  sameBlockUses: List<usize>,
   deferred: List<bool>,
   readsFrom: List<usize>,
   effectsBefore: List<usize>,
+  hoistArm: List<usize>,
+}
+
+fn containsU64(items: &[u64], value: u64) -> bool {
+  let mut at = usize.ZERO
+  while at < items.length {
+    if items[at] == value { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn valueTouchesWritten(function: &SsaFunction, values: &[u64], block: usize, root: u64, written: &[u64], edgeArgs: &[u64], depth: usize) -> bool {
+  if root == none() || depth == usize.ZERO { return false }
+  let bodyVal = values[u64.toUsize(root)]
+  if bodyVal != none() && containsU64(written, bodyVal) { return true }
+  if containsU64(edgeArgs, root) { return false }
+  let prod = function.producerOf(root)
+  if prod == usize.MAX || function.instruction(prod).block != block { return false }
+  let ops = function.operandsOf(prod)
+  let mut at = usize.ZERO
+  while at < ops.length {
+    if valueTouchesWritten(function, values, block, ops[at], written, edgeArgs, depth - usize.ONE) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn canHoistBranchArm(function: &SsaFunction, values: &[u64], block: usize, arm: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let found = function.block(block)
+  let edges = List<Edge>.asSlice(&found.edges)
+  let other = usize.ONE - arm
+  let target = edges[arm].block
+  let otherTarget = edges[other].block
+  if target == otherTarget { return false }
+  let params = List<u64>.asSlice(&function.block(target).parameters)
+  let args = List<u64>.asSlice(&edges[arm].arguments)
+  if args.length == usize.ZERO { return false }
+  let mut written = List<u64>.make()
+  let mut k = usize.ZERO
+  while k < args.length {
+    if args[k] != params[k] {
+      let dst = values[u64.toUsize(params[k])]
+      let src = values[u64.toUsize(args[k])]
+      if dst != none() && dst != src && !containsU64(List<u64>.asSlice(&written), dst) {
+        run List<u64>.append(&mut written, dst)
+      }
+    }
+    k = k + usize.ONE
+  }
+  let writtenSlice = List<u64>.asSlice(&written)
+  if writtenSlice.length == usize.ZERO { return true }
+  // 1. Branch condition (and any single-use deferred tree feeding it) must not read written locals.
+  if valueTouchesWritten(function, values, block, found.value, writtenSlice, args, 16) { return false }
+  // 2. Other arm's edge arguments must not read written locals.
+  let otherArgs = List<u64>.asSlice(&edges[other].arguments)
+  k = usize.ZERO
+  while k < otherArgs.length {
+    let v = otherArgs[k]
+    if v != none() {
+      let bv = values[u64.toUsize(v)]
+      if bv != none() && containsU64(writtenSlice, bv) { return false }
+    }
+    k = k + usize.ONE
+  }
+  // 3. No block reachable from `otherTarget` without passing through `target` may read a written
+  // local (except via `otherTarget`'s own parameters, which `edges[other]` overwrites on entry).
+  let otherParams = List<u64>.asSlice(&function.block(otherTarget).parameters)
+  let count = function.blockCount()
+  let mut seen = run List<bool>.makeWithCapacity(count)
+  run List<bool>.appendRepeated(&mut seen, false, count)
+  let mut stack = List<usize>.make()
+  List<bool>.set(&mut seen, otherTarget, true)
+  run List<usize>.append(&mut stack, otherTarget)
+  while List<usize>.length(&stack) > usize.ZERO {
+    let top = List<usize>.length(&stack) - usize.ONE
+    let b = List<usize>.get(&stack, top)
+    List<usize>.truncate(&mut stack, top)
+    let blk = function.block(b)
+    let exitVals = [blk.value, blk.secondValue, blk.thirdValue, blk.fourthValue]
+    let mut ei = usize.ZERO
+    while ei < 4 {
+      let v = exitVals[ei]
+      if v != none() && !containsU64(otherParams, v) {
+        let bv = values[u64.toUsize(v)]
+        if bv != none() && containsU64(writtenSlice, bv) { return false }
+      }
+      ei = ei + usize.ONE
+    }
+    let insts = List<usize>.asSlice(&blk.instructions)
+    let mut ii = usize.ZERO
+    while ii < insts.length {
+      let ops = function.operandsOf(insts[ii])
+      let mut oi = usize.ZERO
+      while oi < ops.length {
+        let v = ops[oi]
+        if v != none() && !containsU64(otherParams, v) {
+          let bv = values[u64.toUsize(v)]
+          if bv != none() && containsU64(writtenSlice, bv) { return false }
+        }
+        oi = oi + usize.ONE
+      }
+      ii = ii + usize.ONE
+    }
+    let bEdges = List<Edge>.asSlice(&blk.edges)
+    let mut bi = usize.ZERO
+    while bi < bEdges.length {
+      let eArgs = List<u64>.asSlice(&bEdges[bi].arguments)
+      let mut ai = usize.ZERO
+      while ai < eArgs.length {
+        let v = eArgs[ai]
+        if v != none() && !containsU64(otherParams, v) {
+          let bv = values[u64.toUsize(v)]
+          if bv != none() && containsU64(writtenSlice, bv) { return false }
+        }
+        ai = ai + usize.ONE
+      }
+      let succ = bEdges[bi].block
+      if succ != target && !List<bool>.get(&seen, succ) {
+        List<bool>.set(&mut seen, succ, true)
+        run List<usize>.append(&mut stack, succ)
+      }
+      bi = bi + usize.ONE
+    }
+  }
+  return true
+}
+
+effect fn computeHoistArms(emitter: &mut Emitter, function: &SsaFunction, graph: &SsaGraph, sequence: &[usize]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<usize>.appendRepeated(&mut emitter.hoistArm, usize.MAX, function.blockCount())
+  let values = List<u64>.asSlice(&emitter.values)
+  let mut step = usize.ZERO
+  while step < sequence.length {
+    let block = sequence[step]
+    let found = function.block(block)
+    if found.exit == Exit.Branch {
+      let edges = List<Edge>.asSlice(&found.edges)
+      let t0 = edges[usize.ZERO].block
+      let t1 = edges[usize.ONE].block
+      let a0 = List<u64>.length(&edges[usize.ZERO].arguments)
+      let a1 = List<u64>.length(&edges[usize.ONE].arguments)
+      let mut chosen = usize.MAX
+      if graph.dominates(t0, block) && a0 > usize.ZERO {
+        if run canHoistBranchArm(function, values, block, usize.ZERO) { chosen = usize.ZERO }
+      } else if graph.dominates(t1, block) && a1 > usize.ZERO {
+        if run canHoistBranchArm(function, values, block, usize.ONE) { chosen = usize.ONE }
+      }
+      List<usize>.set(&mut emitter.hoistArm, block, chosen)
+    }
+    step = step + usize.ONE
+  }
+  return ()
 }
 
 // Counts a use of `value` by the instruction at `position` of `block`.
@@ -106,6 +268,14 @@ fn noteUse(emitter: &mut Emitter, value: u64, block: usize, position: usize) -> 
   if value == none() { return () }
   let at = u64.toUsize(value)
   let seen = List<usize>.get(&emitter.uses, at)
+  if seen == usize.ZERO {
+    List<usize>.set(&mut emitter.firstBlock, at, block)
+    List<usize>.set(&mut emitter.firstPosition, at, position)
+  }
+  if block != usize.MAX && block == List<usize>.get(&emitter.firstBlock, at) {
+    let inBlk = List<usize>.get(&emitter.sameBlockUses, at)
+    List<usize>.set(&mut emitter.sameBlockUses, at, inBlk + usize.ONE)
+  }
   List<usize>.set(&mut emitter.uses, at, seen + usize.ONE)
   List<usize>.set(&mut emitter.userBlock, at, block)
   List<usize>.set(&mut emitter.userPosition, at, position)
@@ -113,16 +283,19 @@ fn noteUse(emitter: &mut Emitter, value: u64, block: usize, position: usize) -> 
 }
 
 // Fills the emitter's uses from every block of `function`.
-effect fn countUses(emitter: &mut Emitter, function: &SsaFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn countUses(emitter: &mut Emitter, function: &SsaFunction, sequence: &[usize]) -> () ! OutOfMemoryError ? &mut Allocator {
   let values = function.valueCount()
   run List<usize>.appendRepeated(&mut emitter.uses, usize.ZERO, values)
   run List<usize>.appendRepeated(&mut emitter.userBlock, usize.MAX, values)
   run List<usize>.appendRepeated(&mut emitter.userPosition, usize.MAX, values)
+  run List<usize>.appendRepeated(&mut emitter.firstBlock, usize.MAX, values)
+  run List<usize>.appendRepeated(&mut emitter.firstPosition, usize.MAX, values)
+  run List<usize>.appendRepeated(&mut emitter.sameBlockUses, usize.ZERO, values)
   run List<bool>.appendRepeated(&mut emitter.deferred, false, values)
   run List<usize>.appendRepeated(&mut emitter.readsFrom, usize.MAX, values)
-  let count = function.blockCount()
-  let mut block = usize.ZERO
-  while block < count {
+  let mut step = usize.ZERO
+  while step < sequence.length {
+    let block = sequence[step]
     let found = function.block(block)
     let listed = List<usize>.asSlice(&found.instructions)
     let mut position = usize.ZERO
@@ -146,16 +319,30 @@ effect fn countUses(emitter: &mut Emitter, function: &SsaFunction) -> () ! OutOf
       noteUse(&mut emitter.*, found.thirdValue, usize.MAX, usize.MAX)
       noteUse(&mut emitter.*, found.fourthValue, usize.MAX, usize.MAX)
     }
-    // A jump assigns its arguments in the block itself, so a deferred value can go there; a
-    // branch's or a switch's arm assigns them in a block of its own.
+    // A jump (or a hoisted branch arm) assigns its arguments in the block itself, so a deferred
+    // value can go there; other branch/switch arms assign them in a block of their own.
+    let hoisted = if List<usize>.length(&emitter.hoistArm) > block { List<usize>.get(&emitter.hoistArm, block) } else { usize.MAX }
     let edges = List<Edge>.asSlice(&found.edges)
     let mut edge = usize.ZERO
     while edge < edges.length {
       let passed = List<u64>.asSlice(&edges[edge].arguments)
       let mut at = usize.ZERO
       while at < passed.length {
-        if found.exit == Exit.Jump {
+        if found.exit == Exit.Jump || (found.exit == Exit.Branch && edge == hoisted) {
           noteUse(&mut emitter.*, passed[at], block, listed.length)
+        } else if found.exit == Exit.Branch && hoisted != usize.MAX && edge != hoisted {
+          let hoistedArgs = List<u64>.asSlice(&edges[hoisted].arguments)
+          let hoistedParams = List<u64>.asSlice(&function.block(edges[hoisted].block).parameters)
+          let mut redirected = passed[at]
+          let mut hi = usize.ZERO
+          while hi < hoistedArgs.length {
+            if hoistedArgs[hi] == redirected {
+              redirected = hoistedParams[hi]
+              break
+            }
+            hi = hi + usize.ONE
+          }
+          noteUse(&mut emitter.*, redirected, usize.MAX, usize.MAX)
         } else {
           noteUse(&mut emitter.*, passed[at], usize.MAX, usize.MAX)
         }
@@ -163,13 +350,19 @@ effect fn countUses(emitter: &mut Emitter, function: &SsaFunction) -> () ! OutOf
       }
       edge = edge + usize.ONE
     }
-    block = block + usize.ONE
+    step = step + usize.ONE
   }
   return ()
 }
 
-// Whether `kind` is one scalar lane, which a deferred value is.
-fn oneLane(kind: SsaKind) -> bool { return !kind.isUnit() && !kind.isVector() && kind.bits <= 64 }
+// Whether `kind` is one lane (scalar <= 64-bit, or a native `v128` vector when `simd128` is on),
+// which a deferred value is.
+fn oneLane(kind: SsaKind, simd128: bool) -> bool {
+  if kind.isUnit() { return false }
+  if !kind.isVector() { return kind.bits <= 64 }
+  if !simd128 { return false }
+  return wasmKind(kind, 32, true).isV128()
+}
 
 // The only instruction using this value, or usize.MAX when an exit, edge or other use
 // needs its declared lane layout.
@@ -209,7 +402,7 @@ fn availableWordBits(emitter: &Emitter, function: &SsaFunction, value: u64) -> u
 // their original positions even when the destination overlaps a source.
 fn memoryWordBits(emitter: &Emitter, function: &SsaFunction, instruction: Instruction) -> usize {
   let kind = instruction.kind
-  if !emitter.trees || !kind.isVector() || !kind.isInteger() || (kind.bits != 8 && kind.bits != 16) { return usize.ZERO }
+  if emitter.simd128 || !emitter.trees || !kind.isVector() || !kind.isInteger() || (kind.bits != 8 && kind.bits != 16) { return usize.ZERO }
   let user = onlyUser(emitter, function, instruction.result)
   if user == usize.MAX { return usize.ZERO }
   let usedBy = function.instruction(user)
@@ -241,15 +434,24 @@ fn memoryWordBits(emitter: &Emitter, function: &SsaFunction, instruction: Instru
 // Whether the body operation of `instruction` pushes each scalar operand in straight-line code,
 // so a deferred operand's code can go where it is pushed. The operands of any other instruction
 // are settled before it.
-fn takesDeferred(function: &SsaFunction, number: usize, instruction: Instruction) -> bool {
+fn takesDeferred(function: &SsaFunction, number: usize, instruction: Instruction, simd128: bool) -> bool {
   let used = function.operandsOf(number)
   return match instruction.operation {
-    Operation.Binary {..} => oneLane(instruction.kind)
-    Operation.Rotate {..} => oneLane(instruction.kind) && (instruction.kind.bits == 32 || instruction.kind.bits == 64)
-    Operation.Negate => oneLane(instruction.kind)
-    Operation.Compare {..} => oneLane(function.kindOf(used[0]))
-    Operation.Select => oneLane(instruction.kind) && oneLane(function.kindOf(used[0]))
-    Operation.Cast {..} => oneLane(instruction.kind) && oneLane(function.kindOf(used[0]))
+    Operation.Binary {..} => oneLane(instruction.kind, simd128) && (!instruction.kind.isVector() || simd128)
+    Operation.Rotate {..} => !instruction.kind.isVector() && oneLane(instruction.kind, simd128) && (instruction.kind.bits == 32 || instruction.kind.bits == 64)
+    Operation.Negate => oneLane(instruction.kind, simd128)
+    Operation.Compare {..} => oneLane(function.kindOf(used[0]), simd128)
+    Operation.Select => oneLane(instruction.kind, simd128) && oneLane(function.kindOf(used[0]), simd128)
+    Operation.Cast {..} => oneLane(instruction.kind, simd128) && oneLane(function.kindOf(used[0]), simd128)
+    Operation.Splat {..} => simd128 && oneLane(instruction.kind, true)
+    Operation.Extract => simd128 && oneLane(function.kindOf(used[0]), true) && function.isBits(used[1])
+    Operation.Insert => simd128 && oneLane(instruction.kind, true) && function.isBits(used[2])
+    Operation.Shuffle {..} => simd128 && oneLane(instruction.kind, true) && oneLane(function.kindOf(used[0]), true)
+    Operation.Extreme {..} => simd128 && oneLane(instruction.kind, true)
+    Operation.SquareRoot => simd128 && oneLane(instruction.kind, true)
+    Operation.Reduce {..} => simd128 && oneLane(function.kindOf(used[0]), true) && function.kindOf(used[0]).bits == usize.ONE
+    Operation.Saturate {..} => simd128 && oneLane(instruction.kind, true) && (instruction.kind.bits == 8 || instruction.kind.bits == 16)
+    Operation.ArchIntrinsic {..} => simd128 && oneLane(instruction.kind, true)
     Operation.Load {..} => true
     Operation.Store {..} => true
     Operation.Offset {..} => true
@@ -261,11 +463,11 @@ fn takesDeferred(function: &SsaFunction, number: usize, instruction: Instruction
   }
 }
 
-// Whether the result of the instruction at `position` of `block` is deferred to its one use, and
-// with `from`, the position of the earliest operation its code would hold that reads state or
+// Whether the result of the instruction at `position` of `block` is deferred to its sole use,
+// and with `from`, the position of the earliest operation its code would hold that reads state or
 // can trap, or `usize.MAX` without one.
-fn defers(emitter: &Emitter, function: &SsaFunction, number: usize, instruction: Instruction, block: usize, position: usize, from: usize) -> bool {
-  if !emitter.trees || instruction.result == none() || !oneLane(instruction.kind) { return false }
+fn defers(emitter: &Emitter, instruction: Instruction, block: usize, position: usize, from: usize) -> bool {
+  if !emitter.trees || instruction.result == none() || !oneLane(instruction.kind, emitter.simd128) { return false }
   if instruction.operation.hasSideEffects() || instruction.resultCount() != usize.ONE { return false }
   let result = u64.toUsize(instruction.result)
   if List<usize>.get(&emitter.uses, result) != usize.ONE || List<usize>.get(&emitter.userBlock, result) != block { return false }
@@ -275,20 +477,59 @@ fn defers(emitter: &Emitter, function: &SsaFunction, number: usize, instruction:
   return List<usize>.get(&emitter.effectsBefore, user) == List<usize>.get(&emitter.effectsBefore, from + usize.ONE)
 }
 
-effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph, trees: bool) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+// Whether the multi-use result of `instruction` at `position` of `block` can be sunk to its first
+// use in `block` and emitted with `local.tee`, eliminating a `local.set` + `local.get` pair.
+fn defersTee(emitter: &Emitter, function: &SsaFunction, instruction: Instruction, block: usize, position: usize, from: usize) -> bool {
+  if !emitter.trees || instruction.result == none() || !oneLane(instruction.kind, emitter.simd128) { return false }
+  if instruction.operation.hasSideEffects() || instruction.resultCount() != usize.ONE { return false }
+  let result = u64.toUsize(instruction.result)
+  if List<usize>.get(&emitter.uses, result) < 2 { return false }
+  if List<usize>.get(&emitter.firstBlock, result) != block { return false }
+  let first = List<usize>.get(&emitter.firstPosition, result)
+  let listed = List<usize>.asSlice(&function.block(block).instructions)
+  if first <= position || first > listed.length { return false }
+  let inBlock = List<usize>.get(&emitter.sameBlockUses, result)
+  if first < listed.length {
+    let firstId = listed[first]
+    let firstInst = function.instruction(firstId)
+    if !takesDeferred(function, firstId, firstInst, emitter.simd128) { return false }
+    // `Offset` may fold a local and `Cast` may be a no-op returning its operand without pushing.
+    match firstInst.operation {
+      Operation.Offset {..} => { return false }
+      Operation.Cast {..} => { return false }
+      _ => {}
+    }
+    // When `result` has later uses in the same block, `firstInst` must execute in place (not be
+    // deferred past them).
+    if inBlock >= 2 {
+      if !firstInst.operation.hasSideEffects() && firstInst.result != none() {
+        let fRes = u64.toUsize(firstInst.result)
+        if List<usize>.get(&emitter.firstBlock, fRes) == block { return false }
+      }
+    }
+  }
+  if from == usize.MAX { return true }
+  // When `inBlock == 1` and `first` might itself defer to block exit, guard against side effects
+  // all the way to `listed.length`.
+  let limit = if inBlock == usize.ONE && first < listed.length { listed.length } else { first }
+  return List<usize>.get(&emitter.effectsBefore, limit) == List<usize>.get(&emitter.effectsBefore, from + usize.ONE)
+}
+
+effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph, trees: bool, simd128: bool) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
   if !function.secondResultKind.isUnit() { run WasmObject.unsupported(b"multi-value return", function.name()) }
   let bits = function.addressBits
+  let sequence = graph.reversePostorder()
   let mut emitter = Emitter {values: List<u64>.make(), blocks: List<usize>.make(), slots: List<u64>.make(), addressBits: bits, place: 0,
-    trees: trees, uses: List<usize>.make(), userBlock: List<usize>.make(), userPosition: List<usize>.make(), deferred: List<bool>.make(),
-    readsFrom: List<usize>.make(), effectsBefore: List<usize>.make()}
-  if trees { run countUses(&mut emitter, function) }
+    trees: trees, simd128: simd128, uses: List<usize>.make(), userBlock: List<usize>.make(), userPosition: List<usize>.make(),
+    firstBlock: List<usize>.make(), firstPosition: List<usize>.make(), sameBlockUses: List<usize>.make(),
+    deferred: List<bool>.make(), readsFrom: List<usize>.make(), effectsBefore: List<usize>.make(), hoistArm: List<usize>.make()}
   run List<u64>.appendRepeated(&mut emitter.values, none(), function.valueCount())
   run List<u64>.appendRepeated(&mut emitter.slots, none(), function.slotCount())
-  run body.result(wasmKind(function.result, bits))
+  run body.result(wasmKind(function.result, bits, simd128))
   let arguments = List<u64>.asSlice(&function.arguments)
   let mut at = usize.ZERO
   while at < arguments.length {
-    let made = run body.parameter(wasmKind(function.kindOf(arguments[at]), bits))
+    let made = run body.parameter(wasmKind(function.kindOf(arguments[at]), bits, simd128))
     List<u64>.set(&mut emitter.values, u64.toUsize(arguments[at]), made)
     at = at + usize.ONE
   }
@@ -298,7 +539,6 @@ effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph, tr
     run List<usize>.append(&mut emitter.blocks, run WasmBody.newBlock(&mut body.*))
     at = at + usize.ONE
   }
-  let sequence = graph.reversePostorder()
   // A block parameter is a variable; the parameters of one web share their leader's
   // (`SsaWebs`), which is made first.
   let mut webs = List<u64>.make()
@@ -314,7 +554,7 @@ effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph, tr
         let mut leader = none()
         if trees { leader = List<u64>.get(&webs, u64.toUsize(parameter)) }
         if pass == usize.ZERO && (leader == none() || leader == parameter) {
-          let made = run WasmBody.variable(&mut body.*, wasmKind(function.kindOf(parameter), bits))
+          let made = run WasmBody.variable(&mut body.*, wasmKind(function.kindOf(parameter), bits, simd128))
           List<u64>.set(&mut emitter.values, u64.toUsize(parameter), made)
         }
         if pass == usize.ONE && leader != none() && leader != parameter {
@@ -326,6 +566,10 @@ effect fn emitInto(body: &mut Body, function: &SsaFunction, graph: &SsaGraph, tr
       at = at + usize.ONE
     }
     pass = pass + usize.ONE
+  }
+  if trees {
+    run computeHoistArms(&mut emitter, function, graph, sequence)
+    run countUses(&mut emitter, function, sequence)
   }
   at = usize.ZERO
   while at < sequence.length {
@@ -365,7 +609,7 @@ effect fn emitBlock(body: &mut Body, function: &SsaFunction, emitter: &mut Emitt
     at = at + usize.ONE
   }
   run locate(&mut body.*, &mut emitter.*, found.place)
-  return run emitExit(&mut body.*, function, &mut emitter.*, found)
+  return run emitExit(&mut body.*, function, &mut emitter.*, block, found)
 }
 
 // The body value of `value`: the one made for it, or a constant made now.
@@ -376,7 +620,7 @@ effect fn operand(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter
   if !function.isConstant(value) { return CompilerBug.panic(b"WasmEmission: a value used before its definition") }
   let kind = function.kindOf(value)
   let constant = function.constantOf(value)
-  let wasm = wasmKind(kind, emitter.addressBits)
+  let wasm = wasmKind(kind, emitter.addressBits, emitter.simd128)
   let mut handle = none()
   if constant.form == ConstantForm.Bits {
     handle = run WasmBody.constant(&mut body.*, wasm, constant.low, constant.high)
@@ -427,24 +671,25 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
 ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let made = run operands(&mut body.*, function, &mut emitter.*, number)
   let of = List<u64>.asSlice(&made)
-  let kind = wasmKind(instruction.kind, emitter.addressBits)
+  let kind = wasmKind(instruction.kind, emitter.addressBits, emitter.simd128)
   let mut result = none()
   let mut second = none()
   let mut deferring = false
+  let mut deferringTee = false
   let mut from = usize.MAX
   if emitter.trees {
     let used = function.operandsOf(number)
     let mut at = usize.ZERO
-    if !takesDeferred(function, number, instruction) {
+    if !takesDeferred(function, number, instruction, emitter.simd128) {
       WasmBody.soleUse(&mut body.*, none())
       while at < of.length {
         run WasmBody.settle(&mut body.*, of[at])
         at = at + usize.ONE
       }
     } else {
-      // The instruction's code holds what its deferred operands' does.
+      // The instruction's code holds what its still-deferred operands' does.
       while at < used.length {
-        if used[at] != none() && List<bool>.get(&emitter.deferred, u64.toUsize(used[at])) {
+        if used[at] != none() && List<bool>.get(&emitter.deferred, u64.toUsize(used[at])) && WasmBody.isDeferred(&body.*, of[at]) {
           let earliest = List<usize>.get(&emitter.readsFrom, u64.toUsize(used[at]))
           if earliest < from { from = earliest }
         }
@@ -452,7 +697,11 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
       }
     }
     if from == usize.MAX && (instruction.operation.readsState() || function.mayTrap(number)) { from = position }
-    deferring = defers(&emitter.*, function, number, instruction, block, position, from)
+    deferring = defers(&emitter.*, instruction, block, position, from)
+    if !deferring {
+      deferringTee = defersTee(&emitter.*, function, instruction, block, position, from)
+      deferring = deferringTee
+    }
     if deferring { WasmBody.beginDeferred(&mut body.*) }
   }
   match instruction.operation {
@@ -485,7 +734,7 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
         result = run WasmBody.cast(&mut body.*, operation, of[0], kind)
       }
     }
-    Operation.Load {offset, ..} => {
+    Operation.Load {offset, alignment} => {
       let mut layout = kind
       let bits = memoryWordBits(&emitter.*, function, instruction)
       if bits != usize.ZERO { layout = Kind.vector(Kind.integer(bits), instruction.kind.storeSize() / (bits / 8)) }
@@ -496,16 +745,24 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
           let cast = function.instruction(user)
           if let Operation.Cast {operation} = cast.operation {
             if (operation == Cast.SExt || operation == Cast.ZExt) && !cast.kind.isVector() && (cast.kind.bits == 32 || cast.kind.bits == 64) && cast.kind.bits > kind.bits {
-              result = run WasmBody.wideningLoad(&mut body.*, Kind.integer(cast.kind.bits), kind.elementBytes(), operation == Cast.SExt, of[0], offset)
+              result = run WasmBody.wideningLoad(&mut body.*, Kind.integer(cast.kind.bits), kind.elementBytes(), operation == Cast.SExt, of[0], offset, alignment)
               widened = true
             }
           }
         }
       }
-      if !widened { result = run WasmBody.load(&mut body.*, layout, of[0], offset) }
+      if !widened { result = run WasmBody.load(&mut body.*, layout, of[0], offset, alignment) }
     }
-    Operation.Store {offset, ..} => { run WasmBody.store(&mut body.*, of[0], of[1], offset) }
-    Operation.Offset {offset} => { result = run WasmBody.offset(&mut body.*, of[0], offset) }
+    Operation.Store {offset, alignment} => { run WasmBody.store(&mut body.*, of[0], of[1], offset, alignment) }
+    Operation.Offset {offset} => {
+      let baseVal = function.operandsOf(number)[usize.ZERO]
+      let mut foldable = emitter.trees && function.value(baseVal).definition != Definition.Parameter
+      if !foldable && emitter.trees && instruction.result != none() {
+        let res = u64.toUsize(instruction.result)
+        foldable = List<usize>.get(&emitter.uses, res) == usize.ONE && List<usize>.get(&emitter.userBlock, res) == block
+      }
+      result = run WasmBody.offset(&mut body.*, of[0], offset, foldable)
+    }
     Operation.Index => { result = run WasmBody.indexed(&mut body.*, of[0], of[1]) }
     Operation.CopyBytes {size} => { run WasmBody.copyBytes(&mut body.*, of[0], of[1], size) }
     Operation.Fill {byte, size} => { run WasmBody.fill(&mut body.*, of[0], byte, size) }
@@ -556,7 +813,7 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
     Operation.Extract => { result = run WasmBody.extractElement(&mut body.*, of[0], of[1]) }
     Operation.Insert => { result = run WasmBody.insertElement(&mut body.*, of[0], of[1], of[2]) }
     Operation.Splat {count} => { result = run WasmBody.splat(&mut body.*, of[0], count) }
-    Operation.ArchIntrinsic {..} => { run WasmObject.unsupported(b"target architecture intrinsic", function.name()) }
+    Operation.ArchIntrinsic {operation, ..} => { result = run WasmBody.wasmSimdArch(&mut body.*, operation, of[0], of[1], kind) }
     Operation.InlineAsm {..} => { run WasmObject.unsupported(b"native inline assembly", function.name()) }
     Operation.VaStart => { run WasmObject.unsupported(b"variadic arguments", function.name()) }
     Operation.VaEnd => { run WasmObject.unsupported(b"variadic arguments", function.name()) }
@@ -580,7 +837,7 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
     List<u64>.set(&mut emitter.values, u64.toUsize(instruction.result), result)
     if second != none() { List<u64>.set(&mut emitter.values, u64.toUsize(instruction.result) + usize.ONE, second) }
     if emitter.trees {
-      if deferring && run WasmBody.endDeferred(&mut body.*, result) {
+      if deferring && run WasmBody.endDeferred(&mut body.*, result, deferringTee) {
         List<bool>.set(&mut emitter.deferred, u64.toUsize(instruction.result), true)
         List<usize>.set(&mut emitter.readsFrom, u64.toUsize(instruction.result), from)
       } else {
@@ -611,7 +868,7 @@ effect fn emitInstruction(body: &mut Body, function: &SsaFunction, emitter: &mut
   return ()
 }
 
-effect fn emitExit(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, found: &Block) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
+effect fn emitExit(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, block: usize, found: &Block) -> () ! Unsupported | OutOfMemoryError ? &mut Allocator {
   let edges = List<Edge>.asSlice(&found.edges)
   if found.exit == Exit.Return {
     if found.secondValue != none() { run WasmObject.unsupported(b"multi-value return", function.name()) }
@@ -623,12 +880,21 @@ effect fn emitExit(body: &mut Body, function: &SsaFunction, emitter: &mut Emitte
     run passArguments(&mut body.*, function, &mut emitter.*, &edges[usize.ZERO])
     return run WasmBody.jump(&mut body.*, List<usize>.get(&emitter.blocks, edges[usize.ZERO].block))
   }
+  let hoisted = if found.exit == Exit.Branch && List<usize>.length(&emitter.hoistArm) > block {
+    List<usize>.get(&emitter.hoistArm, block)
+  } else {
+    usize.MAX
+  }
+  if hoisted != usize.MAX {
+    run passArguments(&mut body.*, function, &mut emitter.*, &edges[hoisted])
+  }
   let value = run operand(&mut body.*, function, &mut emitter.*, found.value)
-  // Each arm that passes arguments goes through a block of its own that assigns them.
+  // Each arm that passes arguments goes through a block of its own that assigns them, except a
+  // hoisted branch arm whose arguments were already assigned inline above.
   let mut targets = run List<usize>.makeWithCapacity(edges.length)
   let mut at = usize.ZERO
   while at < edges.length {
-    if List<u64>.length(&edges[at].arguments) == usize.ZERO {
+    if at == hoisted || List<u64>.length(&edges[at].arguments) == usize.ZERO {
       run List<usize>.append(&mut targets, List<usize>.get(&emitter.blocks, edges[at].block))
     } else {
       run List<usize>.append(&mut targets, run WasmBody.newBlock(&mut body.*))
@@ -650,14 +916,52 @@ effect fn emitExit(body: &mut Body, function: &SsaFunction, emitter: &mut Emitte
   }
   at = usize.ZERO
   while at < edges.length {
-    if List<u64>.length(&edges[at].arguments) != usize.ZERO {
+    if at != hoisted && List<u64>.length(&edges[at].arguments) != usize.ZERO {
       run WasmBody.startBlock(&mut body.*, List<usize>.get(&targets, at))
-      run passArguments(&mut body.*, function, &mut emitter.*, &edges[at])
+      if hoisted != usize.MAX {
+        run passArgumentsRedirected(&mut body.*, function, &mut emitter.*, &edges[at], &edges[hoisted])
+      } else {
+        run passArguments(&mut body.*, function, &mut emitter.*, &edges[at])
+      }
       run WasmBody.jump(&mut body.*, List<usize>.get(&emitter.blocks, edges[at].block))
     }
     at = at + usize.ONE
   }
   return ()
+}
+
+// Like `passArguments`, redirecting any argument that was already assigned into a parameter of
+// `hoisted` to read that parameter's local directly.
+effect fn passArgumentsRedirected(body: &mut Body, function: &SsaFunction, emitter: &mut Emitter, edge: &Edge, hoisted: &Edge) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let parameters = List<u64>.asSlice(&function.block(edge.block).parameters)
+  let arguments = List<u64>.asSlice(&edge.arguments)
+  let hoistedArgs = List<u64>.asSlice(&hoisted.arguments)
+  let hoistedParams = List<u64>.asSlice(&function.block(hoisted.block).parameters)
+  let mut sources = run List<u64>.makeWithCapacity(arguments.length)
+  let mut variables = run List<u64>.makeWithCapacity(arguments.length)
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let mut arg = arguments[at]
+    let mut hi = usize.ZERO
+    while hi < hoistedArgs.length {
+      if hoistedArgs[hi] == arg {
+        arg = hoistedParams[hi]
+        break
+      }
+      hi = hi + usize.ONE
+    }
+    if arg != parameters[at] {
+      let source = run operand(&mut body.*, function, &mut emitter.*, arg)
+      let variable = List<u64>.get(&emitter.values, u64.toUsize(parameters[at]))
+      if source != variable {
+        run List<u64>.append(&mut sources, source)
+        run List<u64>.append(&mut variables, variable)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return run WasmBody.assignAll(&mut body.*, List<u64>.asSlice(&variables), List<u64>.asSlice(&sources))
 }
 
 // Assigns edge `edge`'s arguments to its target's parameters at once: every argument that is not

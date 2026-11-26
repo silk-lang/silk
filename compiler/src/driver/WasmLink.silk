@@ -258,6 +258,53 @@ impl Placement {
   }
 }
 
+fn hasNonZeroByte(bytes: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if bytes[at] != 0 { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn isBssObject(object: &Object) -> bool {
+  if List<Pointer>.length(&object.pointers) != usize.ZERO { return false }
+  return !hasNonZeroByte(Bytes.asSlice(&object.image))
+}
+
+struct ReadonlyPool {
+  objects: List<usize>,
+  addresses: List<u64>,
+  lookup: InternIndex,
+}
+
+impl ReadonlyPool {
+  fn make() -> ReadonlyPool {
+    return ReadonlyPool { objects: List<usize>.make(), addresses: List<u64>.make(), lookup: InternIndex.make() }
+  }
+
+  fn find(self: &Self, allObjects: &[Object], image: &[u8], alignment: u64) -> u64 {
+    let hash = InternIndex.hashBytes(0, image)
+    let indices = List<usize>.asSlice(&self.objects)
+    let addrs = List<u64>.asSlice(&self.addresses)
+    let mut at = InternIndex.first(&self.lookup, hash)
+    while at != usize.MAX {
+      let addr = addrs[at]
+      if (alignment <= 1 || addr % alignment == 0) && same(Bytes.asSlice(&allObjects[indices[at]].image), image) {
+        return addr
+      }
+      at = InternIndex.after(&self.lookup, at)
+    }
+    return u64.MAX
+  }
+
+  effect fn record(self: &mut Self, index: usize, image: &[u8], address: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    run List<usize>.append(&mut self.objects, index)
+    run List<u64>.append(&mut self.addresses, address)
+    return run InternIndex.record(&mut self.lookup, InternIndex.hashBytes(0, image))
+  }
+}
+
 // Writes the `size` low bytes of `value` into `image` at `offset`, little end first.
 fn writeLittle(image: &mut Bytes, offset: usize, value: u64, size: usize) -> () {
   let slots = Bytes.asMutSlice(&mut image.*)
@@ -520,20 +567,23 @@ pub effect fn link(text: &[u8], options: Options) -> Linked
     at = at + usize.ONE
   }
 
-  // The data: the frame table's entries together, then every other object, the first of each
-  // symbol's. A threaded module's thread-local objects are placed in their own block, at offsets
-  // from its start.
+  // The data: the frame table's entries together (pass 0), then initialized non-BSS objects
+  // (pass 1), then all-zero BSS objects last (pass 2) so trailing-zero trimming strips 100% of
+  // BSS from the module's Data section. Identical pointer-free read-only objects share one address.
+  // A threaded module's thread-local objects are placed in their own block, at offsets from its start.
   let mut placed = List<usize>.make()
+  let mut roPool = ReadonlyPool.make()
   let mut cursor = stackTop
   let mut framesStart = u64.MAX
   let mut framesEnd = u64.MAX
   let mut pass = usize.ZERO
-  while pass < 2 {
+  while pass < 3 {
     at = usize.ZERO
     while at < objects.length {
       let object = &objects[at]
       let symbol = Bytes.asSlice(&object.symbol)
-      let size = usize.toU64(Bytes.length(&object.image))
+      let imageBytes = Bytes.asSlice(&object.image)
+      let size = usize.toU64(imageBytes.length)
       let local = threaded && object.local
       if placement.objects.find(symbol) == usize.MAX && List<bool>.get(&reached.objects, at) {
         if local && pass == usize.ZERO {
@@ -545,17 +595,31 @@ pub effect fn link(text: &[u8], options: Options) -> Linked
           run List<u64>.append(&mut placement.addresses, placement.tlsSize)
           run List<usize>.append(&mut placed, at)
           placement.tlsSize = placement.tlsSize + size
-        } else if !local && (object.framed == (pass == usize.ZERO)) {
-          cursor = alignUp(cursor, object.alignment)
-          if object.framed && framesStart == u64.MAX {
-            framesStart = cursor
-          }
-          drop run placement.objects.add(symbol)
-          run List<u64>.append(&mut placement.addresses, cursor)
-          run List<usize>.append(&mut placed, at)
-          cursor = cursor + size
-          if object.framed {
-            framesEnd = cursor
+        } else if !local {
+          let bss = !object.framed && isBssObject(object)
+          let fitsPass = (pass == usize.ZERO && object.framed)
+            || (pass == usize.ONE && !object.framed && !bss)
+            || (pass == 2 && bss)
+          if fitsPass {
+            let canDedup = object.readonly && !object.framed && List<Pointer>.length(&object.pointers) == usize.ZERO && imageBytes.length > usize.ZERO
+            let existing = if canDedup { roPool.find(objects, imageBytes, object.alignment) } else { u64.MAX }
+            if existing != u64.MAX {
+              drop run placement.objects.add(symbol)
+              run List<u64>.append(&mut placement.addresses, existing)
+            } else {
+              cursor = alignUp(cursor, object.alignment)
+              if object.framed && framesStart == u64.MAX {
+                framesStart = cursor
+              }
+              drop run placement.objects.add(symbol)
+              run List<u64>.append(&mut placement.addresses, cursor)
+              run List<usize>.append(&mut placed, at)
+              if canDedup { run roPool.record(at, imageBytes, cursor) }
+              cursor = cursor + size
+              if object.framed {
+                framesEnd = cursor
+              }
+            }
           }
         }
       }
@@ -603,18 +667,11 @@ pub effect fn link(text: &[u8], options: Options) -> Linked
     }
     let start = u64.toUsize(offset)
     let bytes = Bytes.asSlice(&object.image)
-    let mut byte = usize.ZERO
-    if local {
-      let slots = Bytes.asMutSlice(&mut template)
-      while byte < bytes.length {
-        slots[start + byte] = bytes[byte]
-        byte = byte + usize.ONE
-      }
-    } else {
-      let slots = Bytes.asMutSlice(&mut image)
-      while byte < bytes.length {
-        slots[start + byte] = bytes[byte]
-        byte = byte + usize.ONE
+    if hasNonZeroByte(bytes) {
+      if local {
+        Slice.copyInto<u8>(Bytes.asMutSlice(&mut template), start, bytes)
+      } else {
+        Slice.copyInto<u8>(Bytes.asMutSlice(&mut image), start, bytes)
       }
     }
     let pointers = List<Pointer>.asSlice(&object.pointers)
@@ -642,14 +699,9 @@ pub effect fn link(text: &[u8], options: Options) -> Linked
 
   // The main thread's block starts as the template.
   if threaded {
-    let slots = Bytes.asMutSlice(&mut image)
     let source = Bytes.asSlice(&template)
     let base = u64.toUsize(mainBlock - stackTop)
-    let mut byte = usize.ZERO
-    while byte < source.length {
-      slots[base + byte] = source[byte]
-      byte = byte + usize.ONE
-    }
+    Slice.copyInto<u8>(Bytes.asMutSlice(&mut image), base, source)
   }
 
   // The function types: the imports', then each body's as the code names them.
@@ -1238,7 +1290,13 @@ effect fn assemble(
   }
 
   // The code.
-  section = Bytes.make()
+  let mut codeBytes: usize = 16
+  at = usize.ZERO
+  while at < entries.length {
+    codeBytes = codeBytes + Bytes.length(&entries[at]) + 5
+    at = at + usize.ONE
+  }
+  section = run Bytes.makeWithCapacity(codeBytes)
   run WasmModule.index(&mut section, entries.length)
   at = usize.ZERO
   while at < entries.length {
