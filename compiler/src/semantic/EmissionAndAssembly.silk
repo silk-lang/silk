@@ -218,7 +218,8 @@ import semantic.SignatureCheck {
 import semantic.ConformanceProve {toolchainModule}
 import semantic.CallResolution {rejectionCodeOf}
 import semantic.ExpressionAndCallCheck {anchoredSpan, instanceAnchor, nominalParts}
-import semantic.BodyDriver {instanceMember}
+import driver.HeapRelease
+import semantic.BodyDriver {emptyMir, instanceMember}
 import semantic.MirLowering {
   DiscoveryDispatch,
   DiscoverySite,
@@ -2529,7 +2530,7 @@ fn runEmitWorker(batch: ParallelEmitBatch) -> () {
 // Results are stored in `thisStore.resolver.preEmitted` and indexed by `preEmitSlots[llvmSlot]` so
 // `resolveLlvmText` publishes them in exact deterministic walk order.
 @trace(name: "codegen.parallel_emit")
-effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit]) -> ()
+effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit], minJobs: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   List<PreEmitOutcome>.clearAndFree(&mut thisStore.resolver.preEmitted)
@@ -2575,7 +2576,7 @@ effect fn preEmitBatch(thisStore: &mut Semantic, pending: &[PendingEmit]) -> ()
     at = at + usize.ONE
   }
   let jobCount = List<EmitJob>.length(&jobs)
-  if jobCount < 2 || jobCount < thisStore.walkFrontier { return () }
+  if jobCount < 2 || jobCount < minJobs { return () }
   let mut workers = thisStore.walkWorkers
   if workers > jobCount { workers = jobCount }
   let mut outcomes = List<PreEmitOutcome>.make()
@@ -6435,88 +6436,167 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
         closureNodes, observing, &chosen)
     }
   }
-  // All walk restarts and whole-program checks have settled: emit uncached definitions in parallel
-  // across NativeThread workers, then publish into `Family.LlvmText` in exact walk order.
-  run preEmitBatch(&mut thisStore.*, List<PendingEmit>.asSlice(&pendingEmits))
-  let emitList = List<PendingEmit>.asSlice(&pendingEmits)
-  let mut pi = usize.ZERO
-  while pi < emitList.length {
-    match &emitList[pi] {
-      PendingEmit.First {
-        key,
-        prepared,
-        instance,
-        entry,
-        lowered,
-        locationModule,
-        locationDeclaration,
-        requester,
-        enteredModule,
-        enteredSpan,
-        costFrom,
-        costSteps,
-      } => {
-        let answer = run demandPreparedText(&mut thisStore.resolver, &mut thisStore.query, key, &prepared)
-        let gap = Shared<Result<Answer, NoRejection>>.with<Option<Shared<BackendGap>>>(&answer, answerBackendGap)
-        if let Option<Shared<BackendGap>>.Some {value} = move gap {
-          run List<Shared<BackendGap>>.append(&mut gaps, move value)
-        } else {
-          let mut costBytes = usize.ZERO
-          let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerLlvmTextIndex)
-          if let Option<usize>.Some {value} = move index {
-            run List<CollectedText>.append(
-              &mut emitted,
-              CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: value,
-                pack: usize.MAX, member: usize.MAX},
-            )
-            run recordText(&mut texts, lowered, value)
-            costBytes = Bytes.length(&List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues)[value].text)
-            if capturing {
-              let emissionUnit = run emissionInputsUnit(&mut thisStore.resolver, key, &prepared)
-              BuildCapture.emitted(&mut capture, entry, value, emissionUnit)
+  // All walk restarts and whole-program checks have settled: emit uncached definitions in bounded
+  // parallel chunks across NativeThread workers, publishing into `Family.LlvmText` in exact walk
+  // order while progressively releasing consumed MIR and `preEmitted` buffers.
+  let canTrimMir = thisStore.resolver.trimsEmitted && (thisStore.resolver.closedErasures || !mayWriteErasure(&thisStore.resolver))
+  let mirCount = List<MirFunction>.length(&thisStore.resolver.mirValues)
+  let mut mirRefs = List<usize>.make()
+  if canTrimMir {
+    List<MirFunction>.clearAndFree(&mut thisStore.resolver.coalescedValues)
+    List<usize>.clearAndFree(&mut thisStore.resolver.coalescedIndex)
+    run List<usize>.appendRepeated(&mut mirRefs, usize.ZERO, mirCount)
+    let emitScan = List<PendingEmit>.asSlice(&pendingEmits)
+    let inputsScan = List<EmissionInputs>.asSlice(&thisStore.resolver.emissionInputs)
+    let mut si = usize.ZERO
+    while si < emitScan.length {
+      if let PendingEmit.First {prepared, ..} = &emitScan[si] {
+        let emIndex = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&prepared, answerEmissionInputsIndex)
+        if let Option<usize>.Some {value: emissionSlot} = move emIndex {
+          let mirIndex = inputsScan[emissionSlot].mir
+          if mirIndex < mirCount {
+            let count = List<usize>.get(&mirRefs, mirIndex)
+            List<usize>.set(&mut mirRefs, mirIndex, count + usize.ONE)
+          }
+        }
+      }
+      si = si + usize.ONE
+    }
+    let mut functions = List<MirFunction>.asMutSlice(&mut thisStore.resolver.mirValues)
+    let mut mi = usize.ZERO
+    while mi < mirCount {
+      if List<usize>.get(&mirRefs, mi) == usize.ZERO {
+        emptyMir(&mut functions[mi])
+      }
+      mi = mi + usize.ONE
+    }
+    HeapRelease.release()
+  }
+  let emitTotal = List<PendingEmit>.length(&pendingEmits)
+  let chunkLimit: usize = 2048
+  let parallelChunkMin = if emitTotal <= chunkLimit { thisStore.walkFrontier } else { 32 }
+  let allowParallel = emitTotal >= thisStore.walkFrontier
+  let mut chunkStart = usize.ZERO
+  let mut chunkIndex = usize.ZERO
+  while chunkStart < emitTotal {
+    let mut chunkEnd = chunkStart + chunkLimit
+    if chunkEnd > emitTotal { chunkEnd = emitTotal }
+    if allowParallel {
+      let chunk = Slice.view<PendingEmit>(List<PendingEmit>.asSlice(&pendingEmits), chunkStart, chunkEnd - chunkStart)
+      run preEmitBatch(&mut thisStore.*, chunk, parallelChunkMin)
+    }
+    let emitList = List<PendingEmit>.asSlice(&pendingEmits)
+    let mut pi = chunkStart
+    while pi < chunkEnd {
+      match &emitList[pi] {
+        PendingEmit.First {
+          key,
+          prepared,
+          instance,
+          entry,
+          lowered,
+          locationModule,
+          locationDeclaration,
+          requester,
+          enteredModule,
+          enteredSpan,
+          costFrom,
+          costSteps,
+        } => {
+          let answer = run demandPreparedText(&mut thisStore.resolver, &mut thisStore.query, key, &prepared)
+          let gap = Shared<Result<Answer, NoRejection>>.with<Option<Shared<BackendGap>>>(&answer, answerBackendGap)
+          if let Option<Shared<BackendGap>>.Some {value} = move gap {
+            run List<Shared<BackendGap>>.append(&mut gaps, move value)
+          } else {
+            let mut costBytes = usize.ZERO
+            let index = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&answer, answerLlvmTextIndex)
+            if let Option<usize>.Some {value} = move index {
+              run List<CollectedText>.append(
+                &mut emitted,
+                CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: value,
+                  pack: usize.MAX, member: usize.MAX},
+              )
+              run recordText(&mut texts, lowered, value)
+              costBytes = Bytes.length(&List<InstanceDefinition>.asSlice(&thisStore.resolver.llvmValues)[value].text)
+              if capturing {
+                let emissionUnit = run emissionInputsUnit(&mut thisStore.resolver, key, &prepared)
+                BuildCapture.emitted(&mut capture, entry, value, emissionUnit)
+              }
+            }
+            if thisStore.resolver.costs.enabled {
+              let fresh = thisStore.resolver.costs.processSteps - costSteps
+              let steps = run CostTable.lowered(&mut thisStore.resolver.costs, &instance, fresh)
+              let site = if operationDispatch(&instance) == OperationDispatch.Erased {
+                let declared = resolvedModule(&thisStore.resolver, locationModule)
+                let span = run declarationSpan(&mut thisStore.resolver, &declared, locationDeclaration)
+                RelatedSite {module: move declared, span: span}
+              } else { requestSite(&requester, &enteredModule, enteredSpan) }
+              let charged = site.span.end != usize.ZERO && !toolchainModule(&site.module) && CostTable.inRoot(&thisStore.resolver.costs, &site.module)
+              let costTo = run Progress.stamp()
+              let elapsed = costTo - costFrom
+              run CostTable.charge(&mut thisStore.resolver.costs, charged, &site.module, site.span, costBytes, steps, elapsed)
             }
           }
-          if thisStore.resolver.costs.enabled {
-            let fresh = thisStore.resolver.costs.processSteps - costSteps
-            let steps = run CostTable.lowered(&mut thisStore.resolver.costs, &instance, fresh)
-            let site = if operationDispatch(&instance) == OperationDispatch.Erased {
-              let declared = resolvedModule(&thisStore.resolver, locationModule)
-              let span = run declarationSpan(&mut thisStore.resolver, &declared, locationDeclaration)
-              RelatedSite {module: move declared, span: span}
-            } else { requestSite(&requester, &enteredModule, enteredSpan) }
-            let charged = site.span.end != usize.ZERO && !toolchainModule(&site.module) && CostTable.inRoot(&thisStore.resolver.costs, &site.module)
-            let costTo = run Progress.stamp()
-            let elapsed = costTo - costFrom
-            run CostTable.charge(&mut thisStore.resolver.costs, charged, &site.module, site.span, costBytes, steps, elapsed)
+        }
+        PendingEmit.Alias {instance, entry, ownerEntry, lowered} => {
+          let shared = textOf(List<usize>.asSlice(&texts), lowered)
+          if capturing { BuildCapture.alias(&mut capture, entry, ownerEntry, shared) }
+          if shared != usize.MAX {
+            run List<CollectedText>.append(
+              &mut emitted,
+              CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: shared,
+                pack: usize.MAX, member: usize.MAX},
+            )
           }
         }
       }
-      PendingEmit.Alias {instance, entry, ownerEntry, lowered} => {
-        let shared = textOf(List<usize>.asSlice(&texts), lowered)
-        if capturing { BuildCapture.alias(&mut capture, entry, ownerEntry, shared) }
-        if shared != usize.MAX {
-          run List<CollectedText>.append(
-            &mut emitted,
-            CollectedText {key: Option<InstanceKey>.some(InstanceKey.copy(&instance)), replayed: Option<Replayed>.none(), index: shared,
-              pack: usize.MAX, member: usize.MAX},
-          )
+      pi = pi + usize.ONE
+    }
+    List<PreEmitOutcome>.clearAndFree(&mut thisStore.resolver.preEmitted)
+    List<usize>.clearAndFree(&mut thisStore.resolver.preEmitSlots)
+    if canTrimMir {
+      let emitDone = List<PendingEmit>.asSlice(&pendingEmits)
+      let inputsDone = List<EmissionInputs>.asSlice(&thisStore.resolver.emissionInputs)
+      let mut functions = List<MirFunction>.asMutSlice(&mut thisStore.resolver.mirValues)
+      let mut ci = chunkStart
+      while ci < chunkEnd {
+        if let PendingEmit.First {prepared, ..} = &emitDone[ci] {
+          let emIndex = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&prepared, answerEmissionInputsIndex)
+          if let Option<usize>.Some {value: emissionSlot} = move emIndex {
+            let mirIndex = inputsDone[emissionSlot].mir
+            if mirIndex < mirCount {
+              let count = List<usize>.get(&mirRefs, mirIndex)
+              if count > usize.ZERO {
+                let nextCount = count - usize.ONE
+                List<usize>.set(&mut mirRefs, mirIndex, nextCount)
+                if nextCount == usize.ZERO {
+                  emptyMir(&mut functions[mirIndex])
+                }
+              }
+            }
+          }
         }
+        ci = ci + usize.ONE
+      }
+      if chunkEnd < emitTotal && usize.bitAnd(chunkIndex, 3) == 3 {
+        HeapRelease.release()
       }
     }
-    pi = pi + usize.ONE
+    chunkStart = chunkEnd
+    chunkIndex = chunkIndex + usize.ONE
   }
-  List<PreEmitOutcome>.clearAndFree(&mut thisStore.resolver.preEmitted)
-  List<usize>.clearAndFree(&mut thisStore.resolver.preEmitSlots)
+  List<usize>.clearAndFree(&mut mirRefs)
   if List<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
     return BackendBuild.Unsupported {gaps: move gaps}
   }
-  if thisStore.resolver.trimsEmitted && (thisStore.resolver.closedErasures || !mayWriteErasure(&thisStore.resolver)) {
+  if canTrimMir {
     List<MirFunction>.clearAndFree(&mut thisStore.resolver.coalescedValues)
     List<usize>.clearAndFree(&mut thisStore.resolver.coalescedIndex)
     List<MirFunction>.clearAndFree(&mut thisStore.resolver.mirValues)
     List<bool>.clearAndFree(&mut thisStore.resolver.splicedCopies)
     List<usize>.clearAndFree(&mut thisStore.resolver.emittedMir)
     thisStore.resolver.mirReleasedCount = usize.ZERO
+    HeapRelease.release()
   }
   let mut packed = PackedBuild.make()
   let starts = run collectedOrigins(&mut thisStore.resolver, List<CollectedText>.asSlice(&emitted))
@@ -6532,13 +6612,14 @@ pub effect fn buildFromTimed(thisStore: &mut Semantic, module: &ModuleId, runtim
   // After assembly has copied all fragment bytes into `text`/`units`, `BuildRecord.encodeDefinition`
   // only reads `encoding`, `symbol`, `foreign`, and `borrow` — release the duplicate `.text` buffers
   // once erasures are settled so a retry walk after `closeErasures` never reads cleared text.
-  if thisStore.resolver.trimsEmitted && (thisStore.resolver.closedErasures || !mayWriteErasure(&thisStore.resolver)) {
+  if canTrimMir {
     let mut defs = List<InstanceDefinition>.asMutSlice(&mut thisStore.resolver.llvmValues)
     let mut di = usize.ZERO
     while di < defs.length {
       Bytes.clearAndFree(&mut defs[di].text)
       di = di + usize.ONE
     }
+    HeapRelease.release()
   }
   thisStore.packedBuild = move packed
   if capturing {
