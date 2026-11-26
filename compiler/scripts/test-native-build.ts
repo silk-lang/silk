@@ -505,6 +505,45 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const checkedTasks = yield* invoke(silk, ['check', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
   assert.equal(checkedTasks.status, 1, checkedTasks.stderr)
   assert.match(checkedTasks.stderr, /src\/tasks\.silk:2:/)
+  // A package-root `tasks.silk` takes precedence over `src/tasks.silk`, still resolves package
+  // imports below the source root, and compiles with the direct backend where the host supports it.
+  yield* fs.writeFileString(join(aliased, 'src/task_helper.silk'), 'pub fn code() -> i32 { return 27 }\n')
+  yield* fs.writeFileString(join(aliased, 'tasks.silk'), [
+    'import task_helper',
+    'import silk.cli.command { Command, CommandLine }',
+    'import silk.cli.task { Task, TaskSet, TaskError }',
+    'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+    'import silk.text.string { String }',
+    'import silk.system.host_input { HostInput }',
+    'union Tasks { Root }',
+    'impl CommandLine for Tasks {',
+    '  static fn command() -> Command<Tasks> {',
+    '    return Command<Tasks>.make("tasks", "Root tasks") |> Command.variant("Root", "Return helper code")',
+    '  }',
+    '}',
+    'impl TaskSet for Tasks {',
+    '  effect fn perform(self: Self) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {',
+    '    drop self',
+    '    fail TaskError { message: run String.copy("root tasks selected"), status: task_helper.code() }',
+    '  }',
+    '}',
+    'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
+    '',
+  ].join('\n'))
+  const rootTask = yield* invoke(silk, ['task', '--progress', 'plain', '--stdlib', standardLibrary, 'root'], aliased, requestEnv, 120_000)
+  assert.equal(rootTask.status, 27, rootTask.stderr)
+  assert.match(rootTask.stderr, /root tasks selected/)
+  if ((process.platform === 'linux' && process.arch === 'x64') || (process.platform === 'darwin' && process.arch === 'arm64')) {
+    assert.match(rootTask.stderr, /(elf|macho)-(link|patch|cached)/, 'tasks program uses direct backend by default on supported hosts')
+  }
+  const checkedRootTasks = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
+  assert.equal(checkedRootTasks.status, 0, checkedRootTasks.stderr)
+  yield* fs.writeFileString(join(aliased, 'tasks.silk'), 'pub fn main() -> i32 {\n  return "seven"\n}\n')
+  const checkedBrokenRootTasks = yield* invoke(silk, ['check', '--no-server', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
+  assert.equal(checkedBrokenRootTasks.status, 1, checkedBrokenRootTasks.stderr)
+  assert.match(checkedBrokenRootTasks.stderr, /(^|\n)tasks\.silk:2:/)
+  yield* fs.remove(join(aliased, 'tasks.silk'))
+  yield* fs.remove(join(aliased, 'src/task_helper.silk'))
   // A tasks program takes its package's own native plan only once it reaches a module of the
   // package besides tasks.silk, the way a dependency's plan applies once reached: this package's C
   // calls a function nothing links, so its tasks program links only while it leaves that C out.
