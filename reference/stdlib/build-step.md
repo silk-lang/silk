@@ -52,6 +52,7 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
 
 ```silk
 pub type StepFailure = StepError
+  | TaskError
   | AtomicWriteError
   | FileError
   | ProcessError
@@ -1113,14 +1114,15 @@ pub effect fn execShown(
     self: &mut Self,
     program: &Deferred<Path>,
     arguments: &[string],
-  ) -> bool
+  ) -> i32
     ! StepFailure
     ? &mut Allocator
 ```
 
 Executes a declared program as [`Make.exec`](#Make.impl.exec) does, with the program's standard error on this
-process's own, so what it writes, such as live progress, shows while it runs. Answers whether
-it exited with status 0. Where children cannot share the stream, the errors show once it ends.
+process's own, so what it writes, such as live progress, shows while it runs. Answers the
+program's exit status (0 on success, 128 plus the signal number after a signal, or 1 when no
+status was reported). Where children cannot share the stream, the errors show once it ends.
 
 <a id="Make.impl.shouldCompile"></a>
 
