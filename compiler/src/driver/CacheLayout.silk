@@ -1,0 +1,875 @@
+//! Cache mode selection and directory layout for Silk's shared system cache and workspace-local
+//! cache.
+//!
+//! # When to use
+//! Call [`resolve`] once per compiler invocation to determine whether this command uses the
+//! system-wide shared cache or the workspace-local cache inside each project's build output
+//! directory, along with the resolved shared root and eviction limits. Pass the resulting
+//! [`CachePolicy`] to the path helpers in this module instead of inferring cache roots from parent
+//! directories.
+//!
+//! # Details
+//! Precedence from highest to lowest:
+//! 1. CLI flags (`--cache-mode`, `--cache-dir`).
+//! 2. Environment variables (`SILK_CACHE_MODE`, `SILK_CACHE_DIR`, `SILK_CACHE_MAX_SIZE`,
+//!    `SILK_CACHE_MAX_AGE_DAYS`).
+//! 3. User settings in `$SILK_HOME/settings.toml` (`[cache]` table).
+//! 4. Built-in default (`shared` rooted at `$SILK_HOME/cache`, falling back to `$HOME/.silk/cache`
+//!    or `%USERPROFILE%\.silk\cache` on Windows, or `workspace` when no host home directory is
+//!    available or on WASI).
+//!
+//! In shared mode, every cache category lives under `<base>/v1/`:
+//! - `semantic/<compiler>/scopes/<pkg><variant>-<scope16>/`: project-scoped semantic images,
+//!   locks, prefetch hints, import summaries, parsed digests, and declaration origins.
+//! - `semantic/<compiler>/packs/<xx>/<digest>`: sharded content-addressed IR/MIR pack bodies.
+//! - `semantic/<compiler>/deps/<pkg>/`: cross-project dependency and stdlib sibling markers.
+//! - `objects/<xx>/<digest>.o`: sharded content-addressed LLVM object units.
+//! - `native/<xx>/<digest>.{o,headers}`: sharded content-addressed C/C++/ObjC objects.
+//! - `glibc-stubs/<digest>/`: shared Linux glibc stub libraries and startup object.
+//! - `steps/`: content-addressed build plan and graph step outputs.
+//!
+//! In workspace mode, caches remain inside each project's output directory (`build/` by default),
+//! keeping the original per-workspace layout and pruning rules.
+
+import driver.CacheStamp
+import driver.CommandPath
+import semantic.ContentHash { ContentHash }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, Value as TomlValue }
+
+/// Whether reusable caches are shared across projects on the system or kept inside each
+/// workspace's output directory.
+pub enum CacheMode {
+  /// Reusable caches live under one system-wide cache directory (`$SILK_HOME/cache/v1` by default).
+  Shared,
+  /// Reusable caches live inside each project's or workspace's build output directory.
+  Workspace,
+}
+
+/// Command-line cache options parsed from `--cache-mode` and `--cache-dir`.
+pub struct CacheSelection {
+  /// The mode named by `--cache-mode` (`shared` or `workspace`), if passed.
+  pub mode: Option<Bytes>,
+  /// The shared cache directory named by `--cache-dir`, if passed.
+  pub dir: Option<Bytes>,
+}
+
+/// An invalid cache flag, environment variable, or setting.
+pub struct InvalidCacheOption {
+  /// A human-readable description of the rejected cache option.
+  pub reason: Bytes,
+}
+
+/// The resolved cache mode, shared root directory, and eviction budget for one command.
+pub struct CachePolicy {
+  /// Whether this command uses the shared system cache or the workspace-local cache.
+  pub mode: CacheMode,
+  /// The versioned shared cache root (`<base>/v1`) when `mode` is `CacheMode.Shared`; `None` in
+  /// workspace mode.
+  pub sharedRoot: Option<Path>,
+  /// Maximum shared cache size in bytes before automatic eviction trims oldest entries.
+  pub maxBytes: u64,
+  /// Maximum age in days for unused shared cache entries before automatic eviction removes them.
+  pub maxAgeDays: u64,
+  /// Maximum number of distinct compiler tags retained in the semantic cache.
+  pub keptCompilers: usize,
+}
+
+/// Default maximum shared cache size in bytes (10 GiB).
+pub const DEFAULT_MAX_BYTES: u64 = 10737418240
+
+/// Default maximum unused entry age in days before eviction.
+pub const DEFAULT_MAX_AGE_DAYS: u64 = 30
+
+/// Default number of compiler tags kept in shared mode.
+pub const DEFAULT_SHARED_COMPILERS: usize = 5
+
+/// Default number of compiler tags kept per package in workspace mode.
+pub const DEFAULT_WORKSPACE_COMPILERS: usize = 3
+
+const DEFAULT_TO_SHARED: bool = true
+
+/// Empty CLI cache selection with neither `--cache-mode` nor `--cache-dir` set.
+pub fn noSelection() -> CacheSelection {
+  return CacheSelection { mode: Option<Bytes>.none(), dir: Option<Bytes>.none() }
+}
+
+/// A workspace-local [`CachePolicy`] with default limits.
+pub fn workspacePolicy() -> CachePolicy {
+  return CachePolicy {
+    mode: CacheMode.Workspace,
+    sharedRoot: Option<Path>.none(),
+    maxBytes: DEFAULT_MAX_BYTES,
+    maxAgeDays: DEFAULT_MAX_AGE_DAYS,
+    keptCompilers: DEFAULT_WORKSPACE_COMPILERS,
+  }
+}
+
+/// Copies `policy` into a new owned [`CachePolicy`].
+pub effect fn copyPolicy(policy: &CachePolicy) -> CachePolicy
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let root = match &policy.sharedRoot {
+    Option<Path>.Some { value } => Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
+    Option<Path>.None => Option<Path>.none()
+  }
+  return CachePolicy {
+    mode: policy.mode,
+    sharedRoot: move root,
+    maxBytes: policy.maxBytes,
+    maxAgeDays: policy.maxAgeDays,
+    keptCompilers: policy.keptCompilers,
+  }
+}
+
+/// Returns true when `policy` uses the system-wide shared cache.
+pub fn isShared(policy: &CachePolicy) -> bool {
+  return match policy.mode {
+    CacheMode.Shared => policy.sharedRoot.isSome()
+    CacheMode.Workspace => false
+  }
+}
+
+/// Returns the versioned shared cache root (`<base>/v1`) when `policy` is in shared mode.
+pub fn sharedRoot(policy: &CachePolicy) -> Option<&Path> {
+  return match &policy.sharedRoot {
+    Option<Path>.Some { value } => Option<&Path>.some(&value)
+    Option<Path>.None => Option<&Path>.none()
+  }
+}
+
+/// Resolves the active [`CachePolicy`] from CLI flags (`selection`), environment variables,
+/// `$SILK_HOME/settings.toml`, and built-in defaults.
+pub effect fn resolve(working: &Path, selection: &CacheSelection) -> CachePolicy
+  ! InvalidCacheOption | HostInputError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  let silkHome = run resolveSilkHome()
+  let settingsDoc = match &silkHome {
+    Option<Path>.Some { value: home } => run readSettings(&home)
+    Option<Path>.None => Option<TomlValue>.none()
+  }
+
+  let mut cliMode = Option<CacheMode>.none()
+  if let Option<Bytes>.Some { value } = &selection.mode {
+    cliMode = Option<CacheMode>.some(run parseMode(value.asSlice(), b"--cache-mode"))
+  }
+
+  let mut cliDir = Option<Path>.none()
+  if let Option<Bytes>.Some { value } = &selection.dir {
+    if value.length() == usize.ZERO {
+      fail InvalidCacheOption { reason: run Bytes.copy(b"--cache-dir must not be empty") }
+    }
+    if let Option<CacheMode>.Some { value: selected } = cliMode {
+      if match selected {
+        CacheMode.Workspace => true
+        CacheMode.Shared => false
+      } {
+        fail InvalidCacheOption {
+          reason: run Bytes.copy(b"--cache-dir cannot be used with --cache-mode workspace"),
+        }
+      }
+    }
+    cliDir = Option<Path>.some(run resolveArgumentPath(working, value.asSlice(), b"--cache-dir"))
+  }
+
+  let mut envMode = Option<CacheMode>.none()
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_CACHE_MODE") {
+    if value.length() > usize.ZERO {
+      envMode = Option<CacheMode>.some(run parseMode(value.asSlice(), b"SILK_CACHE_MODE"))
+    }
+  }
+
+  let mut envDir = Option<Path>.none()
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_CACHE_DIR") {
+    if value.length() > usize.ZERO {
+      envDir = Option<Path>.some(run resolveAbsolutePath(value.asSlice(), b"SILK_CACHE_DIR"))
+    }
+  }
+
+  let mut settingsMode = Option<CacheMode>.none()
+  let mut settingsDir = Option<Path>.none()
+  let mut maxBytes = DEFAULT_MAX_BYTES
+  let mut maxAgeDays = DEFAULT_MAX_AGE_DAYS
+  let mut keptCompilers = DEFAULT_SHARED_COMPILERS
+  let mut keptConfigured = false
+
+  if let Option<TomlValue>.Some { value: document } = &settingsDoc {
+    if let Option<&TomlValue>.Some { value: cacheTable } = move Toml.field(&document, "cache") {
+      if let Option<string>.Some { value } = move Toml.asString(Toml.field(cacheTable, "mode")) {
+        if let Option<CacheMode>.Some { value: parsed } = parseModeOptional(
+          String.utf8Bytes(value),
+        ) {
+          settingsMode = Option<CacheMode>.some(parsed)
+        }
+      }
+      if let Option<string>.Some { value } = move Toml.asString(Toml.field(cacheTable, "dir")) {
+        let bytes = String.utf8Bytes(value)
+        if bytes.length > usize.ZERO {
+          settingsDir = run parseAbsoluteOptional(bytes)
+        }
+      }
+      if let Option<string>.Some { value } = move Toml.asString(
+        Toml.field(cacheTable, "max-size"),
+      ) {
+        if let Option<u64>.Some { value: parsed } = parseSize(String.utf8Bytes(value)) {
+          maxBytes = parsed
+        }
+      } else if let Option<&TomlValue>.Some { value } = move Toml.field(cacheTable, "max-size") {
+        if let TomlValue.Integer { text } = &value.* {
+          if let Option<u64>.Some { value: parsed } = parseDecimal(String.ownedUtf8Bytes(&text)) {
+            maxBytes = parsed
+          }
+        }
+      }
+      if let Option<&TomlValue>.Some { value } = move Toml.field(cacheTable, "max-age-days") {
+        if let TomlValue.Integer { text } = &value.* {
+          if let Option<u64>.Some { value: days } = parseDecimal(String.ownedUtf8Bytes(&text)) {
+            maxAgeDays = days
+          }
+        }
+      }
+      if let Option<&TomlValue>.Some { value } = move Toml.field(cacheTable, "kept-compilers") {
+        if let TomlValue.Integer { text } = &value.* {
+          if let Option<u64>.Some { value: count } = parseDecimal(String.ownedUtf8Bytes(&text)) {
+            if count > 0 {
+              keptCompilers = u64.toUsize(count)
+              keptConfigured = true
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_CACHE_MAX_SIZE") {
+    if value.length() > usize.ZERO {
+      maxBytes = match parseSize(value.asSlice()) {
+        Option<u64>.Some { value: parsed } => parsed
+        Option<u64>.None => {
+          fail InvalidCacheOption {
+            reason: run Bytes.copy(
+              b"SILK_CACHE_MAX_SIZE must be a byte count or size such as 10G or 512M",
+            ),
+          }
+        }
+      }
+    }
+  }
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed(
+    "SILK_CACHE_MAX_AGE_DAYS",
+  ) {
+    if value.length() > usize.ZERO {
+      maxAgeDays = match parseDecimal(value.asSlice()) {
+        Option<u64>.Some { value: parsed } => parsed
+        Option<u64>.None => {
+          fail InvalidCacheOption {
+            reason: run Bytes.copy(b"SILK_CACHE_MAX_AGE_DAYS must be a non-negative integer"),
+          }
+        }
+      }
+    }
+  }
+
+  // Decide mode: CLI > env > settings.toml > default.
+  // Passing `--cache-dir` implies shared mode; `SILK_CACHE_DIR` implies shared mode unless
+  // `SILK_CACHE_MODE` or `--cache-mode` explicitly selected workspace mode.
+  let mut mode = if DEFAULT_TO_SHARED {
+    CacheMode.Shared
+  } else {
+    CacheMode.Workspace
+  }
+  static if Intrinsic.targetOperatingSystem() == "wasi" {
+    mode = CacheMode.Workspace
+  }
+  if let Option<CacheMode>.Some { value } = settingsMode {
+    mode = value
+  }
+  if envDir.isSome() {
+    mode = CacheMode.Shared
+  }
+  if let Option<CacheMode>.Some { value } = envMode {
+    mode = value
+  }
+  if cliDir.isSome() {
+    mode = CacheMode.Shared
+  }
+  if let Option<CacheMode>.Some { value } = cliMode {
+    mode = value
+  }
+
+  if match mode {
+    CacheMode.Workspace => true
+    CacheMode.Shared => false
+  } {
+    let kept = if keptConfigured {
+      keptCompilers
+    } else {
+      DEFAULT_WORKSPACE_COMPILERS
+    }
+    return CachePolicy {
+      mode: CacheMode.Workspace,
+      sharedRoot: Option<Path>.none(),
+      maxBytes: maxBytes,
+      maxAgeDays: maxAgeDays,
+      keptCompilers: kept,
+    }
+  }
+
+  // Shared mode: choose base dir from CLI > env > settings.toml > $SILK_HOME/cache.
+  let mut base = Option<Path>.none()
+  if let Option<Path>.Some { value } = move cliDir {
+    base = Option<Path>.some(move value)
+  } else if let Option<Path>.Some { value } = move envDir {
+    base = Option<Path>.some(move value)
+  } else if let Option<Path>.Some { value } = move settingsDir {
+    base = Option<Path>.some(move value)
+  } else if let Option<Path>.Some { value: home } = &silkHome {
+    base = run joinOptional(&home, b"cache")
+  }
+
+  let versioned = match move base {
+    Option<Path>.Some { value } => run joinOptional(&value, b"v1")
+    Option<Path>.None => Option<Path>.none()
+  }
+
+  // Without any usable host root, fall back cleanly to workspace mode.
+  if versioned.isNone() {
+    return CachePolicy {
+      mode: CacheMode.Workspace,
+      sharedRoot: Option<Path>.none(),
+      maxBytes: maxBytes,
+      maxAgeDays: maxAgeDays,
+      keptCompilers: DEFAULT_WORKSPACE_COMPILERS,
+    }
+  }
+
+  return CachePolicy {
+    mode: CacheMode.Shared,
+    sharedRoot: move versioned,
+    maxBytes: maxBytes,
+    maxAgeDays: maxAgeDays,
+    keptCompilers: keptCompilers,
+  }
+}
+
+/// The directory name for one package instance inside the shared semantic cache:
+/// `<name><variant>-<16-hex-digest-of-packageDirectory>`.
+///
+/// Two unrelated projects or git worktrees with the same package name receive distinct scopes so
+/// they never overwrite each other's semantic images, import summaries, or prefetch hints.
+pub effect fn scopeKey(name: &[u8], packageDirectory: &Path, variant: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digest = ContentHash.of(Path.rawBytes(packageDirectory))
+  let mut key = run Bytes.copy(name)
+  run Bytes.append(&mut key, variant)
+  run Bytes.append(&mut key, b"-")
+  run appendHex(&mut key, digest.high)
+  return move key
+}
+
+/// The directory of this compiler's semantic cache files for one package.
+///
+/// In shared mode this is `<sharedRoot>/semantic/<compiler>/scopes/<name><variant>-<scope16>`.
+/// In workspace mode this is `<output>/cache/<name><variant>/<compiler>`.
+pub effect fn semanticScopeDir(
+  policy: &CachePolicy,
+  output: &Path,
+  name: &[u8],
+  packageDirectory: &Path,
+  variant: &[u8],
+) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let tag = run CacheStamp.tag()
+  if let Option<Path>.Some { value: root } = &policy.sharedRoot {
+    let mut relative = run Bytes.copy(b"semantic/")
+    run appendHex(&mut relative, tag.high)
+    run Bytes.append(&mut relative, b"/scopes/")
+    let scoped = run scopeKey(name, packageDirectory, variant)
+    run Bytes.append(&mut relative, scoped.asSlice())
+    return run joinOptional(&root, relative.asSlice())
+  }
+  let mut relative = run Bytes.copy(b"cache/")
+  run Bytes.append(&mut relative, name)
+  run Bytes.append(&mut relative, variant)
+  run Bytes.append(&mut relative, b"/")
+  run appendHex(&mut relative, tag.high)
+  return run joinOptional(output, relative.asSlice())
+}
+
+/// The shared content-addressed IR/MIR pack directory `<sharedRoot>/semantic/<compiler>/packs` in
+/// shared mode, or `None` in workspace mode (where each semantic image keeps its own `.packs`
+/// directory).
+pub effect fn semanticPacksDir(policy: &CachePolicy) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = match &policy.sharedRoot {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return Option<Path>.none()
+    }
+  }
+  let tag = run CacheStamp.tag()
+  let mut relative = run Bytes.copy(b"semantic/")
+  run appendHex(&mut relative, tag.high)
+  run Bytes.append(&mut relative, b"/packs")
+  return run joinOptional(root, relative.asSlice())
+}
+
+/// The shared dependency/stdlib sibling marker directory
+/// `<sharedRoot>/semantic/<compiler>/deps/<packageName>` in shared mode, or `None` in workspace
+/// mode.
+pub effect fn semanticDepsDir(policy: &CachePolicy, packageName: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = match &policy.sharedRoot {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return Option<Path>.none()
+    }
+  }
+  let tag = run CacheStamp.tag()
+  let mut relative = run Bytes.copy(b"semantic/")
+  run appendHex(&mut relative, tag.high)
+  run Bytes.append(&mut relative, b"/deps/")
+  run Bytes.append(&mut relative, packageName)
+  return run joinOptional(root, relative.asSlice())
+}
+
+/// The shared compiler root `<sharedRoot>/semantic/<compiler>` in shared mode, or `None` in
+/// workspace mode.
+pub effect fn semanticCompilerDir(policy: &CachePolicy) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = match &policy.sharedRoot {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return Option<Path>.none()
+    }
+  }
+  let tag = run CacheStamp.tag()
+  let mut relative = run Bytes.copy(b"semantic/")
+  run appendHex(&mut relative, tag.high)
+  return run joinOptional(root, relative.asSlice())
+}
+
+/// The shared LLVM object store `<sharedRoot>/objects` in shared mode, or `None` in workspace
+/// mode.
+pub effect fn objectsDir(policy: &CachePolicy) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &policy.sharedRoot {
+    Option<Path>.Some { value } => run joinOptional(&value, b"objects")
+    Option<Path>.None => Option<Path>.none()
+  }
+}
+
+/// The shared native C/C++/ObjC object store `<sharedRoot>/native` in shared mode, or `None` in
+/// workspace mode.
+pub effect fn nativeDir(policy: &CachePolicy) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &policy.sharedRoot {
+    Option<Path>.Some { value } => run joinOptional(&value, b"native")
+    Option<Path>.None => Option<Path>.none()
+  }
+}
+
+/// The glibc stubs root: `<sharedRoot>/glibc-stubs` in shared mode, or
+/// `<output>.units/glibc-stubs` in workspace mode.
+pub effect fn glibcStubsRoot(policy: &CachePolicy, output: &Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<Path>.Some { value: root } = &policy.sharedRoot {
+    return run Path.joinBytes(&root, b"glibc-stubs")
+  }
+  let mut named = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut named, b".units/glibc-stubs")
+  return run Path.fromBytes(named.asSlice())
+}
+
+/// The build step cache root: `<sharedRoot>/steps` in shared mode, or `<output>/steps` in
+/// workspace mode.
+pub effect fn stepsDir(policy: &CachePolicy, output: &Path) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<Path>.Some { value: root } = &policy.sharedRoot {
+    return run Path.joinBytes(&root, b"steps")
+  }
+  return run Path.joinBytes(output, b"steps")
+}
+
+/// The garbage-collection stamp file `<sharedRoot>/gc.stamp` in shared mode, or `None` in
+/// workspace mode.
+pub effect fn gcStampPath(policy: &CachePolicy) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &policy.sharedRoot {
+    Option<Path>.Some { value } => run joinOptional(&value, b"gc.stamp")
+    Option<Path>.None => Option<Path>.none()
+  }
+}
+
+/// The sharded path `<directory>/<first-two-hex>/<filename>` for a hex-named cache entry, keeping
+/// each shard directory small even at tens of thousands of entries.
+pub effect fn shardedPath(directory: &Path, filename: &[u8]) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  if filename.length < 2 {
+    return run Path.joinBytes(directory, filename)
+  }
+  let mut relative = run Bytes.copy(Slice.view<u8>(filename, usize.ZERO, 2))
+  run Bytes.append(&mut relative, b"/")
+  run Bytes.append(&mut relative, filename)
+  return run Path.joinBytes(directory, relative.asSlice())
+}
+
+/// Parses a human-readable byte size such as `10G`, `512M`, `256K`, `10GiB`, or a plain byte
+/// count (`1048576`). Returns `None` on invalid syntax or overflow.
+pub fn parseSize(text: &[u8]) -> Option<u64> {
+  if text.length == usize.ZERO {
+    return Option<u64>.none()
+  }
+  let mut end = usize.ZERO
+  while end < text.length && text[end] >= 48 && text[end] <= 57 {
+    end = end + usize.ONE
+  }
+  if end == usize.ZERO {
+    return Option<u64>.none()
+  }
+  let base = match parseDecimal(Slice.view<u8>(text, usize.ZERO, end)) {
+    Option<u64>.Some { value } => value
+    Option<u64>.None => {
+      return Option<u64>.none()
+    }
+  }
+  let suffix = Slice.view<u8>(text, end, text.length - end)
+  if suffix.length == usize.ZERO {
+    return Option<u64>.some(base)
+  }
+  let multiplier: u64 = if sameAsciiCase(suffix, b"b") {
+    1
+  } else if sameAsciiCase(suffix, b"k") || sameAsciiCase(suffix, b"kb")
+    || sameAsciiCase(suffix, b"kib") {
+    1024
+  } else if sameAsciiCase(suffix, b"m") || sameAsciiCase(suffix, b"mb")
+    || sameAsciiCase(suffix, b"mib") {
+    1048576
+  } else if sameAsciiCase(suffix, b"g") || sameAsciiCase(suffix, b"gb")
+    || sameAsciiCase(suffix, b"gib") {
+    1073741824
+  } else if sameAsciiCase(suffix, b"t") || sameAsciiCase(suffix, b"tb")
+    || sameAsciiCase(suffix, b"tib") {
+    1099511627776
+  } else {
+    return Option<u64>.none()
+  }
+  if base > u64.MAX / multiplier {
+    return Option<u64>.none()
+  }
+  return Option<u64>.some(base * multiplier)
+}
+
+/// Formats `bytes` as a compact human-readable size (for example, `1.5 GiB` or `420 B`).
+pub effect fn formatSize(bytes: u64) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let kib: u64 = 1024
+  let mib: u64 = 1048576
+  let gib: u64 = 1073741824
+  let tib: u64 = 1099511627776
+  if bytes >= tib {
+    return run formatScaled(bytes, tib, b" TiB")
+  }
+  if bytes >= gib {
+    return run formatScaled(bytes, gib, b" GiB")
+  }
+  if bytes >= mib {
+    return run formatScaled(bytes, mib, b" MiB")
+  }
+  if bytes >= kib {
+    return run formatScaled(bytes, kib, b" KiB")
+  }
+  let mut out = Bytes.make()
+  run appendDecimal(&mut out, bytes)
+  run Bytes.append(&mut out, b" B")
+  return move out
+}
+
+effect fn formatScaled(bytes: u64, unit: u64, suffix: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let whole = bytes / unit
+  let tenths = ((bytes % unit) * 10) / unit
+  let mut out = Bytes.make()
+  run appendDecimal(&mut out, whole)
+  run Bytes.append(&mut out, b".")
+  run appendDecimal(&mut out, tenths)
+  run Bytes.append(&mut out, suffix)
+  return move out
+}
+
+effect fn appendDecimal(out: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendDecimal(&mut out.*, value / 10)
+  }
+  let digit: [u8; 1] = [u64.toU8(48 + value % 10)]
+  return run Bytes.append(&mut out.*, &digit)
+}
+
+fn parseDecimal(text: &[u8]) -> Option<u64> {
+  if text.length == usize.ZERO || text.length > 20 {
+    return Option<u64>.none()
+  }
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    if byte < 48 || byte > 57 {
+      return Option<u64>.none()
+    }
+    let digit = u8.toU64(byte - 48)
+    if value > (u64.MAX - digit) / 10 {
+      return Option<u64>.none()
+    }
+    value = value * 10 + digit
+    at = at + usize.ONE
+  }
+  return Option<u64>.some(value)
+}
+
+fn lowerAscii(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+fn sameAsciiCase(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if lowerAscii(left[at]) != lowerAscii(right[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn parseModeOptional(text: &[u8]) -> Option<CacheMode> {
+  if same(text, b"shared") {
+    return Option<CacheMode>.some(CacheMode.Shared)
+  }
+  if same(text, b"workspace") {
+    return Option<CacheMode>.some(CacheMode.Workspace)
+  }
+  return Option<CacheMode>.none()
+}
+
+effect fn parseMode(text: &[u8], origin: &[u8]) -> CacheMode
+  ! InvalidCacheOption | OutOfMemoryError
+  ? &mut Allocator {
+  return match parseModeOptional(text) {
+    Option<CacheMode>.Some { value } => value
+    Option<CacheMode>.None => {
+      let mut reason = run Bytes.copy(origin)
+      run Bytes.append(&mut reason, b" must be `shared` or `workspace`, not `")
+      run Bytes.append(&mut reason, text)
+      run Bytes.append(&mut reason, b"`")
+      fail InvalidCacheOption { reason: move reason }
+    }
+  }
+}
+
+effect fn resolveArgumentPath(working: &Path, raw: &[u8], origin: &[u8]) -> Path
+  ! InvalidCacheOption | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(CommandPath.resolve(working, raw)) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        let mut reason = run Bytes.copy(origin)
+        run Bytes.append(&mut reason, b" is not a valid directory path")
+        fail InvalidCacheOption { reason: move reason }
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn resolveAbsolutePath(raw: &[u8], origin: &[u8]) -> Path
+  ! InvalidCacheOption | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run parseAbsoluteOptional(raw) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      let mut reason = run Bytes.copy(origin)
+      run Bytes.append(&mut reason, b" must be an absolute directory path")
+      fail InvalidCacheOption { reason: move reason }
+    }
+  }
+}
+
+effect fn parseAbsoluteOptional(raw: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return match move run Effect.result(CommandPath.fromHost(raw)) {
+      Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+      Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+        FileError failure => {
+          drop failure
+          Option<Path>.none()
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+  if raw.length == usize.ZERO || raw[usize.ZERO] != 47 {
+    return Option<Path>.none()
+  }
+  let mut end = raw.length
+  while end > usize.ONE && raw[end - usize.ONE] == 47 {
+    end = end - usize.ONE
+  }
+  return match move run Effect.result(Path.fromBytes(Slice.view<u8>(raw, usize.ZERO, end))) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn resolveSilkHome() -> Option<Path>
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_HOME") {
+    return run parseAbsoluteOptional(value.asSlice())
+  }
+  let mut homeName = "HOME"
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    homeName = "USERPROFILE"
+  }
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed(homeName) {
+    if let Option<Path>.Some { value: home } = move run parseAbsoluteOptional(value.asSlice()) {
+      return run joinOptional(&home, b".silk")
+    }
+  }
+  return Option<Path>.none()
+}
+
+effect fn readSettings(home: &Path) -> Option<TomlValue>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let path = match move run joinOptional(home, b"settings.toml") {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<TomlValue>.none()
+    }
+  }
+  let bytes = match move run Effect.result(FileSystem.readFile(&path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        return Option<TomlValue>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return match move run Effect.result(Toml.parse(bytes.asSlice())) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success { value } => Option<TomlValue>.some(
+      move value,
+    )
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError invalid => {
+        drop invalid
+        Option<TomlValue>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn joinOptional(base: &Path, relative: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(Path.joinBytes(base, relative)) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+fn hexDigit(value: u64) -> u8 {
+  if value < 10 {
+    return u64.toU8(value) + 48
+  }
+  return u64.toU8(value) + 87
+}
+
+effect fn appendHex(output: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut at = usize.ZERO
+  while at < 16 {
+    digits[at] = hexDigit(u64.bitAnd(u64.shiftRight(value, usize.toU64((15 - at) * 4)), 15))
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut output.*, &digits)
+}

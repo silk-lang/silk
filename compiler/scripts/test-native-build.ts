@@ -38,12 +38,23 @@ class VerificationError extends Data.TaggedError('NativeBuildVerificationError')
 // the file's `.lock` until it is done (compiler/src/driver/DetachedWriter.silk). Waiting for the
 // copies below the build directories of `cwd` and of the packages beside it keeps the next step
 // from reading or removing a cache the copy is still writing.
-const settleCaches = (cwd: string) => {
+const settleCaches = (cwd: string, env: NodeJS.ProcessEnv = process.env) => {
   const directories = (path: string) =>
     existsSync(path) ? readdirSync(path, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => join(path, entry.name)) : []
   const caches = [cwd, ...directories(cwd)].map((root) => join(root, 'build', 'cache'))
   // Each compiler keeps its files in a directory below its package's (`SemanticCache.directory`).
-  const locks = caches.flatMap(directories).flatMap(directories).flatMap((cache) => readdirSync(cache).filter((name) => name.endsWith('.lock')).map((name) => join(cache, name)))
+  const workspaceLocks = caches.flatMap(directories).flatMap(directories).flatMap((cache) => readdirSync(cache).filter((name) => name.endsWith('.lock')).map((name) => join(cache, name)))
+  const sharedBase = env.SILK_CACHE_DIR
+    ? join(env.SILK_CACHE_DIR, 'v1', 'semantic')
+    : env.SILK_HOME
+      ? join(env.SILK_HOME, 'cache', 'v1', 'semantic')
+      : env.HOME
+        ? join(env.HOME, '.silk', 'cache', 'v1', 'semantic')
+        : ''
+  const sharedLocks = sharedBase && existsSync(sharedBase)
+    ? directories(sharedBase).flatMap((compiler) => directories(join(compiler, 'scopes'))).flatMap((scope) => readdirSync(scope).filter((name) => name.endsWith('.lock')).map((name) => join(scope, name)))
+    : []
+  const locks = [...workspaceLocks, ...sharedLocks]
   if (locks.length === 0) return
   const waited = spawnSync('python3', ['-c', 'import fcntl, sys\nfor path in sys.argv[1:]:\n    fcntl.flock(open(path), fcntl.LOCK_SH)', ...locks], { encoding: 'utf8' })
   assert.equal(waited.status, 0, waited.stderr)
@@ -63,7 +74,7 @@ const invoke = Effect.fnUntraced(function* (
   return yield* Effect.try({
     try: () => {
       const ran = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout, input })
-      settleCaches(cwd)
+      settleCaches(cwd, env)
       return ran
     },
     catch: (cause) => new VerificationError({ message: 'Native CLI invocation failed', cause }),
@@ -82,6 +93,9 @@ const program = Effect.gen(function* () {
   const clang = resolve(tool)
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-build-' })
+  if (!process.env.SILK_CACHE_DIR) {
+    process.env.SILK_CACHE_DIR = join(directory, '.shared-cache')
+  }
   const repository = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
   // Reuse the existing small shared acceptance program without importing the bootstrap.
   const source = yield* fs.readFileString(
@@ -369,7 +383,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const beforeEmbedding = yield* fs.readFileString(join(requestRoot, 'main.silk'))
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), 'import payload { data }\n' + beforeEmbedding.replace(
     'pub fn main() -> i32 {', 'pub fn main() -> i32 {\n  if data.length != 5 || data[0] != 5 || data[1] != 0 || data[2] != 255 || data[3] != 34 || data[4] != 10 { return 8 }'))
-  const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
+  const graphEnv = { ...requestEnv, SILK_CACHE_MODE: 'workspace', SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }
+  const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, graphEnv, 120_000)
   assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
   assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
   // The compilation builds outside its step with the package cache, so the next one after an edit
@@ -381,7 +396,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded.replace('{ return 8 }', '{ return 9 }'))
   // The fixture checks that planning leaves no published program, so the first one goes first.
   yield* fs.remove(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture'))
-  const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
+  const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, graphEnv, 120_000)
   assert.equal(graphRecompiled.status, 0, graphRecompiled.stderr)
   assert.match(graphRecompiled.stderr, /checks? reused/, 'an edited graph compilation reuses its cache')
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded)
@@ -2591,11 +2606,11 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     join(directory, 'adopt/app/src/main.silk'),
     'import adoptcore.lib { size }\n\npub fn main() -> i32 {\n  let n: i64 = size()\n  return 0\n}\n',
   )
-  const coreChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/core'))
+  const coreChecked = yield* invoke(silk, ['check', '--cache-mode', 'workspace', '--stdlib', standardLibrary], join(directory, 'adopt/core'))
   assert.equal(coreChecked.status, 0, coreChecked.stderr)
   assert.ok(yield* fs.exists(join(directory, 'adopt/build/cache/adoptcore')), 'the library check leaves its cache in the workspace output')
   yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> bool {\n  return true\n}\n')
-  const adoptedCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'adopt/app'))
+  const adoptedCheck = yield* invoke(silk, ['check', '--cache-mode', 'workspace', '--stdlib', standardLibrary], join(directory, 'adopt/app'))
   assert.equal(adoptedCheck.status, 1, adoptedCheck.stderr)
   assert.match(adoptedCheck.stderr, /app\/src\/main\.silk:4:\d+: error\[/)
   // A `mut fn` binding is lent to each call it is passed to, so it stays usable afterwards, and one
@@ -2839,7 +2854,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     yield* fs.makeDirectory(join(project, 'src'), { recursive: true })
     yield* fs.writeFileString(join(project, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n`)
     yield* fs.writeFileString(join(project, 'src/main.silk'), 'fn half(value: i32) -> i32 {\n  return value / 2\n}\n\npub fn main() -> i32 {\n  return half(0)\n}\n')
-    const first = checkedFirst ? ['check', '--no-server'] : ['build']
+    const first = checkedFirst ? ['check', '--no-server', '--cache-mode', 'workspace'] : ['build', '--cache-mode', 'workspace']
     const prepared = yield* invoke(silk, [...first, '--stdlib', standardLibrary], project, { ...process.env, SILK_CLANG: clang })
     assert.equal(prepared.status, 0, prepared.stderr)
     const cache = compilerCache(join(project, 'build/cache', name))
@@ -2852,7 +2867,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     })
     yield* Effect.promise(() => new Promise<void>((resolved) => holder.stdout.once('data', () => resolved())))
     const heldAt = Date.now()
-    const checked = spawnSync(silk, ['check', '--no-server', '--stdlib', standardLibrary, '--progress', 'plain'], { cwd: project, encoding: 'utf8', timeout: 50_000 })
+    const checked = spawnSync(silk, ['check', '--no-server', '--cache-mode', 'workspace', '--stdlib', standardLibrary, '--progress', 'plain'], { cwd: project, encoding: 'utf8', timeout: 50_000 })
     const waited = Date.now() - heldAt
     holder.kill()
     settleCaches(project)
@@ -2885,6 +2900,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     [
       'test',
       '--no-cache',
+      '--cache-mode',
+      'workspace',
       '--stdlib',
       standardLibrary,
       '--file',
@@ -3199,7 +3216,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(sourcesRoot, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nclib = { path = "../clib" }\n')
   yield* fs.writeFileString(join(sourcesRoot, 'app/main.silk'), 'import clib.Clib\n\npub fn main() -> i32 {\n  return Clib.value()\n}\n')
   const compiledApp = join(sourcesRoot, 'app')
-  const sourcesEnvironment = { ...process.env, SILK_CLANG: clang }
+  const sourcesEnvironment = { ...process.env, SILK_CLANG: clang, SILK_CACHE_MODE: 'workspace' }
   const nativeCache = join(compiledApp, `build/${hostTarget}/dev/app.native`)
   const nativeObjects = Effect.fnUntraced(function* () {
     return (yield* fs.readDirectory(nativeCache)).filter((name) => name.endsWith('.o')).sort()
@@ -3559,7 +3576,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(toolApp, 'silk.toml'), toolManifest(false))
   yield* fs.writeFileString(join(toolApp, 'main.silk'), 'import tlib.Tlib\n\npub fn main() -> i32 {\n  return Tlib.value()\n}\n')
   const stepBuild = (environment: Record<string, string> = {}) =>
-    invoke(silk, ['build', '--stdlib', standardLibrary], toolApp, { ...sourcesEnvironment, ...environment })
+    invoke(silk, ['build', '--stdlib', standardLibrary], toolApp, { ...sourcesEnvironment, SILK_CACHE_MODE: 'workspace', ...environment })
   const unlisted = yield* stepBuild()
   assert.equal(unlisted.status, 1, unlisted.stderr)
   assert.match(unlisted.stderr, /tlib\/build\.silk: build\.silk computes no plan: this dependency runs a package tool without permission; add `tools = true`/)
@@ -3633,7 +3650,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     'fn twice(value: i32) -> i32 {\n  return value * 2\n}\n\npub fn main() -> i32 {\n  return twice(0)\n}\n',
   )
   yield* writePlan(ordered, '  plan = Plan.functionOrder(plan, sourcePath("/tmp/order.txt"))')
-  const escapedOrder = yield* invoke(silk, ['build', '--stdlib', standardLibrary], ordered, { ...process.env, SILK_CLANG: clang })
+  const escapedOrder = yield* invoke(silk, ['build', '--cache-mode', 'workspace', '--stdlib', standardLibrary], ordered, { ...process.env, SILK_CLANG: clang })
   assert.equal(escapedOrder.status, 1, escapedOrder.stderr)
   assert.match(escapedOrder.stderr, /build\.silk computes no plan:/)
   // The linked executable's Silk functions by the name its symbol table gives them, with their
@@ -3651,7 +3668,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   for (const profile of [[], ['--release']]) {
     const executable = join(ordered, `build/${hostTarget}/${profile.length === 0 ? 'dev' : 'release'}/ordered`)
     const orderedBuild = Effect.fnUntraced(function* () {
-      const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
+      const built = yield* invoke(silk, ['build', '--cache-mode', 'workspace', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
       assert.equal(built.status, 0, built.stderr)
       return yield* functionAddresses(executable)
     })
@@ -3689,7 +3706,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.ok(latest !== undefined, `${profile}: no linked function is named by its declaration`)
     const declaration = latest[0]
     yield* fs.writeFileString(join(ordered, 'order.txt'), `${declaration}\nsilk_00000000000000000000000000000000\n`)
-    const byDeclaration = yield* invoke(silk, ['build', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
+    const byDeclaration = yield* invoke(silk, ['build', '--cache-mode', 'workspace', '--stdlib', standardLibrary, ...profile], ordered, { ...process.env, SILK_CLANG: clang })
     assert.equal(byDeclaration.status, 0, byDeclaration.stderr)
     assert.match(byDeclaration.stderr, /silk: note: 1 of 2 entries in .*order\.txt name no function of this build/)
     const declaredAddresses = yield* functionAddresses(executable)
@@ -5679,7 +5696,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     join(split, 'src/main.silk'),
     'import helper\n\npub fn main() -> i32 {\n  return helper.value() + 4\n}\n',
   )
-  const splitEnvironment = { ...process.env, SILK_CLANG: clang }
+  const splitEnvironment = { ...process.env, SILK_CLANG: clang, SILK_CACHE_MODE: 'workspace' }
   // The objects are in the store the outputs of one directory share.
   const unitObjects = join(split, `build/${hostTarget}/dev/units`)
   const objectNames = Effect.fnUntraced(function* () {
@@ -6492,8 +6509,144 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   const packedEmbed = yield* embedPack()
   assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
+  // Shared system cache: default under `$SILK_HOME/cache/v1`, opt-out to workspace mode,
+  // cross-project reuse with scope isolation for same-named packages, hash invariance,
+  // project-scoped `silk clean`, and `silk cache {path, info, prune, clean}`.
+  const sharedCacheRoot = join(directory, 'shared-cache-suite')
+  const sharedHome = join(sharedCacheRoot, 'silk-home')
+  const customCache = join(sharedCacheRoot, 'custom-cache')
+  const projectA = join(sharedCacheRoot, 'a/app')
+  const projectB = join(sharedCacheRoot, 'b/app')
+  const makeSharedEnv = (overrides: Record<string, string | undefined> = {}) => {
+    const next: NodeJS.ProcessEnv = { ...process.env, SILK_CLANG: clang, SILK_HOME: sharedHome }
+    delete next.SILK_CACHE_DIR
+    delete next.SILK_CACHE_MODE
+    delete next.SILK_CACHE_MAX_SIZE
+    delete next.SILK_CACHE_MAX_AGE_DAYS
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete next[key]
+      else next[key] = value
+    }
+    return next
+  }
+  const sharedEnv = makeSharedEnv()
+  const writeSharedApp = Effect.fnUntraced(function* (root: string, delta: number) {
+    yield* fs.makeDirectory(join(root, 'src'), { recursive: true })
+    yield* fs.makeDirectory(join(root, 'c'), { recursive: true })
+    yield* fs.writeFileString(
+      join(root, 'silk.toml'),
+      '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
+    )
+    yield* writePlan(root, '  plan = Plan.compileC(plan, sourcePath("c/helper.c"))')
+    yield* fs.writeFileString(
+      join(root, 'c/helper.c'),
+      'int shared_helper_value(void) { return 20; }\n',
+    )
+    yield* fs.writeFileString(
+      join(root, 'src/main.silk'),
+      `unsafe extern "C" fn shared_helper_value() -> i32\n\npub fn main() -> i32 {\n  return unsafe shared_helper_value() + ${delta}\n}\n`,
+    )
+  })
+  yield* writeSharedApp(projectA, 3)
+  yield* writeSharedApp(projectB, 7)
+  // `silk cache path` reports `$SILK_HOME/cache/v1` by default, `workspace` under `--cache-mode workspace`,
+  // and `<custom>/v1` under `--cache-dir <custom>`.
+  const defaultPath = yield* invoke(silk, ['cache', 'path'], projectA, sharedEnv)
+  assert.equal(defaultPath.status, 0, defaultPath.stderr)
+  assert.equal(defaultPath.stdout.trim(), join(sharedHome, 'cache/v1'))
+  const workspacePath = yield* invoke(silk, ['cache', 'path', '--cache-mode', 'workspace'], projectA, sharedEnv)
+  assert.equal(workspacePath.status, 0, workspacePath.stderr)
+  assert.equal(workspacePath.stdout.trim(), 'workspace')
+  const customPath = yield* invoke(silk, ['cache', 'path', '--cache-dir', customCache], projectA, sharedEnv)
+  assert.equal(customPath.status, 0, customPath.stderr)
+  assert.equal(customPath.stdout.trim(), join(customCache, 'v1'))
+  const conflictingCacheFlags = yield* invoke(
+    silk,
+    ['cache', 'path', '--cache-mode', 'workspace', '--cache-dir', customCache],
+    projectA,
+    sharedEnv,
+  )
+  assert.notEqual(conflictingCacheFlags.status, 0)
+  // `$SILK_HOME/settings.toml` can default to workspace mode, and `--cache-mode shared` overrides it.
+  yield* fs.makeDirectory(sharedHome, { recursive: true })
+  yield* fs.writeFileString(join(sharedHome, 'settings.toml'), '[cache]\nmode = "workspace"\n')
+  const settingsWorkspacePath = yield* invoke(silk, ['cache', 'path'], projectA, sharedEnv)
+  assert.equal(settingsWorkspacePath.status, 0, settingsWorkspacePath.stderr)
+  assert.equal(settingsWorkspacePath.stdout.trim(), 'workspace')
+  const cliOverridesSettings = yield* invoke(silk, ['cache', 'path', '--cache-mode', 'shared'], projectA, sharedEnv)
+  assert.equal(cliOverridesSettings.status, 0, cliOverridesSettings.stderr)
+  assert.equal(cliOverridesSettings.stdout.trim(), join(sharedHome, 'cache/v1'))
+  yield* fs.remove(join(sharedHome, 'settings.toml'))
+  // Building two separate projects both named `app` shares objects, native `.o`, and stdlib semantic caches
+  // under `$SILK_HOME/cache/v1`, keeps their scopes isolated, and leaves no `build/cache` in either project.
+  const builtA = yield* invoke(silk, ['run', '--stdlib', standardLibrary], projectA, sharedEnv)
+  assert.equal(builtA.status, 23, builtA.stderr)
+  assert.equal(yield* fs.exists(join(projectA, 'build/cache')), false)
+  assert.equal(yield* fs.exists(join(projectA, `build/${hostTarget}/dev/units`)), false)
+  const sharedV1 = join(sharedHome, 'cache/v1')
+  assert.equal(yield* fs.exists(join(sharedV1, 'objects')), true)
+  assert.equal(yield* fs.exists(join(sharedV1, 'native')), true)
+  const semanticCompilers = (yield* fs.readDirectory(join(sharedV1, 'semantic'))).filter((name) => name !== 'compilers')
+  assert.equal(semanticCompilers.length, 1, `expected one compiler tag in shared semantic cache, found ${semanticCompilers.join(', ')}`)
+  const compilerTag = semanticCompilers[0]
+  const scopesDir = join(sharedV1, 'semantic', compilerTag, 'scopes')
+  const scopesAfterA = yield* fs.readDirectory(scopesDir)
+  assert.equal(scopesAfterA.length, 1, `expected one scope after project A, found ${scopesAfterA.join(', ')}`)
+  assert.equal(yield* fs.exists(join(sharedV1, 'semantic', compilerTag, 'deps/silk')), true)
+  const builtB = yield* invoke(silk, ['run', '--stdlib', standardLibrary], projectB, sharedEnv)
+  assert.equal(builtB.status, 27, builtB.stderr)
+  assert.equal(yield* fs.exists(join(projectB, 'build/cache')), false)
+  const scopesAfterB = yield* fs.readDirectory(scopesDir)
+  assert.equal(scopesAfterB.length, 2, `expected two isolated scopes for same-named apps, found ${scopesAfterB.join(', ')}`)
+  // `silk hash` is invariant between shared and workspace cache modes.
+  const hashShared = yield* invoke(silk, ['hash', '--stdlib', standardLibrary], projectA, sharedEnv)
+  assert.equal(hashShared.status, 0, hashShared.stderr)
+  const hashWorkspace = yield* invoke(
+    silk,
+    ['hash', '--cache-mode', 'workspace', '--stdlib', standardLibrary],
+    projectA,
+    sharedEnv,
+  )
+  assert.equal(hashWorkspace.status, 0, hashWorkspace.stderr)
+  assert.equal(hashShared.stdout.trim(), hashWorkspace.stdout.trim())
+  // `silk cache info` reports shared mode, path, categories, and limits on stdout.
+  const cacheInfo = yield* invoke(silk, ['cache', 'info'], projectA, sharedEnv)
+  assert.equal(cacheInfo.status, 0, cacheInfo.stderr)
+  assert.match(cacheInfo.stdout, /^Mode: shared$/m)
+  assert.match(cacheInfo.stdout, /^Total: .* \(\d+ files\)$/m)
+  assert.match(cacheInfo.stdout, /^  semantic: /m)
+  assert.match(cacheInfo.stdout, /^  objects: /m)
+  assert.match(cacheInfo.stdout, /^  native: /m)
+  assert.match(cacheInfo.stdout, /^Limits: max-size=/m)
+  // `silk clean` in project A removes project A's `build/` and its shared scope, leaving project B's scope
+  // and shared objects intact.
+  const cleanedA = yield* invoke(silk, ['clean'], projectA, sharedEnv)
+  assert.equal(cleanedA.status, 0, cleanedA.stderr)
+  assert.equal(yield* fs.exists(join(projectA, 'build')), false)
+  const scopesAfterCleanA = yield* fs.readDirectory(scopesDir)
+  assert.equal(scopesAfterCleanA.length, 1, `expected only project B's scope after cleaning A, found ${scopesAfterCleanA.join(', ')}`)
+  assert.equal(yield* fs.exists(join(sharedV1, 'objects')), true)
+  // `silk cache prune --max-size 0` evicts cached entries immediately.
+  const pruned = yield* invoke(silk, ['cache', 'prune', '--max-size', '0'], projectB, sharedEnv)
+  assert.equal(pruned.status, 0, pruned.stderr)
+  assert.match(pruned.stdout, /^Pruned [1-9]\d* files, /m)
+  // `silk clean --cache` removes both project B's `build/` and the shared cache root.
+  const cleanedAll = yield* invoke(silk, ['clean', '--cache'], projectB, sharedEnv)
+  assert.equal(cleanedAll.status, 0, cleanedAll.stderr)
+  assert.equal(yield* fs.exists(join(projectB, 'build')), false)
+  assert.equal(yield* fs.exists(sharedV1), false)
+  // `--cache-mode workspace` still places caches inside `<project>/build/cache` when opted into.
+  const workspaceBuild = yield* invoke(
+    silk,
+    ['run', '--cache-mode', 'workspace', '--stdlib', standardLibrary],
+    projectA,
+    sharedEnv,
+  )
+  assert.equal(workspaceBuild.status, 23, workspaceBuild.stderr)
+  assert.equal(yield* fs.exists(join(projectA, 'build/cache/app')), true)
+  assert.equal(yield* fs.exists(sharedV1), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, compilation definitions, requests, bindings, source root, path dependencies, native source globs and per-file flags, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, compressed embedded files, embedded files of a dependency, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, compilation definitions, requests, bindings, source root, path dependencies, native source globs and per-file flags, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, compressed embedded files, embedded files of a dependency, object and static library artifacts, emission stages, and shared system cache passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))

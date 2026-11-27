@@ -1,0 +1,1108 @@
+//! Shared cache access-time touching, disk usage inspection, and bounded LRU/age garbage
+//! collection.
+//!
+//! # When to use
+//! - Call [`processNonce`] to form collision-free temporary file names for concurrent builds
+//!   writing into a shared cache directory.
+//! - Call [`touchIfStale`] on a cache hit so active entries refresh their modification time at
+//!   most once per hour without causing write amplification on edit-build loops.
+//! - Call [`maybeSweep`] after a shared-mode command finishes to run amortized, lock-guarded
+//!   eviction at most once per day.
+//! - Call [`inspect`], [`prune`], and [`cleanAll`] from `silk cache` and `silk clean --cache`.
+//!
+//! # Details
+//! Automatic eviction uses a non-blocking exclusive lock on `<sharedRoot>/gc.stamp`. If another
+//! process is already sweeping or the last sweep ran within 24 hours, [`maybeSweep`] returns
+//! immediately. To guarantee that concurrent builds never lose an entry they just checked, entries
+//! modified within the last hour (the grace window) and semantic scopes holding an active
+//! `DetachedWriter` lock are never evicted during automatic sweeps.
+
+import driver.CacheLayout { CachePolicy }
+import driver.DetachedWriter
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem {
+  DirectoryEntry,
+  DirectoryInfo,
+  FileError,
+  FileInfo,
+  FileSystem,
+  Path
+}
+import silk.text.string { String }
+
+static if Intrinsic.targetOperatingSystem() == "linux"
+  || Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.file { FileStatus, NativeFile, NativeFileError, Timestamp }
+  import silk.system.system_clock { SystemClock }
+  import silk.system.system_clock_native { OsSystemClock }
+
+  unsafe extern "C" fn getpid() -> i32
+} else static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.system.system_clock { SystemClock }
+  import silk.system.system_clock_native { OsSystemClock }
+
+  unsafe extern "C" fn GetCurrentProcessId() -> u32
+}
+
+/// Minimum interval between mtime touches on cache hits (1 hour).
+const TOUCH_INTERVAL_SECONDS: i64 = 3600
+
+/// Minimum interval between automatic GC sweeps (24 hours).
+const SWEEP_INTERVAL_SECONDS: i64 = 86400
+
+/// Recent-modification grace window protecting in-flight concurrent builds (1 hour).
+const GRACE_WINDOW_SECONDS: i64 = 3600
+
+/// Size and entry counts of a shared cache directory, broken down by category.
+pub struct CacheStats {
+  pub semanticBytes: u64,
+  pub objectsBytes: u64,
+  pub nativeBytes: u64,
+  pub glibcStubsBytes: u64,
+  pub stepsBytes: u64,
+  pub thinLtoBytes: u64,
+  pub otherBytes: u64,
+  pub totalBytes: u64,
+  pub files: usize,
+}
+
+/// Summary of what a [`prune`] sweep removed and how many bytes remain.
+pub struct PruneReport {
+  pub removedFiles: usize,
+  pub removedDirectories: usize,
+  pub freedBytes: u64,
+  pub remainingBytes: u64,
+}
+
+struct NonceCounter {
+  next: u64,
+}
+
+impl Copy for NonceCounter {}
+
+/// A process-unique lowercase hexadecimal tag for temporary files (`.partial`, `.d`) written into
+/// shared cache directories, preventing concurrent processes from clobbering each other's in-flight
+/// builds.
+pub effect fn processNonce() -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = Intrinsic.processSlot<NonceCounter>()
+  let current = unsafe Pointer.read(slot)
+  let seq = current.next + 1
+  unsafe Pointer.write(slot, NonceCounter { next: seq })
+  let mut pid: u64 = 0
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    let raw = unsafe getpid()
+    if raw > 0 {
+      pid = i32.toU64(raw)
+    }
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      pid = u32.toU64(unsafe GetCurrentProcessId())
+    }
+  }
+  let mut out = Bytes.make()
+  run appendHex(&mut out, pid)
+  run Bytes.append(&mut out, b"-")
+  run appendHex(&mut out, seq)
+  return move out
+}
+
+/// Current wall-clock time as whole Unix seconds, or `None` on hosts without a system clock.
+pub effect fn nowSeconds() -> Option<i64> {
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin"
+    || Intrinsic.targetOperatingSystem() == "windows" {
+    let mut clock = OsSystemClock.make()
+    let now = run SystemClock.now() |> Effect.provideMut<SystemClock>(&mut clock)
+    return Option<i64>.some(now.unixSeconds())
+  } else {
+    return Option<i64>.none()
+  }
+}
+
+/// The modification time of `path` in whole Unix seconds, or `None` when unavailable.
+pub effect fn modifiedSeconds(path: &Path) -> Option<i64> {
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    return match move run Effect.result(NativeFile.status(Path.rawBytes(path), true)) {
+      Result<FileStatus, NativeFileError>.Success { value } => Option<i64>.some(
+        value.modified.seconds,
+      )
+      Result<FileStatus, NativeFileError>.Failure { error } => {
+        drop error
+        Option<i64>.none()
+      }
+    }
+  } else {
+    drop path
+    return Option<i64>.none()
+  }
+}
+
+/// Refreshes the modification time of `path` to the current time if its existing modification time
+/// is older than 1 hour. Best effort: errors are ignored.
+pub effect fn touchIfStale(path: &Path) -> () {
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    let now = match run nowSeconds() {
+      Option<i64>.Some { value } => value
+      Option<i64>.None => {
+        return ()
+      }
+    }
+    let mtime = match run modifiedSeconds(path) {
+      Option<i64>.Some { value } => value
+      Option<i64>.None => {
+        return ()
+      }
+    }
+    if now - mtime < TOUCH_INTERVAL_SECONDS {
+      return ()
+    }
+    let stamp = Timestamp { seconds: now, nanoseconds: 0 }
+    drop run Effect.result(NativeFile.setTimes(Path.rawBytes(path), stamp, stamp, true))
+  } else {
+    drop path
+  }
+}
+
+/// Measures disk usage of each category under the shared cache root `root`.
+pub effect fn inspect(root: &Path) -> CacheStats
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut stats = CacheStats {
+    semanticBytes: 0,
+    objectsBytes: 0,
+    nativeBytes: 0,
+    glibcStubsBytes: 0,
+    stepsBytes: 0,
+    thinLtoBytes: 0,
+    otherBytes: 0,
+    totalBytes: 0,
+    files: usize.ZERO,
+  }
+  let top = run listEntries(root)
+  let entries = top.asSlice()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    at = at + usize.ONE
+    let name = match Path.name(&entry.path) {
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => b""
+    }
+    let measured = run measurePath(&entry.path, entry.kind.code == FileSystem.directory().code)
+    stats.files = stats.files + measured.files
+    stats.totalBytes = stats.totalBytes + measured.bytes
+    if same(name, b"semantic") {
+      stats.semanticBytes = stats.semanticBytes + measured.bytes
+    } else if same(name, b"objects") {
+      stats.objectsBytes = stats.objectsBytes + measured.bytes
+    } else if same(name, b"native") {
+      stats.nativeBytes = stats.nativeBytes + measured.bytes
+    } else if same(name, b"glibc-stubs") {
+      stats.glibcStubsBytes = stats.glibcStubsBytes + measured.bytes
+    } else if same(name, b"steps") {
+      stats.stepsBytes = stats.stepsBytes + measured.bytes
+    } else if same(name, b"thinlto") {
+      stats.thinLtoBytes = stats.thinLtoBytes + measured.bytes
+    } else {
+      stats.otherBytes = stats.otherBytes + measured.bytes
+    }
+  }
+  return move stats
+}
+
+/// Runs an amortized, non-blocking automatic sweep of the shared cache if `policy` is in shared
+/// mode and `gc.stamp` is older than 24 hours. Errors are swallowed so eviction never fails a
+/// user command.
+pub effect fn maybeSweep(policy: &CachePolicy) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let root = match &policy.sharedRoot {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let stamp = match move run joinOptional(root, b"gc.stamp") {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let rootExists = match run Effect.result(FileSystem.exists(root)) {
+    Result<bool, FileError>.Success { value } => value
+    Result<bool, FileError>.Failure { error } => {
+      drop error
+      return ()
+    }
+  }
+  if !rootExists {
+    return ()
+  }
+  let now = match run nowSeconds() {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => {
+      return ()
+    }
+  }
+  if let Option<i64>.Some { value: last } = run modifiedSeconds(&stamp) {
+    if now - last < SWEEP_INTERVAL_SECONDS {
+      return ()
+    }
+  }
+  let lock = match move run joinOptional(root, b"gc.lock") {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let created = run Effect.result(FileSystem.createDirectoriesRecursively(root))
+  drop created
+  let held = match move run DetachedWriter.tryHold(&lock) {
+    Option<DetachedWriter.Held>.Some { value } => move value
+    Option<DetachedWriter.Held>.None => {
+      return ()
+    }
+  }
+
+  // Re-check stamp after taking the lock in case another process just swept.
+  if let Option<i64>.Some { value: last } = run modifiedSeconds(&stamp) {
+    if now - last < SWEEP_INTERVAL_SECONDS {
+      drop held
+      return ()
+    }
+  }
+  let mut stampBytes = Bytes.make()
+  if now > 0 {
+    run appendDecimal(&mut stampBytes, i64.toU64(now))
+  } else {
+    run Bytes.append(&mut stampBytes, b"0")
+  }
+  run Bytes.append(&mut stampBytes, b"\n")
+  drop run Effect.result(
+    FileSystem.writeFileAtomic(
+      &stamp,
+      stampBytes.asSlice(),
+      FileSystem.replaceExisting(),
+      FileSystem.buffered(),
+    ),
+  )
+
+  // Aim for 80% of maxBytes during automatic sweeps to avoid thrashing on consecutive builds.
+  let targetBytes = (policy.maxBytes / 5) * 4
+  drop run prune(root, targetBytes, policy.maxAgeDays, policy.keptCompilers, true)
+  drop held
+}
+
+/// Evicts expired and oldest entries in `root` to enforce `maxAgeDays`, `maxBytes`, and
+/// `keptCompilers`. When `respectGrace` is true, entries modified within the last hour are kept
+/// untouched to protect concurrent in-flight builds.
+pub effect fn prune(
+  root: &Path,
+  maxBytes: u64,
+  maxAgeDays: u64,
+  keptCompilers: usize,
+  respectGrace: bool,
+) -> PruneReport
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut report = PruneReport {
+    removedFiles: usize.ZERO,
+    removedDirectories: usize.ZERO,
+    freedBytes: 0,
+    remainingBytes: 0,
+  }
+  let now = match run nowSeconds() {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => 0
+  }
+  let graceCutoff = if respectGrace && now > GRACE_WINDOW_SECONDS {
+    now - GRACE_WINDOW_SECONDS
+  } else {
+    i64.MAX
+  }
+  let ageCutoff = if maxAgeDays > 0 && now > 0 {
+    let span = u64.toI64(maxAgeDays * 86400)
+    if now > span {
+      now - span
+    } else {
+      0
+    }
+  } else {
+    0
+  }
+
+  // 1. Prune compiler directories past `keptCompilers` in `semantic/`.
+  if let Option<Path>.Some { value: semanticRoot } = move run joinOptional(root, b"semantic") {
+    run pruneOldCompilers(&semanticRoot, keptCompilers, &mut report)
+  }
+
+  // 2. Collect evictable items across all shared cache categories.
+  let mut items = List<Evictable>.make()
+  let mut protectedBytes: u64 = 0
+
+  if let Option<Path>.Some { value: objectsRoot } = move run joinOptional(root, b"objects") {
+    run collectShardedFiles(&objectsRoot, false, graceCutoff, &mut items, &mut protectedBytes)
+  }
+  if let Option<Path>.Some { value: nativeRoot } = move run joinOptional(root, b"native") {
+    run collectShardedFiles(&nativeRoot, true, graceCutoff, &mut items, &mut protectedBytes)
+  }
+  if let Option<Path>.Some { value: stubsRoot } = move run joinOptional(root, b"glibc-stubs") {
+    run collectDirectories(&stubsRoot, b"start.o", graceCutoff, &mut items, &mut protectedBytes)
+  }
+  if let Option<Path>.Some { value: stepsRoot } = move run joinOptional(root, b"steps") {
+    run collectStepEntries(&stepsRoot, graceCutoff, &mut items, &mut protectedBytes)
+  }
+  if let Option<Path>.Some { value: semanticRoot } = move run joinOptional(root, b"semantic") {
+    run collectSemanticEntries(&semanticRoot, graceCutoff, &mut items, &mut protectedBytes)
+  }
+
+  // 3. Remove entries older than `maxAgeDays` first.
+  let mut surviving = List<Evictable>.make()
+  let mut remainingBytes = protectedBytes
+  while items.length() > usize.ZERO {
+    let item = items.remove(usize.ZERO)
+    if ageCutoff > 0 && item.mtime > 0 && item.mtime < ageCutoff {
+      run deleteItem(&item, &mut report)
+    } else {
+      remainingBytes = remainingBytes + item.bytes
+      run surviving.append(move item)
+    }
+  }
+
+  // 4. If still over `maxBytes`, sort by oldest mtime ascending and evict until within budget.
+  if remainingBytes > maxBytes {
+    let listed = surviving.asSlice()
+    let order = run sortedOrderByMtime(listed)
+    let indices = order.asSlice()
+    let mut at = usize.ZERO
+    while at < indices.length && remainingBytes > maxBytes {
+      let item = &listed[indices[at]]
+      run deleteItem(item, &mut report)
+      if remainingBytes >= item.bytes {
+        remainingBytes = remainingBytes - item.bytes
+      } else {
+        remainingBytes = 0
+      }
+      at = at + usize.ONE
+    }
+  }
+
+  report.remainingBytes = remainingBytes
+  return move report
+}
+
+/// Settles any detached cache writers under `root` and removes the entire shared cache directory.
+pub effect fn cleanAll(root: &Path) -> bool
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Path>.Some { value: semanticRoot } = move run joinOptional(root, b"semantic") {
+    run settleAllScopes(&semanticRoot)
+  }
+  let exists = match move run Effect.result(FileSystem.exists(root)) {
+    Result<bool, FileError>.Success { value } => value
+    Result<bool, FileError>.Failure { error } => {
+      drop error
+      false
+    }
+  }
+  if !exists {
+    return true
+  }
+  return match move run Effect.result(FileSystem.removeDirectoryRecursively(root)) {
+    Result<(), FileError | OutOfMemoryError>.Success { .. } => true
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        false
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+/// Waits for any detached cache writers active inside `scope` to finish.
+pub effect fn settleScope(scope: &Path) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let files = run listEntries(scope)
+  let held = files.asSlice()
+  let mut at = usize.ZERO
+  while at < held.length {
+    let raw = Path.rawBytes(&held[at].path)
+    if endsIn(raw, b".lock") {
+      run DetachedWriter.waitFor(&held[at].path)
+    }
+    at = at + usize.ONE
+  }
+}
+
+effect fn settleAllScopes(semanticRoot: &Path) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let compilers = run listEntries(semanticRoot)
+  let listed = compilers.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].kind.code == FileSystem.directory().code {
+      if let Option<Path>.Some { value: scopes } = move run joinOptional(
+        &listed[at].path,
+        b"scopes",
+      ) {
+        let entries = run listEntries(&scopes)
+        let scopesList = entries.asSlice()
+        let mut s = usize.ZERO
+        while s < scopesList.length {
+          if scopesList[s].kind.code == FileSystem.directory().code {
+            run settleScope(&scopesList[s].path)
+          }
+          s = s + usize.ONE
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+}
+
+struct Measured {
+  bytes: u64,
+  files: usize,
+}
+
+effect fn measurePath(path: &Path, isDirectory: bool) -> Measured
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if !isDirectory {
+    let size = run fileSize(path)
+    return Measured { bytes: size, files: usize.ONE }
+  }
+  let mut total: u64 = 0
+  let mut count = usize.ZERO
+  let entries = run listEntries(path)
+  let listed = entries.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let sub = run measurePath(&listed[at].path, listed[at].kind.code == FileSystem.directory().code)
+    total = total + sub.bytes
+    count = count + sub.files
+    at = at + usize.ONE
+  }
+  return Measured { bytes: total, files: count }
+}
+
+effect fn fileSize(path: &Path) -> u64
+  ? &mut FileSystem {
+  return match move run Effect.result(FileSystem.stat(path)) {
+    Result<FileInfo | DirectoryInfo, FileError>.Success { value } => match move value {
+      FileInfo file => usize.toU64(file.byteLength)
+      DirectoryInfo _dir => 0
+    }
+    Result<FileInfo | DirectoryInfo, FileError>.Failure { error } => {
+      drop error
+      0
+    }
+  }
+}
+
+struct Evictable {
+  path: Path,
+  companion: Option<Path>,
+  isDirectory: bool,
+  bytes: u64,
+  mtime: i64,
+}
+
+effect fn deleteItem(item: &Evictable, report: &mut PruneReport) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if item.isDirectory {
+    if let Result<(), FileError | OutOfMemoryError>.Success { .. } = move run Effect.result(
+      FileSystem.removeDirectoryRecursively(&item.path),
+    ) {
+      report.removedDirectories = report.removedDirectories + usize.ONE
+      report.freedBytes = report.freedBytes + item.bytes
+    }
+    return ()
+  }
+  if let Result<(), FileError>.Success { .. } = move run Effect.result(
+    FileSystem.removeFile(&item.path),
+  ) {
+    report.removedFiles = report.removedFiles + usize.ONE
+    report.freedBytes = report.freedBytes + item.bytes
+  }
+  if let Option<Path>.Some { value: extra } = &item.companion {
+    if let Result<(), FileError>.Success { .. } = move run Effect.result(
+      FileSystem.removeFile(&extra),
+    ) {
+      report.removedFiles = report.removedFiles + usize.ONE
+    }
+  }
+}
+
+effect fn pruneOldCompilers(
+  semanticRoot: &Path,
+  keptCompilers: usize,
+  report: &mut PruneReport,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let compilersPath = match move run joinOptional(semanticRoot, b"compilers") {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let listed = match move run Effect.result(FileSystem.readFile(&compilersPath)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let mut keep = List<Bytes>.make()
+  let text = listed.asSlice()
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= text.length {
+    if at == text.length || text[at] == 10 {
+      let name = Slice.view<u8>(text, start, at - start)
+      if name.length == 16 && keep.length() < keptCompilers {
+        run keep.append(run Bytes.copy(name))
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if keep.length() == usize.ZERO {
+    return ()
+  }
+  let keepSlice = keep.asSlice()
+  let present = run listEntries(semanticRoot)
+  let found = present.asSlice()
+  at = usize.ZERO
+  while at < found.length {
+    let entry = &found[at]
+    at = at + usize.ONE
+    if entry.kind.code != FileSystem.directory().code {
+      continue
+    }
+    let name = match Path.name(&entry.path) {
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => {
+        continue
+      }
+    }
+    if listedName(keepSlice, name) {
+      continue
+    }
+    if run compilerDirBusy(&entry.path) {
+      continue
+    }
+    let measured = run measurePath(&entry.path, true)
+    if let Result<(), FileError | OutOfMemoryError>.Success { .. } = move run Effect.result(
+      FileSystem.removeDirectoryRecursively(&entry.path),
+    ) {
+      report.removedDirectories = report.removedDirectories + usize.ONE
+      report.freedBytes = report.freedBytes + measured.bytes
+    }
+  }
+}
+
+effect fn compilerDirBusy(compilerDir: &Path) -> bool
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let scopes = match move run joinOptional(compilerDir, b"scopes") {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return false
+    }
+  }
+  let entries = run listEntries(&scopes)
+  let listed = entries.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].kind.code == FileSystem.directory().code && run scopeBusy(&listed[at].path) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn scopeBusy(scope: &Path) -> bool
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let entries = run listEntries(scope)
+  let listed = entries.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if endsIn(Path.rawBytes(&listed[at].path), b".lock") {
+      if run DetachedWriter.busy(&listed[at].path) {
+        return true
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn collectShardedFiles(
+  root: &Path,
+  pairedHeaders: bool,
+  graceCutoff: i64,
+  items: &mut List<Evictable>,
+  protectedBytes: &mut u64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let shards = run listEntries(root)
+  let shardSlice = shards.asSlice()
+  let mut s = usize.ZERO
+  while s < shardSlice.length {
+    let shard = &shardSlice[s]
+    s = s + usize.ONE
+    if shard.kind.code != FileSystem.directory().code {
+      continue
+    }
+    let files = run listEntries(&shard.path)
+    let fileSlice = files.asSlice()
+    let mut f = usize.ZERO
+    while f < fileSlice.length {
+      let entry = &fileSlice[f]
+      f = f + usize.ONE
+      if entry.kind.code == FileSystem.directory().code {
+        continue
+      }
+      let raw = Path.rawBytes(&entry.path)
+      if pairedHeaders && endsIn(raw, b".headers") {
+        // Counted with its `.o` companion below.
+        continue
+      }
+      let mut bytes = run fileSize(&entry.path)
+      let mut companion = Option<Path>.none()
+      if pairedHeaders && endsIn(raw, b".o") {
+        let mut headerBytes = run Bytes.copy(Slice.view<u8>(raw, usize.ZERO, raw.length - 2))
+        run Bytes.append(&mut headerBytes, b".headers")
+        if let Result<Path, FileError | OutOfMemoryError>.Success {
+          value: headerPath
+        } = move run Effect.result(Path.fromBytes(headerBytes.asSlice())) {
+          bytes = bytes + run fileSize(&headerPath)
+          companion = Option<Path>.some(move headerPath)
+        }
+      }
+      let mtime = match run modifiedSeconds(&entry.path) {
+        Option<i64>.Some { value } => value
+        Option<i64>.None => 0
+      }
+      if mtime > 0 && mtime >= graceCutoff {
+        protectedBytes.* = protectedBytes.* + bytes
+      } else {
+        if let Result<Path, FileError | OutOfMemoryError>.Success {
+          value: copied
+        } = move run Effect.result(Path.fromBytes(raw)) {
+          run items.append(
+            Evictable {
+              path: move copied,
+              companion: move companion,
+              isDirectory: false,
+              bytes: bytes,
+              mtime: mtime,
+            },
+          )
+        }
+      }
+    }
+  }
+}
+
+effect fn collectDirectories(
+  root: &Path,
+  sentinel: &[u8],
+  graceCutoff: i64,
+  items: &mut List<Evictable>,
+  protectedBytes: &mut u64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let entries = run listEntries(root)
+  let listed = entries.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let entry = &listed[at]
+    at = at + usize.ONE
+    if entry.kind.code != FileSystem.directory().code {
+      continue
+    }
+    let measured = run measurePath(&entry.path, true)
+    let mut mtime: i64 = 0
+    if let Option<Path>.Some { value: marker } = move run joinOptional(&entry.path, sentinel) {
+      if let Option<i64>.Some { value } = run modifiedSeconds(&marker) {
+        mtime = value
+      }
+    }
+    if mtime == 0 {
+      if let Option<i64>.Some { value } = run modifiedSeconds(&entry.path) {
+        mtime = value
+      }
+    }
+    if mtime > 0 && mtime >= graceCutoff {
+      protectedBytes.* = protectedBytes.* + measured.bytes
+    } else if let Result<Path, FileError | OutOfMemoryError>.Success {
+      value: copied
+    } = move run Effect.result(Path.fromBytes(Path.rawBytes(&entry.path))) {
+      run items.append(
+        Evictable {
+          path: move copied,
+          companion: Option<Path>.none(),
+          isDirectory: true,
+          bytes: measured.bytes,
+          mtime: mtime,
+        },
+      )
+    }
+  }
+}
+
+effect fn collectStepEntries(
+  stepsRoot: &Path,
+  graceCutoff: i64,
+  items: &mut List<Evictable>,
+  protectedBytes: &mut u64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let entries = run listEntries(stepsRoot)
+  let listed = entries.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let entry = &listed[at]
+    at = at + usize.ONE
+    let name = match Path.name(&entry.path) {
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => {
+        continue
+      }
+    }
+    if same(name, b".inputs") || same(name, b".graphs") {
+      // Collect individual files inside `.inputs` / `.graphs`.
+      let sub = run listEntries(&entry.path)
+      let subSlice = sub.asSlice()
+      let mut i = usize.ZERO
+      while i < subSlice.length {
+        let child = &subSlice[i]
+        i = i + usize.ONE
+        let isDir = child.kind.code == FileSystem.directory().code
+        let measured = run measurePath(&child.path, isDir)
+        let mtime = match run modifiedSeconds(&child.path) {
+          Option<i64>.Some { value } => value
+          Option<i64>.None => 0
+        }
+        if mtime > 0 && mtime >= graceCutoff {
+          protectedBytes.* = protectedBytes.* + measured.bytes
+        } else if let Result<Path, FileError | OutOfMemoryError>.Success {
+          value: copied
+        } = move run Effect.result(Path.fromBytes(Path.rawBytes(&child.path))) {
+          run items.append(
+            Evictable {
+              path: move copied,
+              companion: Option<Path>.none(),
+              isDirectory: isDir,
+              bytes: measured.bytes,
+              mtime: mtime,
+            },
+          )
+        }
+      }
+      continue
+    }
+    if entry.kind.code != FileSystem.directory().code {
+      continue
+    }
+    let measured = run measurePath(&entry.path, true)
+    let mut mtime: i64 = 0
+    if let Option<Path>.Some { value: marker } = move run joinOptional(&entry.path, b".complete") {
+      if let Option<i64>.Some { value } = run modifiedSeconds(&marker) {
+        mtime = value
+      }
+    }
+    if mtime == 0 {
+      if let Option<i64>.Some { value } = run modifiedSeconds(&entry.path) {
+        mtime = value
+      }
+    }
+    if mtime > 0 && mtime >= graceCutoff {
+      protectedBytes.* = protectedBytes.* + measured.bytes
+    } else if let Result<Path, FileError | OutOfMemoryError>.Success {
+      value: copied
+    } = move run Effect.result(Path.fromBytes(Path.rawBytes(&entry.path))) {
+      run items.append(
+        Evictable {
+          path: move copied,
+          companion: Option<Path>.none(),
+          isDirectory: true,
+          bytes: measured.bytes,
+          mtime: mtime,
+        },
+      )
+    }
+  }
+}
+
+effect fn collectSemanticEntries(
+  semanticRoot: &Path,
+  graceCutoff: i64,
+  items: &mut List<Evictable>,
+  protectedBytes: &mut u64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let compilers = run listEntries(semanticRoot)
+  let compilerSlice = compilers.asSlice()
+  let mut c = usize.ZERO
+  while c < compilerSlice.length {
+    let comp = &compilerSlice[c]
+    c = c + usize.ONE
+    if comp.kind.code != FileSystem.directory().code {
+      continue
+    }
+    if let Option<Path>.Some { value: packs } = move run joinOptional(&comp.path, b"packs") {
+      run collectShardedFiles(&packs, false, graceCutoff, &mut items.*, &mut protectedBytes.*)
+    }
+    if let Option<Path>.Some { value: scopes } = move run joinOptional(&comp.path, b"scopes") {
+      let scopeEntries = run listEntries(&scopes)
+      let scopeSlice = scopeEntries.asSlice()
+      let mut s = usize.ZERO
+      while s < scopeSlice.length {
+        let entry = &scopeSlice[s]
+        s = s + usize.ONE
+        if entry.kind.code != FileSystem.directory().code {
+          continue
+        }
+        let measured = run measurePath(&entry.path, true)
+        if run scopeBusy(&entry.path) {
+          protectedBytes.* = protectedBytes.* + measured.bytes
+          continue
+        }
+        let mtime = run newestMtime(&entry.path)
+        if mtime > 0 && mtime >= graceCutoff {
+          protectedBytes.* = protectedBytes.* + measured.bytes
+        } else if let Result<Path, FileError | OutOfMemoryError>.Success {
+          value: copied
+        } = move run Effect.result(Path.fromBytes(Path.rawBytes(&entry.path))) {
+          run items.append(
+            Evictable {
+              path: move copied,
+              companion: Option<Path>.none(),
+              isDirectory: true,
+              bytes: measured.bytes,
+              mtime: mtime,
+            },
+          )
+        }
+      }
+    }
+  }
+}
+
+effect fn newestMtime(directory: &Path) -> i64
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut newest: i64 = match run modifiedSeconds(directory) {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => 0
+  }
+  let entries = run listEntries(directory)
+  let listed = entries.asSlice()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<i64>.Some { value } = run modifiedSeconds(&listed[at].path) {
+      if value > newest {
+        newest = value
+      }
+    }
+    at = at + usize.ONE
+  }
+  return newest
+}
+
+// Bottom-up merge sort of indices into `items` by ascending `mtime` (oldest first).
+effect fn sortedOrderByMtime(items: &[Evictable]) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = items.length
+  let mut order = List<usize>.make()
+  let mut scratch = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run order.append(at)
+    run scratch.append(at)
+    at = at + usize.ONE
+  }
+  let mut width = usize.ONE
+  while width < count {
+    let mut left = usize.ZERO
+    while left < count {
+      let mut mid = left + width
+      if mid > count {
+        mid = count
+      }
+      let mut right = mid + width
+      if right > count {
+        right = count
+      }
+      let mut i = left
+      let mut j = mid
+      let mut out = left
+      while i < mid && j < right {
+        let li = order.get(i)
+        let ri = order.get(j)
+        if items[li].mtime <= items[ri].mtime {
+          scratch.set(out, li)
+          i = i + usize.ONE
+        } else {
+          scratch.set(out, ri)
+          j = j + usize.ONE
+        }
+        out = out + usize.ONE
+      }
+      while i < mid {
+        scratch.set(out, order.get(i))
+        i = i + usize.ONE
+        out = out + usize.ONE
+      }
+      while j < right {
+        scratch.set(out, order.get(j))
+        j = j + usize.ONE
+        out = out + usize.ONE
+      }
+      left = right
+    }
+    let swapped = move order
+    order = move scratch
+    scratch = move swapped
+    width = width * 2
+  }
+  return move order
+}
+
+effect fn listEntries(directory: &Path) -> List<DirectoryEntry>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.listDirectory(directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+        List<DirectoryEntry>.make()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn joinOptional(base: &Path, relative: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(Path.joinBytes(base, relative)) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+fn listedName(names: &[Bytes], name: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < names.length {
+    if same(names[at].asSlice(), name) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn endsIn(text: &[u8], suffix: &[u8]) -> bool {
+  if text.length < suffix.length {
+    return false
+  }
+  return same(Slice.view<u8>(text, text.length - suffix.length, suffix.length), suffix)
+}
+
+fn hexDigit(value: u64) -> u8 {
+  if value < 10 {
+    return u64.toU8(value) + 48
+  }
+  return u64.toU8(value) + 87
+}
+
+effect fn appendHex(output: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut at = usize.ZERO
+  while at < 16 {
+    digits[at] = hexDigit(u64.bitAnd(u64.shiftRight(value, usize.toU64((15 - at) * 4)), 15))
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut output.*, &digits)
+}
+
+effect fn appendDecimal(out: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendDecimal(&mut out.*, value / 10)
+  }
+  let digit: [u8; 1] = [u64.toU8(48 + value % 10)]
+  return run Bytes.append(&mut out.*, &digit)
+}

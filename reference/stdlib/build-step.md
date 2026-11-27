@@ -1110,11 +1110,7 @@ Executes a declared program through a declared sandbox launcher with only keyed 
 ### Method `execShown`
 
 ```silk
-pub effect fn execShown(
-    self: &mut Self,
-    program: &Deferred<Path>,
-    arguments: &[string],
-  ) -> i32
+pub effect fn execShown(self: &mut Self, program: &Deferred<Path>, arguments: &[string]) -> i32
     ! StepFailure
     ? &mut Allocator
 ```
@@ -1294,6 +1290,20 @@ pub effect fn make(root: Path, cache: Path, identity: &[u8]) -> Self
 
 Sets the package root, cache directory, and identity of the task program and compiler.
 The caller must include both executables' content digests in `identity`.
+
+<a id="Runner.impl.excludingOutput"></a>
+
+### Method `excludingOutput`
+
+```silk
+pub fn excludingOutput(self: Self, output: Path) -> Self
+```
+
+Sets the project output directory excluded when fingerprinting package trees.
+
+Without this call, the runner excludes the parent directory of its step cache directory,
+which matches a workspace-local `<output>/steps` layout. Set this explicitly when the step
+cache lives outside the project's build output directory, such as in a shared system cache.
 
 <a id="Runner.impl.linking"></a>
 
