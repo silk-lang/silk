@@ -3176,7 +3176,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(sourcesRoot, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n\n[dependencies]\nclib = { path = "../clib" }\n')
   yield* fs.writeFileString(join(sourcesRoot, 'app/main.silk'), 'import clib.Clib\n\npub fn main() -> i32 {\n  return Clib.value()\n}\n')
   const compiledApp = join(sourcesRoot, 'app')
-  const sourcesEnvironment = { ...process.env, SILK_CLANG: clang }
+  const sourcesEnvironment = { ...process.env, SILK_CLANG: clang, SILK_CACHE_MODE: 'workspace' }
   const nativeCache = join(compiledApp, `build/${hostTarget}/dev/app.native`)
   const nativeObjects = Effect.fnUntraced(function* () {
     return (yield* fs.readDirectory(nativeCache)).filter((name) => name.endsWith('.o')).sort()
