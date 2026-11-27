@@ -1,0 +1,169 @@
+//! Shared cache inspection, LRU/age eviction, concurrent grace-window protection, compiler-tag
+//! pruning, and full cleanup.
+
+import driver.CacheGc
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.testing.testing { AssertionError, Testing }
+
+static if Intrinsic.targetOperatingSystem() == "linux"
+  || Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.file { NativeFile, Timestamp }
+}
+
+fn temporaryParent() -> string<'static> {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return "/private/tmp"
+  } else {
+    return "/tmp"
+  }
+}
+
+effect fn ignoreCleanup(error: FileError | OutOfMemoryError) -> () {
+  drop error
+  return ()
+}
+
+effect fn cleanup(path: &Path) -> ()
+  ? &mut FileSystem | &mut Allocator {
+  return run Effect.catchAll(FileSystem.removeDirectoryRecursively(path), ignoreCleanup)
+}
+
+effect fn setAgeSeconds(path: &Path, now: i64, ageSeconds: i64) -> () {
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    let target = now - ageSeconds
+    let ts = Timestamp { seconds: target, nanoseconds: 0 }
+    drop run Effect.result(NativeFile.setTimes(Path.rawBytes(path), ts, ts, true))
+  }
+}
+
+effect fn writeBytes(path: &Path, count: usize, fill: u8) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut payload = Bytes.make()
+  let mut i = usize.ZERO
+  while i < count {
+    run Bytes.append(&mut payload, &[fill])
+    i = i + usize.ONE
+  }
+  run FileSystem.writeFileWithParents(path, payload.asSlice())
+}
+
+effect fn claims(root: &Path) -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  // Populate sharded objects, native object + companion headers, and semantic compiler tags.
+  let objOld = run Path.join(root, "objects/aa/aa000001.o")
+  let objMid = run Path.join(root, "objects/bb/bb000002.o")
+  let objFresh = run Path.join(root, "objects/cc/cc000003.o")
+  let natObj = run Path.join(root, "native/dd/dd000004.o")
+  let natHeaders = run Path.join(root, "native/dd/dd000004.headers")
+  run writeBytes(&objOld, 1000, 65)
+  run writeBytes(&objMid, 1000, 66)
+  run writeBytes(&objFresh, 1000, 67)
+  run writeBytes(&natObj, 800, 68)
+  run writeBytes(&natHeaders, 200, 69)
+
+  // Three 16-char semantic compiler tags; keeping 2 should prune the oldest (`2222222222222222`).
+  let compList = run Path.join(root, "semantic/compilers")
+  run FileSystem.writeFileWithParents(
+    &compList,
+    b"0000000000000001\n0000000000000002\n0000000000000003\n",
+  )
+  let compNewFile = run Path.join(root, "semantic/0000000000000001/scopes/app-1/image")
+  let compMidFile = run Path.join(root, "semantic/0000000000000002/scopes/app-1/image")
+  let compOldFile = run Path.join(root, "semantic/0000000000000003/scopes/app-1/image")
+  run writeBytes(&compNewFile, 100, 70)
+  run writeBytes(&compMidFile, 100, 71)
+  run writeBytes(&compOldFile, 500, 72)
+
+  // Inspect accounts for each category accurately.
+  let stats = run CacheGc.inspect(root)
+  run Testing.expect(
+    stats.objectsBytes == 3000 && stats.nativeBytes == 1000 && stats.totalBytes >= 4700
+      && stats.files >= 9,
+    "inspect reports byte totals by cache category",
+  )
+
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    if let Option<i64>.Some { value: now } = run CacheGc.nowSeconds() {
+      // objOld: 40 days old; objMid: 5 days old; natObj+headers: 3 days old; objFresh: 10s old (in grace window).
+      run setAgeSeconds(&objOld, now, 40 * 86400)
+      run setAgeSeconds(&objMid, now, 5 * 86400)
+      run setAgeSeconds(&natObj, now, 3 * 86400)
+      run setAgeSeconds(&natHeaders, now, 3 * 86400)
+      run setAgeSeconds(&objFresh, now, 10)
+      run setAgeSeconds(&compNewFile, now, 10)
+      run setAgeSeconds(&compMidFile, now, 10)
+      run setAgeSeconds(&compOldFile, now, 5 * 86400)
+
+      // 1. Automatic sweep with respectGrace=true, maxBytes=2200, maxAgeDays=30, keptCompilers=2:
+      //    - Prunes compiler 3 (beyond keptCompilers=2)
+      //    - Age-evicts objOld (>30 days)
+      //    - Size-evicts objMid (oldest remaining outside grace) so remaining <= 2200
+      //    - Preserves objFresh (inside 1-hour grace window) and natObj/natHeaders
+      let autoReport = run CacheGc.prune(root, 2200, 30, 2, true)
+      let hasOld = run FileSystem.exists(&objOld)
+      let hasMid = run FileSystem.exists(&objMid)
+      let hasFresh = run FileSystem.exists(&objFresh)
+      let hasNat = run FileSystem.exists(&natObj)
+      let hasNatHeaders = run FileSystem.exists(&natHeaders)
+      let hasCompOld = run FileSystem.exists(&compOldFile)
+      let hasCompNew = run FileSystem.exists(&compNewFile)
+      let hasCompMid = run FileSystem.exists(&compMidFile)
+      run Testing.expect(
+        !hasCompOld && hasCompNew && hasCompMid,
+        "prunes compiler directories beyond keptCompilers",
+      )
+      run Testing.expect(!hasOld && !hasMid, "evicts aged and oldest entries above maxBytes")
+      run Testing.expect(
+        hasFresh && hasNat && hasNatHeaders,
+        "preserves grace-window and remaining entries within budget",
+      )
+      run Testing.expect(
+        autoReport.removedFiles >= 2 && autoReport.removedDirectories >= 1,
+        "prune report counts removed files and directories",
+      )
+
+      // 2. Manual prune with respectGrace=false and maxBytes=0 evicts everything including recent entries
+      //    and removes native companion .headers together with .o.
+      let manualReport = run CacheGc.prune(root, 0, 30, 2, false)
+      let hasFreshAfter = run FileSystem.exists(&objFresh)
+      let hasNatAfter = run FileSystem.exists(&natObj)
+      let hasNatHeadersAfter = run FileSystem.exists(&natHeaders)
+      run Testing.expect(
+        !hasFreshAfter && !hasNatAfter && !hasNatHeadersAfter && manualReport.freedBytes >= 2000,
+        "manual prune ignores the grace window and removes native .o/.headers pairs together",
+      )
+    }
+  }
+
+  // 3. cleanAll removes the entire cache directory cleanly.
+  run Testing.expect(run CacheGc.cleanAll(root), "cleanAll succeeds")
+  run Testing.expect(!run FileSystem.exists(root), "cleanAll removes the cache root directory")
+}
+
+effect fn exercise() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let parent = run Path.make(temporaryParent())
+  let temporary = run FileSystem.temporaryDirectory(&parent, "silk-cache-gc-case")
+  return run Effect.ensuring(claims(&temporary.path), cleanup(&temporary.path))
+}
+
+test effect fn cacheGcInspectPruneAndClean() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)
+  return run exercise()
+    |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

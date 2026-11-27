@@ -114,7 +114,9 @@ impl Path
 ### Associated function `make`
 
 ```silk
-pub effect fn make(value: string) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect fn make(value: string) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns a copy of `value` as a [`Path`](#Path).
@@ -134,7 +136,9 @@ contain NUL, empty components, `.`, or `..`. To interpret `.` and `..`, use [`Pa
 ### Associated function `fromBytes`
 
 ```silk
-pub effect fn fromBytes(values: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect fn fromBytes(values: &[u8]) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns a copy of `values` as a [`Path`](#Path). The bytes do not have to be valid UTF-8.
@@ -159,7 +163,9 @@ contain NUL, empty components, `.`, or `..`. The result can have no text view.
 ### Associated function `root`
 
 ```silk
-pub effect fn root() -> Path ! OutOfMemoryError ? &mut Allocator
+pub effect fn root() -> Path
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns the root path `/`.
@@ -224,10 +230,9 @@ For the root, the result is empty text. It does not allocate.
 ### Associated function `join`
 
 ```silk
-pub effect fn join(
-    base: &Path,
-    fragment: string
-  ) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect fn join(base: &Path, fragment: string) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns `base` followed by `/` and `fragment`.
@@ -248,10 +253,9 @@ interpret `.` and `..`, use [`Path.resolve`](#Path.impl.resolve).
 ### Associated function `joinUtf8`
 
 ```silk
-pub effect fn joinUtf8(
-    base: &Path,
-    fragment: &[u8]
-  ) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect fn joinUtf8(base: &Path, fragment: &[u8]) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns `base` followed by `/` and `fragment`, where `fragment` is bytes that must be valid
@@ -272,10 +276,9 @@ Use it for a name that you got as bytes, when the result must have a text view.
 ### Associated function `joinBytes`
 
 ```silk
-pub effect fn joinBytes(
-    base: &Path,
-    fragment: &[u8]
-  ) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect fn joinBytes(base: &Path, fragment: &[u8]) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns `base` followed by `/` and `fragment`. The bytes do not have to be valid UTF-8.
@@ -295,10 +298,9 @@ Use it for a name from a directory listing on the host, to keep the exact bytes.
 ### Associated function `resolve`
 
 ```silk
-pub effect fn resolve(
-    base: &Path,
-    relativeText: string
-  ) -> Path ! FileError | OutOfMemoryError ? &mut Allocator
+pub effect fn resolve(base: &Path, relativeText: string) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns the path that `relativeText` names when you start at `base`.
@@ -322,7 +324,8 @@ computes the path. It does not access the file system, so it does not follow lin
 
 ```silk
 pub effect fn resolveBytes(base: &Path, relative: &[u8]) -> Path
-  ! FileError | OutOfMemoryError ? &mut Allocator
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Resolves relative host bytes against `base` without interpreting their text encoding.
@@ -343,9 +346,9 @@ and a trailing separator are accepted. Other bytes are preserved without accessi
 ### Method `parent`
 
 ```silk
-pub effect fn parent(
-    self: &Self
-  ) -> Option<Path> ! OutOfMemoryError ? &mut Allocator
+pub effect fn parent(self: &Self) -> Option<Path>
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Returns the parent of the path. Returns an absent option for the root.
@@ -477,7 +480,9 @@ impl Debug for FileOperation
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 Writes the name of the code, such as `ReadFile`, or the code when it has no name.
@@ -516,7 +521,9 @@ impl Debug for FileReason
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 Writes the name of the code, such as `NotFound`, or the code when it has no name.
@@ -570,7 +577,9 @@ impl Debug for FileError
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 Writes the fields, as `FileError { operation: ReadFile, reason: NotFound, providerCode: 2 }`.
@@ -700,7 +709,9 @@ impl Debug for AtomicWriteError
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 Writes the fields, as `AtomicWriteError { published: ..., cause: ..., ... }`.
@@ -751,9 +762,9 @@ done.
 ### Operation `readFile`
 
 ```silk
-effect fn readFile(
-    path: &Path
-  ) -> Bytes ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+effect fn readFile(path: &Path) -> Bytes
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Returns a copy of the contents of the regular file at `path`.
@@ -821,8 +832,10 @@ effect fn writeFileAtomic(
     path: &Path,
     bytes: &[u8],
     policy: PublicationPolicy,
-    durability: Durability
-  ) -> () ! AtomicWriteError ? &mut FileSystem
+    durability: Durability,
+  ) -> ()
+    ! AtomicWriteError
+    ? &mut FileSystem
 ```
 
 Writes `bytes` to `path` so that a reader sees either the old contents or all of the new
@@ -898,9 +911,9 @@ the file.
 ### Operation `listDirectory`
 
 ```silk
-effect fn listDirectory(
-    path: &Path
-  ) -> List<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+effect fn listDirectory(path: &Path) -> List<DirectoryEntry>
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Returns the direct children of the directory at `path`, sorted by path bytes.
@@ -972,10 +985,9 @@ Removes the empty directory at `path`.
 ### Operation `createTemporaryDirectory`
 
 ```silk
-effect fn createTemporaryDirectory(
-    parent: &Path,
-    prefix: &[u8]
-  ) -> Path ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+effect fn createTemporaryDirectory(parent: &Path, prefix: &[u8]) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Creates a new directory in `parent` with a unique name that starts with `prefix`, and returns
@@ -1415,10 +1427,9 @@ Returns the provider code of `error`, if it has one.
 ### Associated function `temporaryDirectory`
 
 ```silk
-pub effect fn temporaryDirectory(
-    parent: &Path,
-    prefix: string
-  ) -> TemporaryDirectory ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect fn temporaryDirectory(parent: &Path, prefix: string) -> TemporaryDirectory
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Creates a new directory in `parent` with a unique name that starts with `prefix`, and returns
@@ -1439,9 +1450,9 @@ Nothing removes the directory until you call [`FileSystem.release`](#FileSystem.
 ### Method `release`
 
 ```silk
-pub effect fn release(
-    self: TemporaryDirectory
-  ) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect fn release(self: TemporaryDirectory) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Removes the temporary directory and everything in it.
@@ -1466,9 +1477,8 @@ the failure.
 ### Method `releaseIgnored`
 
 ```silk
-pub effect fn releaseIgnored(
-    self: TemporaryDirectory
-  ) -> () ? &mut FileSystem | &mut Allocator
+pub effect fn releaseIgnored(self: TemporaryDirectory) -> ()
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Removes the temporary directory and everything in it, and ignores a failure.
@@ -1488,9 +1498,9 @@ that the protected code needs before you pass the owner to the finalizer.
 ### Associated function `removeDirectoryRecursively`
 
 ```silk
-pub effect fn removeDirectoryRecursively(
-    path: &Path
-  ) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect fn removeDirectoryRecursively(path: &Path) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Removes the directory at `path`, all files in it, and all directories in it.
@@ -1516,9 +1526,9 @@ of the tree stays.
 ### Associated function `createDirectoriesRecursively`
 
 ```silk
-pub effect fn createDirectoriesRecursively(
-    path: &Path
-  ) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect fn createDirectoriesRecursively(path: &Path) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Creates the directory `path` and each missing parent. Existing directories are kept.
@@ -1539,10 +1549,9 @@ the same time, the result depends on the provider.
 ### Associated function `writeFileWithParents`
 
 ```silk
-pub effect fn writeFileWithParents(
-    path: &Path,
-    bytes: &[u8]
-  ) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+pub effect fn writeFileWithParents(path: &Path, bytes: &[u8]) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator
 ```
 
 Creates the missing parent directories of `path` and then writes `bytes` to it with
@@ -1563,7 +1572,9 @@ It is not a transaction. If the write fails, the new parent directories stay.
 ### Associated function `exists`
 
 ```silk
-pub effect fn exists(path: &Path) -> bool ! FileError ? &mut FileSystem
+pub effect fn exists(path: &Path) -> bool
+    ! FileError
+    ? &mut FileSystem
 ```
 
 Returns `true` if a file or directory exists at `path`.

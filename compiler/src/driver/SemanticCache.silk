@@ -42,31 +42,33 @@
 //! ([`CacheFile.unsettled`]): the image it would write carries the build definitions of the file
 //! it read, not those the running write leaves.
 
-import backend.CodegenUnits {CodegenUnit}
+import backend.CodegenUnits { CodegenUnit }
+import driver.CacheGc
+import driver.CacheLayout
 import driver.CacheStamp
 import diagnostic.JsonText
-import driver.DetachedWriter as DetachedWriter {Handoff, Held}
-import driver.ImportSummaries as Summaries {ImportSummaries}
+import driver.DetachedWriter as DetachedWriter { Handoff, Held }
+import driver.ImportSummaries as Summaries { ImportSummaries }
 import semantic.BuildRecord
 import semantic.CacheImage
-import semantic.CacheImage {Merge as ImageMerge}
-import semantic.ContentHash {ContentHash}
+import semantic.CacheImage { Merge as ImageMerge }
+import semantic.ContentHash { ContentHash }
 import semantic.RuntimeEncoding
 import semantic.StableKey
-import semantic.Semantic {Adopted, Request, Semantic, recordsEscapeWalks}
-import semantic.Query {Cycle}
-import semantic.Types {Types}
-import silk.mem.allocator {Allocator, OutOfMemoryError}
-import silk.collections.bytes {Bytes}
-import silk.core.effect {Effect}
-import silk.system.filesystem {AtomicWriteError, DirectoryEntry, FileError, FileSystem, Path}
-import silk.text.string {String}
-import silk.collections.list {List}
-import silk.concurrency.thread_native {JoinHandle, NativeThread, SpawnError}
-import silk.core.option {Option}
-import silk.system.filesystem_machine {MachineFileSystem}
-import silk.core.result {Result}
-import silk.collections.slice {Slice}
+import semantic.Semantic { Adopted, Request, Semantic, recordsEscapeWalks }
+import semantic.Query { Cycle }
+import semantic.Types { Types }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.system.filesystem { AtomicWriteError, DirectoryEntry, FileError, FileSystem, Path }
+import silk.text.string { String }
+import silk.collections.list { List }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.core.option { Option }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
 import silk.num.u64
 import silk.num.u8
 import silk.num.usize
@@ -77,8 +79,13 @@ import silk.trace { Trace }
 /// store reused from it.
 pub struct CacheFile {
   path: Path,
-  // The directory of the pack bodies beside it.
+  // The directory of the pack bodies (per-image `.packs` in workspace mode, or shared sharded
+  // `semantic/<compiler>/packs` in shared mode).
   packs: Path,
+  // In shared mode, `<image>.packlist` naming the pack digests this image's build uses.
+  packList: Option<Path>,
+  // Whether this cache file lives in the shared system cache (`semantic/<compiler>/scopes/<scope>`).
+  shared: bool,
   // The lock file a write of it holds.
   lock: Path,
   // The lock file a write of it holds too unless a build writes it; a check's read waits on it.
@@ -102,11 +109,15 @@ pub struct CacheFile {
 }
 
 fn hexDigit(value: u64) -> u8 {
-  if value < 10 { return u64.toU8(value) + 48 }
+  if value < 10 {
+    return u64.toU8(value) + 48
+  }
   return u64.toU8(value) + 87
 }
 
-effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn appendHex(output: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut digits: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   let mut at = usize.ZERO
   while at < 16 {
@@ -119,59 +130,98 @@ effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &
 /// The directory of this compiler's cache files for `package` below the output directory `output`:
 /// `<output>/cache/<package>/<compiler>`, where `<compiler>` is 16 hex digits of
 /// `CacheStamp.tag`; none when no such path can be formed.
-pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn directory(output: &Path, package: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let tag = run CacheStamp.tag()
   let mut relative = run Bytes.copy(b"cache/")
   run Bytes.append(&mut relative, package)
   run Bytes.append(&mut relative, b"/")
   run appendHex(&mut relative, tag.high)
   return match move run Effect.result(Path.joinBytes(output, Bytes.asSlice(&relative))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
-// How many compilers keep cache files for one package: the ones that used theirs last.
-const keptCompilers: usize = 3
-
-// Records in its package's `compilers` file that this compiler, whose directory is `cache`, used
-// its files last: the file names the compilers that did, most recent first, `keptCompilers` at
-// most. When that changes the list, the package's directory keeps only the directories the list
-// names; another compiler's directory, or a file an earlier layout of the cache left there, is
-// removed. A compiler that already used its files last writes nothing.
-effect fn claim(cache: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let own = match Path.name(cache) {
-    Option<string>.Some {value} => String.utf8Bytes(value)
-    Option<string>.None => { return () }
-  }
-  let package = match move run Path.parent(cache) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
-  }
-  let listed = match move run Effect.result(Path.joinBytes(&package, b"compilers")) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+// Records in its `compilers` file that this compiler used its files last: the file names the
+// compilers that did, most recent first, `keptLimit` at most.
+// In workspace mode (`!shared`), `cache` is `<output>/cache/<package>/<compiler>` and the
+// `compilers` file lives in `<output>/cache/<package>`.
+// In shared mode (`shared`), `cache` is `<root>/semantic/<compiler>/scopes/<scope>` and the
+// `compilers` file lives globally in `<root>/semantic`.
+effect fn claim(cache: &Path, shared: bool, keptLimit: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut compilerDir = match move run Effect.result(Path.fromBytes(Path.rawBytes(cache))) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return ()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  if shared {
+    // `<root>/semantic/<compiler>/scopes/<scope>` -> parent `scopes` -> parent `<compiler>`.
+    let scopes = match move run Path.parent(&compilerDir) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return ()
+      }
+    }
+    compilerDir = match move run Path.parent(&scopes) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return ()
+      }
+    }
+  }
+  let own = match Path.name(&compilerDir) {
+    Option<string>.Some { value } => String.utf8Bytes(value)
+    Option<string>.None => {
+      return ()
+    }
+  }
+  let container = match move run Path.parent(&compilerDir) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
+  }
+  let listed = match move run Effect.result(Path.joinBytes(&container, b"compilers")) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let previous = match move run Effect.result(FileSystem.readFile(&listed)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         Bytes.make()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let mut kept = List<Bytes>.make()
@@ -185,8 +235,9 @@ effect fn claim(cache: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut 
       if start == usize.ZERO && same(name, own) {
         return ()
       }
+
       // Every name is a tag as long as this compiler's; a shorter one is a torn write.
-      if name.length == own.length && !same(name, own) && List<Bytes>.length(&kept) < keptCompilers {
+      if name.length == own.length && !same(name, own) && List<Bytes>.length(&kept) < keptLimit {
         run List<Bytes>.append(&mut kept, run Bytes.copy(name))
       }
       start = at + usize.ONE
@@ -202,22 +253,32 @@ effect fn claim(cache: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut 
     at = at + usize.ONE
   }
   match move run Effect.result(write(&listed, Bytes.asSlice(&written))) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure }
-      AtomicWriteError failure => { drop failure }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+      }
+      AtomicWriteError failure => {
+        drop failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
-  let present = run entries(&package)
+  let present = run entries(&container)
   let found = List<DirectoryEntry>.asSlice(&present)
   at = usize.ZERO
   while at < found.length {
     let entry = &found[at]
     at = at + usize.ONE
     let name = match Path.name(&entry.path) {
-      Option<string>.Some {value} => String.utf8Bytes(value)
-      Option<string>.None => { continue }
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => {
+        continue
+      }
     }
     if same(name, b"compilers") || listedName(names, name) {
       continue
@@ -243,15 +304,19 @@ fn listedName(names: &[Bytes], name: &[u8]) -> bool {
 
 /// Waits until no copy of an earlier build is writing a cache file below the output directory
 /// `output`, so the directory can be removed or moved whole.
-pub effect fn settle(output: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn settle(output: &Path) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let caches = match move run Effect.result(Path.joinBytes(output, b"cache")) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return ()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let packages = run entries(&caches)
@@ -265,7 +330,9 @@ pub effect fn settle(output: &Path) -> () ! OutOfMemoryError ? &mut FileSystem |
     let held = List<DirectoryEntry>.asSlice(&compilers)
     let mut compiler = usize.ZERO
     while compiler < held.length {
-      if held[compiler].kind.code == FileSystem.directory().code { run settleFiles(&held[compiler].path) }
+      if held[compiler].kind.code == FileSystem.directory().code {
+        run settleFiles(&held[compiler].path)
+      }
       compiler = compiler + usize.ONE
     }
     at = at + usize.ONE
@@ -273,26 +340,36 @@ pub effect fn settle(output: &Path) -> () ! OutOfMemoryError ? &mut FileSystem |
 }
 
 // Waits for each write of a cache file in `directory` that a copy of an earlier build still runs.
-effect fn settleFiles(directory: &Path) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn settleFiles(directory: &Path) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let files = run entries(directory)
   let held = List<DirectoryEntry>.asSlice(&files)
   let mut file = usize.ZERO
   while file < held.length {
-    if lockName(Path.rawBytes(&held[file].path)) { run DetachedWriter.waitFor(&held[file].path) }
+    if lockName(Path.rawBytes(&held[file].path)) {
+      run DetachedWriter.waitFor(&held[file].path)
+    }
     file = file + usize.ONE
   }
 }
 
 // The entries of `directory`; none when it cannot be listed.
-effect fn entries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn entries(directory: &Path) -> List<DirectoryEntry>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   return match move run Effect.result(FileSystem.listDirectory(directory)) {
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       FileError failure => {
         drop failure
         return List<DirectoryEntry>.make()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
@@ -300,9 +377,12 @@ effect fn entries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemoryError ?
 // Whether `path` names a cache file's lock file, its name and `.lock`.
 fn lockName(path: &[u8]) -> bool {
   let suffix = b".lock"
-  if path.length < suffix.length { return false }
+  if path.length < suffix.length {
+    return false
+  }
   let stem = path.length - suffix.length
-  return imageName(Slice.view<u8>(path, usize.ZERO, stem)) && same(Slice.view<u8>(path, stem, suffix.length), suffix)
+  return imageName(Slice.view<u8>(path, usize.ZERO, stem))
+    && same(Slice.view<u8>(path, stem, suffix.length), suffix)
 }
 
 /// A cache file read and decoded on a thread of its own ([`prefetch`]) while the build loads its
@@ -341,21 +421,36 @@ struct Fetched {
 /// store knows. A directory holding one file and no record for `profile` reads that file. None
 /// when `cache` cannot name the record; `openPrefetched` then reads the file itself, as it does
 /// when no thread starts or the threads read another file.
-pub effect fn prefetch(cache: &Path, building: bool, profile: &[u8]) -> Option<Prefetch> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn prefetch(
+  cache: &Path,
+  building: bool,
+  profile: &[u8],
+  sharedPacks: Option<&Path>,
+) -> Option<Prefetch>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let choice = match move run choicePath(cache, profile) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<Prefetch>.none() }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<Prefetch>.none()
+    }
   }
   let chosen = match move run Effect.result(FileSystem.readFile(&choice)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => {
-      if imageName(Bytes.asSlice(&value)) { Option<Bytes>.some(move value) } else { Option<Bytes>.none() }
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => {
+      if imageName(Bytes.asSlice(&value)) {
+        Option<Bytes>.some(move value)
+      } else {
+        Option<Bytes>.none()
+      }
     }
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         Option<Bytes>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let listed = run entries(cache)
@@ -366,84 +461,129 @@ pub effect fn prefetch(cache: &Path, building: bool, profile: &[u8]) -> Option<P
   while at < found.length {
     let path = Path.rawBytes(&found[at].path)
     at = at + usize.ONE
-    if !imageName(path) { continue }
+    if !imageName(path) {
+      continue
+    }
     images = images + usize.ONE
     let wanted = match &chosen {
-      Option<Bytes>.Some {value} => namedBy(path, Bytes.asSlice(&value))
+      Option<Bytes>.Some { value } => namedBy(path, Bytes.asSlice(&value))
       Option<Bytes>.None => true
     }
-    if wanted { named = Option<Bytes>.some(run Bytes.copy(path)) }
+    if wanted {
+      named = Option<Bytes>.some(run Bytes.copy(path))
+    }
   }
+
   // Without a record, a directory of several files leaves no way to tell which is this profile's.
   if let Option<Bytes>.None = &chosen {
-    if images > usize.ONE { named = Option<Bytes>.none() }
+    if images > usize.ONE {
+      named = Option<Bytes>.none()
+    }
   }
   let path = match move named {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<Prefetch>.some(Prefetch {choice: move choice, reading: Option<Reading>.none()}) }
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return Option<Prefetch>.some(
+        Prefetch { choice: move choice, reading: Option<Reading>.none() },
+      )
+    }
   }
-  return Option<Prefetch>.some(Prefetch {choice: move choice, reading: run startReading(move path, building)})
+  let copiedPacks = match sharedPacks {
+    Option<&Path>.Some { value } => Option<Bytes>.some(run Bytes.copy(Path.rawBytes(value)))
+    Option<&Path>.None => Option<Bytes>.none()
+  }
+  return Option<Prefetch>.some(
+    Prefetch {
+      choice: move choice,
+      reading: run startReading(move path, building, move copiedPacks),
+    },
+  )
 }
 
 // Starts the threads that read the image at `path`; none when either cannot start.
-effect fn startReading(path: Bytes, building: bool) -> Option<Reading> ! OutOfMemoryError ? &mut Allocator {
+effect fn startReading(path: Bytes, building: bool, sharedPacks: Option<Bytes>) -> Option<Reading>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let rootsPath = run Bytes.copy(Bytes.asSlice(&path))
-  let roots = match move run Effect.result(NativeThread.spawn(
-    || -> Option<CacheImage.Roots> {
-      return run fetchRootsDetached(move rootsPath, building)
-    }
-  )) {
-    Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Success {value} => move value
-    Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
+  let roots = match move run Effect.result(
+    NativeThread.spawn(
+      || -> Option<CacheImage.Roots> {
+        return run fetchRootsDetached(move rootsPath, building)
+      },
+    ),
+  ) {
+    Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Success {
+      value
+    } => move value
+    Result<JoinHandle<Option<CacheImage.Roots>>, OutOfMemoryError | SpawnError>.Failure {
+      error
+    } => match move error {
       SpawnError unstarted => {
         drop unstarted
         return Option<Reading>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let graphPath = run Bytes.copy(Bytes.asSlice(&path))
-  return match move run Effect.result(NativeThread.spawn(
-    || -> Option<Fetched> {
-      return run fetchDetached(move graphPath, building)
-    }
-  )) {
-    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success {value} => Option<Reading>.some(Reading {path: move path,
-      handle: move value, roots: move roots})
-    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Failure {error} => match move error {
+  return match move run Effect.result(
+    NativeThread.spawn(
+      || -> Option<Fetched> {
+        return run fetchDetached(move graphPath, building, move sharedPacks)
+      },
+    ),
+  ) {
+    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Success { value } => Option<
+      Reading
+    >.some(Reading { path: move path, handle: move value, roots: move roots })
+    Result<JoinHandle<Option<Fetched>>, OutOfMemoryError | SpawnError>.Failure {
+      error
+    } => match move error {
       SpawnError unstarted => {
         drop unstarted
         return Option<Reading>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 // The file in `cache` that names the image the target and profile `profile` last opened:
 // `profile-` and the hex of the digest of `profile`.
-effect fn choicePath(cache: &Path, profile: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn choicePath(cache: &Path, profile: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let digest = ContentHash.of(profile)
   let mut name = run Bytes.copy(b"profile-")
   run appendHex(&mut name, digest.high)
   run appendHex(&mut name, digest.low)
   return match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 // Whether the file at `path` has the name `name`.
 fn namedBy(path: &[u8], name: &[u8]) -> bool {
-  if path.length < name.length { return false }
+  if path.length < name.length {
+    return false
+  }
   let start = path.length - name.length
-  if start > usize.ZERO && path[start - usize.ONE] != 47 { return false }
+  if start > usize.ZERO && path[start - usize.ONE] != 47 {
+    return false
+  }
   return same(Slice.view<u8>(path, start, name.length), name)
 }
 
@@ -451,178 +591,277 @@ fn namedBy(path: &[u8], name: &[u8]) -> bool {
 fn imageName(path: &[u8]) -> bool {
   let prefix = b"semantic-"
   let length = prefix.length + 32
-  if path.length < length { return false }
+  if path.length < length {
+    return false
+  }
   let start = path.length - length
-  if start > usize.ZERO && path[start - usize.ONE] != 47 { return false }
+  if start > usize.ZERO && path[start - usize.ONE] != 47 {
+    return false
+  }
   let mut at = usize.ZERO
   while at < prefix.length {
-    if path[start + at] != prefix[at] { return false }
+    if path[start + at] != prefix[at] {
+      return false
+    }
     at = at + usize.ONE
   }
   at = start + prefix.length
   while at < path.length {
     let byte = path[at]
-    if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) { return false }
+    if !(byte >= 48 && byte <= 57) && !(byte >= 97 && byte <= 102) {
+      return false
+    }
     at = at + usize.ONE
   }
   return true
 }
 
 fn same(left: &[u8], right: &[u8]) -> bool {
-  if left.length != right.length { return false }
+  if left.length != right.length {
+    return false
+  }
   let mut at = usize.ZERO
   while at < left.length {
-    if left[at] != right[at] { return false }
+    if left[at] != right[at] {
+      return false
+    }
     at = at + usize.ONE
   }
   return true
 }
 
 // `fetch` on a thread of its own, with its own allocator and file system.
-effect fn fetchDetached(path: Bytes, building: bool) -> Option<Fetched> {
+effect fn fetchDetached(path: Bytes, building: bool, sharedPacks: Option<Bytes>) -> Option<
+  Fetched
+> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let fetched = run Effect.result(fetchOpened(&path, building) |> Effect.provideMut<Allocator>(&mut allocator))
+  let fetched = run Effect.result(
+    fetchOpened(&path, building, &sharedPacks) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
   return match move fetched {
-    Result<Option<Fetched>, OutOfMemoryError>.Success {value} => move value
-    Result<Option<Fetched>, OutOfMemoryError>.Failure {error} => {
+    Result<Option<Fetched>, OutOfMemoryError>.Success { value } => move value
+    Result<Option<Fetched>, OutOfMemoryError>.Failure { error } => {
       drop error
       return Option<Fetched>.none()
     }
   }
 }
 
-effect fn fetchOpened(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryError ? &mut Allocator {
+effect fn fetchOpened(path: &Bytes, building: bool, sharedPacks: &Option<Bytes>) -> Option<Fetched>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut files = run MachineFileSystem.make()
-  return run fetch(path, building) |> Effect.provideMut<FileSystem>(&mut files)
+  return run fetch(path, building, sharedPacks) |> Effect.provideMut<FileSystem>(&mut files)
 }
 
 // Reads and decodes the cache file at `path` under the stamp it was written with.
-effect fn fetch(path: &Bytes, building: bool) -> Option<Fetched> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn fetch(path: &Bytes, building: bool, sharedPacks: &Option<Bytes>) -> Option<Fetched>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let located = match move run Effect.result(Path.fromBytes(Bytes.asSlice(&path.*))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Fetched>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   run waitForWrite(Bytes.asSlice(&path.*), building)
   let mut unsettled = false
   if !building {
-    if let Option<Path>.Some {value: lock} = move run suffixed(Bytes.asSlice(&path.*), b".lock") { unsettled = run DetachedWriter.busy(&lock) }
+    if let Option<Path>.Some { value: lock } = move run suffixed(Bytes.asSlice(&path.*), b".lock") {
+      unsettled = run DetachedWriter.busy(&lock)
+    }
   }
   let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Fetched>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let stamp = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<Fetched>.none() }
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return Option<Fetched>.none()
+    }
   }
   let graph = match move run graphOf(move bytes, Bytes.asSlice(&stamp)) {
-    Option<CacheImage.Graph>.Some {value} => move value
-    Option<CacheImage.Graph>.None => { return Option<Fetched>.none() }
+    Option<CacheImage.Graph>.Some { value } => move value
+    Option<CacheImage.Graph>.None => {
+      return Option<Fetched>.none()
+    }
   }
   let mut packs = List<BuildRecord.PackBody>.make()
   if building {
-    let mut named = run Bytes.copy(Bytes.asSlice(&path.*))
-    run Bytes.append(&mut named, b".packs")
-    if let Result<Path, FileError | OutOfMemoryError>.Success {value: directory} = move run Effect.result(Path.fromBytes(Bytes.asSlice(&named))) {
-      packs = run readPacks(&directory)
+    if let Option<Bytes>.Some { value: packsBytes } = &sharedPacks.* {
+      if let Result<Path, FileError | OutOfMemoryError>.Success {
+        value: packsDir
+      } = move run Effect.result(Path.fromBytes(packsBytes.asSlice())) {
+        if let Option<Path>.Some { value: listPath } = move run suffixed(
+          Bytes.asSlice(&path.*),
+          b".packlist",
+        ) {
+          packs = run readSharedPacks(&packsDir, &listPath)
+        }
+      }
+    } else {
+      let mut named = run Bytes.copy(Bytes.asSlice(&path.*))
+      run Bytes.append(&mut named, b".packs")
+      if let Result<Path, FileError | OutOfMemoryError>.Success {
+        value: directory
+      } = move run Effect.result(Path.fromBytes(Bytes.asSlice(&named))) {
+        packs = run readPacks(&directory)
+      }
     }
   }
-  return Option<Fetched>.some(Fetched {path: run Bytes.copy(Bytes.asSlice(&path.*)), stamp: move stamp, graph: move graph, packs: move packs,
-    unsettled: unsettled})
+  return Option<Fetched>.some(
+    Fetched {
+      path: run Bytes.copy(Bytes.asSlice(&path.*)),
+      stamp: move stamp,
+      graph: move graph,
+      packs: move packs,
+      unsettled: unsettled,
+    },
+  )
 }
 
 // Waits for the writes of the cache file at `path` that a prefetch for a store that builds
 // (`building`) or only checks must not read past: a build waits for every write, a check only
 // for one that is not a build's.
-effect fn waitForWrite(path: &[u8], building: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn waitForWrite(path: &[u8], building: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut suffix = b".checks.lock"
-  if building { suffix = b".lock" }
-  if let Option<Path>.Some {value: lock} = move run suffixed(path, suffix) { run DetachedWriter.waitFor(&lock) }
+  if building {
+    suffix = b".lock"
+  }
+  if let Option<Path>.Some { value: lock } = move run suffixed(path, suffix) {
+    run DetachedWriter.waitFor(&lock)
+  }
 }
 
 // The graph file `bytes` under `stamp`. Its leaves past its anchors and its nodes stay in the file
 // until an adoption needs them (`CacheImage.readLeaves`, `CacheImage.readNodes`).
-effect fn graphOf(bytes: Bytes, stamp: &[u8]) -> Option<CacheImage.Graph> ! OutOfMemoryError ? &mut Allocator {
+effect fn graphOf(bytes: Bytes, stamp: &[u8]) -> Option<CacheImage.Graph>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let parts = match move run CacheImage.graphParts(Bytes.asSlice(&bytes), stamp) {
-    Option<CacheImage.GraphParts>.Some {value} => move value
-    Option<CacheImage.GraphParts>.None => { return Option<CacheImage.Graph>.none() }
+    Option<CacheImage.GraphParts>.Some { value } => move value
+    Option<CacheImage.GraphParts>.None => {
+      return Option<CacheImage.Graph>.none()
+    }
   }
   return match move run CacheImage.decodeSummary(Bytes.asSlice(&bytes), &parts) {
-    Option<CacheImage.Summary>.Some {value: read} => CacheImage.assembled(&parts, move read, move bytes)
+    Option<CacheImage.Summary>.Some { value: read } => CacheImage.assembled(
+      &parts,
+      move read,
+      move bytes,
+    )
     Option<CacheImage.Summary>.None => Option<CacheImage.Graph>.none()
   }
 }
 
-
 // `fetchRoots` on a thread of its own, with its own allocator and file system.
 effect fn fetchRootsDetached(path: Bytes, building: bool) -> Option<CacheImage.Roots> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let fetched = run Effect.result(fetchRootsOpened(&path, building) |> Effect.provideMut<Allocator>(&mut allocator))
+  let fetched = run Effect.result(
+    fetchRootsOpened(&path, building) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
   return match move fetched {
-    Result<Option<CacheImage.Roots>, OutOfMemoryError>.Success {value} => move value
-    Result<Option<CacheImage.Roots>, OutOfMemoryError>.Failure {error} => {
+    Result<Option<CacheImage.Roots>, OutOfMemoryError>.Success { value } => move value
+    Result<Option<CacheImage.Roots>, OutOfMemoryError>.Failure { error } => {
       drop error
       return Option<CacheImage.Roots>.none()
     }
   }
 }
 
-effect fn fetchRootsOpened(path: &Bytes, building: bool) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut Allocator {
+effect fn fetchRootsOpened(path: &Bytes, building: bool) -> Option<CacheImage.Roots>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut files = run MachineFileSystem.make()
   return run fetchRoots(path, building) |> Effect.provideMut<FileSystem>(&mut files)
 }
 
 // Reads and decodes the roots file beside the cache file at `path`, under the stamp it was
 // written with; joining it to the graph file checks they are one image's.
-effect fn fetchRoots(path: &Bytes, building: bool) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn fetchRoots(path: &Bytes, building: bool) -> Option<CacheImage.Roots>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   run waitForWrite(Bytes.asSlice(&path.*), building)
   return match move run rootsPath(Bytes.asSlice(&path.*)) {
-    Option<Path>.Some {value: located} => run readRoots(&located)
+    Option<Path>.Some { value: located } => run readRoots(&located)
     Option<Path>.None => Option<CacheImage.Roots>.none()
   }
 }
 
 // The roots the roots file at `path` holds under the stamp it was written with; none when it
 // cannot be read or decoded.
-effect fn readRoots(path: &Path) -> Option<CacheImage.Roots> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn readRoots(path: &Path) -> Option<CacheImage.Roots>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let bytes = match move run Effect.result(FileSystem.readFile(path)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<CacheImage.Roots>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let stamp = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<CacheImage.Roots>.none() }
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return Option<CacheImage.Roots>.none()
+    }
   }
   return run CacheImage.decodeRoots(Bytes.asSlice(&bytes), Bytes.asSlice(&stamp))
 }
 
-/// Opens the cache file of `store` in the cache directory `cache` ([`directory`]) and adopts what
-/// it still holds. `compiler` is the running compiler's identity, from `CacheStamp.compiler`. `linked` is whether the store
-/// will be revised, as `Semantic.adoptCache` takes it. A store that will build reads the pack
-/// bodies too (`building`), which `Semantic.offerPacks` takes.
+/// Opens the cache file of `store` in the cache directory `cache` and adopts what it still holds.
+/// `compiler` is the running compiler's identity, from `CacheStamp.compiler`. `linked` is whether
+/// the store will be revised, as `Semantic.adoptCache` takes it. A store that will build reads the
+/// pack bodies too (`building`), which `Semantic.offerPacks` takes. Pass `sharedPacks` (`Some`) in
+/// shared mode or `None` in workspace mode.
 @trace(name: "cache")
-pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool)
-  -> Option<CacheFile>
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
-  return run openPrefetched(&mut store.*, request, cache, compiler, linked, building, Option<Prefetch>.none(), &[], &[])
+pub effect fn open(
+  store: &mut Semantic,
+  request: &Request,
+  cache: &Path,
+  compiler: &[u8],
+  linked: bool,
+  building: bool,
+  sharedPacks: Option<&Path>,
+  keptCompilers: usize,
+) -> Option<CacheFile>
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  return run openPrefetched(
+    &mut store.*,
+    request,
+    cache,
+    compiler,
+    linked,
+    building,
+    Option<Prefetch>.none(),
+    &[],
+    &[],
+    sharedPacks,
+    keptCompilers,
+  )
 }
 
 /// As [`open`], taking what `prefetched` read when it read the file the store names under the
@@ -639,10 +878,23 @@ pub effect fn open(store: &mut Semantic, request: &Request, cache: &Path, compil
 /// waits unless the write is a build's and the file as it stands holds a check's escape walks; it
 /// then adopts the file as it stands and marks it `unsettled`.
 @trace(name: "cache")
-pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Path, compiler: &[u8], linked: bool, building: bool,
-  prefetched: Option<Prefetch>, dependencies: &[Path], runtime: &[Path]) -> Option<CacheFile>
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
-  run claim(cache)
+pub effect fn openPrefetched(
+  store: &mut Semantic,
+  request: &Request,
+  cache: &Path,
+  compiler: &[u8],
+  linked: bool,
+  building: bool,
+  prefetched: Option<Prefetch>,
+  dependencies: &[Path],
+  runtime: &[Path],
+  sharedPacks: Option<&Path>,
+  keptCompilers: usize,
+) -> Option<CacheFile>
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let shared = sharedPacks.isSome()
+  run claim(cache, shared, keptCompilers)
   let stamp = run CacheStamp.stamp(&store.*, compiler)
   let identity = run Semantic.stampIdentity(&store.*)
   let digest = ContentHash.of(Bytes.asSlice(&identity))
@@ -650,89 +902,164 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
   run appendHex(&mut name, digest.high)
   run appendHex(&mut name, digest.low)
   let path = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<CacheFile>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let imageFile = run Bytes.copy(Bytes.asSlice(&name))
   let mut lockName = run Bytes.copy(Bytes.asSlice(&name))
-  run Bytes.append(&mut name, b".packs")
-  let packs = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => {
-        drop failure
-        return Option<CacheFile>.none()
+  let mut packList = Option<Path>.none()
+  let packs = match sharedPacks {
+    Option<&Path>.Some { value: sharedDir } => {
+      let mut listName = run Bytes.copy(Bytes.asSlice(&imageFile))
+      run Bytes.append(&mut listName, b".packlist")
+      if let Result<Path, FileError | OutOfMemoryError>.Success {
+        value: listPath
+      } = move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&listName))) {
+        packList = Option<Path>.some(move listPath)
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      match move run Effect.result(Path.fromBytes(Path.rawBytes(sharedDir))) {
+        Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+        Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+          FileError failure => {
+            drop failure
+            return Option<CacheFile>.none()
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+    }
+    Option<&Path>.None => {
+      run Bytes.append(&mut name, b".packs")
+      match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&name))) {
+        Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+        Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+          FileError failure => {
+            drop failure
+            return Option<CacheFile>.none()
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
     }
   }
   run Bytes.append(&mut lockName, b".lock")
   let lock = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&lockName))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<CacheFile>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let mut checksName = run Bytes.copy(Bytes.asSlice(&imageFile))
   run Bytes.append(&mut checksName, b".checks.lock")
   let checksLock = match move run Effect.result(Path.joinBytes(cache, Bytes.asSlice(&checksName))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<CacheFile>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
-  let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
+  let mut adopted = Adopted {
+    roots: usize.ZERO,
+    stale: usize.ZERO,
+    nodes: usize.ZERO,
+    changedLeaves: usize.ZERO,
+  }
   let mut fetched = Option<Fetched>.none()
   let mut fetchedRoots = Option<CacheImage.Roots>.none()
-  if let Option<Prefetch>.Some {value: started} = move prefetched {
-    let Prefetch {choice, reading} = move started
+  if let Option<Prefetch>.Some { value: started } = move prefetched {
+    let Prefetch { choice, reading } = move started
     let mut guessed = false
-    if let Option<Reading>.Some {value: read} = move reading {
-      let Reading {path: readPath, handle, roots: rootsHandle} = move read
+    if let Option<Reading>.Some { value: read } = move reading {
+      let Reading { path: readPath, handle, roots: rootsHandle } = move read
       guessed = same(Bytes.asSlice(&readPath), Path.rawBytes(&path))
       fetched = handle.join()
       fetchedRoots = rootsHandle.join()
     }
+
     // The next prefetch for this profile reads this file.
-    if !guessed { run remember(&choice, Bytes.asSlice(&imageFile)) }
+    if !guessed {
+      run remember(&choice, Bytes.asSlice(&imageFile))
+    }
   }
-  if let Option<Fetched>.Some {value: read} = move fetched {
-    if same(Bytes.asSlice(&read.path), Path.rawBytes(&path)) && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
-      let Fetched {path: _, stamp: _, graph, packs: bodies, unsettled: early} = move read
+  if let Option<Fetched>.Some { value: read } = move fetched {
+    if same(Bytes.asSlice(&read.path), Path.rawBytes(&path))
+      && same(Bytes.asSlice(&read.stamp), Bytes.asSlice(&stamp)) {
+      let Fetched { path: _, stamp: _, graph, packs: bodies, unsettled: early } = move read
+
       // Whether a check read the file while a build's write of it was running.
       let unsettled = !building && (early || run DetachedWriter.busy(&lock))
-      if let Option<CacheImage.Roots>.Some {value: roots} = move fetchedRoots {
-        if let Option<CacheImage.Image>.Some {value: whole} = move CacheImage.joined(move graph, move roots) {
+      if let Option<CacheImage.Roots>.Some { value: roots } = move fetchedRoots {
+        if let Option<CacheImage.Image>.Some { value: whole } = move CacheImage.joined(
+          move graph,
+          move roots,
+        ) {
           // A file read beside a build's write serves a check only when it holds a check's walks.
           // One that holds none, as after a first build, is read again once the write is done.
           if !unsettled || recordsEscapeWalks(&whole) {
+            if shared {
+              run CacheGc.touchIfStale(&path)
+            }
             let mut offered = move bodies
             let mut borrowed = false
             let mut image = move whole
             if building {
               let own = move image
-              image = run withSiblingBuild(&store.*, compiler, &path, runtime, move own, &mut offered, &mut borrowed)
+              image = run withSiblingBuild(
+                &store.*,
+                compiler,
+                &path,
+                runtime,
+                sharedPacks,
+                move own,
+                &mut offered,
+                &mut borrowed,
+              )
               Semantic.offerPacks(&mut store.*, move offered)
             }
             adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
-            if borrowed { Semantic.borrowBuildRecord(&mut store.*) }
+            if borrowed {
+              Semantic.borrowBuildRecord(&mut store.*)
+            }
             traceAdopted(&adopted, true)
-            return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, checksLock: move checksLock,
-              building: building, stamp: move stamp, adopted: move adopted, own: true, unsettled: unsettled, borrowed: borrowed})
+            return Option<CacheFile>.some(
+              CacheFile {
+                path: move path,
+                packs: move packs,
+                packList: move packList,
+                shared: shared,
+                lock: move lock,
+                checksLock: move checksLock,
+                building: building,
+                stamp: move stamp,
+                adopted: move adopted,
+                own: true,
+                unsettled: unsettled,
+                borrowed: borrowed,
+              },
+            )
           }
         }
       }
@@ -740,41 +1067,91 @@ pub effect fn openPrefetched(store: &mut Semantic, request: &Request, cache: &Pa
   }
   run DetachedWriter.waitFor(&lock)
   let mut offered = List<BuildRecord.PackBody>.make()
-  if building { offered = run readPacks(&packs) }
+  if building {
+    if shared {
+      if let Option<Path>.Some { value: listPath } = &packList {
+        offered = run readSharedPacks(&packs, &listPath)
+      }
+    } else {
+      offered = run readPacks(&packs)
+    }
+  }
   let mut own = false
   let mut borrowed = false
-  if let Option<CacheImage.Image>.Some {value: read} = move run readImage(&path, Bytes.asSlice(&stamp)) {
+  if let Option<CacheImage.Image>.Some { value: read } = move run readImage(
+    &path,
+    Bytes.asSlice(&stamp),
+  ) {
+    if shared {
+      run CacheGc.touchIfStale(&path)
+    }
     let mut image = move read
     if building {
       let held = move image
-      image = run withSiblingBuild(&store.*, compiler, &path, runtime, move held, &mut offered, &mut borrowed)
+      image = run withSiblingBuild(
+        &store.*,
+        compiler,
+        &path,
+        runtime,
+        sharedPacks,
+        move held,
+        &mut offered,
+        &mut borrowed,
+      )
       Semantic.offerPacks(&mut store.*, move offered)
     }
     adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
     own = true
   } else {
-    let walked = run markedImage(b"runtime-", &path, runtime)
+    let walked = run markedImage(b"runtime-", &path, runtime, shared)
     let mut found = run dependencyImage(&store.*, compiler, dependencies, &walked)
     if building {
       let held = match move found {
-        Option<CacheImage.Image>.Some {value} => move value
+        Option<CacheImage.Image>.Some { value } => move value
         Option<CacheImage.Image>.None => CacheImage.make()
       }
-      let joined = run withSiblingBuild(&store.*, compiler, &path, runtime, move held, &mut offered, &mut borrowed)
+      let joined = run withSiblingBuild(
+        &store.*,
+        compiler,
+        &path,
+        runtime,
+        sharedPacks,
+        move held,
+        &mut offered,
+        &mut borrowed,
+      )
       found = Option<CacheImage.Image>.none()
-      if List<CacheImage.Root>.length(&joined.roots) > usize.ZERO { found = Option<CacheImage.Image>.some(move joined) }
+      if List<CacheImage.Root>.length(&joined.roots) > usize.ZERO {
+        found = Option<CacheImage.Image>.some(move joined)
+      }
       Semantic.offerPacks(&mut store.*, move offered)
     }
-    if let Option<CacheImage.Image>.Some {value: image} = move found {
+    if let Option<CacheImage.Image>.Some { value: image } = move found {
       // The image is held as if read from this file, so the checks adopted from it are carried
       // into the file the store writes.
       adopted = run Semantic.adoptImage(&mut store.*, request, move image, linked)
     }
   }
-  if borrowed { Semantic.borrowBuildRecord(&mut store.*) }
+  if borrowed {
+    Semantic.borrowBuildRecord(&mut store.*)
+  }
   traceAdopted(&adopted, own)
-  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, lock: move lock, checksLock: move checksLock,
-    building: building, stamp: move stamp, adopted: move adopted, own: own, unsettled: false, borrowed: borrowed})
+  return Option<CacheFile>.some(
+    CacheFile {
+      path: move path,
+      packs: move packs,
+      packList: move packList,
+      shared: shared,
+      lock: move lock,
+      checksLock: move checksLock,
+      building: building,
+      stamp: move stamp,
+      adopted: move adopted,
+      own: own,
+      unsettled: false,
+      borrowed: borrowed,
+    },
+  )
 }
 
 // Says on the `cache` span what the store took from the file: the module checks it reused and
@@ -796,33 +1173,56 @@ fn traceAdopted(adopted: &Adopted, own: bool) -> () {
 // build that reaches the same instance emits the same text. `offered` gains the sibling's pack
 // bodies and `borrowed` is set. `image` is returned as it is when it holds a build record of its
 // own, when no sibling built, or when an image does not read.
-effect fn withSiblingBuild(store: &Semantic, compiler: &[u8], path: &Path, loaded: &[Path], image: CacheImage.Image,
-  offered: &mut List<BuildRecord.PackBody>, borrowed: &mut bool) -> CacheImage.Image
-  ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if Semantic.holdsBuildRecord(&image) { return move image }
-  let built = match move run markedImage(b"built-", path, loaded) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return move image }
+effect fn withSiblingBuild(
+  store: &Semantic,
+  compiler: &[u8],
+  path: &Path,
+  loaded: &[Path],
+  sharedPacks: Option<&Path>,
+  image: CacheImage.Image,
+  offered: &mut List<BuildRecord.PackBody>,
+  borrowed: &mut bool,
+) -> CacheImage.Image
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if Semantic.holdsBuildRecord(&image) {
+    return move image
+  }
+  let shared = sharedPacks.isSome()
+  let built = match move run markedImage(b"built-", path, loaded, shared) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return move image
+    }
   }
   let mut sibling = match move run dependencyFile(store, compiler, Path.rawBytes(&built)) {
-    Option<CacheImage.Image>.Some {value} => move value
-    Option<CacheImage.Image>.None => { return move image }
+    Option<CacheImage.Image>.Some { value } => move value
+    Option<CacheImage.Image>.None => {
+      return move image
+    }
   }
-  if !Semantic.holdsBuildRecord(&sibling) { return move image }
-  let packs = match move run suffixed(Path.rawBytes(&built), b".packs") {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return move image }
+  if !Semantic.holdsBuildRecord(&sibling) {
+    return move image
   }
   let mut own = move image
+
   // A merge copies leaves by key and walks nodes, so both images' leaves and nodes are read.
   let mut read = true
   if List<CacheImage.Root>.length(&own.roots) > usize.ZERO {
     read = run CacheImage.readLeaves(&mut own)
-    if read { read = run CacheImage.readNodes(&mut own) }
+    if read {
+      read = run CacheImage.readNodes(&mut own)
+    }
   }
-  if read { read = run CacheImage.readLeaves(&mut sibling) }
-  if read { read = run CacheImage.readNodes(&mut sibling) }
-  if !read { return move own }
+  if read {
+    read = run CacheImage.readLeaves(&mut sibling)
+  }
+  if read {
+    read = run CacheImage.readNodes(&mut sibling)
+  }
+  if !read {
+    return move own
+  }
   let mut merged = ImageMerge.make()
   let mut every = List<usize>.make()
   let mut root = usize.ZERO
@@ -830,12 +1230,32 @@ effect fn withSiblingBuild(store: &Semantic, compiler: &[u8], path: &Path, loade
     run List<usize>.append(&mut every, root)
     root = root + usize.ONE
   }
-  if List<usize>.length(&every) > usize.ZERO { run ImageMerge.add(&mut merged, &own, List<usize>.asSlice(&every)) }
+  if List<usize>.length(&every) > usize.ZERO {
+    run ImageMerge.add(&mut merged, &own, List<usize>.asSlice(&every))
+  }
   let replayed = run Semantic.buildRoots(&sibling)
   run ImageMerge.add(&mut merged, &sibling, List<usize>.asSlice(&replayed))
-  let mut bodies = run readPacks(&packs)
+  let mut bodies = List<BuildRecord.PackBody>.make()
+  if let Option<&Path>.Some { value: packsDir } = sharedPacks {
+    if let Option<Path>.Some { value: listPath } = move run suffixed(
+      Path.rawBytes(&built),
+      b".packlist",
+    ) {
+      bodies = run readSharedPacks(packsDir, &listPath)
+    }
+  } else {
+    if let Option<Path>.Some { value: packs } = move run suffixed(
+      Path.rawBytes(&built),
+      b".packs",
+    ) {
+      bodies = run readPacks(&packs)
+    }
+  }
   while List<BuildRecord.PackBody>.length(&bodies) > usize.ZERO {
-    run List<BuildRecord.PackBody>.append(&mut offered.*, List<BuildRecord.PackBody>.remove(&mut bodies, usize.ZERO))
+    run List<BuildRecord.PackBody>.append(
+      &mut offered.*,
+      List<BuildRecord.PackBody>.remove(&mut bodies, usize.ZERO),
+    )
   }
   borrowed.* = true
   return ImageMerge.finish(move merged)
@@ -846,7 +1266,9 @@ effect fn withSiblingBuild(store: &Semantic, compiler: &[u8], path: &Path, loade
 /// next package that walks a runtime under the same name and holds no file of its own starts from
 /// the walk of the one that loaded most of the packages it loads ([`openPrefetched`]). Best effort,
 /// like the cache.
-pub effect fn rememberRuntime(file: &CacheFile, packages: &[Path]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn rememberRuntime(file: &CacheFile, packages: &[Path]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   run rememberUnder(b"runtime-", file, packages)
 }
 
@@ -855,32 +1277,53 @@ pub effect fn rememberRuntime(file: &CacheFile, packages: &[Path]) -> () ! OutOf
 /// under the same name and holds no build record of its own borrows the record of the one that
 /// loaded most of the packages it loads ([`openPrefetched`]). Best effort, like the cache.
 @trace(name: "cache.remember")
-pub effect fn rememberBuild(file: &CacheFile, packages: &[Path]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn rememberBuild(file: &CacheFile, packages: &[Path]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   run rememberUnder(b"built-", file, packages)
 }
 
-// Lists the package of the cache file `file` in the marker of kind `kind` (`marker`) of each
-// package directory in `packages`.
-effect fn rememberUnder(kind: &[u8], file: &CacheFile, packages: &[Path]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  // The file lies in the compiler's directory, below the package's.
-  let compiler = match move run Path.parent(&file.path) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
+// Maximum number of recent sibling scopes retained in one shared marker file so a long-lived
+// machine's `deps/silk/` marker stays bounded.
+const MAX_SHARED_MARKED: usize = 16
+
+// Lists the package (or scope in shared mode) of the cache file `file` in the marker of kind
+// `kind` (`marker`) of each package directory in `packages`.
+effect fn rememberUnder(kind: &[u8], file: &CacheFile, packages: &[Path]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  // In workspace mode: `<caches>/<package>/<compiler>/<image>` -> `own` is `<package>`.
+  // In shared mode: `<root>/semantic/<compiler>/scopes/<scope>/<image>` -> `own` is `<scope>`.
+  let parent = match move run Path.parent(&file.path) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
   }
-  let package = match move run Path.parent(&compiler) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
+  let ownerDir = if file.shared {
+    move parent
+  } else {
+    match move run Path.parent(&parent) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return ()
+      }
+    }
   }
-  let own = lastName(Path.rawBytes(&package))
+  let own = lastName(Path.rawBytes(&ownerDir))
   let mut at = usize.ZERO
   while at < packages.length {
-    if let Option<Path>.Some {value: listing} = move run marker(kind, &file.path, &packages[at]) {
-      // Each package is listed once, the latest last, a line each: its name, a space, and how
+    if let Option<Path>.Some { value: listing } = move run marker(kind, &file.path, &packages[at]) {
+      // Each package/scope is listed once, the latest last, a line each: its name, a space, and how
       // many packages it loads.
       let mut listed = Bytes.make()
       let read = run markerNames(&listing)
       let names = List<MarkedRuntime>.asSlice(&read)
-      let mut name = usize.ZERO
+      let mut start = usize.ZERO
+      if file.shared && names.length >= MAX_SHARED_MARKED {
+        start = names.length + usize.ONE - MAX_SHARED_MARKED
+      }
+      let mut name = start
       while name < names.length {
         if !same(Bytes.asSlice(&names[name].name), own) {
           run appendMarked(&mut listed, Bytes.asSlice(&names[name].name), names[name].loads)
@@ -900,7 +1343,9 @@ struct MarkedRuntime {
   loads: usize,
 }
 
-effect fn appendMarked(listed: &mut Bytes, name: &[u8], loads: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn appendMarked(listed: &mut Bytes, name: &[u8], loads: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   run Bytes.append(&mut listed.*, name)
   run Bytes.append(&mut listed.*, b" ")
   run JsonText.appendDecimal(&mut listed.*, loads)
@@ -909,16 +1354,20 @@ effect fn appendMarked(listed: &mut Bytes, name: &[u8], loads: usize) -> () ! Ou
 
 // The packages the marker file `marker` lists ([`rememberRuntime`]); none when it cannot be read,
 // and a line that does not read is left out.
-effect fn markerNames(marker: &Path) -> List<MarkedRuntime> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn markerNames(marker: &Path) -> List<MarkedRuntime>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let mut names = List<MarkedRuntime>.make()
   let read = match move run Effect.result(FileSystem.readFile(marker)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return move names
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let bytes = Bytes.asSlice(&read)
@@ -927,17 +1376,28 @@ effect fn markerNames(marker: &Path) -> List<MarkedRuntime> ! OutOfMemoryError ?
   while at < bytes.length {
     if bytes[at] == 10 {
       let mut space = start
-      while space < at && bytes[space] != 32 { space = space + usize.ONE }
+      while space < at && bytes[space] != 32 {
+        space = space + usize.ONE
+      }
       let mut loads = usize.ZERO
       let mut digit = space + usize.ONE
       let mut valid = space > start && digit < at
       while valid && digit < at {
-        if bytes[digit] < 48 || bytes[digit] > 57 { valid = false } else { loads = loads * 10 + u8.toUsize(bytes[digit] - 48) }
+        if bytes[digit] < 48 || bytes[digit] > 57 {
+          valid = false
+        } else {
+          loads = loads * 10 + u8.toUsize(bytes[digit] - 48)
+        }
         digit = digit + usize.ONE
       }
       if valid {
-        run List<MarkedRuntime>.append(&mut names, MarkedRuntime {name: run Bytes.copy(Slice.view<u8>(bytes, start, space - start)),
-          loads: loads})
+        run List<MarkedRuntime>.append(
+          &mut names,
+          MarkedRuntime {
+            name: run Bytes.copy(Slice.view<u8>(bytes, start, space - start)),
+            loads: loads,
+          },
+        )
       }
       start = at + usize.ONE
     }
@@ -949,24 +1409,30 @@ effect fn markerNames(marker: &Path) -> List<MarkedRuntime> ! OutOfMemoryError ?
 // The last component of `path`.
 fn lastName(path: &[u8]) -> &[u8] {
   let mut start = path.length
-  while start > usize.ZERO && path[start - usize.ONE] != 47 { start = start - usize.ONE }
+  while start > usize.ZERO && path[start - usize.ONE] != 47 {
+    start = start - usize.ONE
+  }
   return Slice.view<u8>(path, start, path.length - start)
 }
 
 // The file in the cache directory `package` that lists the packages loading it whose file, named
 // as `image` is, holds what `kind` names: `runtime-` for a runtime's escape walk, `built-` for an
 // executable's build record. The file is named `kind` and the image's name.
-effect fn marker(kind: &[u8], image: &Path, package: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn marker(kind: &[u8], image: &Path, package: &Path) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut name = run Bytes.copy(kind)
   run Bytes.append(&mut name, lastName(Path.rawBytes(image)))
   return match move run Effect.result(Path.joinBytes(package, Bytes.asSlice(&name))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
@@ -975,72 +1441,110 @@ effect fn marker(kind: &[u8], image: &Path, package: &Path) -> Option<Path> ! Ou
 // loads.
 fn loadedByEither(ours: usize, marked: &MarkedRuntime, shared: usize) -> usize {
   let mut theirs = marked.loads
-  if theirs < shared { theirs = shared }
+  if theirs < shared {
+    theirs = shared
+  }
   return ours + theirs - shared
 }
 
-// The file named as `image` in the directory of the package whose walk most likely reaches what
-// this one does ([`rememberRuntime`], [`rememberBuild`]): of those the markers of kind `kind` of `packages` list, the one sharing
-// the largest part of the packages either loads, the first listed on a tie, among those that still hold
-// the file. None when no marker lists such a package.
-effect fn markedImage(kind: &[u8], image: &Path, packages: &[Path]) -> Option<Path> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if packages.length == usize.ZERO { return Option<Path>.none() }
-  // `image` is `<caches>/<package>/<compiler>/<name>`; a sibling's file is the one this compiler
-  // keeps under the sibling's package.
-  let compiler = match move run Path.parent(image) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<Path>.none() }
+// The file named as `image` in the directory of the package/scope whose walk most likely reaches
+// what this one does ([`rememberRuntime`], [`rememberBuild`]): of those the markers of kind `kind`
+// of `packages` list, the one sharing the largest part of the packages either loads, the first
+// listed on a tie, among those that still hold the file. None when no marker lists such a package.
+effect fn markedImage(kind: &[u8], image: &Path, packages: &[Path], shared: bool) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if packages.length == usize.ZERO {
+    return Option<Path>.none()
   }
-  let own = match move run Path.parent(&compiler) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<Path>.none() }
+
+  // Workspace mode: `image` is `<caches>/<package>/<compiler>/<name>`.
+  // Shared mode: `image` is `<root>/semantic/<compiler>/scopes/<scope>/<name>`.
+  let first = match move run Path.parent(image) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<Path>.none()
+    }
   }
-  let caches = match move run Path.parent(&own) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<Path>.none() }
+  let second = match move run Path.parent(&first) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<Path>.none()
+    }
   }
-  let tag = lastName(Path.rawBytes(&compiler))
+  let mut ownName = run Bytes.copy(lastName(Path.rawBytes(&first)))
+  let mut tag = Bytes.make()
+  let caches = if shared {
+    move second
+  } else {
+    ownName = run Bytes.copy(lastName(Path.rawBytes(&second)))
+    tag = run Bytes.copy(lastName(Path.rawBytes(&first)))
+    match move run Path.parent(&second) {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return Option<Path>.none()
+      }
+    }
+  }
   let mut named = List<MarkedRuntime>.make()
   let mut counts = List<usize>.make()
   let mut at = usize.ZERO
   while at < packages.length {
     let listing = match move run marker(kind, image, &packages[at]) {
-      Option<Path>.Some {value} => move value
-      Option<Path>.None => { return Option<Path>.none() }
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return Option<Path>.none()
+      }
     }
     at = at + usize.ONE
     let read = run markerNames(&listing)
     let mut names = move read
     while List<MarkedRuntime>.length(&names) > usize.ZERO {
       let listed = List<MarkedRuntime>.remove(&mut names, usize.ZERO)
-      if same(Bytes.asSlice(&listed.name), lastName(Path.rawBytes(&own))) { continue }
+      if same(Bytes.asSlice(&listed.name), ownName.asSlice()) {
+        continue
+      }
       let known = List<MarkedRuntime>.asSlice(&named)
       let mut found = usize.ZERO
-      while found < known.length && !same(Bytes.asSlice(&known[found].name), Bytes.asSlice(&listed.name)) { found = found + usize.ONE }
+      while found < known.length
+        && !same(Bytes.asSlice(&known[found].name), Bytes.asSlice(&listed.name)) {
+        found = found + usize.ONE
+      }
       if found < known.length {
         let tally = List<usize>.get(&counts, found) + usize.ONE
         List<usize>.set(&mut counts, found, tally)
       } else {
         // A package whose file is gone, as one cleaned since it wrote the marker, has no walk to start from.
-        let held = match move run siblingFile(&caches, Bytes.asSlice(&listed.name), tag, image) {
-          Option<Path>.Some {value} => match move run Effect.result(FileSystem.exists(&value)) {
-            Result<bool, FileError>.Success {value: exists} => exists
-            Result<bool, FileError>.Failure {error} => {
+        let held = match move run siblingFile(
+          &caches,
+          Bytes.asSlice(&listed.name),
+          tag.asSlice(),
+          image,
+          shared,
+        ) {
+          Option<Path>.Some { value } => match move run Effect.result(FileSystem.exists(&value)) {
+            Result<bool, FileError>.Success { value: exists } => exists
+            Result<bool, FileError>.Failure { error } => {
               drop error
               false
             }
           }
           Option<Path>.None => false
         }
-        if !held { continue }
+        if !held {
+          continue
+        }
         run List<MarkedRuntime>.append(&mut named, move listed)
         run List<usize>.append(&mut counts, usize.ONE)
       }
     }
   }
   let tallies = List<usize>.asSlice(&counts)
-  if tallies.length == usize.ZERO { return Option<Path>.none() }
+  if tallies.length == usize.ZERO {
+    return Option<Path>.none()
+  }
   let marked = List<MarkedRuntime>.asSlice(&named)
+
   // The share is `shared / (ours + theirs - shared)`; two compare by cross multiplication.
   let mut best = usize.ZERO
   at = usize.ONE
@@ -1051,25 +1555,33 @@ effect fn markedImage(kind: &[u8], image: &Path, packages: &[Path]) -> Option<Pa
     }
     at = at + usize.ONE
   }
-  return run siblingFile(&caches, Bytes.asSlice(&marked[best].name), tag, image)
+  return run siblingFile(&caches, Bytes.asSlice(&marked[best].name), tag.asSlice(), image, shared)
 }
 
-// The file named as `image` in the directory of the compiler `tag` of the package `name`, beside
-// the other packages in `caches`.
-effect fn siblingFile(caches: &Path, name: &[u8], tag: &[u8], image: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+// The file named as `image` in the sibling's directory (`<caches>/<name>/<tag>/<image>` in
+// workspace mode, or `<scopes>/<name>/<image>` in shared mode).
+effect fn siblingFile(caches: &Path, name: &[u8], tag: &[u8], image: &Path, shared: bool) -> Option<
+  Path
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut relative = run Bytes.copy(name)
-  run Bytes.append(&mut relative, b"/")
-  run Bytes.append(&mut relative, tag)
+  if !shared {
+    run Bytes.append(&mut relative, b"/")
+    run Bytes.append(&mut relative, tag)
+  }
   run Bytes.append(&mut relative, b"/")
   run Bytes.append(&mut relative, lastName(Path.rawBytes(image)))
   return match move run Effect.result(Path.joinBytes(caches, Bytes.asSlice(&relative))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
@@ -1086,8 +1598,14 @@ effect fn siblingFile(caches: &Path, name: &[u8], tag: &[u8], image: &Path) -> O
 /// executable's walk from the runtime's roots rests on what it reached, never on which package
 /// roots the check, so a package checked for the first time walks again only what the last
 /// executable's walk did not reach (`Semantic.escapeRoots`).
-effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Path], walked: &Option<Path>) -> Option<CacheImage.Image>
-  ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn dependencyImage(
+  store: &Semantic,
+  compiler: &[u8],
+  dependencies: &[Path],
+  walked: &Option<Path>,
+) -> Option<CacheImage.Image>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let mut merged = ImageMerge.make()
   let mut found = false
   let mut at = usize.ZERO
@@ -1100,13 +1618,24 @@ effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Pat
     while file < files.length && !taken {
       let named = Path.rawBytes(&files[file].path)
       file = file + usize.ONE
-      if !imageName(named) { continue }
-      if let Option<CacheImage.Image>.Some {value: read} = move run dependencyFile(store, compiler, named) {
+      if !imageName(named) {
+        continue
+      }
+      if let Option<CacheImage.Image>.Some { value: read } = move run dependencyFile(
+        store,
+        compiler,
+        named,
+      ) {
         let mut image = move read
+
         // A merge copies leaves by key and walks nodes, so the leaves and nodes are read; their
         // keys are read packed. An image whose leaves or nodes do not read is passed over.
-        if !run CacheImage.readLeaves(&mut image) { continue }
-        if !run CacheImage.readNodes(&mut image) { continue }
+        if !run CacheImage.readLeaves(&mut image) {
+          continue
+        }
+        if !run CacheImage.readNodes(&mut image) {
+          continue
+        }
         let roots = run Semantic.checkRoots(&image)
         run ImageMerge.add(&mut merged, &image, List<usize>.asSlice(&roots))
         taken = true
@@ -1114,9 +1643,14 @@ effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Pat
       }
     }
   }
+
   // Added last, so a dependency's own walk of a module wins over the copy carried here.
-  if let Option<Path>.Some {value: sibling} = &walked.* {
-    if let Option<CacheImage.Image>.Some {value: read} = move run dependencyFile(store, compiler, Path.rawBytes(&sibling)) {
+  if let Option<Path>.Some { value: sibling } = &walked.* {
+    if let Option<CacheImage.Image>.Some { value: read } = move run dependencyFile(
+      store,
+      compiler,
+      Path.rawBytes(&sibling),
+    ) {
       let mut image = move read
       let leaves = run CacheImage.readLeaves(&mut image)
       if leaves && run CacheImage.readNodes(&mut image) {
@@ -1126,7 +1660,9 @@ effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Pat
       }
     }
   }
-  if !found { return Option<CacheImage.Image>.none() }
+  if !found {
+    return Option<CacheImage.Image>.none()
+  }
   return Option<CacheImage.Image>.some(ImageMerge.finish(move merged))
 }
 
@@ -1134,7 +1670,9 @@ effect fn dependencyImage(store: &Semantic, compiler: &[u8], dependencies: &[Pat
 // takes a file's lock before it forks to write the file, and a member checked right after the
 // package that writes the directory would otherwise list it before the image is in place and
 // check that package's modules again.
-effect fn settledEntries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn settledEntries(directory: &Path) -> List<DirectoryEntry>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let listed = run entries(directory)
   let files = List<DirectoryEntry>.asSlice(&listed)
   let mut waited = false
@@ -1146,7 +1684,9 @@ effect fn settledEntries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemory
     }
     at = at + usize.ONE
   }
-  if !waited { return move listed }
+  if !waited {
+    return move listed
+  }
   drop listed
   return run entries(directory)
 }
@@ -1154,110 +1694,154 @@ effect fn settledEntries(directory: &Path) -> List<DirectoryEntry> ! OutOfMemory
 // The image whose graph file is at `path`, once no process is writing it, when the running
 // compiler wrote it for the store's target (`CacheStamp.sameTarget`).
 effect fn dependencyFile(store: &Semantic, compiler: &[u8], path: &[u8]) -> Option<CacheImage.Image>
-  ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<Path>.Some {value: lock} = move run suffixed(path, b".lock") { run DetachedWriter.waitFor(&lock) }
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Path>.Some { value: lock } = move run suffixed(path, b".lock") {
+    run DetachedWriter.waitFor(&lock)
+  }
   let located = match move run suffixed(path, b"") {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<CacheImage.Image>.none() }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<CacheImage.Image>.none()
+    }
   }
   let bytes = match move run Effect.result(FileSystem.readFile(&located)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<CacheImage.Image>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let written = match move run CacheImage.writtenStamp(Bytes.asSlice(&bytes)) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return Option<CacheImage.Image>.none() }
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return Option<CacheImage.Image>.none()
+    }
   }
-  if !run CacheStamp.sameTarget(store, compiler, Bytes.asSlice(&written)) { return Option<CacheImage.Image>.none() }
-  let graph = match move run CacheImage.decodeGraph(Bytes.asSlice(&bytes), Bytes.asSlice(&written)) {
-    Option<CacheImage.Graph>.Some {value} => move value
-    Option<CacheImage.Graph>.None => { return Option<CacheImage.Image>.none() }
+  if !run CacheStamp.sameTarget(store, compiler, Bytes.asSlice(&written)) {
+    return Option<CacheImage.Image>.none()
+  }
+  let graph = match move run CacheImage.decodeGraph(
+    Bytes.asSlice(&bytes),
+    Bytes.asSlice(&written),
+  ) {
+    Option<CacheImage.Graph>.Some { value } => move value
+    Option<CacheImage.Graph>.None => {
+      return Option<CacheImage.Image>.none()
+    }
   }
   drop bytes
   let rooted = match move run rootsPath(path) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<CacheImage.Image>.none() }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<CacheImage.Image>.none()
+    }
   }
   return match move run readRoots(&rooted) {
-    Option<CacheImage.Roots>.Some {value: roots} => CacheImage.joined(move graph, move roots)
+    Option<CacheImage.Roots>.Some { value: roots } => CacheImage.joined(move graph, move roots)
     Option<CacheImage.Roots>.None => Option<CacheImage.Image>.none()
   }
 }
 
 // The path `path` names with `suffix` appended; none when no such path can be formed.
-effect fn suffixed(path: &[u8], suffix: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn suffixed(path: &[u8], suffix: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut named = run Bytes.copy(path)
   run Bytes.append(&mut named, suffix)
   return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&named))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 // Records in `choice` that its profile opens the image named `name`; best effort, like the cache.
-effect fn remember(choice: &Path, name: &[u8]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn remember(choice: &Path, name: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   match move run Effect.result(write(choice, name)) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure }
-      AtomicWriteError failure => { drop failure }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+      }
+      AtomicWriteError failure => {
+        drop failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 // The image whose graph file is at `path` and whose roots file is beside it, under `stamp`; none
 // when either cannot be read or decoded, or they are not one image's.
-effect fn readImage(path: &Path, stamp: &[u8]) -> Option<CacheImage.Image> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn readImage(path: &Path, stamp: &[u8]) -> Option<CacheImage.Image>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let bytes = match move run Effect.result(FileSystem.readFile(path)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<CacheImage.Image>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let graph = match move run CacheImage.decodeGraph(Bytes.asSlice(&bytes), stamp) {
-    Option<CacheImage.Graph>.Some {value} => move value
-    Option<CacheImage.Graph>.None => { return Option<CacheImage.Image>.none() }
+    Option<CacheImage.Graph>.Some { value } => move value
+    Option<CacheImage.Graph>.None => {
+      return Option<CacheImage.Image>.none()
+    }
   }
   drop bytes
   let located = match move run rootsPath(Path.rawBytes(path)) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Option<CacheImage.Image>.none() }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Option<CacheImage.Image>.none()
+    }
   }
   return match move run readRoots(&located) {
-    Option<CacheImage.Roots>.Some {value: roots} => CacheImage.joined(move graph, move roots)
+    Option<CacheImage.Roots>.Some { value: roots } => CacheImage.joined(move graph, move roots)
     Option<CacheImage.Roots>.None => Option<CacheImage.Image>.none()
   }
 }
 
 // The roots file beside the graph file at `path`; none when no such path can be formed.
-effect fn rootsPath(path: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn rootsPath(path: &[u8]) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut named = run Bytes.copy(path)
   run Bytes.append(&mut named, b".roots")
   return match move run Effect.result(Path.fromBytes(Bytes.asSlice(&named))) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
@@ -1268,8 +1852,12 @@ effect fn rootsPath(path: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Alloc
 /// would write. Writes nothing either when the file was read while a build's write of it was
 /// running (`CacheFile.unsettled`).
 pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if current(&store.*, file) || file.unsettled || run malformed(&store.*) { return () }
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if current(&store.*, file) || file.unsettled || run malformed(&store.*) {
+    return ()
+  }
+
   // A copy of an earlier build may still be writing the file.
   let held = run DetachedWriter.hold(&file.lock)
   let checks = run holdChecks(file)
@@ -1282,15 +1870,21 @@ pub effect fn save(store: &mut Semantic, file: &CacheFile) -> ()
 // would be reused while its text stays the same, though the next process never parses a module
 // whose checks it reuses, so the error would no longer be reported (silk-lang/silk#3116). The
 // file the store read stays as it was, and the next process checks the broken module again.
-effect fn malformed(store: &Semantic) -> bool ! OutOfMemoryError ? &mut Allocator {
+effect fn malformed(store: &Semantic) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let found = run Semantic.syntaxRejections(store)
   return List.length(&found) > usize.ZERO
 }
 
 // The lock a write of `file` holds beside its own unless a build writes it, so a check waits for
 // the write (`waitForWrite`); none for a build's write, or where the lock cannot be taken.
-effect fn holdChecks(file: &CacheFile) -> Option<Held> ! OutOfMemoryError ? &mut Allocator {
-  if file.building { return Option<Held>.none() }
+effect fn holdChecks(file: &CacheFile) -> Option<Held>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if file.building {
+    return Option<Held>.none()
+  }
   return run DetachedWriter.hold(&file.checksLock)
 }
 
@@ -1305,8 +1899,12 @@ effect fn holdChecks(file: &CacheFile) -> Option<Held> ! OutOfMemoryError ? &mut
 /// Packs written beside the file before the call are the ones the file names.
 @trace(name: "cache.save")
 pub effect fn saveBuilt(store: &mut Semantic, file: &CacheFile, units: Option<&[CodegenUnit]>) -> ()
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
-  if current(&store.*, file) || file.unsettled || run malformed(&store.*) { return () }
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  if current(&store.*, file) || file.unsettled || run malformed(&store.*) {
+    return ()
+  }
+
   // A copy of an earlier check may still be writing the file.
   let held = run DetachedWriter.hold(&file.lock)
   let checks = run holdChecks(file)
@@ -1333,60 +1931,80 @@ effect fn writeDetached(store: &mut Semantic, file: &CacheFile) -> ()
 /// either writes is copied.
 @trace(name: "cache.save")
 pub effect fn saveDetached(store: &mut Semantic, file: &CacheFile) -> ()
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
-  if current(&store.*, file) || file.unsettled || run malformed(&store.*) { return () }
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  if current(&store.*, file) || file.unsettled || run malformed(&store.*) {
+    return ()
+  }
   let held = match move run DetachedWriter.hold(&file.lock) {
-    Option<Held>.Some {value} => move value
+    Option<Held>.Some { value } => move value
     Option<Held>.None => {
       return run persist(&mut store.*, file, true, true)
     }
   }
+
   // The copy inherits this lock too and holds it until it exits; the caller's own handle closes
   // when this returns.
   let _checks = run holdChecks(file)
+
   // The copy must hold nothing of the trace that this process has yet to write.
   run Tracing.flush()
   match move DetachedWriter.handOff(move held) {
     Handoff.Original => {}
-    Handoff.Copy {held: kept} => {
+    Handoff.Copy { held: kept } => {
       // The copy shares the caller's call stack, so no failure may return into it.
       let mut traced = match move run Effect.result(Tracing.copied(true)) {
-        Result<Option<Tracing.Session>, OutOfMemoryError>.Success {value} => move value
-        Result<Option<Tracing.Session>, OutOfMemoryError>.Failure {error} => {
+        Result<Option<Tracing.Session>, OutOfMemoryError>.Success { value } => move value
+        Result<Option<Tracing.Session>, OutOfMemoryError>.Failure { error } => {
           drop error
           Tracing.silence()
           Option<Tracing.Session>.none()
         }
       }
-      if let Option<Tracing.Session>.Some {value} = &mut traced { Tracing.install(&mut value) }
+      if let Option<Tracing.Session>.Some { value } = &mut traced {
+        Tracing.install(&mut value)
+      }
       run Tracing.within(&traced, writeDetached(&mut store.*, file))
-      if let Option<Tracing.Session>.Some {value} = &mut traced { run Tracing.close(&mut value) }
+      if let Option<Tracing.Session>.Some { value } = &mut traced {
+        run Tracing.close(&mut value)
+      }
       DetachedWriter.finish(move kept)
     }
-    Handoff.Here {held: kept} => {
+    Handoff.Here { held: kept } => {
       run persist(&mut store.*, file, true, true)
       drop kept
     }
   }
 }
 
-// `prunePacks` for a build that has units.
-effect fn pruneBuilt(file: &CacheFile, units: &Option<&[CodegenUnit]>) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<&[CodegenUnit]>.Some {value: built} = &units.* { run prunePacks(file, built) }
+// `prunePacks` for a build that has units; skipped in shared mode where CacheGc manages packs.
+effect fn pruneBuilt(file: &CacheFile, units: &Option<&[CodegenUnit]>) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if file.shared {
+    return ()
+  }
+  if let Option<&[CodegenUnit]>.Some { value: built } = &units.* {
+    run prunePacks(file, built)
+  }
 }
 
 // Whether `file` already holds what `save` would write: `store` ran no module check, reused every
 // check in the file, and its last build lowered nothing the file lacks.
 fn current(store: &Semantic, file: &CacheFile) -> bool {
-  return Semantic.moduleCheckRuns(store) == usize.ZERO && file.adopted.stale == usize.ZERO && file.adopted.roots > usize.ZERO
+  return Semantic.moduleCheckRuns(store) == usize.ZERO && file.adopted.stale == usize.ZERO
+    && file.adopted.roots > usize.ZERO
     && !Semantic.buildChanged(store)
 }
 
 // `save`, making the file's directory first when `creating`, and dropping the adopted cache image
 // right after `carry` when `dropHeld` (terminal saves that will not revise or carry again).
 effect fn persist(store: &mut Semantic, file: &CacheFile, creating: bool, dropHeld: bool) -> ()
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<Pending>.Some {value} = move run prepare(&mut store.*, file, dropHeld) { run writePending(&value, creating) }
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Pending>.Some { value } = move run prepare(&mut store.*, file, dropHeld) {
+    run writePending(&value, creating)
+  }
 }
 
 // An image `save` writes, with the stamp and the path it is written under.
@@ -1398,15 +2016,19 @@ struct Pending {
 
 // The image `save` would write, with the reused checks carried over from the file read.
 effect fn prepare(store: &mut Semantic, file: &CacheFile, dropHeld: bool) -> Option<Pending>
-  ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if current(&store.*, file) { return Option<Pending>.none() }
+  ! Cycle | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if current(&store.*, file) {
+    return Option<Pending>.none()
+  }
   let mut image = run Semantic.cacheImage(&mut store.*)
+
   // A carry copies leaves by key and walks nodes, so the read image's keys are expanded and its
   // nodes read.
   run Semantic.unpackAdoptedImage(&mut store.*)
   let mut adopted = false
   let mut nodes = List<usize>.make()
-  if let Option<&CacheImage.Image>.Some {value: read} = Semantic.adoptedImage(&store.*) {
+  if let Option<&CacheImage.Image>.Some { value: read } = Semantic.adoptedImage(&store.*) {
     adopted = true
     let mut carried = List<usize>.make()
     let checks = Semantic.carried(&store.*)
@@ -1423,31 +2045,46 @@ effect fn prepare(store: &mut Semantic, file: &CacheFile, dropHeld: bool) -> Opt
     }
     nodes = run CacheImage.carry(&mut image, read, List<usize>.asSlice(&carried))
   }
-  if dropHeld { Semantic.releaseAdoptedImage(&mut store.*) }
+  if dropHeld {
+    Semantic.releaseAdoptedImage(&mut store.*)
+  }
   if adopted {
     run Semantic.imageCarriedChecks(&mut store.*, &mut image, List<usize>.asSlice(&nodes))
     run Semantic.imageReplayedChecks(&store.*, &mut image)
     run Semantic.imageCarriedFiles(&mut store.*, &mut image)
   }
-  return Option<Pending>.some(Pending {image: move image, stamp: run Bytes.copy(Bytes.asSlice(&file.stamp)),
-    path: run Bytes.copy(Path.rawBytes(&file.path))})
+  return Option<Pending>.some(
+    Pending {
+      image: move image,
+      stamp: run Bytes.copy(Bytes.asSlice(&file.stamp)),
+      path: run Bytes.copy(Path.rawBytes(&file.path)),
+    },
+  )
 }
 
 // Encodes `pending` and writes it over its two files, the roots file first; a file that cannot be
 // written is left as it was, and a graph file left beside roots of another image reads as none.
-effect fn writePending(pending: &Pending, creating: bool) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn writePending(pending: &Pending, creating: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let files = run CacheImage.encodeFiles(&pending.image, Bytes.asSlice(&pending.stamp))
   let mut rootsName = run Bytes.copy(Bytes.asSlice(&pending.path))
   run Bytes.append(&mut rootsName, b".roots")
-  if !run written(Bytes.asSlice(&rootsName), Bytes.asSlice(&files.roots), creating) { return () }
+  if !run written(Bytes.asSlice(&rootsName), Bytes.asSlice(&files.roots), creating) {
+    return ()
+  }
   drop run written(Bytes.asSlice(&pending.path), Bytes.asSlice(&files.graph), creating)
 }
 
 // Writes `bytes` over the file at `path` and returns whether it could.
-effect fn written(path: &[u8], bytes: &[u8], creating: bool) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn written(path: &[u8], bytes: &[u8], creating: bool) -> bool
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   return match move run Effect.result(writeAt(path, bytes, creating)) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => true
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => true
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       FileError failure => {
         drop failure
         return false
@@ -1456,38 +2093,64 @@ effect fn written(path: &[u8], bytes: &[u8], creating: bool) -> bool ! OutOfMemo
         drop failure
         return false
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
-effect fn writeAt(path: &[u8], bytes: &[u8], creating: bool) -> () ! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+effect fn writeAt(path: &[u8], bytes: &[u8], creating: bool) -> ()
+  ! FileError | AtomicWriteError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let target = run Path.fromBytes(path)
-  if creating { return run write(&target, bytes) }
-  return run FileSystem.writeFileAtomic(&target, bytes, FileSystem.replaceExisting(), FileSystem.buffered())
+  if creating {
+    return run write(&target, bytes)
+  }
+  return run FileSystem.writeFileAtomic(
+    &target,
+    bytes,
+    FileSystem.replaceExisting(),
+    FileSystem.buffered(),
+  )
 }
 
 /// The import summaries kept in the cache directory `cache` for `compiler`, from
 /// `CacheStamp.compiler`; none when the file is missing or another compiler wrote it.
-pub effect fn openImports(cache: &Path, compiler: &[u8]) -> ImportSummaries ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn openImports(cache: &Path, compiler: &[u8]) -> ImportSummaries
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let copied = run Bytes.copy(compiler)
   let path = match move run importsPath(cache) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return Summaries.make(move copied) }
-  }
-  let mut summaries = match move run Effect.result(FileSystem.readFile(&path)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value: bytes} => run Summaries.decode(move copied, Bytes.asSlice(&bytes))
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => noSummaries(move failure, move copied)
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return Summaries.make(move copied)
     }
   }
-  if let Option<Path>.Some {value: parsedPath} = move run parsedPath(cache) {
+  let mut summaries = match move run Effect.result(FileSystem.readFile(&path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } => run Summaries.decode(
+      move copied,
+      Bytes.asSlice(&bytes),
+    )
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => noSummaries(move failure, move copied)
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  if let Option<Path>.Some { value: parsedPath } = move run parsedPath(cache) {
     match move run Effect.result(FileSystem.readFile(&parsedPath)) {
-      Result<Bytes, FileError | OutOfMemoryError>.Success {value: bytes} => { run Summaries.selectParsed(&mut summaries, Bytes.asSlice(&bytes)) }
-      Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-        FileError failure => { drop failure }
-        OutOfMemoryError exhausted => { fail move exhausted }
+      Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } => {
+        run Summaries.selectParsed(&mut summaries, Bytes.asSlice(&bytes))
+      }
+      Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+        FileError failure => {
+          drop failure
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
       }
     }
   }
@@ -1503,62 +2166,96 @@ fn noSummaries(failure: FileError, compiler: Bytes) -> ImportSummaries {
 /// Writes, in the cache directory `cache`, `digests` as the files a build's store parsed, so the
 /// next load parses them ahead (see `ImportSummaries.wasParsed`).
 @trace(name: "cache.parsed")
-pub effect fn saveParsed(cache: &Path, digests: &[ContentHash]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn saveParsed(cache: &Path, digests: &[ContentHash]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let path = match move run parsedPath(cache) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
   }
   let bytes = run Summaries.encodeParsed(digests)
   match move run Effect.result(write(&path, Bytes.asSlice(&bytes))) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure }
-      AtomicWriteError failure => { drop failure }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+      }
+      AtomicWriteError failure => {
+        drop failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
-effect fn parsedPath(cache: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn parsedPath(cache: &Path) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return match move run Effect.result(Path.joinBytes(cache, b"parsed")) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 /// Writes `summaries` in the cache directory `cache` when the load that used them changed them.
-pub effect fn saveImports(cache: &Path, summaries: &ImportSummaries) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if !Summaries.changed(summaries) { return () }
+pub effect fn saveImports(cache: &Path, summaries: &ImportSummaries) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if !Summaries.changed(summaries) {
+    return ()
+  }
   let path = match move run importsPath(cache) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
   }
   let bytes = run Summaries.encode(summaries)
   match move run Effect.result(write(&path, Bytes.asSlice(&bytes))) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure }
-      AtomicWriteError failure => { drop failure }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+      }
+      AtomicWriteError failure => {
+        drop failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
-effect fn importsPath(cache: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn importsPath(cache: &Path) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return match move run Effect.result(Path.joinBytes(cache, b"imports")) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
@@ -1566,23 +2263,33 @@ effect fn importsPath(cache: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Al
 /// Offers `store` the declaration origins the cache directory `cache` keeps for `compiler`, from
 /// `CacheStamp.compiler` (`Semantic.offerOrigins`), before a build with line tables; nothing when
 /// the file is missing or another compiler wrote it.
-pub effect fn openOrigins(store: &mut Semantic, cache: &Path, compiler: &[u8]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn openOrigins(store: &mut Semantic, cache: &Path, compiler: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let path = match move run originsPath(cache) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
   }
   match move run Effect.result(FileSystem.readFile(&path)) {
-    Result<Bytes, FileError | OutOfMemoryError>.Success {value: bytes} => {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } => {
       let read = Bytes.asSlice(&bytes)
       let mut reader = StableKey.reader()
       let stamped = StableKey.readField(read, &mut reader)
       let held = StableKey.readField(read, &mut reader)
-      if !StableKey.finished(read, &reader) || !same(StableKey.view(read, stamped), compiler) { return () }
+      if !StableKey.finished(read, &reader) || !same(StableKey.view(read, stamped), compiler) {
+        return ()
+      }
       run Semantic.offerOrigins(&mut store.*, StableKey.view(read, held))
     }
-    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => {
+        drop failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
@@ -1590,60 +2297,147 @@ pub effect fn openOrigins(store: &mut Semantic, cache: &Path, compiler: &[u8]) -
 /// Writes the declaration origins of `store` in the cache directory `cache` when its build made
 /// or replaced a module's (`Semantic.takeOrigins`), stamped with `compiler`.
 @trace(name: "cache.origins")
-pub effect fn saveOrigins(store: &Semantic, cache: &Path, compiler: &[u8]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn saveOrigins(store: &Semantic, cache: &Path, compiler: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let held = match move run Semantic.takeOrigins(store) {
-    Option<Bytes>.Some {value} => move value
-    Option<Bytes>.None => { return () }
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return ()
+    }
   }
   let path = match move run originsPath(cache) {
-    Option<Path>.Some {value} => move value
-    Option<Path>.None => { return () }
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return ()
+    }
   }
   let mut bytes = Bytes.make()
   run RuntimeEncoding.field(&mut bytes, compiler)
   run RuntimeEncoding.field(&mut bytes, Bytes.asSlice(&held))
   match move run Effect.result(write(&path, Bytes.asSlice(&bytes))) {
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
-    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-      FileError failure => { drop failure }
-      AtomicWriteError failure => { drop failure }
-      OutOfMemoryError exhausted => { fail move exhausted }
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+      }
+      AtomicWriteError failure => {
+        drop failure
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
-effect fn originsPath(cache: &Path) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+effect fn originsPath(cache: &Path) -> Option<Path>
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return match move run Effect.result(Path.joinBytes(cache, b"origins")) {
-    Result<Path, FileError | OutOfMemoryError>.Success {value} => Option<Path>.some(move value)
-    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return Option<Path>.none()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
 }
 
 // Writes the file so a reader sees the old image or the whole new one, creating its directory.
-effect fn write(path: &Path, bytes: &[u8]) -> () ! FileError | AtomicWriteError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  if let Option<Path>.Some {value: directory} = move run Path.parent(path) {
+effect fn write(path: &Path, bytes: &[u8]) -> ()
+  ! FileError | AtomicWriteError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Path>.Some { value: directory } = move run Path.parent(path) {
     run FileSystem.createDirectoriesRecursively(&directory)
   }
-  return run FileSystem.writeFileAtomic(path, bytes, FileSystem.replaceExisting(), FileSystem.buffered())
+  return run FileSystem.writeFileAtomic(
+    path,
+    bytes,
+    FileSystem.replaceExisting(),
+    FileSystem.buffered(),
+  )
 }
 
-// Each pack body in `directory`, by the digest its name gives; a file named otherwise is left out.
-effect fn readPacks(directory: &Path) -> List<BuildRecord.PackBody> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+// Each pack body listed in `packList` (one 32-hex digest per line), read from the sharded shared
+// pack pool `packsDir`. Touches hits so CacheGc retains actively used packs.
+effect fn readSharedPacks(packsDir: &Path, packList: &Path) -> List<BuildRecord.PackBody>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let mut bodies = List<BuildRecord.PackBody>.make()
-  let entries = match move run Effect.result(FileSystem.listDirectory(directory)) {
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+  let listed = match move run Effect.result(FileSystem.readFile(packList)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return move bodies
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let text = Bytes.asSlice(&listed)
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= text.length {
+    if at == text.length || text[at] == 10 {
+      let line = Slice.view<u8>(text, start, at - start)
+      if line.length == 32 {
+        if let Option<ContentHash>.Some { value: digest } = packDigest(line) {
+          if let Result<Path, FileError | OutOfMemoryError>.Success {
+            value: path
+          } = move run Effect.result(CacheLayout.shardedPath(packsDir, line)) {
+            match move run Effect.result(FileSystem.readFile(&path)) {
+              Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } => {
+                run CacheGc.touchIfStale(&path)
+                run List<BuildRecord.PackBody>.append(
+                  &mut bodies,
+                  BuildRecord.PackBody { digest: digest, bytes: move bytes },
+                )
+              }
+              Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+                FileError failure => {
+                  drop failure
+                }
+                OutOfMemoryError exhausted => {
+                  fail move exhausted
+                }
+              }
+            }
+          }
+        }
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move bodies
+}
+
+// Each pack body in `directory`, by the digest its name gives; a file named otherwise is left out.
+effect fn readPacks(directory: &Path) -> List<BuildRecord.PackBody>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut bodies = List<BuildRecord.PackBody>.make()
+  let entries = match move run Effect.result(FileSystem.listDirectory(directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      FileError failure => {
+        drop failure
+        return move bodies
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let found = List<DirectoryEntry>.asSlice(&entries)
@@ -1651,14 +2445,21 @@ effect fn readPacks(directory: &Path) -> List<BuildRecord.PackBody> ! OutOfMemor
   while at < found.length {
     let path = &found[at].path
     at = at + usize.ONE
-    if let Option<ContentHash>.Some {value: digest} = packDigest(Path.rawBytes(path)) {
+    if let Option<ContentHash>.Some { value: digest } = packDigest(Path.rawBytes(path)) {
       match move run Effect.result(FileSystem.readFile(path)) {
-        Result<Bytes, FileError | OutOfMemoryError>.Success {value: bytes} => {
-          run List<BuildRecord.PackBody>.append(&mut bodies, BuildRecord.PackBody {digest: digest, bytes: move bytes})
+        Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } => {
+          run List<BuildRecord.PackBody>.append(
+            &mut bodies,
+            BuildRecord.PackBody { digest: digest, bytes: move bytes },
+          )
         }
-        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
-          FileError failure => { drop failure }
-          OutOfMemoryError exhausted => { fail move exhausted }
+        Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+          FileError failure => {
+            drop failure
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
         }
       }
     }
@@ -1668,93 +2469,189 @@ effect fn readPacks(directory: &Path) -> List<BuildRecord.PackBody> ! OutOfMemor
 
 // The digest a pack file's path names: its last component, 32 lowercase hex digits.
 fn packDigest(path: &[u8]) -> Option<ContentHash> {
-  if path.length < 32 { return Option<ContentHash>.none() }
+  if path.length < 32 {
+    return Option<ContentHash>.none()
+  }
   let start = path.length - 32
-  if start > usize.ZERO && path[start - usize.ONE] != 47 { return Option<ContentHash>.none() }
+  if start > usize.ZERO && path[start - usize.ONE] != 47 {
+    return Option<ContentHash>.none()
+  }
   let mut high: u64 = 0
   let mut low: u64 = 0
   let mut at = usize.ZERO
   while at < 32 {
     let byte = path[start + at]
     let mut digit: u64 = 16
-    if byte >= 48 && byte <= 57 { digit = u8.toU64(byte - 48) }
-    if byte >= 97 && byte <= 102 { digit = u8.toU64(byte - 87) }
-    if digit == 16 { return Option<ContentHash>.none() }
-    if at < 16 { high = high * 16 + digit } else { low = low * 16 + digit }
+    if byte >= 48 && byte <= 57 {
+      digit = u8.toU64(byte - 48)
+    }
+    if byte >= 97 && byte <= 102 {
+      digit = u8.toU64(byte - 87)
+    }
+    if digit == 16 {
+      return Option<ContentHash>.none()
+    }
+    if at < 16 {
+      high = high * 16 + digit
+    } else {
+      low = low * 16 + digit
+    }
     at = at + usize.ONE
   }
-  return Option<ContentHash>.some(ContentHash {high: high, low: low})
+  return Option<ContentHash>.some(ContentHash { high: high, low: low })
 }
 
-// The path of the pack body with `digest` in `directory`.
-effect fn packPath(directory: &Path, digest: ContentHash) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+// The path of the pack body with `digest` in `directory` (sharded in shared mode).
+effect fn packPath(directory: &Path, digest: ContentHash, sharded: bool) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
   let mut name = Bytes.make()
   run appendHex(&mut name, digest.high)
   run appendHex(&mut name, digest.low)
+  if sharded {
+    return run CacheLayout.shardedPath(directory, Bytes.asSlice(&name))
+  }
   return run Path.joinBytes(directory, Bytes.asSlice(&name))
 }
 
 /// Writes the body of each unit a build assembled that the pack directory lacks, before [`save`]
-/// writes an image that names them. A build that borrowed a sibling program's record also writes
-/// the sibling's packs it left `stored`, which `store` holds, so its own next build finds them.
+/// writes an image that names them. In workspace mode, a build that borrowed a sibling program's
+/// record also writes the sibling's packs it left `stored`, which `store` holds, so its own next
+/// build finds them. In shared mode, packs live in the shared sharded pack pool (so borrowed
+/// packs need no copy) and `<image>.packlist` records every unit's pack digest.
 /// Best effort, as [`save`] is: a body that cannot be written leaves its definitions to be lowered
 /// again.
 @trace(name: "cache.packs")
-pub effect fn storePacks(file: &CacheFile, store: &Semantic, units: &[CodegenUnit]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn storePacks(file: &CacheFile, store: &Semantic, units: &[CodegenUnit]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let created = run Effect.result(FileSystem.createDirectoriesRecursively(&file.packs))
   match move created {
-    Result<(), FileError | OutOfMemoryError>.Success {..} => {}
-    Result<(), FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<(), FileError | OutOfMemoryError>.Success { .. } => {}
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
       FileError failure => {
         drop failure
         return ()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
+  let mut packListBytes = Bytes.make()
   let mut at = usize.ZERO
   while at < units.length {
     let unit = &units[at]
     at = at + usize.ONE
+    if file.shared {
+      run appendHex(&mut packListBytes, unit.digest.high)
+      run appendHex(&mut packListBytes, unit.digest.low)
+      run Bytes.append(&mut packListBytes, b"\n")
+    }
     let mut body = Bytes.asSlice(&unit.body)
     if unit.stored {
-      if !file.borrowed { continue }
+      if file.shared {
+        // Already in the shared pack pool; just touch if stale.
+        if let Result<Path, FileError | OutOfMemoryError>.Success {
+          value: existing
+        } = move run Effect.result(packPath(&file.packs, unit.digest, true)) {
+          run CacheGc.touchIfStale(&existing)
+        }
+        continue
+      }
+      if !file.borrowed {
+        continue
+      }
       body = match move Semantic.packBody(store, unit.digest) {
-        Option<&[u8]>.Some {value} => value
-        Option<&[u8]>.None => { continue }
+        Option<&[u8]>.Some { value } => value
+        Option<&[u8]>.None => {
+          continue
+        }
       }
     }
-    if body.length == usize.ZERO { continue }
-    let written = run Effect.result(storePack(&file.packs, unit.digest, body))
+    if body.length == usize.ZERO {
+      continue
+    }
+    let written = run Effect.result(storePack(&file.packs, unit.digest, body, file.shared))
     match move written {
-      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
-      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
-        FileError failure => { drop failure }
-        AtomicWriteError failure => { drop failure }
-        OutOfMemoryError exhausted => { fail move exhausted }
+      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
+        FileError failure => {
+          drop failure
+        }
+        AtomicWriteError failure => {
+          drop failure
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+  if file.shared {
+    if let Option<Path>.Some { value: listPath } = &file.packList {
+      match move run Effect.result(write(&listPath, packListBytes.asSlice())) {
+        Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { .. } => {}
+        Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          FileError failure => {
+            drop failure
+          }
+          AtomicWriteError failure => {
+            drop failure
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
       }
     }
   }
 }
 
-effect fn storePack(directory: &Path, digest: ContentHash, body: &[u8]) -> () ! FileError | AtomicWriteError | OutOfMemoryError
+effect fn storePack(directory: &Path, digest: ContentHash, body: &[u8], sharded: bool) -> ()
+  ! FileError | AtomicWriteError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
-  let path = run packPath(directory, digest)
-  if run FileSystem.exists(&path) { return () }
-  return run FileSystem.writeFileAtomic(&path, body, FileSystem.replaceExisting(), FileSystem.buffered())
+  let path = run packPath(directory, digest, sharded)
+  if run FileSystem.exists(&path) {
+    if sharded {
+      run CacheGc.touchIfStale(&path)
+    }
+    return ()
+  }
+  if sharded {
+    if let Option<Path>.Some { value: shardDir } = move run Path.parent(&path) {
+      run FileSystem.createDirectoriesRecursively(&shardDir)
+    }
+  }
+  return run FileSystem.writeFileAtomic(
+    &path,
+    body,
+    FileSystem.replaceExisting(),
+    FileSystem.buffered(),
+  )
 }
 
 /// Removes every pack body no unit of `units`, the last build's, names, once [`save`] wrote the
 /// image that names only those.
-pub effect fn prunePacks(file: &CacheFile, units: &[CodegenUnit]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+pub effect fn prunePacks(file: &CacheFile, units: &[CodegenUnit]) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
   let entries = match move run Effect.result(FileSystem.listDirectory(&file.packs)) {
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
-    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
       FileError failure => {
         drop failure
         return ()
       }
-      OutOfMemoryError exhausted => { fail move exhausted }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
     }
   }
   let found = List<DirectoryEntry>.asSlice(&entries)
@@ -1763,7 +2660,7 @@ pub effect fn prunePacks(file: &CacheFile, units: &[CodegenUnit]) -> () ! OutOfM
     let path = &found[at].path
     at = at + usize.ONE
     let mut named = false
-    if let Option<ContentHash>.Some {value: digest} = packDigest(Path.rawBytes(path)) {
+    if let Option<ContentHash>.Some { value: digest } = packDigest(Path.rawBytes(path)) {
       let mut unit = usize.ZERO
       while unit < units.length && !named {
         named = ContentHash.equals(units[unit].digest, digest)

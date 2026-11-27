@@ -41,7 +41,8 @@ Installed versions live in `$SILK_HOME` (default `~/.silk`):
 ```text
 ~/.silk/
   bin/silk                      the tool (install.sh, silk update self)
-  settings.toml                 default = "<version>", optional auto-install = true
+  settings.toml                 default = "<version>", optional auto-install = true, [cache]
+  cache/v1/                     shared build cache (objects, native, semantic, steps, glibc-stubs)
   toolchains/<version>/bin/silkc
   toolchains/<version>/lib/silk/stdlib
 ```

@@ -272,6 +272,51 @@ The compiler, `silkc` in a release, knows nothing about Silk versions: it runs i
 [silk tool](../tool) chooses and installs versions and forwards each command to the selected
 compiler with `SILK_TOOLCHAIN` and `SILK_HOME` set.
 
+## Build cache
+
+By default, compiled objects, native C/C++ objects, semantic caches, step caches, and glibc link
+stubs live in a shared system cache at `$SILK_HOME/cache/v1` (`~/.silk/cache/v1`, or
+`%LOCALAPPDATA%\silk\cache\v1` on Windows when `SILK_HOME` is unset). Distinct workspaces and
+git worktrees share content-addressed artifacts while keeping per-project semantic scopes isolated
+by canonical workspace root and package name. Final build products remain in each workspace's
+`build/` directory.
+
+The previous per-workspace layout under `build/` remains available as an option. Precedence is
+command-line flags, then environment variables, then `$SILK_HOME/settings.toml`, then the default:
+
+```sh
+silk build --cache-mode workspace          # keep caches inside build/ for this command
+SILK_CACHE_MODE=workspace silk build       # per-workspace cache via environment
+silk build --cache-dir /path/to/cache      # custom shared cache root (stores under <dir>/v1)
+SILK_CACHE_DIR=/path/to/cache silk build   # custom shared cache root via environment
+```
+
+Default settings live in `$SILK_HOME/settings.toml`:
+
+```toml
+[cache]
+mode = "shared"        # "shared" (default) or "workspace"
+# dir = "/path/to/cache"
+max-size = "10G"       # or SILK_CACHE_MAX_SIZE
+max-age-days = 30      # or SILK_CACHE_MAX_AGE_DAYS
+kept-compilers = 5
+```
+
+Inspect and manage the shared cache with `silk cache`:
+
+```sh
+silk cache path                          # print the active cache root, or "workspace"
+silk cache info                          # print disk usage by category and active limits
+silk cache prune                         # enforce size, age, and compiler-version limits now
+silk cache prune --max-size 2G --max-age-days 7
+silk cache clean                         # remove all entries in the shared cache
+```
+
+`silk clean` removes the current project's `build/` directory and its shared semantic scopes
+without discarding objects or scopes belonging to other workspaces. Pass `silk clean --cache` to
+also clear the shared system cache. Automatic garbage collection runs at most once every 24 hours
+and never evicts files touched within the last hour.
+
 ## Tracing the compiler
 
 The compiler records its own work as OpenTelemetry spans and logs with `silk.trace`, the way a

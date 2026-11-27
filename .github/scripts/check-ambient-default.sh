@@ -100,7 +100,7 @@ done
 # A program can allocate, suspend, drive and drop executions without providing a service.
 # Compare the emitted object with a build in which the capture branch is physically absent.
 source="$repository/corpus/native/independent-execution-endpoint-drive/main.silk"
-"$compiler" build "$source" --stdlib "$output/stdlib" --clang "$clang" -o "$output/drive"
+"$compiler" build "$source" --cache-mode workspace --stdlib "$output/stdlib" --clang "$clang" -o "$output/drive"
 "$output/drive"
 cp -R "$output/stdlib" "$output/control-stdlib"
 python3 - "$output/control-stdlib/silk/concurrency/execution.silk" <<'PY'
@@ -114,5 +114,5 @@ end = next(i for i in range(start + 1, len(lines)) if lines[i] == "    }\n")
 lines[start:end + 1] = [" " * (len(line) - 1) + "\n" for line in lines[start:end + 1]]
 source.write_text("".join(lines))
 PY
-"$compiler" build "$source" --stdlib "$output/control-stdlib" --clang "$clang" -o "$output/control"
+"$compiler" build "$source" --cache-mode workspace --stdlib "$output/control-stdlib" --clang "$clang" -o "$output/control"
 cmp "$output/drive.units/"*.o "$output/control.units/"*.o
