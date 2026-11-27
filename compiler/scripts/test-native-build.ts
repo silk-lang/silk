@@ -343,7 +343,8 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const beforeEmbedding = yield* fs.readFileString(join(requestRoot, 'main.silk'))
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), 'import payload { data }\n' + beforeEmbedding.replace(
     'pub fn main() -> i32 {', 'pub fn main() -> i32 {\n  if data.length != 5 || data[0] != 5 || data[1] != 0 || data[2] != 255 || data[3] != 34 || data[4] != 10 { return 8 }'))
-  const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
+  const graphEnv = { ...requestEnv, SILK_CACHE_MODE: 'workspace', SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }
+  const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, graphEnv, 120_000)
   assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
   assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
   // The compilation builds outside its step with the package cache, so the next one after an edit
@@ -355,7 +356,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded.replace('{ return 8 }', '{ return 9 }'))
   // The fixture checks that planning leaves no published program, so the first one goes first.
   yield* fs.remove(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture'))
-  const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, { ...requestEnv, SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }, 120_000)
+  const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, graphEnv, 120_000)
   assert.equal(graphRecompiled.status, 0, graphRecompiled.stderr)
   assert.match(graphRecompiled.stderr, /checks? reused/, 'an edited graph compilation reuses its cache')
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded)
