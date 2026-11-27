@@ -170,6 +170,9 @@ struct Writer {
   /// Entry-block copies that cold drops of whole aggregate locals run on: block, statement and
   /// address (`emitDropCopySlots`).
   dropCopies: List<DropCopy>,
+  /// Per MIR block, the entry-block slot its call returns through in place of its destination, or
+  /// `none()` (`emitResultSlots`). Empty in fast-path builds and in steps.
+  results: List<u64>,
   /// Its arguments: each written parameter's first lane (`none()` for a unit one), the hidden
   /// provider addresses, and the hidden result, failure, context, observer, cause and site
   /// addresses; a coroutine's transfer record and frame. Absent ones are `none()`.
@@ -282,6 +285,7 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer
     alignments: List<usize>.make(),
     copies: List<CallerCopy>.make(),
     dropCopies: List<DropCopy>.make(),
+    results: List<u64>.make(),
     parameters: List<u64>.make(),
     extras: List<u64>.make(),
     providers: List<u64>.make(),
@@ -322,6 +326,7 @@ fn resetFunction(writer: &mut Writer) -> () {
   List<usize>.clear(&mut writer.*.alignments)
   List<CallerCopy>.clear(&mut writer.*.copies)
   List<DropCopy>.clear(&mut writer.*.dropCopies)
+  List<u64>.clear(&mut writer.*.results)
   List<u64>.clear(&mut writer.*.parameters)
   List<u64>.clear(&mut writer.*.extras)
   List<u64>.clear(&mut writer.*.providers)
@@ -6445,6 +6450,98 @@ fn dropCopy(writer: &Writer, block: usize, statement: usize) -> Option<DropCopy>
   return Option<DropCopy>.none()
 }
 
+// Gives each call that returns through an out-address an entry-block slot of its own when a
+// statement also writes its destination, a whole local smaller than `directMinimumSize`. The call
+// would otherwise take the destination's address, so the values the other paths store there stay
+// in memory: once LLVM inlines the function, they meet the call's result through a reload, which
+// cannot forward from their stores when it is wider than they are (#3328). With a slot of its own
+// the destination is written by plain stores on every path, the call's by a copy after it.
+effect fn emitResultSlots(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &TypeLayouts,
+) -> ()
+  ! Gap | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let locals = List<Local>.asSlice(&function.locals)
+  let mut stated = run List<bool>.makeWithCapacity(locals.length)
+  run List<bool>.appendRepeated(&mut stated, false, locals.length)
+  let mut calls = false
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let statements = List<Statement>.asSlice(&blocks[block].statements)
+    let mut at = usize.ZERO
+    while at < statements.length {
+      if let Statement.Assign { destination, .. } = &statements[at] {
+        if writesLocal(&destination) {
+          List<bool>.set(&mut stated, destination.local, true)
+        }
+      }
+      at = at + usize.ONE
+    }
+    if let Terminator.Call { .. } = &blocks[block].terminator {
+      calls = true
+    }
+    block = block + usize.ONE
+  }
+  if !calls {
+    return ()
+  }
+  let mut results = run List<u64>.makeWithCapacity(blocks.length)
+  run List<u64>.appendRepeated(&mut results, Bitcode.none(), blocks.length)
+  block = usize.ZERO
+  while block < blocks.length {
+    if let Terminator.Call { call } = &blocks[block].terminator {
+      let CallTerminator { callee, destination, .. } = &call.get().*
+      let silk = match &callee {
+        Callee.Extern { .. } => false
+        Callee.NativeIndirect { .. } => false
+        _ => true
+      }
+      let local = destination.local
+      if silk && List<Projection>.length(&destination.projections) == usize.ZERO
+        && directBinding(&writer.*, block) == usize.MAX && List<bool>.get(&stated, local) {
+        let facts = run layoutOf(layouts, &locals[local].ty, function, locals[local].origin.location)
+        let kind = storageRepresentation(&locals[local].ty, target, facts)
+        if (kind.aggregate || passedIndirectly(kind)) && facts.size < directMinimumSize() {
+          let ty = run typeOf(&mut writer.*, kind)
+          let address = run Module.alloca(&mut writer.*.module, ty, usize.toU64(facts.alignment))
+          Module.setName(&mut writer.*.module, address, Bitcode.named(Bitcode.prefixResult, block))
+          List<u64>.set(&mut results, block, address)
+        }
+      }
+    }
+    block = block + usize.ONE
+  }
+  writer.results = move results
+  return ()
+}
+
+// Whether assigning to `place` writes its local's own storage, not memory it points to.
+fn writesLocal(place: &Place) -> bool {
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    match &steps[at] {
+      Projection.Deref => { return false }
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The slot the call ending MIR block `index` returns through in place of its destination, or
+// `none()` (Writer.results).
+fn resultSlot(writer: &Writer, index: usize) -> u64 {
+  if index < List<u64>.length(&writer.results) {
+    return List<u64>.get(&writer.results, index)
+  }
+  return Bitcode.none()
+}
+
 // The caller copy slot of indirect C argument `parameter` of block `block`'s call.
 fn callerCopy(writer: &Writer, block: usize, parameter: usize) -> u64 {
   let copies = List<CallerCopy>.asSlice(&writer.copies)
@@ -6913,6 +7010,7 @@ effect fn emitCall(
     )
   }
   let cold = isCold(&writer.*, block)
+  let returned = resultSlot(&writer.*, block)
   return run emitCallInner(
     &mut writer.*,
     function,
@@ -6928,6 +7026,7 @@ effect fn emitCall(
     failure,
     span,
     cold,
+    returned,
   )
 }
 
@@ -6954,11 +7053,18 @@ effect fn emitCallInner(
   failure: &Option<FailureEdge>,
   span: Location,
   cold: bool,
+  slot: u64,
 ) -> ()
   ! Gap | OutOfMemoryError
   ? &mut Allocator | &mut Types {
   let output = run emitPlace(&mut writer.*, function, target, layouts, destination)
   let kind = output.representation
+
+  // The call returns through its own slot, which is then copied to the destination (`emitResultSlots`).
+  let mut written = output.value
+  if slot != Bitcode.none() {
+    written = slot
+  }
 
   // A fallible callee takes success and failure out-addresses after its arguments and returns a
   // status: 0 continues at `normal`, 1 at the failure edge (D3).
@@ -7068,7 +7174,7 @@ effect fn emitCallInner(
         run appendLane(&mut parameters, &mut passed, pointer, addressed[hidden.length + 2])
       }
       Lane.Result => {
-        run appendLane(&mut parameters, &mut passed, pointer, output.value)
+        run appendLane(&mut parameters, &mut passed, pointer, written)
       }
       Lane.Failure => {
         if let Option<Address>.Some { value: failureSlot } = &failed {
@@ -7119,14 +7225,46 @@ effect fn emitCallInner(
   }
   if fallible {
     let onFailure = blockAt(&writer.*, handler)
-    let onSuccess = blockAt(&writer.*, normal)
+    let mut onSuccess = blockAt(&writer.*, normal)
+    if slot != Bitcode.none() {
+      let number = Module.fresh(&mut writer.*.module)
+      onSuccess = run Module.newBlock(&mut writer.*.module, Bitcode.named(Bitcode.prefixSafe, number))
+      run branchUnlikely(&mut writer.*, returned, onFailure, onSuccess)
+      startBlock(&mut writer.*, onSuccess)
+      run copyResult(&mut writer.*, function, target, layouts, &output, slot)
+      let continued = blockAt(&writer.*, normal)
+      return run branch(&mut writer.*, continued)
+    }
     return run branchUnlikely(&mut writer.*, returned, onFailure, onSuccess)
   }
-  if !kind.unit && !outward {
+  if slot != Bitcode.none() {
+    run copyResult(&mut writer.*, function, target, layouts, &output, slot)
+  } else if !kind.unit && !outward {
     run storeValue(&mut writer.*, &output, &Value { scalar: kind, value: returned })
   }
   let next = blockAt(&writer.*, normal)
   return run branch(&mut writer.*, next)
+}
+
+// Copies the result a call wrote to its own `slot` (`emitResultSlots`) into its destination.
+effect fn copyResult(
+  writer: &mut Writer,
+  function: &MirFunction,
+  target: &Target,
+  layouts: &TypeLayouts,
+  output: &Address,
+  slot: u64,
+) -> ()
+  ! Gap | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let source = Address {
+    ty: Interned<Type>.clone(&output.ty),
+    value: slot,
+    alignment: output.alignment,
+    representation: output.representation,
+  }
+  let value = run loadAddress(&mut writer.*, &source)
+  return run storeCopy(&mut writer.*, function, target, layouts, output, &value, true)
 }
 
 // Appends the current observer, selected cause and site addresses an observed callee takes.
@@ -8116,6 +8254,7 @@ effect fn emitEntrySlots(
   run emitCCopySlots(&mut writer.*, function, target, layouts, foreign)
   if !writer.fastPath {
     run emitDropCopySlots(&mut writer.*, function, target, layouts)
+    run emitResultSlots(&mut writer.*, function, target, layouts)
   }
   let locals = List<Local>.asSlice(&function.locals)
   let parameters = List<Interned<Type>>.asSlice(&function.parameters)
