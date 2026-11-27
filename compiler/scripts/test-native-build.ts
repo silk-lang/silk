@@ -204,11 +204,51 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     genericUnits++
     assert.ok(call.includes('-O2') && call.includes('-g'), 'dependency generics use the defining package optimization and debug settings')
     assert.ok(!call.includes('-O0'), 'program defaults must not override package flags')
-    const dwarf = yield* invoke(join(dirname(clang), 'llvm-dwarfdump'), ['--debug-info', object], requestRoot)
-    assert.equal(dwarf.status, 0, dwarf.stderr)
-    assert.match(dwarf.stdout, /DW_TAG_compile_unit/, 'the dependency object must contain usable debug information')
+    // A `speed` unit compiles for ThinLTO, so the link inlines across the package's units.
+    assert.ok(call.includes('-flto=thin'), 'a speed package compiles for ThinLTO')
+    const listing = yield* invoke(join(dirname(clang), 'llvm-dis'), [object, '-o', '-'], requestRoot)
+    assert.equal(listing.status, 0, listing.stderr)
+    assert.match(listing.stdout, /!DICompileUnit\(/, 'the dependency object must contain usable debug information')
   }
   assert.equal(genericUnits, 1)
+  // Units the program's own `none` settings compile stay native objects outside ThinLTO.
+  assert.ok(calls.some((call) => call.includes('-c') && call.includes('ir') && call.includes('-O0') && !call.includes('-flto=thin')),
+    'program units keep their own settings')
+  // A `speed` package without debug settings of its own takes the standard library functions it
+  // reaches into its ThinLTO units, so its calls to them inline.
+  yield* fs.writeFileString(mixedLog, '')
+  const flowText = requestText.replace('name = "request-dependency"', 'optimization = "speed"\nname = "request-dependency"')
+  const flow = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, { ...requestEnv, SILK_CLANG: mixedClang }, 120_000, flowText)
+  assert.equal(flow.status, 0, flow.stderr)
+  assert.equal((yield* invoke(requestOutput, [], requestRoot)).status, 0)
+  const negate = (yield* fs.readFileString(`${requestOutput}.symbols`)).split('\n')
+    .find((line) => line.endsWith('silk:silk/num/i32.silk::wrappingNegate'))?.split('\t')[0]
+  assert.ok(negate, 'the dependency calls the standard library')
+  const flowCalls = yield* Schema.decodeUnknownEffect(Schema.Array(Schema.Array(Schema.String)))(
+    yield* decodeJson(`[${(yield* fs.readFileString(mixedLog)).trim().split('\n').join(',')}]`))
+  let negateThin = 0
+  for (const call of flowCalls) {
+    if (!call.includes('-c') || !call.includes('ir')) continue
+    const partial = call[call.indexOf('-o') + 1]
+    const object = partial.slice(0, partial.indexOf('.o.') + 2)
+    const symbols = yield* invoke(join(dirname(clang), 'llvm-nm'), ['--defined-only', object], requestRoot)
+    assert.equal(symbols.status, 0, symbols.stderr)
+    if (symbols.stdout.split('\n').some((line) => line.endsWith(` ${negate}`))) {
+      assert.ok(call.includes('-flto=thin') && call.includes('-O2'), 'a function only the speed package reaches compiles with it')
+      negateThin++
+    }
+  }
+  assert.equal(negateThin, 1)
+  // A package setting that repeats the program's own changes nothing: a `speed` program with a
+  // `speed` dependency stays one module, where calls inline across every module.
+  yield* fs.writeFileString(mixedLog, '')
+  const sameText = mixedText.replace('optimization = "none"', 'optimization = "speed"').replace('debug = true\n', 'debug = false\n')
+  const same = yield* invoke(silk, ['compile', '--request', '-'], requestRoot, { ...requestEnv, SILK_CLANG: mixedClang }, 120_000, sameText)
+  assert.equal(same.status, 0, same.stderr)
+  assert.equal((yield* invoke(requestOutput, [], requestRoot)).status, 0)
+  const sameCalls = (yield* fs.readFileString(mixedLog)).trim().split('\n')
+    .filter((line) => line.includes('"-c"') && line.includes('"ir"'))
+  assert.equal(sameCalls.length, 1, "a setting equal to the program's compiles the program as one module")
   // Intermediate artifacts retain defining-package settings too. Validate the emitted IR,
   // then feed the other formats back through LLVM to verify they remain consumable.
   for (const [emit, suffix] of [['llvm-ir', 'll'], ['llvm-bitcode', 'bc'], ['assembly', 's'], ['object', 'o']]) {
