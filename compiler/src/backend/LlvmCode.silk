@@ -71,6 +71,7 @@ import backend.Mir {
   Diagnostics,
   FailureEdge,
   Local,
+  LocalKind,
   MirFunction,
   Operand,
   Place,
@@ -197,6 +198,9 @@ struct Writer {
   /// Per MIR block, whether every path from it ends in `fail` or a trap, so its calls are cold
   /// and branches into it are unlikely (#2568). Empty in fast-path builds.
   cold: List<bool>,
+  /// Per MIR local, what every value it can hold was weighed as by `Intrinsic.boolExpect`
+  /// ([`expectedLocals`]), so a branch on it carries the weight (#3324). Empty in fast-path builds.
+  expected: List<u8>,
   /// Per MIR block, the large `let` binding its call writes in place of its temporary, or
   /// `usize.MAX`; the move out of the temporary is then skipped (#2515). Empty in fast-path builds.
   direct: List<usize>,
@@ -293,6 +297,7 @@ effect fn writerOfWidth(pointerBits: usize, fastPath: bool) -> Writer
     steps: Bitcode.none(),
     threaded: List<bool>.make(),
     cold: List<bool>.make(),
+    expected: List<u8>.make(),
     direct: List<usize>.make(),
     skipped: List<usize>.make(),
     tables: List<JumpTable>.make(),
@@ -544,6 +549,15 @@ fn blockAt(writer: &Writer, index: usize) -> u64 {
 // Whether MIR block `index` only leads to `fail` or a trap (Writer.cold).
 fn isCold(writer: &Writer, index: usize) -> bool {
   return index < List<bool>.length(&writer.cold) && List<bool>.get(&writer.cold, index)
+}
+
+// What a branch on `condition` was weighed as by `Intrinsic.boolExpect` (Writer.expected): one of
+// `expectsFalse` or `expectsTrue`, or another value when no weight reaches it.
+fn expectationOf(writer: &Writer, condition: &Operand) -> u8 {
+  if List<u8>.length(&writer.expected) == usize.ZERO {
+    return expectsMixed
+  }
+  return weightOf(&writer.expected, condition)
 }
 
 // The binding the call ending MIR block `index` writes directly, or `usize.MAX` (Writer.direct).
@@ -7354,8 +7368,13 @@ effect fn emitBlock(
       let onTrue = blockAt(&writer.*, thenBlock)
       let onFalse = blockAt(&writer.*, elseBlock)
       let coldTrue = isCold(&writer.*, thenBlock)
+      let expected = expectationOf(&writer.*, &condition)
       if coldTrue != isCold(&writer.*, elseBlock) {
         run branchExpecting(&mut writer.*, tested.value, !coldTrue, onTrue, onFalse)
+      } else if expected == expectsFalse || expected == expectsTrue {
+        // The weight goes on the branch itself: LLVM reads an `llvm.expect` only when it feeds a
+        // branch directly, before SROA removes the slots between the call and its test.
+        run branchExpecting(&mut writer.*, tested.value, expected == expectsTrue, onTrue, onFalse)
       } else {
         run branchIf(&mut writer.*, tested.value, onTrue, onFalse)
       }
@@ -7556,6 +7575,182 @@ effect fn emitBlock(
 // dispatches the next case itself instead of jumping back to one shared jump-table branch, which
 // saves the jump and lets the branch predictor learn from each arm. A function with an `indirectbr`
 // is never inlined, so only switches with many cases inside a loop qualify.
+// The states of one local in [`expectedLocals`]: no value reaches it yet, every value is weighed as
+// usually false or as usually true, or its values carry no single weight.
+const expectsNone: u8 = 0
+const expectsFalse: u8 = 1
+const expectsTrue: u8 = 2
+const expectsMixed: u8 = 3
+
+// Per MIR local, the weight `Intrinsic.boolExpect` gave every value it holds (Writer.expected). A
+// local assigned `boolExpect(condition, expected)` with a constant `expected` takes that weight; a
+// copy or move of a weighed local, or its negation, takes the source's (flipped). The weights flow
+// through the temporaries and return slots an inlined `hint.likely` or `hint.unlikely` leaves, and
+// through the joins `&&` and `||` build. Any other write, a borrow or a parameter, carries none.
+effect fn expectedLocals(function: &MirFunction) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let locals = List<Local>.asSlice(&function.locals)
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut expected = List<u8>.make()
+  run List<u8>.appendRepeated(&mut expected, expectsNone, locals.length)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let mut carried = false
+    match &locals[at].kind {
+      LocalKind.Temp => {
+        carried = true
+      }
+      LocalKind.User { .. } => {
+        carried = true
+      }
+      LocalKind.Return => {
+        carried = true
+      }
+      _ => {}
+    }
+    if !carried {
+      List<u8>.set(&mut expected, at, expectsMixed)
+    }
+    at = at + usize.ONE
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut block = usize.ZERO
+    while block < blocks.length {
+      let statements = List<Statement>.asSlice(&blocks[block].statements)
+      let mut statement = usize.ZERO
+      while statement < statements.length {
+        match &statements[statement] {
+          Statement.Assign { destination, value, .. } => {
+            let weight = assignedWeight(&expected, &value)
+            changed = joinWeight(&mut expected, &destination, weight) || changed
+            changed = borrowsUnweighed(&mut expected, &value) || changed
+          }
+          Statement.Drop { destination, .. } => {
+            changed = joinWeight(&mut expected, &destination, expectsMixed) || changed
+          }
+          Statement.FailureContext { destination, .. } => {
+            changed = joinWeight(&mut expected, &destination, expectsMixed) || changed
+          }
+          _ => {}
+        }
+        statement = statement + usize.ONE
+      }
+      if let Terminator.Call { call } = &blocks[block].terminator {
+        let CallTerminator { destination, failure, .. } = &call.get().*
+        changed = joinWeight(&mut expected, &destination, expectsMixed) || changed
+        if let Option<FailureEdge>.Some { value: edge } = &failure {
+          changed = joinWeight(&mut expected, &edge.destination, expectsMixed) || changed
+        }
+      }
+      block = block + usize.ONE
+    }
+  }
+  return move expected
+}
+
+// The weight an assignment of `value` gives its destination, from the weights known so far.
+fn assignedWeight(expected: &List<u8>, value: &Rvalue) -> u8 {
+  match &value.* {
+    Rvalue.ScalarBinary { operation, right, .. } => {
+      if operation == ScalarBinary.Expect {
+        if let Operand.Boolean { value: likely } = &right {
+          if likely {
+            return expectsTrue
+          }
+          return expectsFalse
+        }
+      }
+    }
+    Rvalue.Use { value: source } => {
+      return weightOf(expected, &source)
+    }
+    Rvalue.Unary { operation, value: source } => {
+      if operation == PrefixOperator.Not {
+        let weight = weightOf(expected, &source)
+        if weight == expectsTrue {
+          return expectsFalse
+        }
+        if weight == expectsFalse {
+          return expectsTrue
+        }
+        return weight
+      }
+    }
+    _ => {}
+  }
+  return expectsMixed
+}
+
+// The weight known so far for `operand`: a whole local's, or none.
+fn weightOf(expected: &List<u8>, operand: &Operand) -> u8 {
+  match &operand.* {
+    Operand.Copy { place } => {
+      return placeWeight(expected, &place)
+    }
+    Operand.Move { place } => {
+      return placeWeight(expected, &place)
+    }
+    _ => {}
+  }
+  return expectsMixed
+}
+
+// The weight known so far for the value at `place`: a whole local's, or none.
+fn placeWeight(expected: &List<u8>, place: &Place) -> u8 {
+  if List<Projection>.length(&place.projections) != usize.ZERO
+    || place.local >= List<u8>.length(expected) {
+    return expectsMixed
+  }
+  return List<u8>.get(expected, place.local)
+}
+
+// Joins `weight` into the local `destination` writes; a write to part of a local leaves it none.
+// Returns whether the local's state changed.
+fn joinWeight(expected: &mut List<u8>, destination: &Place, weight: u8) -> bool {
+  let mut joined = weight
+  if List<Projection>.length(&destination.projections) != usize.ZERO {
+    joined = expectsMixed
+  }
+  let before = List<u8>.get(&expected.*, destination.local)
+  let mut after = joined
+  if before == expectsMixed || (before != expectsNone && joined != expectsNone && before != joined) {
+    after = expectsMixed
+  } else if joined == expectsNone {
+    after = before
+  }
+  if after == before {
+    return false
+  }
+  List<u8>.set(&mut expected.*, destination.local, after)
+  return true
+}
+
+// Marks a local that `value` borrows or takes the address of as unweighed, since writes through
+// the address are not tracked. Returns whether a local's state changed.
+fn borrowsUnweighed(expected: &mut List<u8>, value: &Rvalue) -> bool {
+  let mut borrowed = usize.MAX
+  match &value.* {
+    Rvalue.Ref { place, .. } => {
+      borrowed = place.local
+    }
+    Rvalue.AddressOf { place, .. } => {
+      borrowed = place.local
+    }
+    Rvalue.ContextOf { place } => {
+      borrowed = place.local
+    }
+    _ => {}
+  }
+  if borrowed == usize.MAX || List<u8>.get(&expected.*, borrowed) == expectsMixed {
+    return false
+  }
+  List<u8>.set(&mut expected.*, borrowed, expectsMixed)
+  return true
+}
+
 // Per MIR block, whether every path from it ends in `fail`, a trap or `unreachable`: such a block
 // builds and reports an error or stops, so it is rarely taken (Writer.cold). The facts flow
 // backward from those exits until nothing changes.
@@ -8965,6 +9160,7 @@ pub effect fn emit(
   if !fastPath {
     writer.threaded = run threadedSwitches(function, target)
     writer.cold = run coldBlocks(function)
+    writer.expected = run expectedLocals(function)
     run directBindings(&mut writer, function, layouts)
   }
   noteDiagnosticLocals(&mut writer, function)
