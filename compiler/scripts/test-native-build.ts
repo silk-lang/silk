@@ -363,7 +363,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
     '-o', graphCompiler, '--stdlib', standardLibrary, '--clang', clang], directory, process.env, 300_000)
   assert.equal(graphCompilerBuilt.status, 0, graphCompilerBuilt.stderr || String(graphCompilerBuilt.error))
   yield* fs.writeFileString(join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n[workspace]\nmembers = ["request-fixture"]\noutput-dir = "request-fixture/custom-output"\n')
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n[workspace]\nmembers = ["request-fixture"]\n')
   yield* fs.writeFile(join(requestRoot, 'dependency/asset.bin'), new Uint8Array([5, 0, 255, 34, 10]))
   const packagePath = (dependency: string, path: string) => invoke(silk,
     ['package-path', '--manifest', join(requestRoot, 'silk.toml'), '--dependency', dependency, '--path', path], requestRoot, requestEnv)
@@ -386,22 +386,23 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   const graphEnv = { ...requestEnv, SILK_CACHE_MODE: 'workspace', SILK_TEST_COMPILER: silk, SILK_COMPILER: silk }
   const graphCompiled = yield* invoke(graphCompiler, [], requestRoot, graphEnv, 120_000)
   assert.equal(graphCompiled.status, 0, graphCompiled.stderr)
-  assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  assert.ok(yield* fs.exists(join(directory, 'build/x86_64-unknown-linux-gnu/dev/request-fixture')))
   // The compilation builds outside its step with the package cache, so the next one after an edit
   // reuses the checks of what it did not change.
-  assert.ok(yield* fs.exists(join(requestRoot, 'custom-output/steps/compilations/x86_64-unknown-linux-gnu/dev/request-fixture')))
-  const graphCache = compilerCache(join(requestRoot, 'custom-output/cache/request-fixture'))
+  assert.ok(yield* fs.exists(join(directory, 'build/steps/compilations/x86_64-unknown-linux-gnu/dev/request-fixture')))
+  const graphCache = compilerCache(join(directory, 'build/cache/request-fixture'))
   assert.ok((yield* fs.readDirectory(graphCache)).some((name) => name.startsWith('semantic-')), 'the graph compilation keeps a semantic cache')
   const embedded = yield* fs.readFileString(join(requestRoot, 'main.silk'))
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded.replace('{ return 8 }', '{ return 9 }'))
   // The fixture checks that planning leaves no published program, so the first one goes first.
-  yield* fs.remove(join(requestRoot, 'custom-output/x86_64-unknown-linux-gnu/dev/request-fixture'))
+  yield* fs.remove(join(directory, 'build/x86_64-unknown-linux-gnu/dev/request-fixture'))
   const graphRecompiled = yield* invoke(graphCompiler, [], requestRoot, graphEnv, 120_000)
   assert.equal(graphRecompiled.status, 0, graphRecompiled.stderr)
   assert.match(graphRecompiled.stderr, /checks? reused/, 'an edited graph compilation reuses its cache')
   yield* fs.writeFileString(join(requestRoot, 'main.silk'), embedded)
   yield* fs.writeFileString(join(directory, 'silk.toml'),
     '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n')
+  yield* fs.remove(join(directory, 'build'), { recursive: true })
   const runnerDirectory = join(directory, 'artifact-runners')
   yield* fs.makeDirectory(runnerDirectory)
   const explicitRunner = join(runnerDirectory, 'explicit')
@@ -2879,7 +2880,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
       assert.ok(waited >= holdSeconds * 1000, `${name}: the check read a file without a check's walks ${waited} ms into the build's write`)
     }
   }
-  // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
+  // `test` builds the project's runner below `build/` as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
   yield* fs.makeDirectory(join(directory, 'tested/src/util'), { recursive: true })
@@ -3339,6 +3340,11 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.ok(yield* fs.exists(join(archiveStore, vendDigest, 'lib/libvend.a')), 'the archive is extracted below its digest, its top directory stripped')
   yield* archivedRun(35, { ...vendorArchiveEnvironment, SILK_OFFLINE: '1' })
   yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), `${appManifest}\n[native.override.vend]\npath = "${join(vendorArchived, 'alt')}"\n`)
+  const manifestOverride = yield* archivedBuild()
+  assert.equal(manifestOverride.status, 2, 'manifest [native.override] was accepted')
+  assert.match(manifestOverride.stderr, /override/)
+  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
+  yield* fs.writeFileString(join(vendorArchived, 'home/native-overrides.toml'), '[native.override.vend]\npath = "../alt"\n')
   yield* archivedRun(55)
   // A declared archive is named by its bytes in the link stamp: an unchanged rebuild links
   // nothing, and new bytes at the same path link again.
@@ -3349,9 +3355,6 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* packVendor('alt', 60)
   yield* archivedRun(65)
   yield* packVendor('alt', 50)
-  yield* archivedRun(55)
-  yield* fs.writeFileString(join(vendorArchived, 'app/silk.toml'), appManifest)
-  yield* fs.writeFileString(join(vendorArchived, 'home/native-overrides.toml'), '[native.override.vend]\npath = "../alt"\n')
   yield* archivedRun(55)
   yield* fs.remove(join(vendorArchived, 'home/native-overrides.toml'))
   yield* archivedRun(35)
@@ -4732,92 +4735,239 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.match(missing.stderr, /silk\.local\.toml:2: .*has no silk\.toml/)
   }
   {
-    // `[pack.binary]` ships binaries without `--bin`: a tar file with the executable in `bin/`
-    // and the included files, or for a target that says so a ZIP file with it at the top.
+    // `silk pack --bin` drives `tasks.silk` (`Plan`), packages only root final executables under
+    // `<top>/bin/` alongside package-root docs, clears signing secrets before invoking `tasks.silk`,
+    // and `silk pack` includes package-root `build.silk` in the source archive.
     const tool = join(directory, 'binary/tool')
     const output = join(directory, 'binary/out')
     const environment = { ...process.env, SILK_CLANG: clang }
     yield* fs.makeDirectory(join(tool, 'src'), { recursive: true })
-    yield* fs.makeDirectory(join(tool, 'completions'), { recursive: true })
-    const manifest = (more: string) =>
-      `[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "${releasePin}"\n\n[pack.binary]\ninclude = ["completions", "notes.txt"]\n${more}`
-    yield* fs.writeFileString(join(tool, 'silk.toml'), manifest(''))
-    yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
-    yield* fs.writeFileString(join(tool, 'completions/tool.bash'), 'complete -W "pack" packed-tool\n')
-    yield* fs.writeFileString(join(tool, 'notes.txt'), 'notes\n')
+    yield* fs.writeFileString(
+      join(tool, 'silk.toml'),
+      `[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "${releasePin}"\n`,
+    )
+    yield* fs.writeFileString(join(tool, 'src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+    yield* fs.writeFileString(join(tool, 'src/app.silk'), 'import generated { value }\npub fn main() -> i32 { return value }\n')
+    yield* fs.writeFileString(join(tool, 'src/worker.silk'), 'pub fn main() -> i32 { return 0 }\n')
+    yield* fs.writeFileString(
+      join(tool, 'src/helper.silk'),
+      [
+        'import silk.core.effect { Effect }',
+        'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+        'import silk.system.filesystem { FileError, FileSystem, Path }',
+        'import silk.system.filesystem_native { OsFileSystem }',
+        'import silk.system.host_input { HostInput, HostInputError }',
+        'pub effect fn main() -> i32 ! FileError | HostInputError | OutOfMemoryError ? &mut HostInput {',
+        '  let mut allocator = Allocator.systemAllocatorProvider()',
+        '  let args = run HostInput.arguments() |> Effect.provideMut<Allocator>(&mut allocator)',
+        '  let mut files = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)',
+        '  let out = run Path.fromBytes(args.asSlice()[1].asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)',
+        '  run FileSystem.writeFile(&out, b"pub const value: i32 = 42\\n")',
+        '    |> Effect.provideMut<FileSystem>(&mut files)',
+        '  return 0',
+        '}',
+        '',
+      ].join('\n'),
+    )
+    yield* fs.writeFileString(
+      join(tool, 'build.silk'),
+      'import silk.build.plan { Plan }\npub const PLAN: Plan = Plan.empty()\n',
+    )
+    yield* fs.writeFileString(
+      join(tool, 'src/tasks.silk'),
+      [
+        'import silk.build.graph { Build, BuildError, Compilation }',
+        'import silk.build.options { Optimize, Options }',
+        'import silk.build.run { Run }',
+        'import silk.build.tasks { StandardError }',
+        'import silk.build.step { Deferred }',
+        'import silk.cli.command { Command, CommandLine }',
+        'import silk.cli.task { Task, TaskSet }',
+        'import silk.collections.bytes { Bytes }',
+        'import silk.core.option { Option }',
+        'import silk.mem.allocator { Allocator }',
+        'import silk.system.child_process { ChildProcess }',
+        'import silk.system.filesystem { FileSystem }',
+        'import silk.system.host_input { HostInput }',
+        'import silk.text.string { String }',
+        '',
+        'union Tasks { Build { pub options: Options }, Plan { pub options: Options } }',
+        'impl CommandLine for Tasks {',
+        '  static fn command() -> Command<Tasks> {',
+        '    return Command<Tasks>.make("tasks", "Pack tasks")',
+        '      |> Command.variant("Build", "Build")',
+        '      |> Command.variant("Plan", "Plan")',
+        '      |> Command.flatten("options")',
+        '  }',
+        '}',
+        'effect fn applyOptions(compilation: Compilation, options: &Options) -> Compilation ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {',
+        '  let targeted = if options.target.length() == 1 && options.target.asSlice()[0].view() != "host" {',
+        '    let target = run String.copy(options.target.asSlice()[0].view())',
+        '    run compilation.target(run Deferred<String>.value(move target))',
+        '  } else {',
+        '    move compilation',
+        '  }',
+        '  let optimized = run targeted.optimize(run Deferred<Optimize>.value(options.optimize))',
+        '  let debugged = run optimized.debug(run Deferred<bool>.value(options.debugInfo()))',
+        '  return run debugged.unsandboxedTools(options.unsandboxedTools)',
+        '}',
+        'effect fn graphFor(options: &Options) -> Build ! BuildError ? &mut Allocator | &mut FileSystem | &mut HostInput {',
+        '  let helperComp = run Compilation.executable("helper", "src/helper.silk")',
+        '  let gen = run (run Run.artifact(run helperComp.artifact()).outputFile("generated.silk")).register()',
+        '  let app = run applyOptions(run (run Compilation.executable("app", "src/app.silk")).moduleFile("generated", run gen.output("generated.silk")), options)',
+        '  let worker = run applyOptions(run Compilation.executable("worker", "src/worker.silk"), options)',
+        '  return run (run (run Build.make()).add(move app)).add(move worker)',
+        '}',
+        'impl TaskSet for Tasks {',
+        '  effect fn perform(self: Tasks) -> () ! StandardError ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {',
+        '    if let Option<Bytes>.Some { .. } = move run HostInput.variableNamed("SILK_SIGNING_KEY") {',
+        '      run Task.abort("SILK_SIGNING_KEY must not reach tasks during silk pack --bin")',
+        '    }',
+        '    if let Option<Bytes>.Some { .. } = move run HostInput.variableNamed("SILK_SIGNING_PASSWORD") {',
+        '      run Task.abort("SILK_SIGNING_PASSWORD must not reach tasks during silk pack --bin")',
+        '    }',
+        '    match move self {',
+        '      Tasks.Build { options } => { drop run (run graphFor(&options)).compile() }',
+        '      Tasks.Plan { options } => { drop run (run graphFor(&options)).write() }',
+        '    }',
+        '  }',
+        '}',
+        'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
+        '',
+      ].join('\n'),
+    )
     yield* fs.writeFileString(join(tool, 'LICENSE'), 'license\n')
+    const keyFile = join(directory, 'binary/release.key')
+    const madeKey = yield* invoke(silk, ['pack', '--new-key', keyFile, '--stdlib', standardLibrary], tool, { ...environment, SILK_SIGNING_PASSWORD: 'test-password' })
+    assert.equal(madeKey.status, 0, madeKey.stderr)
+    const secretKeyText = yield* fs.readFileString(keyFile)
+
+    // With `--bin`, signing secret env vars are stripped before tasks.silk runs, and transitive
+    // helper executables are excluded from `bin/`.
     const packed = yield* invoke(
       silk,
-      ['pack', '--json', '--output', output, '--stdlib', standardLibrary],
+      ['pack', '--bin', '--json', '--output', output, '--stdlib', standardLibrary],
       tool,
-      environment,
+      { ...environment, SILK_SIGNING_KEY: secretKeyText, SILK_SIGNING_PASSWORD: 'test-password' },
       120_000,
     )
     assert.equal(packed.status, 0, packed.stdout + packed.stderr)
-    const binaries = JSON.parse(packed.stdout).archives[0].binaries as ReadonlyArray<{ platform: string; path: string }>
-    assert.equal(binaries.length, 1, packed.stdout)
-    const platform = binaries[0].platform
+    const summary = JSON.parse(packed.stdout).archives[0] as {
+      path: string
+      files: ReadonlyArray<string>
+      binaries: ReadonlyArray<{ platform: string; path: string }>
+    }
+    assert.ok(summary.files.includes('build.silk'), `source archive missing root build.silk: ${summary.files.join(', ')}`)
+    const sourceTar = spawnSync('tar', ['-tzf', summary.path], { encoding: 'utf8' })
+    assert.equal(sourceTar.status, 0, sourceTar.stderr)
+    assert.ok(sourceTar.stdout.includes('packed-tool-1.2.0/build.silk'), sourceTar.stdout)
+
+    assert.equal(summary.binaries.length, 1, packed.stdout)
+    const platform = summary.binaries[0].platform
     const top = `packed-tool-1.2.0-${platform}`
-    assert.equal(binaries[0].path, join(output, `${top}.tar.gz`))
-    const tarred = spawnSync('tar', ['-tzf', binaries[0].path], { encoding: 'utf8' })
+    assert.equal(summary.binaries[0].path, join(output, `${top}.tar.gz`))
+    const tarred = spawnSync('tar', ['-tzf', summary.binaries[0].path], { encoding: 'utf8' })
     assert.equal(tarred.status, 0, tarred.stderr)
     assert.deepEqual(tarred.stdout.trim().split('\n'), [
-      `${top}/bin/packed-tool`,
+      `${top}/bin/app`,
+      `${top}/bin/worker`,
       `${top}/LICENSE`,
-      `${top}/completions/tool.bash`,
-      `${top}/notes.txt`,
     ])
-    // The target's own table replaces the format, the layout and the included files.
-    yield* fs.writeFileString(
-      join(tool, 'silk.toml'),
-      manifest(`\n[pack.binary.target.${platform}]\nformat = "zip"\nlayout = "flat"\ninclude = ["notes.txt"]\n`),
-    )
-    const zipped = yield* invoke(
+
+    // Unpacking the source archive preserves build.silk and builds cleanly.
+    const unpacked = join(directory, 'binary/unpacked')
+    yield* fs.makeDirectory(unpacked, { recursive: true })
+    const extracted = spawnSync('tar', ['-xzf', summary.path, '-C', unpacked], { encoding: 'utf8' })
+    assert.equal(extracted.status, 0, extracted.stderr)
+    assert.ok(yield* fs.exists(join(unpacked, 'packed-tool-1.2.0/build.silk')))
+    const rebuiltFromArchive = yield* invoke(
       silk,
-      ['pack', '--json', '--output', output, '--stdlib', standardLibrary],
+      ['build', '--stdlib', standardLibrary],
+      join(unpacked, 'packed-tool-1.2.0'),
+      environment,
+      120_000,
+    )
+    assert.equal(rebuiltFromArchive.status, 0, rebuiltFromArchive.stderr)
+
+    // Without `--bin`, only the source archive is written even for an executable with tasks.
+    const sourceOnlyOut = join(directory, 'binary/src-only')
+    const sourceOnly = yield* invoke(
+      silk,
+      ['pack', '--json', '--output', sourceOnlyOut, '--stdlib', standardLibrary],
       tool,
       environment,
       120_000,
     )
-    assert.equal(zipped.status, 0, zipped.stderr)
-    const archive = JSON.parse(zipped.stdout).archives[0].binaries[0].path as string
-    assert.equal(archive, join(output, `${top}.zip`))
-    const tested = spawnSync('unzip', ['-t', archive], { encoding: 'utf8' })
-    assert.equal(tested.status, 0, tested.stdout + tested.stderr)
-    const names = spawnSync('unzip', ['-Z1', archive], { encoding: 'utf8' })
-    assert.deepEqual(names.stdout.trim().split('\n'), [`${top}/packed-tool`, `${top}/LICENSE`, `${top}/notes.txt`])
-    const modes = spawnSync('unzip', ['-Z', archive], { encoding: 'utf8' })
-    assert.match(modes.stdout, /^-rwxr-xr-x .* packed-tool-1\.2\.0-.*\/packed-tool$/m)
-    assert.match(modes.stdout, /^-rw-r--r-- .*\/LICENSE$/m)
+    assert.equal(sourceOnly.status, 0, sourceOnly.stderr)
+    assert.deepEqual(JSON.parse(sourceOnly.stdout).archives[0].binaries, [])
+
     // `--list` writes nothing, so it builds nothing.
-    const listed = yield* invoke(silk, ['pack', '--list', '--stdlib', standardLibrary], tool, { ...process.env, SILK_CLANG: '/nonexistent' })
+    const listed = yield* invoke(silk, ['pack', '--list', '--bin', '--stdlib', standardLibrary], tool, { ...process.env, SILK_CLANG: '/nonexistent' })
     assert.equal(listed.status, 0, listed.stderr)
-    // An entry that names nothing is refused with the table it is written in.
-    yield* fs.writeFileString(join(tool, 'silk.toml'), manifest('').replace('"notes.txt"', '"missing.txt"'))
-    const missing = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
-    assert.equal(missing.status, 1, 'an include entry that names nothing was packed')
-    assert.match(missing.stderr, /\[pack\.binary\]\.include entry missing\.txt names no file or directory/)
-    // An included path at, above or below the executable's is refused, naming its table.
-    yield* fs.writeFileString(join(tool, 'bin'), 'a file named as the directory of the executable\n')
+
+    // `[pack.binary]` in silk.toml is rejected.
+    const oldManifest = join(directory, 'binary/legacy-manifest')
+    yield* fs.makeDirectory(join(oldManifest, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(oldManifest, 'silk.toml'), `[package]\nname = "legacy"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\n[pack.binary]\n`)
+    yield* fs.writeFileString(join(oldManifest, 'src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+    const legacy = yield* invoke(silk, ['pack', '--stdlib', standardLibrary], oldManifest, environment)
+    assert.equal(legacy.status, 2, legacy.stderr)
+
+    // A library with no executables in its build plan reports no executables with exit status 1.
+    const libPkg = join(directory, 'binary/lib-pkg')
+    yield* fs.makeDirectory(join(libPkg, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(libPkg, 'silk.toml'), `[package]\nname = "libpkg"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\nkind = "library"\nmain = "lib.silk"\nexports = ["lib"]\n`)
+    yield* fs.writeFileString(join(libPkg, 'src/lib.silk'), 'pub const VALUE: i32 = 1\n')
+    const libPack = yield* invoke(silk, ['pack', '--bin', '--output', join(directory, 'binary/lib-out'), '--stdlib', standardLibrary], libPkg, environment, 120_000)
+    assert.equal(libPack.status, 1, 'packing binaries for a library should fail')
+    assert.match(libPack.stderr, /no executables in build plan/)
+
+    // A failing `tasks.silk` `Plan` surfaces its task error without claiming "no executables".
+    const brokenPlan = join(directory, 'binary/broken-plan')
+    yield* fs.makeDirectory(join(brokenPlan, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(brokenPlan, 'silk.toml'), `[package]\nname = "broken"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\n`)
+    yield* fs.writeFileString(join(brokenPlan, 'src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
     yield* fs.writeFileString(
-      join(tool, 'silk.toml'),
-      manifest(`\n[pack.binary.target.${platform}]\ninclude = ["bin"]\n`),
+      join(brokenPlan, 'src/tasks.silk'),
+      [
+        'import silk.build.options { Options }',
+        'import silk.cli.command { Command, CommandLine }',
+        'import silk.cli.task { Task, TaskError, TaskSet }',
+        'import silk.system.host_input { HostInput }',
+        'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+        'import silk.system.child_process { ChildProcess }',
+        'import silk.system.filesystem { FileSystem }',
+        'union Tasks { Plan { pub options: Options } }',
+        'impl CommandLine for Tasks {',
+        '  static fn command() -> Command<Tasks> {',
+        '    return Command<Tasks>.make("tasks", "Broken") |> Command.variant("Plan", "Plan") |> Command.flatten("options")',
+        '  }',
+        '}',
+        'impl TaskSet for Tasks {',
+        '  effect fn perform(self: Tasks) -> () ! TaskError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {',
+        '    drop self',
+        '    run Task.abort("plan intentionally failed")',
+        '  }',
+        '}',
+        'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
+        '',
+      ].join('\n'),
     )
-    const displaced = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
-    assert.equal(displaced.status, 1, 'an included file took the place of the executable directory')
-    assert.ok(
-      displaced.stderr.includes(`[pack.binary.target.${platform}].include holds bin, which takes the place of the executable at bin/packed-tool`),
-      displaced.stderr,
-    )
-    yield* fs.remove(join(tool, 'bin'))
-    // The table is an executable's.
-    yield* fs.writeFileString(
-      join(tool, 'silk.toml'),
-      '[package]\nname = "packed-tool"\nversion = "1.2.0"\nsilk-version = "' + releasePin + '"\nkind = "library"\nmain = "main.silk"\nexports = ["main"]\n\n[pack.binary]\n',
-    )
-    const library = yield* invoke(silk, ['pack', '--output', output, '--stdlib', standardLibrary], tool, environment, 120_000)
-    assert.equal(library.status, 1, 'a library with [pack.binary] was packed')
-    assert.match(library.stderr, /\[pack\.binary\] archives an executable, and \[package\]\.kind is library/)
+    const failedPlan = yield* invoke(silk, ['pack', '--bin', '--output', join(directory, 'binary/broken-out'), '--stdlib', standardLibrary], brokenPlan, environment, 120_000)
+    assert.notEqual(failedPlan.status, 0)
+    assert.match(failedPlan.stderr, /plan intentionally failed/)
+    assert.ok(!failedPlan.stderr.includes('no executables in build plan'), failedPlan.stderr)
+
+    // A symlinked `build.silk` is refused when packing the source archive.
+    const symlinkBuild = join(directory, 'binary/symlink-build')
+    yield* fs.makeDirectory(join(symlinkBuild, 'src'), { recursive: true })
+    yield* fs.writeFileString(join(symlinkBuild, 'silk.toml'), `[package]\nname = "sym"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\nkind = "library"\nmain = "lib.silk"\nexports = ["lib"]\n`)
+    yield* fs.writeFileString(join(symlinkBuild, 'src/lib.silk'), 'pub const VALUE: i32 = 1\n')
+    yield* fs.writeFileString(join(directory, 'binary/real-build.silk'), 'import silk.build.plan { Plan }\npub const PLAN: Plan = Plan.empty()\n')
+    yield* fs.symlink(join(directory, 'binary/real-build.silk'), join(symlinkBuild, 'build.silk'))
+    const refusedSym = yield* invoke(silk, ['pack', '--stdlib', standardLibrary], symlinkBuild, environment)
+    assert.equal(refusedSym.status, 1, refusedSym.stderr)
+    assert.match(refusedSym.stderr, /build\.silk is a symbolic link/)
   }
   {
     // `init --template` copies one directory of a GitHub repository, here served from local
@@ -5682,6 +5832,55 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     assert.equal((instance.exports.silk_answer as () => number)(), 42)
     assert.equal(instance.exports._start, undefined)
   }
+  // Partial `[settings.wasm]` overrides merge over target defaults, `wit` resolves relative to
+  // the package directory, and `wasm32-wasip2` reactors automatically clear default startup.
+  {
+    const wasmResolveDir = join(directory, 'wasm-resolve')
+    yield* fs.makeDirectory(join(wasmResolveDir, 'wit'), { recursive: true })
+    yield* fs.writeFileString(
+      join(wasmResolveDir, 'silk.toml'),
+      '[package]\nname = "wasm_resolve"\nversion = "0.1.0"\nsilk-version = "0.0.0"\nsource = "."\n',
+    )
+    yield* fs.writeFileString(join(wasmResolveDir, 'main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+    yield* fs.writeFileString(join(wasmResolveDir, 'wit/world.wit'), 'package example:demo;\nworld demo { export run: func() -> u32; }\n')
+    const resolveCase = Effect.fnUntraced(function* (label: string, extra: string) {
+      const defPath = join(wasmResolveDir, `${label}.def.toml`)
+      const reqPath = join(wasmResolveDir, `${label}.req.toml`)
+      yield* fs.writeFileString(
+        defPath,
+        `manifest = ${encodeJson(join(wasmResolveDir, 'silk.toml'))}\nstdlib = ${encodeJson(standardLibrary)}\n[settings]\nmodules = []\n${extra}\n[settings.native]\nsources = []\nlink = []\n`,
+      )
+      const res = yield* invoke(silk, ['resolve', '--definition', defPath, '--output', reqPath], directory)
+      assert.equal(res.status, 0, res.stderr)
+      return yield* fs.readFileString(reqPath)
+    })
+    const partialBare = yield* resolveCase(
+      'partial-bare',
+      '[settings.profile]\ntarget = "wasm32-unknown-unknown"\n[settings.wasm]\nexport-table = true\n',
+    )
+    assert.match(partialBare, /^wasm = \{[^}\n]*import-memory = false/m)
+    assert.match(partialBare, /^wasm = \{[^}\n]*shared-memory = false/m)
+    assert.match(partialBare, /^wasm = \{[^}\n]*export-table = true/m)
+    assert.match(partialBare, /^wasm = \{[^}\n]*execution-model = "command"/m)
+
+    const reactorWasip2 = yield* resolveCase(
+      'reactor-wasip2',
+      '[settings.profile]\ntarget = "wasm32-wasip2"\n[settings.wasm]\nwit = "wit"\nworld = "demo"\nexecution-model = "reactor"\n',
+    )
+    assert.match(reactorWasip2, /^profile = \{[^}\n]*entry = "none"/m)
+    assert.match(reactorWasip2, /^profile = \{[^}\n]*runtime = "none"/m)
+    assert.match(reactorWasip2, /^wasm = \{[^}\n]*execution-model = "reactor"/m)
+    assert.match(reactorWasip2, /^wasm = \{[^}\n]*world = "demo"/m)
+    assert.ok(reactorWasip2.includes(`wit = ${encodeJson(join(wasmResolveDir, 'wit'))}`), reactorWasip2)
+
+    const defaultWasip2 = yield* resolveCase(
+      'default-wasip2',
+      '[settings.profile]\ntarget = "wasm32-wasip2"\n',
+    )
+    assert.match(defaultWasip2, /^wasm = \{[^}\n]*execution-model = "command"/m)
+    assert.match(defaultWasip2, /^wasm = \{[^}\n]*world = "command"/m)
+    assert.ok(defaultWasip2.includes(`wit = ${encodeJson(join(standardLibrary, 'wit'))}`), defaultWasip2)
+  }
   // A debug build compiles each module's codegen unit to an object of its own, cached by its text,
   // so a rebuild after an edit to one module recompiles that module's unit alone.
   const split = join(directory, 'split')
@@ -6216,7 +6415,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // building one member never replaces the cache another member's next build reads.
   const pair = join(directory, 'pair')
   yield* fs.makeDirectory(pair, { recursive: true })
-  yield* fs.writeFileString(join(pair, 'silk.toml'), '[workspace]\nmembers = ["first", "second"]\noutput-dir = "build"\n')
+  yield* fs.writeFileString(join(pair, 'silk.toml'), '[workspace]\nmembers = ["first", "second"]\n')
   const memberSource = (value: number) => `pub fn main() -> i32 {\n  return ${value}\n}\n`
   for (const member of ['first', 'second']) {
     yield* fs.makeDirectory(join(pair, member, 'src'), { recursive: true })

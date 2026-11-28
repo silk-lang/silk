@@ -51,6 +51,16 @@ pub compilation: bool
 
 Whether the root is a compilation, which publishes its request.
 
+<a id="RootDescription.transitive"></a>
+
+### Field `transitive`
+
+```silk
+pub transitive: bool
+```
+
+Whether this root was added only as a transitive dependency compilation.
+
 <a id="RootDescription.impl.Schema"></a>
 
 ## Implementation `Schema for RootDescription`

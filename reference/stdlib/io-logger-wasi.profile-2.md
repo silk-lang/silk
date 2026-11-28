@@ -14,8 +14,8 @@ error, which every WASI runtime supports.
 ## Details
 `wasi:logging` is a draft proposal, `wasi:logging@0.1.0-draft`, and not part of the command
 world, so no logger uses it by default. The bundled WIT world `command` lists the interface, and
-a component imports it only when it provides [`WasiLogger`](#WasiLogger). A component with its own
-`[component].world` imports `wasi:logging/logging@0.1.0-draft` there.
+a component imports it only when it provides [`WasiLogger`](#WasiLogger). A component with its own WIT world
+(configured via `Compilation.wasm`) imports `wasi:logging/logging@0.1.0-draft` there.
 
 Each call passes the level, the context given to [`WasiLogger.make`](#WasiLogger.impl.make), and the formatted message.
 The logger formats into a 512-byte buffer on the stack, so a longer message is passed as several

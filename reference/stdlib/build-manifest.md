@@ -6,7 +6,7 @@ Package identities, fetch pins, and publication settings read from `silk.toml`.
 
 Import as `Manifest` with `import silk.build.manifest { Manifest }`.
 
-Public declarations: 23.
+Public declarations: 18.
 
 <a id="Manifest"></a>
 
@@ -56,17 +56,7 @@ Workspace membership and shared dependency pins.
 pub native: Option<Native>
 ```
 
-Downloaded native archives and local replacements.
-
-<a id="Manifest.component"></a>
-
-### Field `component`
-
-```silk
-pub component: Option<Component>
-```
-
-The package's WebAssembly component interface and world.
+Downloaded native archives.
 
 <a id="Manifest.unstable"></a>
 
@@ -78,16 +68,6 @@ pub unstable: Option<Unstable>
 
 Runtime composition declarations that travel with the package.
 
-<a id="Manifest.pack"></a>
-
-### Field `pack`
-
-```silk
-pub pack: Option<Pack>
-```
-
-Source and binary archive publication settings.
-
 <a id="Manifest.release"></a>
 
 ### Field `release`
@@ -96,7 +76,7 @@ Source and binary archive publication settings.
 pub release: Option<Release>
 ```
 
-Release publication settings.
+Release version-source settings.
 
 <a id="Manifest.postInit"></a>
 
@@ -169,52 +149,6 @@ Decoding discards its contents; a manifest editor must preserve the source docum
 
 ```silk
 impl Schema for Tool
-```
-
-<a id="Component"></a>
-
-## `Component`
-
-```silk
-pub struct Component
-```
-
-The interface definition and exported world of a WebAssembly component package.
-
-<a id="Component.wit"></a>
-
-### Field `wit`
-
-```silk
-pub wit: String
-```
-
-A WIT file or directory relative to this package.
-
-<a id="Component.world"></a>
-
-### Field `world`
-
-```silk
-pub world: String
-```
-
-The WIT world to compile.
-
-<a id="Component.impl.Schema"></a>
-
-## Implementation `Schema for Component`
-
-```silk
-impl Schema for Component
-```
-
-<a id="Component.impl.Schema.spec"></a>
-
-### Operation `spec`
-
-```silk
-static fn spec() -> Spec<Component>
 ```
 
 <a id="Unstable"></a>
@@ -302,16 +236,6 @@ pub retention: Option<List<Retention>>
 ```
 
 Declarations retained regardless of import reachability.
-
-<a id="Composition.requirements"></a>
-
-### Field `requirements`
-
-```silk
-pub requirements: Option<List<String>>
-```
-
-Reserved requirements; the current compiler accepts only an empty list.
 
 <a id="Composition.impl.Schema"></a>
 
@@ -855,7 +779,7 @@ fn check(self: &Self, checks: &mut Checks<Self>) -> ()
 pub struct Workspace
 ```
 
-A workspace's member paths, output directory, and dependency catalog.
+A workspace's member paths and dependency catalog.
 
 <a id="Workspace.members"></a>
 
@@ -866,16 +790,6 @@ pub members: List<String>
 ```
 
 Package directories or globs relative to this manifest.
-
-<a id="Workspace.outputDir"></a>
-
-### Field `outputDir`
-
-```silk
-pub outputDir: String
-```
-
-The build output directory relative to the workspace root.
 
 <a id="Workspace.silkVersion"></a>
 
@@ -940,16 +854,6 @@ pub archive: Dictionary<Archive>
 ```
 
 Archives keyed by their package-local names.
-
-<a id="Native.overrides"></a>
-
-### Field `overrides`
-
-```silk
-pub overrides: Dictionary<ArchiveOverride>
-```
-
-Local archive replacements keyed by the same names.
 
 <a id="Native.impl.Schema"></a>
 
@@ -1097,200 +1001,6 @@ impl Schema for ArchivePin
 static fn spec() -> Spec<ArchivePin>
 ```
 
-<a id="ArchiveOverride"></a>
-
-## `ArchiveOverride`
-
-```silk
-pub struct ArchiveOverride
-```
-
-A developer's local replacement for a downloaded native archive.
-
-<a id="ArchiveOverride.path"></a>
-
-### Field `path`
-
-```silk
-pub path: String
-```
-
-The local installation directory.
-
-<a id="ArchiveOverride.impl.Schema"></a>
-
-## Implementation `Schema for ArchiveOverride`
-
-```silk
-impl Schema for ArchiveOverride
-```
-
-<a id="ArchiveOverride.impl.Schema.spec"></a>
-
-### Operation `spec`
-
-```silk
-static fn spec() -> Spec<ArchiveOverride>
-```
-
-<a id="Pack"></a>
-
-## `Pack`
-
-```silk
-pub struct Pack
-```
-
-Optional binary archives published beside the source archive.
-
-<a id="Pack.binary"></a>
-
-### Field `binary`
-
-```silk
-pub binary: Option<Binary>
-```
-
-Enables binary publication and configures its layout.
-
-<a id="Pack.impl.Schema"></a>
-
-## Implementation `Schema for Pack`
-
-```silk
-impl Schema for Pack
-```
-
-<a id="Pack.impl.Schema.spec"></a>
-
-### Operation `spec`
-
-```silk
-static fn spec() -> Spec<Pack>
-```
-
-<a id="Binary"></a>
-
-## `Binary`
-
-```silk
-pub struct Binary
-```
-
-Default binary archive settings and target-specific overrides.
-
-<a id="Binary.format"></a>
-
-### Field `format`
-
-```silk
-pub format: String
-```
-
-Archive format: `tar.gz` or `zip`.
-
-<a id="Binary.layout"></a>
-
-### Field `layout`
-
-```silk
-pub layout: String
-```
-
-Executable placement: `bin` or `flat`.
-
-<a id="Binary.include"></a>
-
-### Field `include`
-
-```silk
-pub include: Option<List<String>>
-```
-
-Additional paths copied into every binary archive.
-
-<a id="Binary.target"></a>
-
-### Field `target`
-
-```silk
-pub target: Dictionary<BinaryTarget>
-```
-
-Settings that replace the defaults for each named target.
-
-<a id="Binary.impl.Schema"></a>
-
-## Implementation `Schema for Binary`
-
-```silk
-impl Schema for Binary
-```
-
-<a id="Binary.impl.Schema.spec"></a>
-
-### Operation `spec`
-
-```silk
-static fn spec() -> Spec<Binary>
-```
-
-<a id="BinaryTarget"></a>
-
-## `BinaryTarget`
-
-```silk
-pub struct BinaryTarget
-```
-
-Binary archive settings replaced for one target; absent fields retain the defaults.
-
-<a id="BinaryTarget.format"></a>
-
-### Field `format`
-
-```silk
-pub format: Option<String>
-```
-
-The replacement archive format.
-
-<a id="BinaryTarget.layout"></a>
-
-### Field `layout`
-
-```silk
-pub layout: Option<String>
-```
-
-The replacement executable placement.
-
-<a id="BinaryTarget.include"></a>
-
-### Field `include`
-
-```silk
-pub include: Option<List<String>>
-```
-
-The replacement list of additional files.
-
-<a id="BinaryTarget.impl.Schema"></a>
-
-## Implementation `Schema for BinaryTarget`
-
-```silk
-impl Schema for BinaryTarget
-```
-
-<a id="BinaryTarget.impl.Schema.spec"></a>
-
-### Operation `spec`
-
-```silk
-static fn spec() -> Spec<BinaryTarget>
-```
-
 <a id="Release"></a>
 
 ## `Release`
@@ -1299,27 +1009,7 @@ static fn spec() -> Spec<BinaryTarget>
 pub struct Release
 ```
 
-Release repository and version-source settings.
-
-<a id="Release.repository"></a>
-
-### Field `repository`
-
-```silk
-pub repository: Option<String>
-```
-
-The GitHub repository as owner/name.
-
-<a id="Release.directory"></a>
-
-### Field `directory`
-
-```silk
-pub directory: Option<String>
-```
-
-The release directory relative to the repository root.
+Release version-source settings.
 
 <a id="Release.versionFile"></a>
 

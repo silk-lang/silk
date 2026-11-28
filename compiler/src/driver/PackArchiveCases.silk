@@ -1,0 +1,410 @@
+//! Unit tests for `PackArchives.binaryArchive`: Unix `.tar.gz` and Windows `.zip` formats, sorted
+//! `bin/` executable layout, root-only documentation filtering, and duplicate basename refusal.
+
+import driver.NativeArchive as NativeArchives
+import driver.PackArchive as PackArchives { Packed, PackRefused }
+import driver.Project as Projects { ProjectError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.compress.inflate {
+  DecodeError,
+  Decoder,
+  Format as InflateFormat,
+  Limits as InflateLimits,
+  MEMORY_BOUND as INFLATE_MEMORY_BOUND,
+  Status as InflateStatus
+}
+import silk.compress.tar { TarError, TarKind, TarReader, TarStatus }
+import silk.compress.zip { ZipError, ZipKind, ZipMember, ZipReader }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.testing.testing { AssertionError, Testing }
+import silk.toml.scanner { TomlError }
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn temporaryParent() -> &'static [u8] {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return b"/private/tmp"
+  } else {
+    return b"/tmp"
+  }
+}
+
+effect fn ignoreCleanup(error: FileError | OutOfMemoryError) -> () {
+  return ()
+}
+
+effect fn holds(
+  path: &Path,
+  expected: &[u8],
+) -> bool
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(FileSystem.readFile(path)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => same(
+      Bytes.asSlice(&value),
+      expected,
+    )
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError _missing => false
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn gunzip(
+  compressed: &[u8],
+) -> Bytes
+  ! DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = InflateLimits {
+    maxInputBytes: 1048576,
+    maxOutputBytes: 4194304,
+    maxMembers: 4,
+    maxHeaderBytes: 4096,
+    maxMemoryBytes: INFLATE_MEMORY_BOUND,
+  }
+  let mut decoder = run Decoder.make(InflateFormat.Gzip, move limits)
+  let mut out = Bytes.make()
+  let mut scratch: [u8; 4096] = [0; 4096]
+  let mut offset = usize.ZERO
+  while true {
+    let input = Slice.view<u8>(compressed, offset, compressed.length - offset)
+    let progress = match move Decoder.step(&mut decoder, input, &mut scratch, true) {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        fail move error
+      }
+    }
+    offset = offset + progress.consumed
+    if progress.written > usize.ZERO {
+      run Bytes.append(&mut out, Slice.view<u8>(&scratch, usize.ZERO, progress.written))
+    }
+    if progress.status == InflateStatus.Finished {
+      return move out
+    }
+  }
+  return move out
+}
+
+effect fn tarFileMembers(
+  archive: &[u8],
+) -> List<Bytes>
+  ! DecodeError | TarError | OutOfMemoryError
+  ? &mut Allocator {
+  let tar = run gunzip(archive)
+  let tarSlice = Bytes.asSlice(&tar)
+  let mut reader = TarReader.make()
+  let mut members = List<Bytes>.make()
+  let mut offset = usize.ZERO
+  while true {
+    let input = Slice.view<u8>(tarSlice, offset, tarSlice.length - offset)
+    let progress = match move TarReader.step(&mut reader, input, true) {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        fail move error
+      }
+    }
+    offset = offset + progress.consumed
+    if progress.status == TarStatus.Member {
+      let entry = TarReader.member(&reader)
+      if entry.kind == TarKind.File {
+        let mut full = run Bytes.copy(entry.prefix)
+        if entry.prefix.length > usize.ZERO && entry.name.length > usize.ZERO {
+          run Bytes.append(&mut full, b"/")
+        }
+        run Bytes.append(&mut full, entry.name)
+        run List<Bytes>.append(&mut members, move full)
+      }
+    }
+    if progress.status == TarStatus.End {
+      return move members
+    }
+  }
+  return move members
+}
+
+effect fn zipFileMembers(
+  archive: &[u8],
+) -> List<Bytes>
+  ! ZipError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut reader = match ZipReader.open(archive, 4194304) {
+    Result.Success { value } => move value
+    Result.Failure { error } => {
+      fail move error
+    }
+  }
+  let mut members = List<Bytes>.make()
+  while true {
+    let next = match move ZipReader.next(&mut reader) {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        fail move error
+      }
+    }
+    match move next {
+      Option<ZipMember>.Some { value: member } => {
+        if member.kind == ZipKind.File {
+          run List<Bytes>.append(&mut members, run Bytes.copy(member.name))
+        }
+      }
+      Option<ZipMember>.None => {
+        return move members
+      }
+    }
+  }
+  return move members
+}
+
+effect fn exercise(
+  root: &Path,
+) -> ()
+  ! PackRefused | ProjectError | TomlError | FileError | DecodeError | TarError | ZipError | OutOfMemoryError | AssertionError<'static>
+  ? &mut FileSystem | &mut Allocator {
+  let manifestPath = run Path.join(root, "silk.toml")
+  let manifestText = b"[package]\nname = \"demo\"\nversion = \"1.2.3\"\n"
+  run FileSystem.writeFile(&manifestPath, manifestText)
+  run FileSystem.writeFile(&run Path.join(root, "README.md"), b"demo readme\n")
+  run FileSystem.writeFile(&run Path.join(root, "LICENSE"), b"MIT\n")
+  let srcDir = run Path.join(root, "src")
+  run FileSystem.createDirectoriesRecursively(&srcDir)
+  run FileSystem.writeFile(&run Path.join(&srcDir, "main.silk"), b"pub fn main() -> i32 { return 0 }\n")
+
+  let outDir = run Path.join(root, "out")
+  let winDir = run Path.join(root, "win")
+  let dupDir = run Path.join(root, "dup")
+  run FileSystem.createDirectoriesRecursively(&outDir)
+  run FileSystem.createDirectoriesRecursively(&winDir)
+  run FileSystem.createDirectoriesRecursively(&dupDir)
+
+  let zeta = run Path.join(&outDir, "zeta-tool")
+  let alpha = run Path.join(&outDir, "alpha-tool")
+  let winZeta = run Path.join(&winDir, "zeta-tool.exe")
+  let winAlpha = run Path.join(&winDir, "alpha-tool.exe")
+  let dupAlpha = run Path.join(&dupDir, "alpha-tool")
+  run FileSystem.writeFile(&zeta, b"zeta-bin")
+  run FileSystem.writeFile(&alpha, b"alpha-bin")
+  run FileSystem.writeFile(&winZeta, b"win-zeta")
+  run FileSystem.writeFile(&winAlpha, b"win-alpha")
+  run FileSystem.writeFile(&dupAlpha, b"dup-bin")
+
+  let project = run Projects.decode(&manifestPath, manifestText)
+  let mut docs = List<Bytes>.make()
+  run List<Bytes>.append(&mut docs, run Bytes.copy(b"README.md"))
+  run List<Bytes>.append(&mut docs, run Bytes.copy(b"src/main.silk"))
+  run List<Bytes>.append(&mut docs, run Bytes.copy(b"LICENSE"))
+
+  let mut unixExes = List<Path>.make()
+  run List<Path>.append(&mut unixExes, move zeta)
+  run List<Path>.append(&mut unixExes, move alpha)
+  let unixPacked = run PackArchives.binaryArchive(
+    &project,
+    b"x86_64-unknown-linux-gnu",
+    List<Path>.asSlice(&unixExes),
+    List<Bytes>.asSlice(&docs),
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&unixPacked.fileName), b"demo-1.2.3-x86_64-unknown-linux-gnu.tar.gz"),
+    "Unix targets pack binary archives as .tar.gz",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&unixPacked.stem), b"demo-1.2.3-x86_64-unknown-linux-gnu"),
+    "binary archive stem includes name, version, and platform",
+  )
+  run Testing.expect(
+    unixPacked.files == 4,
+    "binary archive holds both executables and only root documentation files",
+  )
+
+  let tarMembers = run tarFileMembers(Bytes.asSlice(&unixPacked.bytes))
+  let tarSlice = List<Bytes>.asSlice(&tarMembers)
+  run Testing.expect(tarSlice.length == 4, "tar archive contains 4 file members")
+  run Testing.expect(
+    same(Bytes.asSlice(&tarSlice[0]), b"demo-1.2.3-x86_64-unknown-linux-gnu/bin/alpha-tool"),
+    "first tar member is alpha-tool sorted under bin/",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&tarSlice[1]), b"demo-1.2.3-x86_64-unknown-linux-gnu/bin/zeta-tool"),
+    "second tar member is zeta-tool sorted under bin/",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&tarSlice[2]), b"demo-1.2.3-x86_64-unknown-linux-gnu/LICENSE"),
+    "third tar member is root LICENSE sorted ahead of README.md",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&tarSlice[3]), b"demo-1.2.3-x86_64-unknown-linux-gnu/README.md"),
+    "fourth tar member is root README.md",
+  )
+
+  let unixExtract = run Path.join(root, "extract-unix")
+  run FileSystem.createDirectoriesRecursively(&unixExtract)
+  let unixRefused = run NativeArchives.extractArchive(
+    Bytes.asSlice(&unixPacked.bytes),
+    &unixExtract,
+    usize.ZERO,
+  )
+  run Testing.expect(Option<Bytes>.isNone(&unixRefused), "tar binary archive extracts cleanly")
+  let unixTop = run Path.join(&unixExtract, "demo-1.2.3-x86_64-unknown-linux-gnu")
+  run Testing.expect(
+    run holds(&run Path.join(&unixTop, "bin/alpha-tool"), b"alpha-bin"),
+    "extracted tar alpha-tool matches original bytes",
+  )
+  run Testing.expect(
+    run holds(&run Path.join(&unixTop, "bin/zeta-tool"), b"zeta-bin"),
+    "extracted tar zeta-tool matches original bytes",
+  )
+  run Testing.expect(
+    run holds(&run Path.join(&unixTop, "README.md"), b"demo readme\n"),
+    "extracted tar README.md matches original bytes",
+  )
+  run Testing.expect(
+    !run FileSystem.exists(&run Path.join(&unixTop, "src/main.silk")),
+    "binary archive omits non-root source files",
+  )
+
+  let mut winExes = List<Path>.make()
+  run List<Path>.append(&mut winExes, move winZeta)
+  run List<Path>.append(&mut winExes, move winAlpha)
+  let winPacked = run PackArchives.binaryArchive(
+    &project,
+    b"x86_64-pc-windows-msvc",
+    List<Path>.asSlice(&winExes),
+    List<Bytes>.asSlice(&docs),
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&winPacked.fileName), b"demo-1.2.3-x86_64-pc-windows-msvc.zip"),
+    "Windows targets pack binary archives as .zip",
+  )
+  run Testing.expect(
+    winPacked.files == 4,
+    "Windows binary archive holds both executables and both root docs",
+  )
+
+  let zipMembers = run zipFileMembers(Bytes.asSlice(&winPacked.bytes))
+  let zipSlice = List<Bytes>.asSlice(&zipMembers)
+  run Testing.expect(zipSlice.length == 4, "zip archive contains 4 file members")
+  run Testing.expect(
+    same(Bytes.asSlice(&zipSlice[0]), b"demo-1.2.3-x86_64-pc-windows-msvc/bin/alpha-tool.exe"),
+    "first zip member is alpha-tool.exe sorted under bin/",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&zipSlice[1]), b"demo-1.2.3-x86_64-pc-windows-msvc/bin/zeta-tool.exe"),
+    "second zip member is zeta-tool.exe sorted under bin/",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&zipSlice[2]), b"demo-1.2.3-x86_64-pc-windows-msvc/LICENSE"),
+    "third zip member is root LICENSE",
+  )
+  run Testing.expect(
+    same(Bytes.asSlice(&zipSlice[3]), b"demo-1.2.3-x86_64-pc-windows-msvc/README.md"),
+    "fourth zip member is root README.md",
+  )
+
+  let winExtract = run Path.join(root, "extract-win")
+  run FileSystem.createDirectoriesRecursively(&winExtract)
+  let winRefused = run NativeArchives.extractArchive(
+    Bytes.asSlice(&winPacked.bytes),
+    &winExtract,
+    usize.ZERO,
+  )
+  run Testing.expect(Option<Bytes>.isNone(&winRefused), "zip binary archive extracts cleanly")
+  let winTop = run Path.join(&winExtract, "demo-1.2.3-x86_64-pc-windows-msvc")
+  run Testing.expect(
+    run holds(&run Path.join(&winTop, "bin/alpha-tool.exe"), b"win-alpha"),
+    "extracted zip alpha-tool.exe matches original bytes",
+  )
+  run Testing.expect(
+    run holds(&run Path.join(&winTop, "bin/zeta-tool.exe"), b"win-zeta"),
+    "extracted zip zeta-tool.exe matches original bytes",
+  )
+  run Testing.expect(
+    run holds(&run Path.join(&winTop, "LICENSE"), b"MIT\n"),
+    "extracted zip LICENSE matches original bytes",
+  )
+
+  let mut dupExes = List<Path>.make()
+  run List<Path>.append(&mut dupExes, run Path.join(&outDir, "alpha-tool"))
+  run List<Path>.append(&mut dupExes, move dupAlpha)
+  let dupOutcome = run Effect.result(
+    PackArchives.binaryArchive(
+      &project,
+      b"x86_64-unknown-linux-gnu",
+      List<Path>.asSlice(&dupExes),
+      List<Bytes>.asSlice(&docs),
+    ),
+  )
+  match move dupOutcome {
+    Result<Packed, PackRefused | FileError | TomlError | OutOfMemoryError>.Success { .. } => {
+      run Testing.expect(false, "duplicate executable basenames must be refused")
+    }
+    Result<Packed, PackRefused | FileError | TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      PackRefused refused => {
+        run Testing.expect(
+          same(
+            Bytes.asSlice(&refused.detail),
+            b"two executables in the build plan share the name alpha-tool",
+          ),
+          "duplicate executable refusal names the colliding binary",
+        )
+      }
+      FileError failure => {
+        fail move failure
+      }
+      TomlError malformed => {
+        fail move malformed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+test effect fn binaryArchivesSortAndValidateByTarget() -> ()
+  ! PackRefused | ProjectError | TomlError | FileError | DecodeError | TarError | ZipError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)
+  let parent = run Path.fromBytes(temporaryParent())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = run FileSystem.createTemporaryDirectory(&parent, b"silk-pack-archive")
+    |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let outcome = run Effect.result(
+    exercise(&root)
+      |> Effect.provideMut<FileSystem>(&mut files)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Effect.catchAll(FileSystem.removeDirectoryRecursively(&root), ignoreCleanup)
+    |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match move outcome {
+    Result<(), PackRefused | ProjectError | TomlError | FileError | DecodeError | TarError | ZipError | OutOfMemoryError | AssertionError<'static>>.Success { .. } => {
+      return ()
+    }
+    Result<(), PackRefused | ProjectError | TomlError | FileError | DecodeError | TarError | ZipError | OutOfMemoryError | AssertionError<'static>>.Failure { error } => {
+      fail move error
+    }
+  }
+}

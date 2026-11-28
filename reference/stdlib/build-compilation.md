@@ -461,7 +461,7 @@ Selects macOS installation, framework, and signing settings.
 ### Method `wasm`
 
 ```silk
-pub effect fn wasm(self: Self, value: Deferred<Wasm>) -> Self
+pub effect fn wasm(self: Self, value: Deferred<WasmSettings>) -> Self
     ! StepFailure
     ? &mut Allocator
 ```

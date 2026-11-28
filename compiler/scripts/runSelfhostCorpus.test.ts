@@ -117,7 +117,7 @@ void it('supplies corpus runtime components as the host default composition', as
   }
   await withStub(
     `[ -f test/refusing.silk ] || exit 7
-grep -qxF 'composition = { runtimes = [{ name = "hosted", module = "silk/platform/native/start" }], defaults = ["hosted"], retention = [], requirements = [], components = [{ capability = "execution-storage", bindings = [{ operation = "acquire", module = "test/refusing", declaration = "refuse" }] }] }' silk.toml || exit 8
+grep -qxF 'composition = { runtimes = [{ name = "hosted", module = "silk/platform/native/start" }], defaults = ["hosted"], retention = [], components = [{ capability = "execution-storage", bindings = [{ operation = "acquire", module = "test/refusing", declaration = "refuse" }] }] }' silk.toml || exit 8
 ${compiled}`,
     async (silkc) => {
       assert.deepStrictEqual(await runCase(silkc, composed), { name: 'literal', status: 'pass' })

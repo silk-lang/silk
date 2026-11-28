@@ -69,7 +69,7 @@ effect fn graph(options: &Options, devtools: bool, release: bool) -> Build
 
 A `Plan` command ends with `Build.write()`. Other commands choose their final operation explicitly. `Built.write` copies artifacts to a destination; `Built.launch` uses the configured runner. WASI programs use Wasmtime by default. A graph may configure a different runner for a foreign target.
 
-Artifacts live under `build/<target>/<mode>/<name>`, relative to the enclosing workspace's `output-dir` when set. Request files and their index live under `build/requests`. Consumers read that index instead of scanning artifact directories or reconstructing filenames.
+Artifacts live under `<output>/<target>/<mode>/<name>`, where `<output>` is `build` at the enclosing workspace root or package root. Request files and their index live under `<output>/requests`. Consumers read that index instead of scanning artifact directories or reconstructing filenames.
 
 ## Steps and deferred values
 

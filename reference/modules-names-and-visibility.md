@@ -1209,13 +1209,12 @@ other by path, a build can start from any member, and members share one output d
 ```toml
 [workspace]
 members = ["compiler", "libs/*"]
-output-dir = "build"
 ```
 
 A `members` entry is a directory inside the workspace, or a directory followed by `/*` for each of
 its child directories. A package belongs to the nearest manifest at or above its directory that
-has a `[workspace]` table and lists it. Its artifacts then go below the workspace's `output-dir`,
-which defaults to `build`, instead of its own. A workspace manifest may also define a package; a
+has a `[workspace]` table and lists it. Its artifacts then go below the workspace's `build`
+directory instead of its own. A workspace manifest may also define a package; a
 manifest with only a `[workspace]` table has nothing to build, so project commands run in a member
 directory.
 
@@ -1226,8 +1225,9 @@ directory.
 directory without a package manifest is an invalid-manifest error, as are a member listed twice and
 two members with the same package name, since they would share artifact paths. Every child
 directory of a `dir/*` entry must hold a package manifest. These errors are reported only to the
-workspace's members; a package the workspace does not list ignores it. Only `[workspace].output-dir` selects a shared output directory. A project command run on a manifest with only a `[workspace]` table is an
-invalid-manifest error that points to the member directories.
+workspace's members; a package the workspace does not list ignores it. A project command run on a
+manifest with only a `[workspace]` table is an invalid-manifest error that points to the member
+directories.
 
 **Evidence:** [native project manifests](../../../../compiler/src/driver/Project.silk),
 [project manifest cases](../../../../compiler/src/driver/ProjectCases.silk),
