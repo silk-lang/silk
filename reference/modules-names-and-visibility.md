@@ -986,17 +986,17 @@ MODULE-001. A package's own imports keep the source-root rule of MODULE-003.
 [package]
 name = "silk_json"
 version = "0.2.0"
-kind = "library"
+exports = ["lib"]
 ```
 
-The source root is `[package].source`, `src` when the manifest omits it. The root module is
-`[package].main` below the source root, by default `main.silk`, or `lib.silk` for a library kind. A
-library kind that writes no `main` and has no `lib.silk` is rooted at the first module its `exports`
-lists (PACKAGE-006), so a library made only of exported modules needs no root file of its own.
-`[package].kind` is `executable` (the default), `library` (Silk source for other packages, which a
-build checks and makes no artifact for), `static-library`, `shared-library` or `object`. The version
-defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits,
-`_` and `-`; `self`, `silk` and `silkc` are reserved.
+The source root is `[package].source`, `src` when the manifest omits it. A package's
+conventional root modules below `[package].source` are all optional: `main.silk` for an
+executable, `lib.silk` (or, when `lib.silk` is absent, the first existing module of
+`[package].exports`, PACKAGE-006) for a library, and `tests.silk` for a standalone test suite. A
+package with none of these roots (such as a tasks-only package) is valid; tasks in `tasks.silk`
+can also declare custom entry points via `Compilation.*`. `[package]` accepts neither `main` nor
+`kind`. The version defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase
+letters, digits, `_` and `-`; `self`, `silk` and `silkc` are reserved.
 
 The manifest's definition is [`silk.build.manifest.Manifest`](../stdlib/silk/build/manifest.silk).
 The compiler decodes root, workspace, and dependency manifests with the shared TOML schema reader.
@@ -1177,7 +1177,6 @@ other packages.
 [package]
 name = "silk_json"
 version = "0.2.0"
-kind = "library"
 exports = ["Value", "Parser"]
 ```
 

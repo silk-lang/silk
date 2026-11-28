@@ -72,7 +72,7 @@ const fixture = Effect.fnUntraced(
           ['stdlib/silk/num/i32.silk', 'pub fn identity(value: i32) -> i32 { return value }'],
           [
             'tomledit/silk.toml',
-            '[package]\nname = "tomledit"\nversion = "0.1.0"\nmain = "Command.silk"\n',
+            '[package]\nname = "tomledit"\nversion = "0.1.0"\n',
           ],
           ['tomledit/src/Command.silk', 'pub fn value() -> i32 { return 2 }'],
         ]

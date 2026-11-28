@@ -513,26 +513,6 @@ pub source: String
 
 The module root, resolved relative to the package directory.
 
-<a id="Package.main"></a>
-
-### Field `main`
-
-```silk
-pub main: Option<String>
-```
-
-The root module relative to `source`; absent roots use `main.silk` or `lib.silk`.
-
-<a id="Package.kind"></a>
-
-### Field `kind`
-
-```silk
-pub kind: String
-```
-
-Whether the default command builds an executable or checks a library.
-
 <a id="Package.exports"></a>
 
 ### Field `exports`

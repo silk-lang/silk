@@ -619,7 +619,7 @@ const program = Effect.gen(function* () {
   for (const member of ['pricing', 'store']) mkdirSync(join(workspace, member, 'src'), { recursive: true })
   writeFileSync(
     join(workspace, 'pricing', 'silk.toml'),
-    '[package]\nname = "pricing"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nmain = "lib.silk"\nkind = "library"\nexports = ["lib"]\n',
+    '[package]\nname = "pricing"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nexports = ["lib"]\n',
   )
   writeFileSync(
     join(workspace, 'store', 'silk.toml'),

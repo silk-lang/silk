@@ -13,7 +13,7 @@ for variant in baseline feature without-encoder-body without-encoder-and-path-bo
   revision=HEAD
   if [ "$variant" = baseline ]; then revision=$baseline; fi
   git archive "$revision" stdlib compiler/fixtures/stdlib-root compiler/fixtures/replay | tar -x -C "$root"
-  cp "$root/compiler/fixtures/stdlib-root/"{silk.toml,stdlib_check.silk} "$root/stdlib/"
+  cp "$root/compiler/fixtures/stdlib-root/"{silk.toml,main.silk} "$root/stdlib/"
   if [[ "$variant" == without-encoder* ]]; then
     python3 - "$root/stdlib/silk/platform/windows/wtf8.silk" <<'PY'
 from pathlib import Path

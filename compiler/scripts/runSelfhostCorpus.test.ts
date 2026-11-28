@@ -46,7 +46,7 @@ const withStub = async (body: string, run: (path: string) => Promise<void>): Pro
 
 const compiled = `if [ "$1" = resolve ]; then
   test "$2" = --definition && test -s "$3" && test "$4" = --output && test "$6" = --artifact || exit 3
-  grep -qxF 'main = "memory/driver.silk"' silk.toml || exit 4
+  grep -qF 'memory/driver.silk' "$3" || exit 4
   test -f memory/driver.silk || exit 5
   exit 0
 fi

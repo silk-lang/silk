@@ -185,9 +185,9 @@ before a successful plan is published.
 ## Build configuration
 
 `Compilation.emit` and the source command's `--emit` accept `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly`,
-`object` or `wasm-text`. `Compilation.object` selects a relocatable artifact; `package.kind`
-only distinguishes `executable` and `library` source packages. Intermediate destinations use
-`.ll`, `.bc`, `.s` or `.o`; `silk run` requires a final executable.
+`object` or `wasm-text`. `Compilation.object` selects a relocatable artifact, while other
+`Compilation` constructors select executables, loadable modules, and static archives.
+Intermediate destinations use `.ll`, `.bc`, `.s` or `.o`; `silk run` requires a final executable.
 
 `wasm-text` applies to a wasm32 or wasm64 executable. The build links the module as a final build
 does, with either backend, and writes the module in the WebAssembly text format to a `.wat`
@@ -201,7 +201,6 @@ stability promise:
 ```toml
 [package]
 name = "custom"
-kind = "library"
 
 [unstable]
 composition = { runtimes = [{ name = "custom", module = "runtime" }], defaults = ["custom"], retention = [{ module = "support", declaration = "keep" }] }

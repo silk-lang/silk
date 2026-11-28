@@ -519,7 +519,7 @@ const writeProgram = async (
   const unstable = composition === undefined ? '' : `\n[unstable]\ncomposition = ${composition}\n`
   writeFileSync(
     join(directory, 'silk.toml'),
-    `[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\nmain = "${programModule}"\n${unstable}`,
+    `[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n${unstable}`,
   )
   for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))
@@ -565,7 +565,7 @@ const buildProgram = Effect.fn('SelfhostCorpus.buildProgram')(function* (
     try: () => writeFileSync(definition, [
       `manifest = ${JSON.stringify(join(directory, 'silk.toml'))}`,
       'artifact = "executable"', `stdlib = ${JSON.stringify(stdlib)}`,
-      '[settings]', 'modules = []', '[settings.native]', 'sources = []', 'link = []',
+      '[settings]', `root = ${JSON.stringify(join(directory, programModule))}`, 'modules = []', '[settings.native]', 'sources = []', 'link = []',
       '[settings.profile]', `optimization = ${JSON.stringify(optimization)}`, `debug = ${debug}`, '',
     ].join('\n')),
     catch: (cause) => new CorpusFixtureError({ reason: 'ExternalFailure', message: 'Could not write compilation definition', cause }),

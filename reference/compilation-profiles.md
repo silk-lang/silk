@@ -486,8 +486,9 @@ is the working directory), then one line per step, with its description dimmed i
 the command. The steps are the template's `[template].next-steps`, an array of tables: `run` is the
 command and `description`, which is optional, says what it does; each is one nonempty line without
 control characters. `next-steps = []` prints no next steps at all. Without it, the step is
-`silk test` (`run its tests`) for a package whose `kind` is `library` and `silk run`
-(`build and run it`) otherwise, which is also what `--lib`, `--workspace` and `-t minimal` print.
+`silk test` (`run its tests`) for a package without an executable `main.silk` root under
+`[package].source` and `silk run` (`build and run it`) otherwise, which is also what `--lib`,
+`--workspace` and `-t minimal` print.
 The `[template]` table, like the `[[post-init]]` entries, is removed from the new manifest. No
 next steps are printed when `silk init` fails, including when it cannot add the package to its
 workspace.

@@ -44,12 +44,12 @@ build() {
   local module=memory/driver.silk
   mkdir -p "$package/memory" "$output/$name"
   cp "corpus/native/$name/main.silk" "$package/$module"
-  printf '[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\nmain = "%s"\n' "$module" > "$package/silk.toml"
+  printf '[package]\nname = "corpus"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n' > "$package/silk.toml"
   python3 - "$package" "$target" "$PWD/stdlib" "$supply" <<'PYCODE'
 import json, sys
 from pathlib import Path
 root, target, stdlib, platform = sys.argv[1:]
-text = f'manifest = {json.dumps(root + "/silk.toml")}\nstdlib = {json.dumps(stdlib)}\n[settings]\nmodules = []\n'
+text = f'manifest = {json.dumps(root + "/silk.toml")}\nstdlib = {json.dumps(stdlib)}\n[settings]\nroot = {json.dumps(root + "/memory/driver.silk")}\nmodules = []\n'
 if platform:
     text += f'platform = {platform}\n'
 text += f'[settings.profile]\ntarget = {json.dumps(target)}\noptimization = "none"\ndebug = false\n'
