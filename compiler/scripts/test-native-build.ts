@@ -4139,7 +4139,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(tuned, 'silk.toml'), `${tunedHeader}\n[packge]\nname = "x"\n`)
   const misspelled = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(misspelled.status, 2, misspelled.stderr)
-  assert.match(misspelled.stderr, /Invalid Silk project manifest .*silk\.toml:7: /)
+  assert.match(misspelled.stderr, /Invalid Silk project manifest .*silk\.toml:6: /)
   // Runtime-name resolution is semantic even though the composition's shape is schema-owned.
   yield* fs.writeFileString(
     join(tuned, 'silk.toml'),
@@ -4147,7 +4147,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   const unresolvedRuntime = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(unresolvedRuntime.status, 2, unresolvedRuntime.stderr)
-  assert.match(unresolvedRuntime.stderr, /Invalid Silk project manifest .*silk\.toml:7: /)
+  assert.match(unresolvedRuntime.stderr, /Invalid Silk project manifest .*silk\.toml:6: /)
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
   // Without a runtime, an executable that exports no C `main` is refused before Clang links it.
   const mainless = yield* compileSettings(tuned, 'mainless', '[settings.profile]\nruntime = "none"\n', { ...process.env, SILK_CLANG: sentinel })
