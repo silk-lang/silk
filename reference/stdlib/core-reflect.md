@@ -69,7 +69,7 @@ pub fn main() -> i32 {
 
 Import as `Reflect` with `import silk.core.reflect { Reflect }`.
 
-Public declarations: 12.
+Public declarations: 13.
 
 <a id="namedKind"></a>
 
@@ -186,6 +186,85 @@ pub const variantFieldKind: u8
 The [`Reflect.fieldKind`](#Reflect.impl.fieldKind) result for a field of a union variant, from [`Reflect.variantFields`](#Reflect.impl.variantFields).
 It has both a name, read with [`Reflect.fieldLabel`](#Reflect.impl.fieldLabel), and a position in its variant, read with
 [`Reflect.fieldOrdinal`](#Reflect.impl.fieldOrdinal).
+
+<a id="TypeId"></a>
+
+## `TypeId`
+
+```silk
+pub struct TypeId
+```
+
+A 128-bit identity for a concrete type with lifetimes erased.
+
+### Details
+
+Returned by [`Reflect.typeId`](#Reflect.impl.typeId). Distinct declarations (including same-named types in different
+modules) and distinct generic instantiations produce distinct `TypeId` values, while types that
+differ only by lifetime annotations share the same `TypeId`. Values implement [`Copy`](./core-ownership.md#Copy), [`Equal`](./core-equal.md#Equal),
+and [`HashKey`](`silk.collections.hash.HashKey`).
+
+<a id="TypeId.high"></a>
+
+### Field `high`
+
+```silk
+pub high: u64
+```
+
+The upper 64 bits of the 128-bit type hash.
+
+<a id="TypeId.low"></a>
+
+### Field `low`
+
+```silk
+pub low: u64
+```
+
+The lower 64 bits of the 128-bit type hash.
+
+<a id="TypeId.impl"></a>
+
+## Implementation `TypeId`
+
+```silk
+impl TypeId
+```
+
+<a id="TypeId.impl.equals"></a>
+
+### Method `equals`
+
+```silk
+pub fn equals(self: &Self, other: TypeId) -> bool
+```
+
+Returns `true` if `self` and `other` identify the same type.
+
+<a id="TypeId.impl.Copy"></a>
+
+## Implementation `Copy for TypeId`
+
+```silk
+impl Copy for TypeId
+```
+
+<a id="TypeId.impl.Equal"></a>
+
+## Implementation `Equal for TypeId`
+
+```silk
+impl Equal for TypeId
+```
+
+<a id="TypeId.impl.Equal.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
 
 <a id="Reflect"></a>
 
@@ -521,13 +600,28 @@ its lines joined by newlines, or empty text when it has none or is not a named t
 pub static fn privateField<Owner>() -> string<'static>
 ```
 
-Returns the name of the first field of the struct `Owner` that is not `pub`, or empty text
-when every field is `pub` or `Owner` is no struct.
+Returns the name of the first field of the struct or union variant `Owner` that is not `pub`,
+or empty text when every field is `pub` or `Owner` is neither a struct nor a union.
 
 #### When to use
 
 Refuse, at compile time, a type that a library must construct from outside its module. An
 `errorAt` on the returned text points at that field's declaration.
+
+<a id="Reflect.impl.typeId"></a>
+
+### Associated function `typeId`
+
+```silk
+pub static fn typeId<Owner>() -> TypeId
+```
+
+Returns a 128-bit [`TypeId`](#TypeId) identifying `Owner` with lifetimes erased.
+
+#### Details
+
+Distinct nominal declarations across modules and distinct type arguments produce distinct
+identities. Validity lifetimes are erased, so `&'a T` and `&'b T` share an identity.
 
 <a id="Reflect.impl.fieldKind"></a>
 

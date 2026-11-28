@@ -306,6 +306,7 @@ import semantic.CallResolution {
   foreignStaticType,
   isStaticIndex,
   primitiveType,
+  proveErasedContract,
   recordFieldNames,
   scalarEnumMembers,
   scalarEnumRepresentation,
@@ -1837,6 +1838,13 @@ effect fn storagePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     if operation == StorageOperation.SharedLayout || operation == StorageOperation.SharedFromAllocation {
       measured = run SealedCore.applied(SealedKind.SharedBlock, &element)
     }
+    if operation == StorageOperation.ErasedFrom {
+      measured = run storageInstanceType(body, node, usize.ONE, callerBindings, projections)
+      if let Option<Shared<Rejection>>.Some {value} = move run proveErasedContract(&mut resolver.*, &mut owner.*,
+        &mut dependencies.*, module, &[], &measured, &element, span) {
+        return Result<MirStoragePlan, PreparationFailure>.failResult(PreparationFailure.Rejected {diagnostic: move value})
+      }
+    }
     // An execution package is measured whole: its header, body, readiness endpoint and allocation.
     if operation == StorageOperation.ExecutionLayout || operation == StorageOperation.ExecutionFromAllocation {
       let mut packaged = List<Interned<Type>>.make()
@@ -1860,6 +1868,13 @@ effect fn storagePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
         Option<usize>.Some {value} => value
         Option<usize>.None => { return Result<MirStoragePlan, PreparationFailure>.failResult(PreparationFailure.Coverage {code: GapCode.ScalarLayout}) }
       }
+    }
+  }
+  if operation == StorageOperation.ErasedNarrow {
+    let targetContract = run storageInstanceType(body, node, usize.ONE, callerBindings, projections)
+    if let Option<Shared<Rejection>>.Some {value} = move run proveErasedContract(&mut resolver.*, &mut owner.*,
+      &mut dependencies.*, module, &[], &element, &targetContract, span) {
+      return Result<MirStoragePlan, PreparationFailure>.failResult(PreparationFailure.Rejected {diagnostic: move value})
     }
   }
   let mut cleanup = false
@@ -2679,6 +2694,10 @@ effect fn exportShim(
 pub enum OperationDispatch { Direct, Union, Erased }
 
 pub fn operationDispatch(instance: &InstanceKey) -> OperationDispatch {
+  if let InstanceKey.DropGlue {ty, ..} = &instance.* {
+    if SealedCore.isCore(&ty, SealedKind.ErasedStorage) { return OperationDispatch.Erased }
+    return OperationDispatch.Direct
+  }
   if let InstanceKey.Function {application, ..} = &instance.* {
     return Interned<Application>.with<OperationDispatch>(&application, |value: &Application| -> OperationDispatch {
       if let SpecializationTarget.Operation {provider, operation, implementation, ..} = &value.target {
@@ -2877,11 +2896,20 @@ effect fn dispatchMembers(resolver: &Resolver, key: Key, provider: &Interned<Typ
 pub effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key, instance: &InstanceKey, caller: &ModuleId, span: Span, positionOut: &mut usize)
   -> Shared<Result<Answer, NoRejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   run List<InstanceKey>.append(&mut resolver.erasureRound.dispatchers, InstanceKey.copy(instance))
-  let application = run InstanceKey.selected(instance)
-  let position = match &application.target {
-    SpecializationTarget.Operation {provider, ..} => run ErasureIndex.position(&mut resolver.erasures, &provider)
-    _ => { fail RevisionMismatch {} }
+  let contract = match &instance.* {
+    InstanceKey.DropGlue {ty, ..} => match move SealedCore.element(&ty) {
+      Option<Interned<Type>>.Some {value} => move value
+      Option<Interned<Type>>.None => { fail RevisionMismatch {} }
+    }
+    _ => {
+      let application = run InstanceKey.selected(instance)
+      match &application.target {
+        SpecializationTarget.Operation {provider, ..} => Interned<Type>.clone(&provider)
+        _ => { fail RevisionMismatch {} }
+      }
+    }
   }
+  let position = run ErasureIndex.position(&mut resolver.erasures, &contract)
   let count = ErasureIndex.countAt(&resolver.erasures, position)
   let dispatchers = List<DiscoveryDispatch>.asSlice(&resolver.erasureDispatchers)
   let mut at = usize.ZERO
@@ -2895,7 +2923,13 @@ pub effect fn discoveryDispatcher(resolver: &mut Resolver, owner: &mut Query<Ans
   }
   positionOut.* = at
   let identity = InstanceKey.identity(instance)
-  let answer = run resolveUnionDispatchMir(&mut resolver.*, &mut owner.*, key, InstanceKey.copy(instance), &identity, false)
+  let answer = match &instance.* {
+    InstanceKey.DropGlue {ty, ..} => {
+      let members = run dispatchMembers(&resolver.*, key, &contract)
+      run resolveGlueMir(&mut resolver.*, &mut owner.*, InstanceKey.copy(instance), &ty, List<ErasureFact>.asSlice(&members), false)
+    }
+    _ => run resolveUnionDispatchMir(&mut resolver.*, &mut owner.*, key, InstanceKey.copy(instance), &identity, false)
+  }
   let mir = run Shared<Result<Answer, NoRejection>>.make(Result<Answer, NoRejection>.succeed(move answer))
   let result = DiscoveryDispatch {instance: InstanceKey.copy(instance), call: RelatedSite {module: ModuleId.copy(caller), span: span}, contract: position, count: count,
     mir: Shared<Result<Answer, NoRejection>>.clone(&mir)}
@@ -4447,7 +4481,19 @@ pub effect fn lowerMir(
     return run resolveHelperMir(&mut resolver.*, &mut owner.*, &instance, Arc<InstanceKey>.get(&creator), node, ordinal, purpose, observing)
   }
   if let Option<Interned<Type>>.Some {value: glued} = move InstanceKey.glueType(&instance) {
-    return run resolveGlueMir(&mut resolver.*, &mut owner.*, move instance, &glued, observing)
+    let dispatch = operationDispatch(&instance)
+    let mutableMembers = dispatch == OperationDispatch.Erased && List<BackendInstance>.asSlice(&resolver.backendInstances)[key.name].checkSet == usize.MAX
+    if mutableMembers { run recordMembership(&mut resolver.*, &instance) }
+    if mutableMembers && !resolver.closedErasures {
+      return memberSuccess(run dispatchGap(GapCode.WitnessOperand, &InstanceKey.identity(&instance)), List<Dependency>.make())
+    }
+    let mut erasedMembers = List<ErasureFact>.make()
+    if dispatch == OperationDispatch.Erased {
+      if let Option<Interned<Type>>.Some {value: contract} = move SealedCore.element(&glued) {
+        erasedMembers = run dispatchMembers(&resolver.*, key, &contract)
+      }
+    }
+    return run resolveGlueMir(&mut resolver.*, &mut owner.*, move instance, &glued, List<ErasureFact>.asSlice(&erasedMembers), observing)
   }
   let inspecting = instances[key.name].inspect
   let selfRaw = instances[key.name].raw

@@ -277,6 +277,352 @@ impl LocalScheduler {
     drop rootState
     return run finishRoot<A, E>(move selected)
   }
+
+  /// Starts a caller-driven [`LocalDriver`] with no root task and an empty ready queue.
+  ///
+  /// # Details
+  ///
+  /// Tasks added with [`LocalDriver.spawn`] share one scheduler, FIFO ready queue, and timer table,
+  /// and advance only when the caller invokes [`LocalDriver.step`] or [`LocalDriver.driveOne`].
+  pub effect fn start() -> LocalDriver
+  ! OutOfMemoryError
+  ? &mut MonotonicClock {
+    let parentResolution = run MonotonicClock.getResolution()
+    let resolution = requirePositiveResolution(parentResolution)
+    let initialMark = run MonotonicClock.now()
+    let initialSeconds = initialMark.seconds()
+    let initialNanoseconds = u32.toI64(initialMark.subsecondNanoseconds())
+    drop initialMark
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let queue = run Shared<ReadyQueue>.make(ReadyQueue {
+      head: NoLink {},
+      tail: NoLink {},
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let clock = run Shared<ClockState>.make(ClockState {
+      seconds: initialSeconds,
+      nanoseconds: initialNanoseconds,
+      resolution: resolution,
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let timerInbox = run Shared<TimerRequestInbox>.make(TimerRequestInbox {
+      request: NoTimerRequest {},
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let deadlines = run Shared<DeadlineBook>.make(DeadlineBook {
+      entries: List<DeadlineEntry>.make(),
+      nextToken: 1,
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let context = run Shared<TaskContext>.make(TaskContext {
+      identities: TaskIdSource { next: 1, exhausted: false },
+      clock: Shared<ClockState>.clone(&clock),
+      timerInbox: Shared<TimerRequestInbox>.clone(&timerInbox),
+      deadlines: Shared<DeadlineBook>.clone(&deadlines),
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let driverValue = Driver {
+      store: TaskStore {
+        timers: List<TimerEntry>.make(),
+        waiters: List<ReadyWaiter>.make(),
+        watches: List<ReadyWatch>.make(),
+        spans: List<usize>.make(),
+        drivesSincePoll: usize.ZERO,
+        tasks: HashMap<TaskId, TaskEntry>.make(Hash.seed(0)),
+        nextTimerOrder: u64.MIN,
+        timerOrderExhausted: false,
+      },
+      queue: move queue,
+      current: TaskId { value: 0 },
+      cancellationHead: NoLink {},
+      rootComplete: false,
+      clock: move clock,
+      timerInbox: move timerInbox,
+      deadlines: move deadlines,
+    }
+    let boxedDriver = run Box<Driver>.make(move driverValue)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    return LocalDriver {
+      owner: DurableDriver { boxed: move boxedDriver },
+      context: move context,
+    }
+  }
+}
+
+/// Handle to a task spawned on a [`LocalDriver`].
+///
+/// # Details
+///
+/// Holds both the scheduler-local [`TaskId`] (for [`LocalDriver.cancel`]) and the task's
+/// completion [`Fiber`].
+pub struct TaskHandle<A: 'static, E: 'static> {
+  identity: TaskId,
+  completion: Fiber<A, E>,
+}
+
+impl<A: 'static, E: 'static> TaskHandle<A, E> {
+  /// Returns the spawned task's identity within its [`LocalDriver`].
+  pub fn id(self: &Self) -> TaskId {
+    return self.identity
+  }
+
+  /// Borrows the spawned task's [`Fiber`].
+  pub fn fiber(self: &Self) -> &Fiber<A, E> {
+    return &self.completion
+  }
+
+  /// Consumes this handle and returns the underlying [`Fiber`].
+  pub fn intoFiber(self: Self) -> Fiber<A, E> {
+    let TaskHandle<A, E> { identity: _, completion } = move self
+    return move completion
+  }
+}
+
+/// Summary reported after one non-blocking [`LocalDriver.step`] call.
+pub struct StepResult {
+  /// Number of ready task activations driven during this call.
+  pub activations: usize,
+  /// Whether more ready tasks remain in the FIFO ready queue.
+  pub hasMoreReady: bool,
+  /// Earliest armed timer or task deadline, or `None` when none are active.
+  pub nextDeadline: Option<Mark>,
+  /// Number of tasks still unfinished in this driver.
+  pub liveTasks: usize,
+}
+
+/// A caller-driven, non-blocking handle to a [`LocalScheduler`] instance.
+///
+/// # When to use
+///
+/// Use [`LocalScheduler.start`] and [`LocalDriver`] when a host event loop (such as a UI loop
+/// waiting on external wakes and OS events) drives fibers in bounded turns instead of handing
+/// control to [`LocalScheduler.execute`] until completion.
+///
+/// # Details
+///
+/// Unlike [`LocalScheduler.execute`], [`LocalDriver.step`] never blocks waiting on timers and never
+/// raises [`StalledError`] when parked tasks wait for external `Execution.wake` calls.
+pub struct LocalDriver {
+  owner: DurableDriver,
+  context: Shared<TaskContext>,
+}
+
+impl LocalDriver {
+  /// Spawns a new top-level task onto this driver and enqueues it for execution.
+  ///
+  /// # Errors
+  ///
+  /// Fails with `OutOfMemoryError` on allocation failure, or `TaskIdExhaustedError` if the
+  /// scheduler's task identity space is exhausted.
+  pub effect fn spawn<A: 'static, E: 'static>(
+    self: &mut Self,
+    work: once Effect<'static;
+      A
+      ! E
+      ? &mut Scheduler | &mut MonotonicClock
+    >,
+  ) -> TaskHandle<A, E>
+  ! OutOfMemoryError | TaskIdExhaustedError {
+    let reserved = run reserve(&self.context)
+    let Reserved {
+      identity,
+      clock: taskClockHandle,
+      timerInbox: taskTimerInbox,
+    } = move reserved
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let prepared = run Fiber<A, E>.prepare(identity) |> Effect.provideMut<Allocator>(&mut allocator)
+    let response = run Shared<PublicationResponse>.make(PublicationResponse {
+      phase: ResponseWaiting {},
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let submission = run Shared<SubmissionSlot>.make(SubmissionSlot {
+      phase: NoSubmission {},
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mailboxResponse = Shared<PublicationResponse>.clone(&response)
+    let mailbox = run Shared<TaskMailbox>.make(TaskMailbox {
+      request: NoRequest {},
+      response: move mailboxResponse,
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let node = run Shared<ReadyNode>.make(ReadyNode {
+      identity: identity,
+      next: NoLink {},
+      enqueued: false,
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let queue = driverQueue(&self.owner)
+    let PreparedFiber<A, E> { producer, canceller, fiber } = move prepared
+    let client = SchedulerClient {
+      identity: identity,
+      mailbox: Shared<TaskMailbox>.clone(&mailbox),
+      submission: Shared<SubmissionSlot>.clone(&submission),
+      response: move response,
+      context: Shared<TaskContext>.clone(&self.context),
+      queue: Shared<ReadyQueue>.clone(&queue),
+    }
+    let taskClock = TaskClockClient {
+      clock: move taskClockHandle,
+      inbox: move taskTimerInbox,
+      ready: Option<Shared<ReadySlot>>.none(),
+    }
+    let endpoint = ReadyEndpoint {
+      queue: move queue,
+      node: move node,
+    }
+    let execution = run Execution.make(
+      runTask<A, E>(move work, move client, move taskClock, move producer),
+      move endpoint,
+      notifyReady,
+    ) |> Effect.provideMut<Allocator>(&mut allocator)
+    let entry = TaskEntry {
+      parent: NoLink {},
+      firstChild: NoLink {},
+      nextSibling: NoLink {},
+      previousSibling: NoLink {},
+      cancellationNext: NoLink {},
+      phase: Initial {},
+      execution: StoredExecution { execution: move execution },
+      cancellation: CompletionCancellation {
+        phase: CancellationAvailable { canceller: move canceller },
+      },
+      mailbox: move mailbox,
+      submission: move submission,
+      nextRegistrationGeneration: u64.MIN,
+      registrationGenerationExhausted: false,
+      registration: RegistrationIdle {},
+    }
+    run insertSpawnedTask(&mut self.owner, identity, move entry)
+    return TaskHandle<A, E> {
+      identity: identity,
+      completion: move fiber,
+    }
+  }
+
+  /// Synchronously cancels `target` and all of its unfinished descendants.
+  ///
+  /// # Details
+  ///
+  /// Parked executions are dropped immediately, running their `Drop` hooks and non-parking
+  /// finalizers and completing their [`Fiber`] observers as cancelled. Calling `cancel` on an
+  /// already finished or cancelled task is a no-op.
+  pub fn cancel(self: &mut Self, target: TaskId) -> () {
+    let mut drivers = Box<Driver>.getMut(&mut self.owner.boxed)
+    cancelDriverTask(&mut drivers[0], target)
+    return ()
+  }
+
+  /// Refreshes the driver's clock snapshot and wakes any tasks whose timers or deadlines are due.
+  pub effect fn tickTimers(self: &mut Self) -> ()
+  ? &mut MonotonicClock {
+    run refreshDurable(&mut self.owner)
+    drainDurableTimers(&mut self.owner)
+    return ()
+  }
+
+  /// Runs at most one ready task activation without blocking, returning `true` if one was driven.
+  pub effect fn driveOne(self: &mut Self) -> bool
+  ! OutOfMemoryError
+  ? &mut MonotonicClock {
+    let selected = takeDurableReady(&mut self.owner)
+    return run driveDurableSelected(&mut self.owner, move selected)
+  }
+
+  /// Advances due timers and runs up to `maxActivations` ready tasks without blocking.
+  ///
+  /// # Details
+  ///
+  /// Never sleeps waiting for timers and never raises [`StalledError`] when live tasks wait for
+  /// external wakes.
+  pub effect fn step(self: &mut Self, maxActivations: usize) -> StepResult
+  ! OutOfMemoryError
+  ? &mut MonotonicClock {
+    run self.tickTimers()
+    let mut activations: usize = 0
+    while activations < maxActivations {
+      if !run self.driveOne() { break }
+      activations = activations + 1
+    }
+    return StepResult {
+      activations: activations,
+      hasMoreReady: self.hasReady(),
+      nextDeadline: self.nextDeadline(),
+      liveTasks: self.liveTasks(),
+    }
+  }
+
+  /// Returns `true` if at least one task is waiting in the FIFO ready queue.
+  pub fn hasReady(self: &Self) -> bool {
+    let drivers = Box<Driver>.get(&self.owner.boxed)
+    return Shared<ReadyQueue>.with<bool>(&drivers[0].queue, queueHasReady)
+  }
+
+  /// Returns the earliest armed timer or deadline across all live tasks, without blocking.
+  pub fn nextDeadline(self: &Self) -> Option<Mark> {
+    return match move durableEarliestTimer(&self.owner) {
+      NoTimerDeadline {} => Option<Mark>.none()
+      TimerDeadline { value } => Option<Mark>.some(move value)
+    }
+  }
+
+  /// Returns the number of tasks still unfinished in this driver.
+  pub fn liveTasks(self: &Self) -> usize {
+    let drivers = Box<Driver>.get(&self.owner.boxed)
+    return HashMap<TaskId, TaskEntry>.length(&drivers[0].store.tasks)
+  }
+}
+
+impl Drop for LocalDriver {
+  fn drop(self: &mut Self) -> () {
+    let limit = Shared<TaskContext>.withMut<u64>(&self.context, readNextIdentity)
+    let mut drivers = Box<Driver>.getMut(&mut self.owner.boxed)
+    let driver = &mut drivers[0]
+    let mut id: u64 = 1
+    while HashMap<TaskId, TaskEntry>.length(&driver.store.tasks) > usize.ZERO {
+      cancelDriverTask(&mut driver.*, TaskId { value: id })
+      if id >= limit || id == u64.MAX { break }
+      id = id + 1
+    }
+    return ()
+  }
+}
+
+fn readNextIdentity(context: &mut TaskContext) -> u64 {
+  return context.identities.next
+}
+
+fn queueHasReady(queue: &ReadyQueue) -> bool {
+  return match &queue.head {
+    NoLink {} => false
+    ReadyNodeLink { .. } => true
+  }
+}
+
+fn driverQueue(owner: &DurableDriver) -> Shared<ReadyQueue> {
+  let drivers = Box<Driver>.get(&owner.boxed)
+  return Shared<ReadyQueue>.clone(&drivers[0].queue)
+}
+
+effect fn insertSpawnedTask(
+  owner: &mut DurableDriver,
+  identity: TaskId,
+  entry: TaskEntry,
+) -> () ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut drivers = Box<Driver>.getMut(&mut owner.boxed)
+  run reserveTimerSlot(&mut drivers[0].store)
+  let previous = run HashMap<TaskId, TaskEntry>.insert(&mut drivers[0].store.tasks, identity, move entry)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  drop previous
+  let _notified = HashMap.withMut(&mut drivers[0].store.tasks, identity, notifyInitialEntry)
+  return ()
+}
+
+fn cancelDriverTask(driver: &mut Driver, target: TaskId) -> () {
+  let mut links = TaskLinks {
+    parent: NoLink {},
+    firstChild: NoLink {},
+    nextSibling: NoLink {},
+  }
+  let found = readTaskLinks(&mut driver.store.tasks, target, &mut links)
+  if !found { return () }
+  unlinkFromParent(&mut driver.*, target, links.parent)
+  let nextWork = driver.cancellationHead
+  let linked = HashMap.withMut(&mut driver.store.tasks, target, installCancellationLink(nextWork))
+  if linked { driver.cancellationHead = TaskLink { identity: target } }
+  drainCancellations(&mut driver.*)
+  return ()
 }
 
 /// Reports that no task is ready and no event registration remains while the root is incomplete.

@@ -328,6 +328,22 @@ can still be awaited, joined, interrupted, or dropped.
 A child runs only when the scheduler drives it, so a loop that checks must also park now and
 then, for example with [`yieldNow`](#Fiber.impl.yieldNow) or a wait for a timer, or its children never finish.
 
+<a id="Fiber.impl.tryAwait"></a>
+
+### Method `tryAwait`
+
+```silk
+pub fn tryAwait(self: Self) -> Result<Outcome<A, E>, Self>
+```
+
+Consumes and returns this Fiber's outcome when already finished, without parking.
+
+#### Details
+
+Returns `Success` with the [`Outcome`](#Outcome) if the task already finished or was cancelled, or
+`Failure` giving the untouched Fiber back while still pending. Never parks and allocates no
+storage, so callers driving a scheduler from a non-parking thread can collect finished tasks.
+
 <a id="Fiber.impl.interrupt"></a>
 
 ### Method `interrupt`

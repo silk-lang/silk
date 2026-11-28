@@ -74,7 +74,7 @@ pub fn main() -> i32 {
 
 Import as `LocalScheduler` with `import silk.concurrency.local_scheduler { LocalScheduler }`.
 
-Public declarations: 2.
+Public declarations: 5.
 
 <a id="LocalScheduler"></a>
 
@@ -149,6 +149,280 @@ Before it returns or fails, it cancels each unfinished descendant and releases t
 #### Errors
 The failure of the root, `OutOfMemoryError`, or [`StalledError`](#StalledError) when no task is ready and no
 timer is waiting.
+
+<a id="LocalScheduler.impl.start"></a>
+
+### Associated function `start`
+
+```silk
+pub effect fn start() -> LocalDriver
+  ! OutOfMemoryError
+  ? &mut MonotonicClock
+```
+
+Starts a caller-driven [`LocalDriver`](#LocalDriver) with no root task and an empty ready queue.
+
+#### Details
+
+Tasks added with [`LocalDriver.spawn`](#LocalDriver.impl.spawn) share one scheduler, FIFO ready queue, and timer table,
+and advance only when the caller invokes [`LocalDriver.step`](#LocalDriver.impl.step) or [`LocalDriver.driveOne`](#LocalDriver.impl.driveOne).
+
+<a id="TaskHandle"></a>
+
+## `TaskHandle`
+
+```silk
+pub struct TaskHandle<A: 'static, E: 'static>
+```
+
+Handle to a task spawned on a [`LocalDriver`](#LocalDriver).
+
+### Details
+
+Holds both the scheduler-local [`TaskId`](./concurrency-scheduler.md#TaskId) (for [`LocalDriver.cancel`](#LocalDriver.impl.cancel)) and the task's
+completion [`Fiber`](./concurrency-fiber.md#Fiber).
+
+<a id="TaskHandle.impl"></a>
+
+## Implementation `TaskHandle<A, E>`
+
+```silk
+impl<A: 'static, E: 'static> TaskHandle<A, E>
+```
+
+<a id="TaskHandle.impl.id"></a>
+
+### Method `id`
+
+```silk
+pub fn id(self: &Self) -> TaskId
+```
+
+Returns the spawned task's identity within its [`LocalDriver`](#LocalDriver).
+
+<a id="TaskHandle.impl.fiber"></a>
+
+### Method `fiber`
+
+```silk
+pub fn fiber(self: &Self) -> &Fiber<A, E>
+```
+
+Borrows the spawned task's [`Fiber`](./concurrency-fiber.md#Fiber).
+
+<a id="TaskHandle.impl.intoFiber"></a>
+
+### Method `intoFiber`
+
+```silk
+pub fn intoFiber(self: Self) -> Fiber<A, E>
+```
+
+Consumes this handle and returns the underlying [`Fiber`](./concurrency-fiber.md#Fiber).
+
+<a id="StepResult"></a>
+
+## `StepResult`
+
+```silk
+pub struct StepResult
+```
+
+Summary reported after one non-blocking [`LocalDriver.step`](#LocalDriver.impl.step) call.
+
+<a id="StepResult.activations"></a>
+
+### Field `activations`
+
+```silk
+pub activations: usize
+```
+
+Number of ready task activations driven during this call.
+
+<a id="StepResult.hasMoreReady"></a>
+
+### Field `hasMoreReady`
+
+```silk
+pub hasMoreReady: bool
+```
+
+Whether more ready tasks remain in the FIFO ready queue.
+
+<a id="StepResult.nextDeadline"></a>
+
+### Field `nextDeadline`
+
+```silk
+pub nextDeadline: Option<Mark>
+```
+
+Earliest armed timer or task deadline, or `None` when none are active.
+
+<a id="StepResult.liveTasks"></a>
+
+### Field `liveTasks`
+
+```silk
+pub liveTasks: usize
+```
+
+Number of tasks still unfinished in this driver.
+
+<a id="LocalDriver"></a>
+
+## `LocalDriver`
+
+```silk
+pub struct LocalDriver
+```
+
+A caller-driven, non-blocking handle to a [`LocalScheduler`](#LocalScheduler) instance.
+
+### When to use
+
+Use [`LocalScheduler.start`](#LocalScheduler.impl.start) and [`LocalDriver`](#LocalDriver) when a host event loop (such as a UI loop
+waiting on external wakes and OS events) drives fibers in bounded turns instead of handing
+control to [`LocalScheduler.execute`](#LocalScheduler.impl.execute) until completion.
+
+### Details
+
+Unlike [`LocalScheduler.execute`](#LocalScheduler.impl.execute), [`LocalDriver.step`](#LocalDriver.impl.step) never blocks waiting on timers and never
+raises [`StalledError`](#StalledError) when parked tasks wait for external `Execution.wake` calls.
+
+<a id="LocalDriver.impl"></a>
+
+## Implementation `LocalDriver`
+
+```silk
+impl LocalDriver
+```
+
+<a id="LocalDriver.impl.spawn"></a>
+
+### Method `spawn`
+
+```silk
+pub effect fn spawn<A: 'static, E: 'static>(
+    self: &mut Self,
+    work: once Effect<'static;
+      A
+      ! E
+      ? &mut Scheduler | &mut MonotonicClock
+    >,
+  ) -> TaskHandle<A, E>
+  ! OutOfMemoryError | TaskIdExhaustedError
+```
+
+Spawns a new top-level task onto this driver and enqueues it for execution.
+
+#### Errors
+
+Fails with `OutOfMemoryError` on allocation failure, or `TaskIdExhaustedError` if the
+scheduler's task identity space is exhausted.
+
+<a id="LocalDriver.impl.cancel"></a>
+
+### Method `cancel`
+
+```silk
+pub fn cancel(self: &mut Self, target: TaskId) -> ()
+```
+
+Synchronously cancels `target` and all of its unfinished descendants.
+
+#### Details
+
+Parked executions are dropped immediately, running their `Drop` hooks and non-parking
+finalizers and completing their [`Fiber`](./concurrency-fiber.md#Fiber) observers as cancelled. Calling `cancel` on an
+already finished or cancelled task is a no-op.
+
+<a id="LocalDriver.impl.tickTimers"></a>
+
+### Method `tickTimers`
+
+```silk
+pub effect fn tickTimers(self: &mut Self) -> ()
+  ? &mut MonotonicClock
+```
+
+Refreshes the driver's clock snapshot and wakes any tasks whose timers or deadlines are due.
+
+<a id="LocalDriver.impl.driveOne"></a>
+
+### Method `driveOne`
+
+```silk
+pub effect fn driveOne(self: &mut Self) -> bool
+  ! OutOfMemoryError
+  ? &mut MonotonicClock
+```
+
+Runs at most one ready task activation without blocking, returning `true` if one was driven.
+
+<a id="LocalDriver.impl.step"></a>
+
+### Method `step`
+
+```silk
+pub effect fn step(self: &mut Self, maxActivations: usize) -> StepResult
+  ! OutOfMemoryError
+  ? &mut MonotonicClock
+```
+
+Advances due timers and runs up to `maxActivations` ready tasks without blocking.
+
+#### Details
+
+Never sleeps waiting for timers and never raises [`StalledError`](#StalledError) when live tasks wait for
+external wakes.
+
+<a id="LocalDriver.impl.hasReady"></a>
+
+### Method `hasReady`
+
+```silk
+pub fn hasReady(self: &Self) -> bool
+```
+
+Returns `true` if at least one task is waiting in the FIFO ready queue.
+
+<a id="LocalDriver.impl.nextDeadline"></a>
+
+### Method `nextDeadline`
+
+```silk
+pub fn nextDeadline(self: &Self) -> Option<Mark>
+```
+
+Returns the earliest armed timer or deadline across all live tasks, without blocking.
+
+<a id="LocalDriver.impl.liveTasks"></a>
+
+### Method `liveTasks`
+
+```silk
+pub fn liveTasks(self: &Self) -> usize
+```
+
+Returns the number of tasks still unfinished in this driver.
+
+<a id="LocalDriver.impl.Drop"></a>
+
+## Implementation `Drop for LocalDriver`
+
+```silk
+impl Drop for LocalDriver
+```
+
+<a id="LocalDriver.impl.Drop.drop"></a>
+
+### Operation `drop`
+
+```silk
+fn drop(self: &mut Self) -> ()
+```
 
 <a id="StalledError"></a>
 
