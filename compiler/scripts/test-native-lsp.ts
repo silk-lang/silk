@@ -696,17 +696,17 @@ const program = Effect.gen(function* () {
   yield* Effect.try({
     try: () => {
       cpSync(resolve('compiler/fixtures/compilation-request'), plannedRoot, { recursive: true })
-      writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
+      writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\n')
       writeFileSync(join(plannedRoot, 'build.silk'), 'this is not a build plan\n')
       writeFileSync(join(plannedRoot, 'main.silk'),
         'import dep.value { answer }\nstatic if answer == 42 { pub fn main() -> i32 { return 0 } } else { pub fn main() -> i32 { return "wrong" } }\n')
-      mkdirSync(join(plannedRoot, 'editor-output/requests'), { recursive: true })
+      mkdirSync(join(plannedRoot, 'build/requests'), { recursive: true })
     },
     catch: (cause) => new SessionError({ reason: 'Spawn', message: String(cause) }),
   })
   const savedSource = readFileSync(join(plannedRoot, 'main.silk'), 'utf8')
   const savedUri = pathToFileURL(join(plannedRoot, 'main.silk')).href
-  const requestsRoot = join(plannedRoot, 'editor-output/requests')
+  const requestsRoot = join(plannedRoot, 'build/requests')
   const savedRequest = readFileSync(join(plannedRoot, 'request.toml'), 'utf8')
     .replaceAll('/REQUEST_ROOT', plannedRoot).replaceAll('/STDLIB_ROOT', stdlib)
     .replace('flags = []', 'flags = ["-DREQUEST_FLAG=1"]')
@@ -734,7 +734,7 @@ const program = Effect.gen(function* () {
     params: { textDocument: { uri: savedUri, languageId: 'silk', version: 1, text: savedSource } } })
   const selectedB = yield* diagnosticsFor(planned, savedUri, 1, [])
   assert.ok(selectedB.diagnostics.some(({ code }) => code === 'SEM0129'), JSON.stringify(selectedB))
-  const nativeCommands = JSON.parse(readFileSync(join(plannedRoot, 'editor-output/compile_commands.json'), 'utf8')) as Array<{ file: string; arguments: string[] }>
+  const nativeCommands = JSON.parse(readFileSync(join(plannedRoot, 'build/compile_commands.json'), 'utf8')) as Array<{ file: string; arguments: string[] }>
   assert.equal(nativeCommands.length, 2, 'the compilation database includes only the plan request set')
   assert.ok(nativeCommands.every((command) => command.arguments.includes('-DREQUEST_FLAG=1') && command.file === join(plannedRoot, 'native.c')))
   assert.ok(nativeCommands.every((command) => ['-O2', '-g', '-march=x86-64-v3'].every((flag) => command.arguments.includes(flag))))
@@ -761,8 +761,8 @@ const program = Effect.gen(function* () {
   assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, malformedManifest.notifications)).diagnostics, [])
   unlinkSync(join(plannedRoot, 'silk.toml'))
   yield* planned.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: { silk: { compilation: 'a' } } } })
-  assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, [])).diagnostics, [], 'a removed manifest retains the custom output request')
-  writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\noutput-dir = "editor-output"\n')
+  assert.deepEqual((yield* diagnosticsFor(planned, savedUri, 1, [])).diagnostics, [], 'a removed manifest retains the saved output request')
+  writeFileSync(join(plannedRoot, 'silk.toml'), '[package]\nname = "request-fixture"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n[workspace]\nmembers = []\n')
   // A custom Plan command is project code, so the server asks before it runs one, and runs it
   // with the developer's permissions once allowed. The answer lives in SILK_HOME, keyed by the
   // repository's common Git directory, so a worktree of the same repository is not asked again.
@@ -784,7 +784,7 @@ impl TaskSet for Tasks {
 pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
 `
   // The plan's witness sits outside the request directory, which a failed plan restores.
-  const entered = join(plannedRoot, 'editor-output/steps/plan-entered')
+  const entered = join(plannedRoot, 'build/steps/plan-entered')
   mkdirSync(join(plannedRoot, '.git'), { recursive: true })
   unlinkSync(join(plannedRoot, 'build.silk'))
   writeFileSync(join(plannedRoot, 'tasks.silk'), tasksSource(entered))
@@ -847,9 +847,9 @@ pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
 
   // A linked worktree of the same repository shares the authorization.
   const worktreeRoot = join(directory, 'planned-worktree')
-  const worktreeEntered = join(worktreeRoot, 'editor-output/steps/plan-entered')
+  const worktreeEntered = join(worktreeRoot, 'build/steps/plan-entered')
   cpSync(plannedRoot, worktreeRoot, { recursive: true, filter: (path) => !path.endsWith('/.git') })
-  rmSync(join(worktreeRoot, 'editor-output/steps'), { recursive: true, force: true })
+  rmSync(join(worktreeRoot, 'build/steps'), { recursive: true, force: true })
   mkdirSync(join(plannedRoot, '.git/worktrees/copy'), { recursive: true })
   writeFileSync(join(plannedRoot, '.git/worktrees/copy/commondir'), '../..\n')
   writeFileSync(join(worktreeRoot, '.git'), `gitdir: ${join(plannedRoot, '.git/worktrees/copy')}\n`)
@@ -871,8 +871,8 @@ pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
   assert.equal(existsSync(entered), false)
   // Without a Plan variant nothing is asked and the tasks program is not even built. The built-in
   // plan replaces the requests above, so this runs last.
-  const tasksBuild = join(plannedRoot, 'editor-output/steps/tasks')
-  rmSync(join(plannedRoot, 'editor-output/steps'), { recursive: true, force: true })
+  const tasksBuild = join(plannedRoot, 'build/steps/tasks')
+  rmSync(join(plannedRoot, 'build/steps'), { recursive: true, force: true })
   writeFileSync(join(plannedRoot, 'tasks.silk'), tasksSource(entered).replace('union Tasks { Plan }', 'union Tasks { Lint }'))
   yield* allowing.send({ jsonrpc: '2.0', method: 'workspace/didChangeConfiguration',
     params: { settings: { workspaceTrusted: true, refreshPlan: true } } })

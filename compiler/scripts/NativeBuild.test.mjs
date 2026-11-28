@@ -68,7 +68,7 @@ const fixture = Effect.fnUntraced(
             'pub fn value() -> &\'static [u8] {\n  return b"0.1.0"\n}\n',
           ],
           ['compiler/src/main.silk', 'pub fn main() -> i32 { return 0 }'],
-          ['silk.toml', '[workspace]\nmembers = ["compiler", "tomledit"]\noutput-dir = "build"\n'],
+          ['silk.toml', '[workspace]\nmembers = ["compiler", "tomledit"]\n'],
           ['stdlib/silk/num/i32.silk', 'pub fn identity(value: i32) -> i32 { return value }'],
           [
             'tomledit/silk.toml',

@@ -2082,6 +2082,17 @@ pub files: List<String>
 
 Request filenames relative to the directory holding `plan.json`.
 
+<a id="RequestSet.roots"></a>
+
+### Field `roots`
+
+```silk
+pub roots: Option<List<String>>
+```
+
+Root compilation request filenames relative to the directory holding `plan.json`.
+Absent in plans written before root tracking; present lists exclude transitive tool compilations.
+
 <a id="RequestSet.impl.Schema"></a>
 
 ## Implementation `Schema for RequestSet`

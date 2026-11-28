@@ -204,7 +204,7 @@ name = "custom"
 kind = "library"
 
 [unstable]
-composition = { runtimes = [{ name = "custom", module = "runtime" }], defaults = ["custom"], retention = [{ module = "support", declaration = "keep" }], requirements = [] }
+composition = { runtimes = [{ name = "custom", module = "runtime" }], defaults = ["custom"], retention = [{ module = "support", declaration = "keep" }] }
 ```
 
 Profile `runtime = { kind = "none" }` overrides default candidates by explicitly selecting no
@@ -212,9 +212,8 @@ runtime. Foreign exports in the selected source and explicit retention declarati
 A custom runtime may call any visible application function with arguments and result handling
 expressed in ordinary Silk. The compiler imposes no special application function shape.
 
-Native requirements are resolved by explicit bindings, preserving their listed input order. The
-native compiler refuses composition requirements for now, and the binding table has no manifest
-spelling yet; the logical contract is:
+Native requirements are resolved by explicit bindings, preserving their listed input order; the
+binding table has no manifest spelling yet, and the logical contract is:
 
 ```toml
 requirements = [{ kind = "library", name = "values", linkage = "dynamic", alternatives = ["system"] }]

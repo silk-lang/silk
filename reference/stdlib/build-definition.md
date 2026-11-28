@@ -6,7 +6,7 @@ Typed compilation definitions whose defaults and package inputs the toolchain re
 
 Import as `Definition` with `import silk.build.definition { Definition }`.
 
-Public declarations: 5.
+Public declarations: 6.
 
 <a id="Definition"></a>
 
@@ -189,10 +189,10 @@ macOS link and signing settings.
 ### Field `wasm`
 
 ```silk
-pub wasm: Option<Wasm>
+pub wasm: Option<WasmSettings>
 ```
 
-WebAssembly memory, execution, and interface settings.
+WebAssembly memory, execution, and interface overrides.
 
 <a id="Settings.header"></a>
 
@@ -257,6 +257,110 @@ pub fn make() -> Self
 ```
 
 Returns settings that leave target-dependent defaults to the compiler.
+
+<a id="WasmSettings"></a>
+
+## `WasmSettings`
+
+```silk
+pub struct WasmSettings
+```
+
+Optional WebAssembly overrides merged over target defaults during compilation resolution.
+
+<a id="WasmSettings.importMemory"></a>
+
+### Field `importMemory`
+
+```silk
+pub importMemory: Option<bool>
+```
+
+Whether linear memory is imported from the host instead of defined by the module.
+
+<a id="WasmSettings.sharedMemory"></a>
+
+### Field `sharedMemory`
+
+```silk
+pub sharedMemory: Option<bool>
+```
+
+Whether imported linear memory is shared across threads.
+
+<a id="WasmSettings.exportTable"></a>
+
+### Field `exportTable`
+
+```silk
+pub exportTable: Option<bool>
+```
+
+Whether the indirect function table is exported.
+
+<a id="WasmSettings.executionModel"></a>
+
+### Field `executionModel`
+
+```silk
+pub executionModel: Option<String>
+```
+
+The WASI execution model: `command` or `reactor`.
+
+<a id="WasmSettings.wit"></a>
+
+### Field `wit`
+
+```silk
+pub wit: Option<String>
+```
+
+A package-relative or absolute WIT file or directory for a component build.
+
+<a id="WasmSettings.world"></a>
+
+### Field `world`
+
+```silk
+pub world: Option<String>
+```
+
+The WIT world name to compile for a component build.
+
+<a id="WasmSettings.impl.Schema"></a>
+
+## Implementation `Schema for WasmSettings`
+
+```silk
+impl Schema for WasmSettings
+```
+
+<a id="WasmSettings.impl.Schema.spec"></a>
+
+### Operation `spec`
+
+```silk
+static fn spec() -> Spec<WasmSettings>
+```
+
+<a id="WasmSettings.impl"></a>
+
+## Implementation `WasmSettings`
+
+```silk
+impl WasmSettings
+```
+
+<a id="WasmSettings.impl.make"></a>
+
+### Associated function `make`
+
+```silk
+pub fn make() -> Self
+```
+
+Leaves every WebAssembly setting unspecified so target defaults apply.
 
 <a id="Package"></a>
 

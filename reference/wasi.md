@@ -150,30 +150,32 @@ returns owned method, URL parts, and ordered fields; `readBody` enforces a calle
 fixture in `compiler/fixtures/wasi-http-server/main.silk` is a complete echo handler.
 
 The bundled `http` world includes `wasi:http/proxy@0.2.12`. Copy `stdlib/wit` into the server
-package as `wit`, select `world = "http"` in `[component]`, and select `runtime = {kind = "none"}`
-with `Compilation.runtime`, target `wasm32-wasip2`, and a reactor execution model. Build it, then run `wasmtime serve --addr 127.0.0.1:8080 <component>`.
+package as `wit`, set `wit = "wit"`, `world = "http"`, and `execution-model = "reactor"` with
+`Compilation.wasm` (`WasmSettings`), target `wasm32-wasip2`, and `runtime` omitted or `"none"`.
+Build it, then run `wasmtime serve --addr 127.0.0.1:8080 <component>`.
 Pure HTTP components do not need command startup, a Preview 1 adapter, or CLI filesystem grants.
 
 ## Custom WIT worlds, imports, and exports
 
-A package can describe any synchronous component interface with its own WIT package:
+A package can describe any synchronous component interface with its own WIT package via `Compilation.wasm` in `src/tasks.silk`:
 
-```toml
-[package]
-name = "calculator"
-source = "."
-
-[component]
-wit = "wit"
-world = "calculator"
+```silk
+let wasm = WasmSettings {
+  importMemory: Option<bool>.none(),
+  sharedMemory: Option<bool>.none(),
+  exportTable: Option<bool>.none(),
+  executionModel: Option<String>.some(run String.copy("reactor")),
+  wit: Option<String>.some(run String.copy("wit")),
+  world: Option<String>.some(run String.copy("calculator")),
+}
 ```
 
-The command selects `wasm32-wasip2` and `runtime = "none"` through its `Compilation`.
-`component.wit` is a file or directory inside the package; its dependency packages belong in
-its WIT `deps` directory. `component.world` selects a world in that package. Both fields are
-required. Test runners select the bundled command world so a library's exported application
-interface does not replace the test entry. WIT file contents and directory listings participate
-in test-runner reuse validation.
+With target `wasm32-wasip2`, `execution-model = "reactor"` clears default `runtime` and `entry`
+selections automatically. `wit` is a file or directory inside or outside the package (relative
+paths resolve against the package directory); its dependency packages belong in its WIT `deps`
+directory. `world` selects a world in that package. Test runners select the bundled command world so
+a library's exported application interface does not replace the test entry. WIT file contents and
+directory listings participate in build-step cache keys and test-runner reuse validation.
 
 For example, a `wit/world.wit` containing:
 

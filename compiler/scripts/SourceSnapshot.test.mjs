@@ -42,7 +42,7 @@ const fixture = Effect.fnUntraced(function* () {
       yield* fs.writeFileString(join(repository, path), text)
     },
   )
-  yield* put('silk.toml', '[workspace]\nmembers = ["compiler", "tomledit"]\noutput-dir = "build"\n')
+  yield* put('silk.toml', '[workspace]\nmembers = ["compiler", "tomledit"]\n')
   yield* put(
     'tomledit/silk.toml',
     '[package]\nname = "tomledit"\nversion = "0.1.0"\nmain = "Command.silk"\n',

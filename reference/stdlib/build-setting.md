@@ -467,7 +467,7 @@ Wasm
 #### Field `value`
 
 ```silk
-pub value: Deferred<Wasm>
+pub value: Deferred<WasmSettings>
 ```
 
 <a id="Setting.Header"></a>
@@ -767,7 +767,7 @@ Resolves a setting only after its declared prerequisites have completed.
 ## `keyValues`
 
 ```silk
-pub effect fn keyValues(values: &Values, key: &mut Key) -> ()
+pub effect fn keyValues(base: &Path, values: &Values, key: &mut Key) -> ()
   ! StepFailure
   ? &mut Allocator
 ```

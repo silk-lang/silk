@@ -7,7 +7,7 @@ and working directory, wait for the image, and return its exact exit status to t
 
 Import as `WindowsProcessImage` with `import silk.platform.windows.process_image as WindowsProcessImage`.
 
-Public declarations: 6.
+Public declarations: 7.
 
 <a id="setVariableBytes"></a>
 
@@ -56,6 +56,18 @@ pub effect fn setVariableDefault(name: string, value: string) -> bool ! OutOfMem
 Sets a default environment variable from text, preserving an existing value, including empty.
 Returns false for NUL, an empty name, `=` in the name, or an OS refusal.
 The presence check and update are separate calls; concurrent environment writers may race.
+
+<a id="unsetVariableBytes"></a>
+
+## `unsetVariableBytes`
+
+```silk
+pub effect fn unsetVariableBytes(name: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator
+```
+
+Removes a live Windows environment variable named by canonical WTF-8 host bytes.
+Returns false for an empty name, `=` in the name, NUL, invalid WTF-8, or an OS refusal.
+Allocation failure remains an Effect. Previously captured `HostInput` snapshots do not change.
 
 <a id="replace"></a>
 

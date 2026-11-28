@@ -1240,10 +1240,9 @@ encrypted, span disks, or use a compression method other than stored or DEFLATE.
 source analysis does not execute the native compiler. With `SILK_OFFLINE` set, a build that needs a missing archive fails
 naming it.
 
-`[native.override.<name>] path = "<directory>"` in the root manifest, or in
-`$SILK_HOME/native-overrides.toml` on the machine, replaces archive `<name>` with that directory,
-which is never fetched; a relative path is resolved against the file that names it, and the
-machine's file wins over the root's. A dependency's overrides are ignored.
+`[native.override.<name>] path = "<directory>"` in `$SILK_HOME/native-overrides.toml` on the
+machine replaces archive `<name>` with that directory, which is never fetched; a relative path is
+resolved against that file's directory.
 
 ```toml
 [native.archive.dawn.targets.aarch64-apple-darwin]

@@ -596,6 +596,24 @@ again after them; set those after this call instead.
 #### Errors
 `OutOfMemoryError` if the `Allocator` cannot supply the copies.
 
+<a id="Subprocess.impl.inheritEnvironmentExcept"></a>
+
+### Associated function `inheritEnvironmentExcept`
+
+```silk
+pub effect fn inheritEnvironmentExcept(
+    request: &mut ProcessRequest,
+    excluded: &[&[u8]],
+  ) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds every variable of this process's environment to `request` except variables whose name
+equals an entry in `excluded`. Variables that `request` already sets are added again after
+them; set those after this call instead.
+
+#### Errors
+`OutOfMemoryError` if the `Allocator` cannot supply the copies.
+
 <a id="Subprocess.impl.takePipe"></a>
 
 ### Method `takePipe`

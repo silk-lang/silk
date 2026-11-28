@@ -493,7 +493,6 @@ const componentComposition = (program: Corpus.Program, stdlib: string): string |
     runtimes: [{ name: runtime.name, module: runtime.module }],
     defaults: [runtime.name],
     retention: [],
-    requirements: [],
     components: program.outcome.components,
   })
 }
