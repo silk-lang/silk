@@ -550,6 +550,30 @@ fn equals(left: &Self, right: &Self) -> bool
 fn hash(value: &Self, seed: &HashSeed) -> u64
 ```
 
+<a id="TypeId.impl.HashKey"></a>
+
+## Implementation `HashKey for TypeId`
+
+```silk
+impl HashKey for TypeId
+```
+
+<a id="TypeId.impl.HashKey.equals"></a>
+
+### Operation `equals`
+
+```silk
+fn equals(left: &Self, right: &Self) -> bool
+```
+
+<a id="TypeId.impl.HashKey.hash"></a>
+
+### Operation `hash`
+
+```silk
+fn hash(value: &Self, seed: &HashSeed) -> u64
+```
+
 
 Category: Collections.
 

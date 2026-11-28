@@ -1,0 +1,339 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.concurrency.execution { Execution, Wake }
+import silk.concurrency.fiber { Cancelled, Fiber, Outcome, Success }
+import silk.concurrency.local_scheduler { LocalDriver, LocalScheduler, StepResult, TaskHandle }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.shared { Shared }
+import silk.testing.testing { AssertionError, Testing }
+import silk.time.mark { Mark }
+import silk.num.usize
+
+struct VirtualClock {
+  pub mark: Mark,
+}
+
+impl MonotonicClock for VirtualClock {
+  effect fn now(self: &mut Self) -> Mark {
+    return self.mark
+  }
+
+  effect fn getResolution(self: &mut Self) -> u64 {
+    return 1
+  }
+
+  effect fn waitUntil(self: &mut Self, when: Mark) -> () {
+    self.mark = move when
+    return ()
+  }
+
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
+    return ()
+  }
+
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Mark>) -> usize {
+    drop watch
+    match move until {
+      Option<Mark>.Some { value } => { self.mark = move value }
+      Option<Mark>.None => Intrinsic.trap("VirtualClock: no handle will be ready")
+    }
+    return 0
+  }
+}
+
+struct WakeEmpty {}
+struct WakeArmed { wake: Wake }
+
+struct WakeCell {
+  slot: WakeEmpty | WakeArmed,
+}
+
+struct Counter {
+  pub value: usize,
+}
+
+fn storeWake(cell: &mut WakeCell, wake: Wake) -> () {
+  let previous = Intrinsic.replace(cell.slot, WakeArmed { wake: move wake })
+  drop previous
+  return ()
+}
+
+fn takeWake(cell: &mut WakeCell) -> WakeEmpty | WakeArmed {
+  return Intrinsic.replace(cell.slot, WakeEmpty {})
+}
+
+fn registerWake(wake: Wake, cell: Shared<WakeCell>) -> () {
+  let storing = storeWake(move wake)
+  Shared.withMut(&cell, move storing)
+  drop cell
+  return ()
+}
+
+fn incCounter(counter: &mut Counter) -> () {
+  counter.value = counter.value + 1
+  return ()
+}
+
+fn readCounter(counter: &Counter) -> usize {
+  return counter.value
+}
+
+struct DropCounterGuard {
+  drops: Shared<Counter>,
+}
+
+impl Drop for DropCounterGuard {
+  fn drop(self: &mut Self) -> () {
+    Shared.withMut(&self.drops, incCounter)
+    return ()
+  }
+}
+
+effect fn parkAndReturn(cell: Shared<WakeCell>, resumed: Shared<Counter>) -> i32 {
+  let registration = registerWake(move cell)
+  run Execution.park(move registration)
+  Shared.withMut(&resumed, incCounter)
+  return 42
+}
+
+effect fn childGuardAndPark(
+  cell: Shared<WakeCell>,
+  drops: Shared<Counter>,
+  afterPark: Shared<Counter>,
+) -> () {
+  let guard = DropCounterGuard { drops: move drops }
+  let registration = registerWake(move cell)
+  run Execution.park(move registration)
+  Shared.withMut(&afterPark, incCounter)
+  drop guard
+  return ()
+}
+
+effect fn parentWithChildGuardAndPark(
+  parentCell: Shared<WakeCell>,
+  childCell: Shared<WakeCell>,
+  drops: Shared<Counter>,
+  afterPark: Shared<Counter>,
+) -> ()
+! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+? &mut Scheduler | &mut MonotonicClock {
+  let guard = DropCounterGuard { drops: Shared<Counter>.clone(&drops) }
+  let child = run Fiber<(), Cancelled>.forkChild(
+    childGuardAndPark(move childCell, move drops, Shared<Counter>.clone(&afterPark)),
+  )
+  let registration = registerWake(move parentCell)
+  run Execution.park(move registration)
+  Shared.withMut(&afterPark, incCounter)
+  drop child
+  drop guard
+  return ()
+}
+
+effect fn sleepAndReturn(resumed: Shared<Counter>) -> i32
+? &mut Scheduler | &mut MonotonicClock {
+  run MonotonicClock.waitFor(50ms)
+  Shared.withMut(&resumed, incCounter)
+  return 99
+}
+
+effect fn yieldAndInc(done: Shared<Counter>) -> ()
+? &mut Scheduler | &mut MonotonicClock {
+  run Fiber.yieldNow()
+  Shared.withMut(&done, incCounter)
+  return ()
+}
+
+effect fn localDriverHandlesExternalParkAndWakeWithoutStall() -> ()
+! OutOfMemoryError | TaskIdExhaustedError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = VirtualClock { mark: Mark.make(10, 0) }
+  let cell = run Shared<WakeCell>.make(WakeCell { slot: WakeEmpty {} })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let resumed = run Shared<Counter>.make(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  let mut driver: LocalDriver = run LocalScheduler.start()
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  let handle: TaskHandle<i32, never> = run driver.spawn<i32, never>(parkAndReturn(Shared<WakeCell>.clone(&cell), Shared<Counter>.clone(&resumed)))
+  run Testing.expect(driver.hasReady(), "newly spawned task is initially ready")
+  run Testing.expect(driver.liveTasks() == 1, "liveTasks counts newly spawned task")
+
+  let r1: StepResult = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(r1.activations == 1, "first step drives spawned task once")
+  run Testing.expect(!r1.hasMoreReady, "no ready tasks while parked externally")
+  run Testing.expect(r1.liveTasks == 1, "parked task stays live without StalledError")
+  run Testing.expect(Option<Mark>.isNone(&r1.nextDeadline), "external park sets no timer deadline")
+  run Testing.expect(Shared<Counter>.with<usize>(&resumed, readCounter) == 0, "task has not resumed before wake")
+  run Testing.expect(!Fiber<i32, never>.isFinished(handle.fiber()), "fiber is not finished while parked")
+
+  let wake = Shared.withMut(&cell, takeWake)
+  match move wake {
+    WakeEmpty {} => { run Testing.expect(false, "parked task registered external Wake") }
+    WakeArmed { wake: handleWake } => Execution.wake(move handleWake)
+  }
+  run Testing.expect(driver.hasReady(), "external Wake re-enqueues parked task")
+
+  let r2 = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(r2.activations == 1, "second step drives woken task")
+  run Testing.expect(!r2.hasMoreReady && r2.liveTasks == 0, "completed task is cleaned up")
+  run Testing.expect(Shared<Counter>.with<usize>(&resumed, readCounter) == 1, "task resumed once after wake")
+  run Testing.expect(Fiber<i32, never>.isFinished(handle.fiber()), "fiber finished after completion")
+
+  let resultValue = match move handle.intoFiber().tryAwait() {
+    Result<Outcome<i32, never>, Fiber<i32, never>>.Success { value: outcome } => {
+      let Outcome<i32, never> { value } = move outcome
+      match move value {
+        Success<i32> { value: v } => v
+        _ => 0
+      }
+    }
+    Result<Outcome<i32, never>, Fiber<i32, never>>.Failure { error: stillPending } => {
+      drop stillPending
+      0
+    }
+  }
+  run Testing.expect(resultValue == 42, "tryAwait returns completed task result")
+}
+
+effect fn localDriverCancelSynchronouslyDropsParkedTasksAndChildren() -> ()
+! OutOfMemoryError | TaskIdExhaustedError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = VirtualClock { mark: Mark.make(20, 0) }
+  let parentCell = run Shared<WakeCell>.make(WakeCell { slot: WakeEmpty {} })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let childCell = run Shared<WakeCell>.make(WakeCell { slot: WakeEmpty {} })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let drops = run Shared<Counter>.make(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let afterPark = run Shared<Counter>.make(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  let mut driver = run LocalScheduler.start()
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  let handle = run driver.spawn<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled>(
+    parentWithChildGuardAndPark(
+      move parentCell,
+      move childCell,
+      Shared<Counter>.clone(&drops),
+      Shared<Counter>.clone(&afterPark),
+    ),
+  )
+
+  let step1 = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(step1.liveTasks == 2, "both parent and forked child are parked live")
+  run Testing.expect(Shared<Counter>.with<usize>(&drops, readCounter) == 0, "guards have not dropped while parked")
+
+  driver.cancel(handle.id())
+  run Testing.expect(Shared<Counter>.with<usize>(&drops, readCounter) == 2, "cancel runs Drop hooks on parent and child immediately")
+  run Testing.expect(Shared<Counter>.with<usize>(&afterPark, readCounter) == 0, "cancelled tasks never resume past park")
+  run Testing.expect(driver.liveTasks() == 0, "cancel removes parent and child from liveTasks")
+  run Testing.expect(Fiber<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled>.isFinished(handle.fiber()), "cancelled fiber is finished")
+
+  // Second cancel is an idempotent no-op.
+  driver.cancel(handle.id())
+  run Testing.expect(driver.liveTasks() == 0 && Shared<Counter>.with<usize>(&drops, readCounter) == 2, "repeat cancel is a no-op")
+
+  let cancelled = match move handle.intoFiber().tryAwait() {
+    Result<
+      Outcome<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled>,
+      Fiber<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled>,
+    >.Success { value: outcome } => {
+      let Outcome<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled> { value } = move outcome
+      match move value {
+        Cancelled {} => true
+        _ => false
+      }
+    }
+    Result<
+      Outcome<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled>,
+      Fiber<(), OutOfMemoryError | TaskIdExhaustedError | Cancelled>,
+    >.Failure { error: stillPending } => {
+      drop stillPending
+      false
+    }
+  }
+  run Testing.expect(cancelled, "cancelled task fiber reports Cancelled")
+}
+
+effect fn localDriverReportsNextDeadlineAndWakesTimersNonBlockingly() -> ()
+! OutOfMemoryError | TaskIdExhaustedError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = VirtualClock { mark: Mark.make(10, 0) }
+  let resumed = run Shared<Counter>.make(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  let mut driver = run LocalScheduler.start()
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  let handle = run driver.spawn<i32, never>(sleepAndReturn(Shared<Counter>.clone(&resumed)))
+
+  let r1 = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(r1.liveTasks == 1 && !r1.hasMoreReady, "sleeping task parked on timer")
+  let expectedDeadline = MonotonicClock.deadlineAfter(&Mark.make(10, 0), 50ms)
+  match move r1.nextDeadline {
+    Option<Mark>.None => { run Testing.expect(false, "nextDeadline reports armed 50ms timer") }
+    Option<Mark>.Some { value: d } => {
+      run Testing.expect(&d == &expectedDeadline, "nextDeadline equals start + 50ms")
+    }
+  }
+
+  clock.mark = MonotonicClock.deadlineAfter(&clock.mark, 25ms)
+  let r2 = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(r2.activations == 0 && r2.liveTasks == 1, "timer does not fire early at 25ms")
+  run Testing.expect(Option<Mark>.isSome(&r2.nextDeadline), "nextDeadline remains present before expiry")
+
+  clock.mark = MonotonicClock.deadlineAfter(&clock.mark, 25ms)
+  let r3 = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(r3.activations == 1 && r3.liveTasks == 0, "timer fires at 50ms and completes task")
+  run Testing.expect(Option<Mark>.isNone(&r3.nextDeadline), "nextDeadline clears after timer fires")
+  run Testing.expect(Shared<Counter>.with<usize>(&resumed, readCounter) == 1, "timer task completed")
+  drop handle
+}
+
+effect fn localDriverStepRespectsMaxActivationsBudget() -> ()
+! OutOfMemoryError | TaskIdExhaustedError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = VirtualClock { mark: Mark.make(0, 0) }
+  let done = run Shared<Counter>.make(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  let mut driver = run LocalScheduler.start()
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+  let h1 = run driver.spawn<(), never>(yieldAndInc(Shared<Counter>.clone(&done)))
+  let h2 = run driver.spawn<(), never>(yieldAndInc(Shared<Counter>.clone(&done)))
+  let h3 = run driver.spawn<(), never>(yieldAndInc(Shared<Counter>.clone(&done)))
+
+  let r1 = run driver.step(2) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(r1.activations == 2, "step(2) stops at 2 activations")
+  run Testing.expect(r1.hasMoreReady, "step(2) reports remaining ready work")
+  run Testing.expect(Shared<Counter>.with<usize>(&done, readCounter) == 0, "no task passed yieldNow yet")
+
+  let r2 = run driver.step(16) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  run Testing.expect(!r2.hasMoreReady && r2.liveTasks == 0, "remaining turns drain all tasks")
+  run Testing.expect(Shared<Counter>.with<usize>(&done, readCounter) == 3, "all three tasks finished")
+  drop h1
+  drop h2
+  drop h3
+}
+
+effect fn runAll() -> i32
+! OutOfMemoryError | TaskIdExhaustedError | AssertionError<'static> {
+  run localDriverHandlesExternalParkAndWakeWithoutStall()
+  run localDriverCancelSynchronouslyDropsParkedTasksAndChildren()
+  run localDriverReportsNextDeadlineAndWakesTimersNonBlockingly()
+  run localDriverStepRespectsMaxActivationsBudget()
+  return 0
+}
+
+effect fn failed(error: OutOfMemoryError | TaskIdExhaustedError | AssertionError<'static>) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(runAll(), failed)
+}
