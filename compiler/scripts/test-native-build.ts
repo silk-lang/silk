@@ -320,7 +320,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(requestRoot, 'silk.toml'),
     '[package]\nname = "request-fixture"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n[dependencies]\ndep = { path = "dependency" }\n')
   yield* fs.writeFileString(join(requestRoot, 'dependency/silk.toml'),
-    '[package]\nname = "request-dependency"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nexports = ["value"]\ninclude = ["asset.bin"]\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "request-dependency"\nversion = "0.1.0"\nsource = "."\nexports = ["value"]\ninclude = ["asset.bin"]\nsilk-version = "0.0.0"\n')
   const definitionText = (yield* fs.readFileString(join(requestRoot, 'definition.toml')))
     .replaceAll('/REQUEST_ROOT', requestRoot).replaceAll('/STDLIB_ROOT', standardLibrary)
   yield* fs.writeFileString(join(requestRoot, 'definition.toml'), definitionText)
@@ -473,22 +473,25 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(aliased, 'src/tasks.silk'), aliasSource(['Build']))
   const builtinRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], aliased, requestEnv, 120_000)
   assert.equal(builtinRun.status, 42, builtinRun.stderr)
-  // A package whose root module is its tasks program has no other program for the built-in `run`
-  // and `build` to make: its tasks answer them, before anything but the tasks program is built.
+  // A tasks-only package has no conventional root modules: tasks it defines answer `build`/`run`
+  // directly, while omitted ones fall back to the built-in (`run` refuses the missing `main.silk`
+  // and `build` has nothing to build).
   const tasksOnly = join(directory, 'tasks-only')
   yield* fs.makeDirectory(join(tasksOnly, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(tasksOnly, 'silk.toml'), '[package]\nname="tasks-only"\nmain="tasks.silk"\nsilk-version = "0.0.0"\n[dependencies]\ncatalog = {path="../aliased/catalog"}\n')
+  yield* fs.writeFileString(join(tasksOnly, 'silk.toml'), '[package]\nname="tasks-only"\nsilk-version = "0.0.0"\n[dependencies]\ncatalog = {path="../aliased/catalog"}\n')
   yield* fs.writeFileString(join(tasksOnly, 'src/tasks.silk'), aliasSource(['Build']))
   const tasksOnlyRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], tasksOnly, requestEnv, 120_000)
-  assert.equal(tasksOnlyRun.status, 2, tasksOnlyRun.stderr)
-  assert.match(tasksOnlyRun.stderr, /^error: unknown command run\b/m)
+  assert.equal(tasksOnlyRun.status, 1, tasksOnlyRun.stderr)
+  assert.match(tasksOnlyRun.stderr, /^silk: package `tasks-only` has no root module: src\/main\.silk does not exist$/m)
+  assert.match(tasksOnlyRun.stderr, /`silk task` lists its tasks/)
   assert.equal(tasksOnlyRun.stderr.match(/^ *Compiling /gm)?.length, 1, 'only the tasks program is compiled')
   const tasksOnlyBuild = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--code', '29'], tasksOnly, requestEnv, 120_000)
   assert.equal(tasksOnlyBuild.status, 29, tasksOnlyBuild.stderr)
   yield* fs.writeFileString(join(tasksOnly, 'src/tasks.silk'), aliasSource(['Run']))
   const tasksOnlyBuiltBuild = yield* invoke(silk, ['build', '--stdlib', standardLibrary], tasksOnly, requestEnv, 120_000)
-  assert.equal(tasksOnlyBuiltBuild.status, 2, tasksOnlyBuiltBuild.stderr)
-  assert.match(tasksOnlyBuiltBuild.stderr, /^error: unknown command build\b/m)
+  assert.equal(tasksOnlyBuiltBuild.status, 0, tasksOnlyBuiltBuild.stderr)
+  const tasksOnlyRunTask = yield* invoke(silk, ['run', '--stdlib', standardLibrary, '--code', '31'], tasksOnly, requestEnv, 120_000)
+  assert.equal(tasksOnlyRunTask.status, 31, tasksOnlyRunTask.stderr)
   const tasksOnlyTargets = (yield* fs.readDirectory(join(tasksOnly, 'build'))).filter((entry) => /^(x86_64|aarch64)-/.test(entry))
   assert.deepEqual(tasksOnlyTargets, [], 'no package artifact is built')
   // Without its root module, the built-in names the missing file and points to the tasks.
@@ -714,7 +717,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // Plan.linkDependency; declaring it is not enough, and naming an undeclared one refuses the plan.
   const heldC = join(held, 'held-c')
   yield* fs.makeDirectory(join(heldC, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(heldC, 'silk.toml'), '[package]\nname="held-c"\nkind="library"\nexports=["lib"]\nsilk-version = "0.0.0"\n')
+  yield* fs.writeFileString(join(heldC, 'silk.toml'), '[package]\nname="held-c"\nexports=["lib"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(heldC, 'src/lib.silk'), '//! Only C.\n')
   yield* fs.writeFileString(join(heldC, 'build.silk'), [
     'import silk.build.plan { Plan }',
@@ -1979,7 +1982,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'unusedapp/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unuseddep/silk.toml'),
-    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "unuseddep"\nversion = "0.1.0"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'unuseddep/src/lib.silk'), 'import silk.num.u64\n\npub fn value() -> i32 {\n  return 0\n}\n')
   yield* fs.writeFileString(
@@ -2510,7 +2513,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'depexport/app/native'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'depexport/core/silk.toml'),
-    '[package]\nname = "core"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["probes"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "core"\nversion = "0.1.0"\nsource = "."\nexports = ["probes"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'depexport/core/probes.silk'),
@@ -2541,7 +2544,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'libmsg/silk.toml'), '[workspace]\nmembers = ["geo", "app"]\n')
   yield* fs.writeFileString(
     join(directory, 'libmsg/geo/silk.toml'),
-    '[package]\nname = "geo"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "geo"\nversion = "0.1.0"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'libmsg/geo/src/lib.silk'),
@@ -2582,13 +2585,12 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   )
   assert.equal(escaped.status, 1, escaped.stderr)
   assert.match(escaped.stderr, /^unhandled error: geo\.lib\.BadSide\n {2}at geo\.lib\.side \(/m)
-  // A member without its root module but with a `lib.silk` is pointed at the library kind.
+  // Without `exports`, `geo` still checks its own `src/lib.silk`, while `app` cannot import `geo.lib`.
   yield* fs.writeFileString(join(directory, 'libmsg/geo/silk.toml'), '[package]\nname = "geo"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   const kindless = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'libmsg'))
-  assert.match(
-    kindless.stderr,
-    /^Skipping geo: its root module \(\[package\]\.main\) is missing\n {2}help: its source root has lib\.silk; a library sets `kind = "library"` and `exports = \["lib"\]` under \[package\]$/m,
-  )
+  assert.equal(kindless.status, 1, kindless.stderr)
+  assert.doesNotMatch(kindless.stderr, /Skipping geo/)
+  assert.match(kindless.stderr, /Checking geo\b/)
   // A member's first check adopts its dependency's semantic cache, and what changed in the
   // dependency since that cache was written is checked again: the stale result is not reused.
   yield* fs.makeDirectory(join(directory, 'adopt/core/src'), { recursive: true })
@@ -2596,7 +2598,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.writeFileString(join(directory, 'adopt/silk.toml'), '[workspace]\nmembers = ["core", "app"]\n')
   yield* fs.writeFileString(
     join(directory, 'adopt/core/silk.toml'),
-    '[package]\nname = "adoptcore"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "adoptcore"\nversion = "0.1.0"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'adopt/core/src/lib.silk'), 'pub fn size() -> i64 {\n  return 2\n}\n')
   yield* fs.writeFileString(
@@ -2886,7 +2888,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   yield* fs.makeDirectory(join(directory, 'tested/src/util'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'tested/silk.toml'),
-    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "tested"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/main.silk'),
@@ -2975,7 +2977,7 @@ os.execv(${encodeJson(clang)}, [${encodeJson(clang)}] + sys.argv[1:])
   // must run again even though it still passes the same concrete value.
   const dispatchTests = join(directory, 'dispatch-tests')
   yield* fs.makeDirectory(join(dispatchTests, 'src'), { recursive: true })
-  yield* fs.writeFileString(join(dispatchTests, 'silk.toml'), '[package]\nname = "dispatch-tests"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "library"\nsilk-version = "0.0.0"\n')
+  yield* fs.writeFileString(join(dispatchTests, 'silk.toml'), '[package]\nname = "dispatch-tests"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(dispatchTests, 'src/main.silk'), `import members
 test fn readsFirst() -> () { drop members.first() }
 test fn independent() -> () {}
@@ -3056,7 +3058,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(directory, 'round-shapes/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'round-shapes/silk.toml'),
-    '[package]\nname = "round-shapes"\nversion = "0.1.0"\nkind = "library"\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "round-shapes"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'round-shapes/src/lib.silk'),
@@ -3119,7 +3121,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   assert.equal(clangTests.status, 0, clangTests.stderr)
   yield* fs.writeFileString(join(directory, 'tested/silk.toml'),
-    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "executable"\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "tested"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(directory, 'tested/src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
   const unstartedBuild = yield* invoke(
     silk,
@@ -3163,7 +3165,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const shimArchive = yield* invoke(join(dirname(clang), 'llvm-ar'), ['rcs', 'libshim.a', 'offset.o'], join(propagated, 'shim'))
   assert.equal(shimArchive.status, 0, shimArchive.stderr)
   yield* fs.writeFileString(join(propagated, 'shim/silk.toml'),
-    '[package]\nname = "shim"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Shim"]\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "shim"\nversion = "0.1.0"\nsource = "."\nexports = ["Shim"]\nsilk-version = "0.0.0"\n')
   yield* writePlan(join(propagated, 'shim'), '  plan = Plan.linkArchive(plan, sourcePath("libshim.a"))')
   yield* fs.writeFileString(
     join(propagated, 'shim/Shim.silk'),
@@ -3173,7 +3175,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   // list links once.
   yield* fs.writeFileString(
     join(propagated, 'middle/silk.toml'),
-    '[package]\nname = "middle"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Middle"]\nsilk-version = "0.0.0"\n\n[dependencies]\nshim = { path = "../shim" }\n',
+    '[package]\nname = "middle"\nversion = "0.1.0"\nsource = "."\nexports = ["Middle"]\nsilk-version = "0.0.0"\n\n[dependencies]\nshim = { path = "../shim" }\n',
   )
   yield* fs.writeFileString(
     join(propagated, 'middle/Middle.silk'),
@@ -3203,7 +3205,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const sourcesRoot = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-sources-' })
   for (const member of ['clib/native', 'clib/include', 'app']) yield* fs.makeDirectory(join(sourcesRoot, member), { recursive: true })
   yield* fs.writeFileString(join(sourcesRoot, 'clib/silk.toml'),
-    '[package]\nname = "clib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Clib"]\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "clib"\nversion = "0.1.0"\nsource = "."\nexports = ["Clib"]\nsilk-version = "0.0.0"\n')
   const clibPlan = '  plan = Plan.compileNative(plan, "c", sourcePath("native/add.c"), &["-DBASE=40"], &[sourcePath("include")])\n' +
     '  plan = Plan.compileSources(plan, "c", sourcePath("native"), "two*.c", &["-DVALUE=2"], &[])\n'
   yield* writePlan(join(sourcesRoot, 'clib'), clibPlan)
@@ -3291,7 +3293,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.equal(packed.status, 0, packed.stdout + packed.stderr)
   const vendDigest = createHash('sha256').update(yield* fs.readFile(join(vendorArchived, 'vend.tar.gz'))).digest('hex')
   const sysManifest = (digest: string, url = `file://${join(vendorArchived, 'vend.tar.gz')}`) =>
-    '[package]\nname = "sys"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Sys"]\nsilk-version = "0.0.0"\n'
+    '[package]\nname = "sys"\nversion = "0.1.0"\nsource = "."\nexports = ["Sys"]\nsilk-version = "0.0.0"\n'
     + `[native.archive.vend]\nurl = "${url}"\nsha256 = "${digest}"\nstrip = 1\n`
   yield* fs.writeFileString(join(vendorArchived, 'sys/silk.toml'), sysManifest(vendDigest))
   const archivePlan = (name = 'vend', path = 'lib/libvend.a') =>
@@ -3377,7 +3379,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   for (const member of ['plib/native', 'app']) yield* fs.makeDirectory(join(planned, member), { recursive: true })
   yield* fs.writeFileString(
     join(planned, 'plib/silk.toml'),
-    '[package]\nname = "plib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Plib"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "plib"\nversion = "0.1.0"\nsource = "."\nexports = ["Plib"]\nsilk-version = "0.0.0"\n',
   )
   const planScript = (body: string) =>
     'import silk.build.plan { Library, Plan }\nimport silk.build.source { Source }\nimport silk.core.static_text { StaticText }\nimport silk.build.write_files { WriteFiles }\nimport silk.build.run { Run }\nimport silk.build.step { sourcePath }\n\n'
@@ -3493,7 +3495,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     '[package]\nname="imports-app"\nsource="."\nsilk-version = "0.0.0"\n[dependencies]\nlib={path="../library"}\nunused={path="../missing"}\n')
   yield* fs.writeFileString(join(importsRoot, 'app/main.silk'), 'import lib.Value\npub fn main() -> i32 { return Value.VALUE }\n')
   yield* fs.writeFileString(join(importsRoot, 'library/silk.toml'),
-    '[package]\nname="imports-library"\nsource="."\nkind="library"\nexports=["Value"]\nsilk-version = "0.0.0"\n[dependencies]\nleaf={path="../leaf"}\n'
+    '[package]\nname="imports-library"\nsource="."\nexports=["Value"]\nsilk-version = "0.0.0"\n[dependencies]\nleaf={path="../leaf"}\n'
       + 'unused={git="https://github.com/silk-lang/unreachable-test-dependency.git",rev="1111111111111111111111111111111111111111"}\n')
   yield* fs.writeFileString(join(importsRoot, 'library/Value.silk'), 'import generated\npub const VALUE: i32 = generated.VALUE\n')
   yield* fs.writeFileString(join(importsRoot, 'library/build.silk'), [
@@ -3504,7 +3506,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     '}', 'pub const PLAN: Plan = plan()', '',
   ].join('\n'))
   yield* fs.writeFileString(join(importsRoot, 'leaf/silk.toml'),
-    '[package]\nname="imports-leaf"\nsource="."\nkind="library"\nexports=["Value"]\nsilk-version = "0.0.0"\n')
+    '[package]\nname="imports-leaf"\nsource="."\nexports=["Value"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(importsRoot, 'leaf/Value.silk'), 'pub const VALUE: i32 = 42\n')
   const importsEnvironment = { ...sourcesEnvironment, SILK_OFFLINE: '1' }
   const importsBuilt = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(importsRoot, 'app'), importsEnvironment)
@@ -3555,7 +3557,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   for (const member of ['tlib/tools', 'app']) yield* fs.makeDirectory(join(tooled, member), { recursive: true })
   yield* fs.writeFileString(
     join(tooled, 'tlib/silk.toml'),
-    '[package]\nname = "tlib"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Tlib"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "tlib"\nversion = "0.1.0"\nsource = "."\nexports = ["Tlib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(tooled, 'tlib/build.silk'),
@@ -4075,7 +4077,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     ? 'export "C" fn silk_tuned_wide(values: simd<f32, 8>) -> simd<f32, 8> { return values }\n\n'
     : ''
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), `${wideExport}${tunedMain}`)
-  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nmain = "main.silk"\nsilk-version = "0.0.0"\n'
+  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n'
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
   const tunedBuild = yield* compileSettings(tuned, 'tuned',
     `[settings.profile]\ntarget = "${hostTarget}"\ncpu-features = ["${x86 ? 'avx2' : 'crc'}"]\n${
@@ -4137,7 +4139,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(tuned, 'silk.toml'), `${tunedHeader}\n[packge]\nname = "x"\n`)
   const misspelled = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(misspelled.status, 2, misspelled.stderr)
-  assert.match(misspelled.stderr, /Invalid Silk project manifest .*silk\.toml:7: /)
+  assert.match(misspelled.stderr, /Invalid Silk project manifest .*silk\.toml:6: /)
   // Runtime-name resolution is semantic even though the composition's shape is schema-owned.
   yield* fs.writeFileString(
     join(tuned, 'silk.toml'),
@@ -4145,7 +4147,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   const unresolvedRuntime = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(unresolvedRuntime.status, 2, unresolvedRuntime.stderr)
-  assert.match(unresolvedRuntime.stderr, /Invalid Silk project manifest .*silk\.toml:7: /)
+  assert.match(unresolvedRuntime.stderr, /Invalid Silk project manifest .*silk\.toml:6: /)
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
   // Without a runtime, an executable that exports no C `main` is refused before Clang links it.
   const mainless = yield* compileSettings(tuned, 'mainless', '[settings.profile]\nruntime = "none"\n', { ...process.env, SILK_CLANG: sentinel })
@@ -4195,7 +4197,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(defaultedRoot, 'app/src'), { recursive: true })
   yield* fs.makeDirectory(join(defaultedRoot, 'greeter/src'), { recursive: true })
   yield* fs.writeFileString(join(defaultedRoot, 'greeter/silk.toml'),
-    '[package]\nname = "greeter"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "greeter"\nversion = "0.1.0"\nexports = ["lib"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(defaultedRoot, 'greeter/src/lib.silk'),
     'pub param times: i32 = 5\n\npub fn count() -> i32 {\n  return times\n}\n')
   yield* fs.writeFileString(join(defaultedRoot, 'app/silk.toml'),
@@ -4204,7 +4206,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     'import greeter.lib { count }\n\npub fn main() -> i32 {\n  return count()\n}\n')
   const defaultedRun = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(defaultedRoot, 'app'), { ...process.env, SILK_CLANG: clang })
   assert.equal(defaultedRun.status, 5, defaultedRun.stderr)
-  // `[package].source` roots module resolution above the root module's own directory.
+  // `[package].source` roots module resolution above an explicit compilation root's own directory.
   yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
   yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
   yield* fs.writeFileString(
@@ -4217,18 +4219,16 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   )
   yield* fs.writeFileString(
     join(directory, 'rooted/silk.toml'),
-    '[package]\nname = "rooted"\nversion = "0.1.0"\nmain = "app/main.silk"\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "rooted"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
-  const rooted = yield* invoke(
-    silk,
-    ['run', '--stdlib', standardLibrary],
+  const rooted = yield* compileSettings(
     join(directory, 'rooted'),
-    {
-      ...process.env,
-      SILK_CLANG: clang,
-    },
+    'rooted',
+    `[settings]\nroot = ${encodeJson(join(directory, 'rooted/src/app/main.silk'))}\n`,
   )
-  assert.equal(rooted.status, 9, rooted.stderr)
+  assert.equal(rooted.status, 0, rooted.stderr)
+  const rootedRan = yield* invoke(compilationPath(join(directory, 'rooted'), 'rooted'), [], join(directory, 'rooted'))
+  assert.equal(rootedRan.status, 9, rootedRan.stderr)
   // A path dependency's modules are imported under its dependency name; its own imports stay in
   // its own package, so both packages can have a `util/digits` module.
   yield* fs.makeDirectory(join(directory, 'packaged/app/util'), { recursive: true })
@@ -4368,7 +4368,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     /Invalid Silk project manifest .*packaged\/broken\/silk\.toml:4: /,
   )
   // A dependency's silk.toml is checked against the manifest schema as the root's is.
-  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nkind = "library"\nnmae = "x"\nsilk-version = "0.0.0"\n')
+  yield* fs.writeFileString(join(directory, 'packaged/broken/silk.toml'), '[package]\nname = "broken"\nversion = "0.1.0"\nnmae = "x"\nsilk-version = "0.0.0"\n')
   const unknownField = yield* invoke(
     silk,
     ['run', '--stdlib', standardLibrary],
@@ -4502,7 +4502,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.writeFileString(join(workspace, 'silk.toml'), root(pin))
     yield* fs.writeFileString(
       join(workspace, 'libs/math/silk.toml'),
-      '[package]\nname = "shared-math"\nversion = "0.1.0"\nsource = "."\nkind = "library"\nmain = "twice.silk"\nexports = ["twice"]\n\n[dependencies]\nlengths = { workspace = true }\n',
+      '[package]\nname = "shared-math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\n\n[dependencies]\nlengths = { workspace = true }\n',
     )
     yield* fs.writeFileString(
       join(workspace, 'libs/math/twice.silk'),
@@ -4916,7 +4916,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     // A library with no executables in its build plan reports no executables with exit status 1.
     const libPkg = join(directory, 'binary/lib-pkg')
     yield* fs.makeDirectory(join(libPkg, 'src'), { recursive: true })
-    yield* fs.writeFileString(join(libPkg, 'silk.toml'), `[package]\nname = "libpkg"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\nkind = "library"\nmain = "lib.silk"\nexports = ["lib"]\n`)
+    yield* fs.writeFileString(join(libPkg, 'silk.toml'), `[package]\nname = "libpkg"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\nexports = ["lib"]\n`)
     yield* fs.writeFileString(join(libPkg, 'src/lib.silk'), 'pub const VALUE: i32 = 1\n')
     const libPack = yield* invoke(silk, ['pack', '--bin', '--output', join(directory, 'binary/lib-out'), '--stdlib', standardLibrary], libPkg, environment, 120_000)
     assert.equal(libPack.status, 1, 'packing binaries for a library should fail')
@@ -4961,7 +4961,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     // A symlinked `build.silk` is refused when packing the source archive.
     const symlinkBuild = join(directory, 'binary/symlink-build')
     yield* fs.makeDirectory(join(symlinkBuild, 'src'), { recursive: true })
-    yield* fs.writeFileString(join(symlinkBuild, 'silk.toml'), `[package]\nname = "sym"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\nkind = "library"\nmain = "lib.silk"\nexports = ["lib"]\n`)
+    yield* fs.writeFileString(join(symlinkBuild, 'silk.toml'), `[package]\nname = "sym"\nversion = "1.0.0"\nsilk-version = "${releasePin}"\nexports = ["lib"]\n`)
     yield* fs.writeFileString(join(symlinkBuild, 'src/lib.silk'), 'pub const VALUE: i32 = 1\n')
     yield* fs.writeFileString(join(directory, 'binary/real-build.silk'), 'import silk.build.plan { Plan }\npub const PLAN: Plan = Plan.empty()\n')
     yield* fs.symlink(join(directory, 'binary/real-build.silk'), join(symlinkBuild, 'build.silk'))
@@ -4999,7 +4999,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     yield* fs.makeDirectory(join(examples, 'library/src'), { recursive: true })
     yield* fs.writeFileString(
       join(examples, 'library/silk.toml'),
-      '[package]\nname = "library"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+      '[package]\nname = "library"\nversion = "0.1.0"\nexports = ["lib"]\n',
     )
     yield* fs.writeFileString(join(examples, 'library/src/lib.silk'), 'pub fn seven() -> i32 {\n  return 7\n}\n')
     yield* fs.makeDirectory(join(examples, 'quiet/src'), { recursive: true })
@@ -5171,14 +5171,13 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     'members share the workspace output',
   )
   assert.equal(yield* fs.exists(join(workspace, 'app/build')), false)
-  // From the workspace root, `run` runs the one member that has an entry; the library member,
-  // which has none, is skipped with a note.
+  // From the workspace root, `run` runs the one member that has an executable root.
   const virtualRoot = yield* invoke(silk, ['run', '--stdlib', standardLibrary], workspace, {
     ...process.env,
     SILK_CLANG: clang,
   })
   assert.equal(virtualRoot.status, 8, virtualRoot.stderr)
-  assert.match(virtualRoot.stderr, /Skipping math: its root module \(\[package\]\.main\) is missing/)
+  assert.doesNotMatch(virtualRoot.stderr, /Skipping math/)
   yield* fs.makeDirectory(join(workspace, 'libs/empty'), { recursive: true })
   const unmanifested = yield* invoke(
     silk,
@@ -5506,7 +5505,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(formatting, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(formatting, 'silk.toml'),
-    '[package]\nname = "formatting"\nversion = "0.1.0"\nmain = "a.silk"\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "formatting"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(join(formatting, 'src/a.silk'), 'pub fn a() -> i32 {\n  return 1\n}\n')
   yield* fs.writeFileString(join(formatting, 'src/b.silk'), 'pub fn b()->i32{return 2}\n')
@@ -5631,7 +5630,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const library = join(directory, 'library')
   yield* fs.makeDirectory(join(library, 'src'), { recursive: true })
   yield* fs.writeFileString(
-    join(library, 'src/Main.silk'),
+    join(library, 'src/lib.silk'),
     'fn helper(value: i32) -> i32 { return value + unsafe offset() }\n' +
       'unsafe extern "C" fn offset() -> i32\n' +
       'pub fn unrelated() -> i32 { return 99 }\n' +
@@ -5643,7 +5642,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
   yield* fs.writeFileString(join(library, 'silk.toml'),
-    '[package]\nname = "library"\nversion = "0.1.0"\nmain = "Main.silk"\nkind = "library"\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "library"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n')
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
     const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
@@ -5758,13 +5757,13 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   const nativeDependency = join(platformLibrary, 'native-dependency')
   yield* fs.makeDirectory(nativeDependency)
   yield* fs.writeFileString(join(nativeDependency, 'silk.toml'),
-    '[package]\nname = "native-dependency"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nexports = ["Value"]\nsilk-version = "0.0.0"\n')
+    '[package]\nname = "native-dependency"\nversion = "0.1.0"\nsource = "."\nexports = ["Value"]\nsilk-version = "0.0.0"\n')
   yield* fs.writeFileString(join(nativeDependency, 'Value.silk'),
     'unsafe extern "C" fn native_answer() -> i32\npub fn answer() -> i32 { return unsafe native_answer() }\n')
   yield* fs.writeFileString(join(nativeDependency, 'answer.c'), 'int native_answer(void) { return 42; }\n')
   yield* writePlan(nativeDependency, '  plan = Plan.compileC(plan, sourcePath("answer.c"))')
   yield* fs.writeFileString(join(platformLibrary, 'silk.toml'),
-    '[package]\nname = "platform-library"\nversion = "0.1.0"\nkind = "library"\nsource = "."\nmain = "main.silk"\nsilk-version = "0.0.0"\n'
+    '[package]\nname = "platform-library"\nversion = "0.1.0"\nsource = "."\nsilk-version = "0.0.0"\n'
       + '[dependencies]\nnative = { path = "native-dependency" }\n')
   yield* fs.writeFileString(join(platformLibrary, 'main.silk'), [
     'import native.Value',
@@ -6131,7 +6130,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.writeFileString(join(siblings, 'silk.toml'), '[workspace]\nmembers = ["spec", "one", "two"]\n')
   yield* fs.writeFileString(
     join(siblings, 'spec/silk.toml'),
-    '[package]\nname = "spec"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "spec"\nversion = "0.1.0"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(siblings, 'spec/src/lib.silk'),
@@ -6465,7 +6464,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(escapes, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(escapes, 'silk.toml'),
-    '[package]\nname = "escapes"\nversion = "0.1.0"\nmain = "main.silk"\nsilk-version = "0.0.0"\n',
+    '[package]\nname = "escapes"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
   )
   yield* fs.writeFileString(
     join(escapes, 'src/main.silk'),
@@ -6595,7 +6594,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   yield* fs.makeDirectory(join(embedApp, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "' + releasePin + '"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "' + releasePin + '"\nexports = ["library"]\n',
   )
   yield* fs.writeFileString(join(embedLibrary, 'js/index.js'), 'export const hello = () => `hi ${1 + 1}`;\n')
   yield* fs.writeFileString(
@@ -6704,7 +6703,7 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.doesNotMatch(unpacked.stderr, /fixtures/)
   yield* fs.writeFileString(
     join(embedLibrary, 'silk.toml'),
-    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "' + releasePin + '"\nkind = "library"\nmain = "library.silk"\nexports = ["library"]\ninclude = ["js"]\n',
+    '[package]\nname = "embed-library"\nversion = "0.1.0"\nsilk-version = "' + releasePin + '"\nexports = ["library"]\ninclude = ["js"]\n',
   )
   const packedEmbed = yield* embedPack()
   assert.equal(packedEmbed.status, 0, packedEmbed.stdout + packedEmbed.stderr)
@@ -6844,6 +6843,170 @@ pub fn first() -> i32 { let member = First {} return read(&member) }
   assert.equal(workspaceBuild.status, 23, workspaceBuild.stderr)
   assert.equal(yield* fs.exists(join(projectA, 'build/cache/app')), true)
   assert.equal(yield* fs.exists(sharedV1), false)
+  // Task-only and test-only workspace members work under --package and --workspace; dual-root
+  // packages build main.silk, check and test all roots without duplicate diagnostics or test runs,
+  // and document lib.silk + exports; [package].main and [package].kind are rejected.
+  {
+    const phase2Ws = join(directory, 'phase2-workspace')
+    const taskOnlyMember = join(phase2Ws, 'tasks-only')
+    const testOnlyMember = join(phase2Ws, 'test-only')
+    const appMember = join(phase2Ws, 'app')
+    yield* fs.makeDirectory(join(taskOnlyMember, 'src'), { recursive: true })
+    yield* fs.makeDirectory(join(testOnlyMember, 'src'), { recursive: true })
+    yield* fs.makeDirectory(join(appMember, 'src'), { recursive: true })
+    yield* fs.writeFileString(
+      join(phase2Ws, 'silk.toml'),
+      '[workspace]\nmembers = ["tasks-only", "test-only", "app"]\n',
+    )
+    yield* fs.writeFileString(
+      join(taskOnlyMember, 'silk.toml'),
+      '[package]\nname = "tasks-only"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
+    )
+    yield* fs.writeFileString(
+      join(taskOnlyMember, 'src/helper.silk'),
+      'pub fn pingValue() -> i32 {\n  return 27\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(taskOnlyMember, 'tasks.silk'),
+      [
+        'import silk.cli.command { Command, CommandLine }',
+        'import silk.cli.task { Task, TaskError, TaskSet }',
+        'import silk.mem.allocator { Allocator, OutOfMemoryError }',
+        'import silk.system.host_input { HostInput }',
+        'import silk.text.string { String }',
+        '',
+        'const DESCRIPTION: string<\'static> = "Tasks-only member fixture"',
+        'union Tasks {',
+        '  Ping,',
+        '}',
+        'impl CommandLine for Tasks {',
+        '  static fn command() -> Command<Tasks> { return Command<Tasks>.make("tasks", DESCRIPTION) }',
+        '}',
+        'impl TaskSet for Tasks {',
+        '  effect fn perform(self: Self) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {',
+        '    match move self {',
+        '      Tasks.Ping => { fail TaskError { message: run String.copy("pong"), status: 27 } }',
+        '    }',
+        '  }',
+        '}',
+        'pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }',
+        '',
+      ].join('\n'),
+    )
+    yield* fs.writeFileString(
+      join(testOnlyMember, 'silk.toml'),
+      '[package]\nname = "test-only"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
+    )
+    yield* fs.writeFileString(
+      join(testOnlyMember, 'src/tests.silk'),
+      'import silk.testing.testing { AssertionError, Testing }\n\ntest effect fn onlyTestRuns() -> ()\n  ! AssertionError<\'static> {\n  run Testing.expect(2 + 2 == 4, "test-only member runs")\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(appMember, 'silk.toml'),
+      '[package]\nname = "app"\nversion = "0.1.0"\nsilk-version = "0.0.0"\n',
+    )
+    yield* fs.writeFileString(
+      join(appMember, 'src/main.silk'),
+      'pub fn main() -> i32 {\n  return 3\n}\n\ntest fn appRuns() -> () {}\n',
+    )
+
+    const wsEnv = { ...process.env, SILK_CLANG: clang }
+    for (const args of [
+      ['check', '--stdlib', standardLibrary, '--package', 'tasks-only'],
+      ['build', '--stdlib', standardLibrary, '--package', 'tasks-only'],
+      ['test', '--stdlib', standardLibrary, '--package', 'tasks-only'],
+      ['check', '--stdlib', standardLibrary, '--package', 'test-only'],
+      ['build', '--stdlib', standardLibrary, '--package', 'test-only'],
+      ['test', '--no-cache', '--stdlib', standardLibrary, '--package', 'test-only'],
+      ['check', '--stdlib', standardLibrary, '--workspace'],
+      ['build', '--stdlib', standardLibrary, '--workspace'],
+      ['test', '--no-cache', '--stdlib', standardLibrary, '--workspace'],
+      ['format', '--check'],
+    ]) {
+      const result = yield* invoke(silk, args, phase2Ws, wsEnv, 120_000)
+      assert.equal(result.status, 0, `${args.join(' ')}: ${result.stdout}${result.stderr}`)
+    }
+    const pinged = yield* invoke(
+      silk,
+      ['task', '--stdlib', standardLibrary, '--package', 'tasks-only', 'ping'],
+      phase2Ws,
+      wsEnv,
+      120_000,
+    )
+    assert.equal(pinged.status, 27, pinged.stderr)
+    assert.match(pinged.stderr, /pong/)
+
+    const runTestOnly = yield* invoke(
+      silk,
+      ['run', '--stdlib', standardLibrary, '--package', 'test-only'],
+      phase2Ws,
+      wsEnv,
+    )
+    assert.notEqual(runTestOnly.status, 0, 'test-only member has no executable root to run')
+
+    const dualRoot = join(directory, 'dual-root')
+    yield* fs.makeDirectory(join(dualRoot, 'src'), { recursive: true })
+    yield* fs.writeFileString(
+      join(dualRoot, 'silk.toml'),
+      '[package]\nname = "dual-root"\nversion = "0.1.0"\nexports = ["lib"]\nsilk-version = "0.0.0"\n',
+    )
+    yield* fs.writeFileString(
+      join(dualRoot, 'src/shared.silk'),
+      'import silk.num.u64\n\npub fn base() -> i32 {\n  return 3\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(dualRoot, 'src/lib.silk'),
+      'import shared\n\n/// Doubles `n`.\npub fn double(n: i32) -> i32 {\n  return n * 2\n}\n\ntest fn libTest() -> () {\n  let _v = shared.base()\n}\n',
+    )
+    yield* fs.writeFileString(
+      join(dualRoot, 'src/main.silk'),
+      'import shared\nimport lib { double }\n\npub fn main() -> i32 {\n  return double(shared.base())\n}\n\ntest fn mainTest() -> () {}\n',
+    )
+    const dualCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], dualRoot, wsEnv)
+    assert.equal(dualCheck.status, 1, dualCheck.stderr)
+    assert.equal(
+      dualCheck.stderr.match(/warning\[MOD0007\] Import `u64` is never used/g)?.length ?? 0,
+      1,
+      `shared warning should be emitted once across dual roots: ${dualCheck.stderr}`,
+    )
+    yield* fs.writeFileString(
+      join(dualRoot, 'src/shared.silk'),
+      'pub fn base() -> i32 {\n  return 3\n}\n',
+    )
+    const dualCleanCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], dualRoot, wsEnv)
+    assert.equal(dualCleanCheck.status, 0, dualCleanCheck.stderr)
+    const dualBuilt = yield* invoke(silk, ['build', '--stdlib', standardLibrary], dualRoot, wsEnv)
+    assert.equal(dualBuilt.status, 0, dualBuilt.stderr)
+    const dualRan = yield* invoke(join(dualRoot, `build/${hostTarget}/dev/dual-root`), [], dualRoot)
+    assert.equal(dualRan.status, 6, dualRan.stderr)
+    const dualTested = yield* invoke(
+      silk,
+      ['test', '--no-cache', '--stdlib', standardLibrary],
+      dualRoot,
+      wsEnv,
+    )
+    assert.equal(dualTested.status, 0, dualTested.stderr)
+    assert.match(dualTested.stdout, /Tests  2 passed, 0 failed \(0 cached, 2 executed, 2 selected, 2 discovered\)/)
+    const dualDoc = yield* invoke(silk, ['doc', '--stdlib-root', standardLibrary], dualRoot, wsEnv)
+    assert.equal(dualDoc.status, 0, dualDoc.stderr)
+    const docJson = yield* fs.readFileString(join(dualRoot, 'build/documentation.json'))
+    assert.ok(docJson.includes('"double"'), 'silk doc documents the library root and its exports')
+
+    for (const [label, extra] of [
+      ['rejected-main', 'main = "main.silk"'],
+      ['rejected-kind', 'kind = "library"'],
+    ]) {
+      const invalidPkg = join(directory, label)
+      yield* fs.makeDirectory(join(invalidPkg, 'src'), { recursive: true })
+      yield* fs.writeFileString(
+        join(invalidPkg, 'silk.toml'),
+        `[package]\nname = "${label}"\nversion = "0.1.0"\n${extra}\n`,
+      )
+      yield* fs.writeFileString(join(invalidPkg, 'src/main.silk'), 'pub fn main() -> i32 { return 0 }\n')
+      const rejected = yield* invoke(silk, ['check', '--stdlib', standardLibrary], invalidPkg, wsEnv)
+      assert.notEqual(rejected.status, 0, `${label} must be rejected`)
+    }
+  }
   yield* Console.log(
     'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, compilation definitions, requests, bindings, source root, path dependencies, native source globs and per-file flags, native archives, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, embedded files, compressed embedded files, embedded files of a dependency, object and static library artifacts, emission stages, and shared system cache passed',
   )

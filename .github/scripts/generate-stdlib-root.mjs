@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const library = fileURLToPath(new URL('../../stdlib/', import.meta.url))
-const fixture = new URL('../../compiler/fixtures/stdlib-root/stdlib_check.silk', import.meta.url)
+const fixture = new URL('../../compiler/fixtures/stdlib-root/main.silk', import.meta.url)
 const manifest = JSON.parse(readFileSync(`${library}manifest.json`, 'utf8'))
 const modules = manifest.map((entry) => entry.module)
 const files = readdirSync(`${library}silk`, { recursive: true })

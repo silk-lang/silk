@@ -73,8 +73,9 @@ const program = Effect.gen(function* () {
   // The typed package plan links `struct_values.o`, so the variadic C object takes that name.
   yield* invoke(clang, ['--target=wasm32-unknown-unknown', '-ffreestanding', '-O2', '-c', 'variadic.c', '-o', 'struct_values.o'])
   yield* fs.writeFileString(join(directory, 'silk.toml'),
-    '[package]\nname = "c-variadic-conformance"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\nmain = "variadic.silk"\n')
+    '[package]\nname = "c-variadic-conformance"\nsilk-version = "0.0.0"\nversion = "0.1.0"\nsource = "."\n')
   const variadicCommands = yield* CompilationBuild.prepare({ compiler, manifest: join(directory, 'silk.toml'),
+    root: join(directory, 'variadic.silk'),
     output: join(directory, 'variadic.wasm'), stdlib: join(repo, 'stdlib'), target: 'wasm32-unknown-unknown',
     optimization: 'none', debug: true, emit: 'final' })
   for (const args of variadicCommands) yield* invoke(compiler, args)
