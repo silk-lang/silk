@@ -107,7 +107,7 @@ try {
   $results.Add(@{ name = 'response-command-limit'; objectArgumentLength = $objectArgumentLength })
   $archiveSource = Join-Path $responsePackage 'src/library.silk'
   [IO.File]::WriteAllText($archiveSource, 'export "C" fn silk_response_answer(value: i32) -> i32 { return value + 1 }')
-  $archiveManifest = "[package]`nname = `"response-library`"`nversion = `"0.0.0`"`nsilk-version = `"0.0.0`"`nmain = `"library.silk`"`nkind = `"library`"`n"
+  $archiveManifest = "[package]`nname = `"response-library`"`nversion = `"0.0.0`"`nsilk-version = `"0.0.0`"`n"
   [IO.File]::WriteAllText((Join-Path $responsePackage 'silk.toml'), $archiveManifest)
   $archive = Join-Path $responsePackage 'response library.lib'
   Build-Definition 'response-archive' (Join-Path $responsePackage 'silk.toml') $archiveSource $archive 'static-archive' ($links.ToArray())
